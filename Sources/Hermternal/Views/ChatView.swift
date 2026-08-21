@@ -3,12 +3,16 @@ import AppKit
 
 struct ChatView: View {
     @Bindable var model: AppModel
+    @Bindable var appearance: AppearanceSettings
     @State private var pendingScrollTask: Task<Void, Never>?
 
     var body: some View {
-        VStack(spacing: 0) {
-            transcript
-            Composer(model: model)
+        AdjustableChatSurface {
+            VStack(spacing: 0) {
+                transcript
+                Composer(model: model)
+            }
+            .chatOpacityVeil(appearance)
         }
     }
 
@@ -192,7 +196,11 @@ private struct Composer: View {
             .disabled(!model.isAwaitingReply && model.composerText.isEmptyAfterTrim)
             .padding(6)
         }
-        .glassEffect(.regular, in: .rect(cornerRadius: 22))
+        .background(.background, in: .rect(cornerRadius: 22))
+        .overlay {
+            RoundedRectangle(cornerRadius: 22)
+                .strokeBorder(.separator, lineWidth: 0.5)
+        }
         .padding(.horizontal, 18)
         .padding(.bottom, 16)
         .onAppear { isFocused = true }

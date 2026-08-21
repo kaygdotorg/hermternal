@@ -2,6 +2,7 @@ import SwiftUI
 
 struct RootView: View {
     @Bindable var model: AppModel
+    @Bindable var appearance: AppearanceSettings
 
     var body: some View {
         switch model.phase {
@@ -10,7 +11,7 @@ struct RootView: View {
         case .connecting:
             ConnectingView()
         case .ready:
-            ChatWindow(model: model)
+            ChatWindow(model: model, appearance: appearance)
         case .failed(let message):
             FailureView(message: message, model: model)
         }
@@ -64,6 +65,7 @@ private struct FailureView: View {
 
 struct ChatWindow: View {
     @Bindable var model: AppModel
+    @Bindable var appearance: AppearanceSettings
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     var body: some View {
@@ -71,7 +73,7 @@ struct ChatWindow: View {
             SidebarView(model: model)
                 .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 340)
         } detail: {
-            ChatView(model: model)
+            ChatView(model: model, appearance: appearance)
         }
         // Tahoe supplies the native floating sidebar and default sidebar
         // toolbar item. No custom material, overlay, or hide/show button.
@@ -107,7 +109,11 @@ private struct NoticeBanner: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .frame(maxWidth: 560)
-        .glassEffect(.regular, in: .rect(cornerRadius: 12))
+        .background(.background, in: .rect(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(.separator, lineWidth: 0.5)
+        }
         .padding(.top, 12)
         .transition(.move(edge: .top).combined(with: .opacity))
     }

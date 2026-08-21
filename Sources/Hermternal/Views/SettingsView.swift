@@ -19,6 +19,13 @@ struct SettingsView: View {
 private struct AppearanceSettingsView: View {
     @Bindable var appearance: AppearanceSettings
 
+    private var chatOpacityBinding: Binding<Double> {
+        Binding(
+            get: { appearance.chatOpacity },
+            set: { appearance.previewChatOpacity($0) }
+        )
+    }
+
     var body: some View {
         Form {
             Section {
@@ -30,6 +37,31 @@ private struct AppearanceSettingsView: View {
                 .pickerStyle(.segmented)
             }
 
+
+            Section("Chat Background") {
+                HStack {
+                    Text("Opacity")
+                    Slider(
+                        value: chatOpacityBinding,
+                        in: 0...1,
+                        onEditingChanged: { editing in
+                            if !editing {
+                                appearance.persistChatOpacity()
+                            }
+                        }
+                    )
+                    Text(
+                        appearance.chatOpacity.formatted(
+                            .percent.precision(.fractionLength(0))
+                        )
+                    )
+                    .monospacedDigit()
+                    .frame(width: 42, alignment: .trailing)
+                }
+                Text("The native sidebar and titlebar adapt independently.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             Section {
                 HStack {

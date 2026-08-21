@@ -7,7 +7,7 @@ struct HermternalApp: App {
 
     var body: some Scene {
         Window("Hermternal", id: "main") {
-            RootView(model: model)
+            RootView(model: model, appearance: appearance)
                 .preferredColorScheme(appearance.mode.colorScheme)
                 .task { await model.restoreOrPromptSignIn() }
         }
