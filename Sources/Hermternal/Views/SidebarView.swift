@@ -3,12 +3,19 @@ import SwiftUI
 struct SidebarView: View {
     @Bindable var model: AppModel
     @State private var pendingOpenTask: Task<Void, Never>?
+    @State private var pointerActivatedID: String?
 
     var body: some View {
         List(selection: $model.selectedSessionID) {
             Section("Chats") {
                 ForEach(model.sessions) { session in
                     SessionRow(session: session)
+                        .contentShape(.rect)
+                        .simultaneousGesture(
+                            TapGesture().onEnded {
+                                openImmediately(session)
+                            }
+                        )
                         .tag(session.id)
                 }
             }
@@ -18,6 +25,11 @@ struct SidebarView: View {
         // background, glass effect, or custom focus system over it.
         .listStyle(.sidebar)
         .onChange(of: model.selectedSessionID) { _, newValue in
+            if pointerActivatedID == newValue {
+                pointerActivatedID = nil
+                return
+            }
+            pointerActivatedID = nil
             scheduleOpen(for: newValue)
         }
         .onDisappear {
@@ -45,8 +57,23 @@ struct SidebarView: View {
         }
     }
 
-    /// Selection and native scrolling update immediately. Detail work waits
-    /// briefly so key repeat coalesces into one cached paint and one resume.
+    /// Mouse activation should paint cached detail immediately. Mark the id
+    /// so the selection change does not schedule a duplicate delayed open.
+    private func openImmediately(_ session: ChatSession) {
+        pointerActivatedID = session.id
+        pendingOpenTask?.cancel()
+        pendingOpenTask = nil
+        if model.selectedSessionID != session.id {
+            model.selectedSessionID = session.id
+        }
+        pendingOpenTask = Task {
+            guard !Task.isCancelled else { return }
+            await model.open(session)
+        }
+    }
+
+    /// Native selection and scrolling update immediately. Delay only detail
+    /// work long enough for key repeat to collapse into the final row.
     private func scheduleOpen(for id: String?) {
         pendingOpenTask?.cancel()
         pendingOpenTask = nil
@@ -56,7 +83,7 @@ struct SidebarView: View {
 
         pendingOpenTask = Task {
             do {
-                try await Task.sleep(for: .milliseconds(120))
+                try await Task.sleep(for: .milliseconds(45))
             } catch {
                 return
             }
