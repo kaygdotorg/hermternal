@@ -33,36 +33,36 @@ final class AppearanceSettings {
         didSet { defaults.set(mode.rawValue, forKey: Keys.mode) }
     }
 
-    /// Darkens the window backing *behind* the glass, so refraction survives.
-    /// Live value while dragging; persisted when editing ends so a pointer
-    /// drag does not write UserDefaults once per sample.
-    var windowDimming: Double
+    /// Crossfades the window between clear Liquid Glass at 0 and a frosted
+    /// material at 1. Live value while dragging; persisted when editing ends
+    /// so a pointer drag does not write UserDefaults once per sample.
+    var windowFrost: Double
 
     private let defaults: UserDefaults
 
     private enum Keys {
         static let mode = "appearance.mode"
-        static let windowDimming = "appearance.windowDimming"
+        static let windowFrost = "appearance.windowFrost"
     }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         mode = AppearanceMode(rawValue: defaults.string(forKey: Keys.mode) ?? "")
             ?? .system
-        windowDimming = defaults.object(forKey: Keys.windowDimming) as? Double ?? 0.20
+        windowFrost = defaults.object(forKey: Keys.windowFrost) as? Double ?? 0.20
     }
 
-    func previewWindowDimming(_ value: Double) {
-        windowDimming = min(max(value, 0), 1)
+    func previewWindowFrost(_ value: Double) {
+        windowFrost = min(max(value, 0), 1)
     }
 
-    func persistWindowDimming() {
-        defaults.set(windowDimming, forKey: Keys.windowDimming)
+    func persistWindowFrost() {
+        defaults.set(windowFrost, forKey: Keys.windowFrost)
     }
 
     func resetToDefaults() {
         mode = .system
-        windowDimming = 0.20
-        persistWindowDimming()
+        windowFrost = 0.20
+        persistWindowFrost()
     }
 }

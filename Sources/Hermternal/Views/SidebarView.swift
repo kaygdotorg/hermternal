@@ -34,28 +34,6 @@ struct SidebarView: View {
             pendingOpenTask?.cancel()
             pendingOpenTask = nil
         }
-        .toolbar {
-            // The system sidebar toggle keeps its own glass backing when the
-            // toolbar background is hidden; custom items do not, so ask for
-            // the same style explicitly. No frames: system metrics are what
-            // keep these matching the toggle beside them.
-            ToolbarItemGroup {
-                Button {
-                    Task { await model.newChat() }
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .help("New chat")
-                .keyboardShortcut("n", modifiers: .command)
-
-                Button {
-                    Task { await model.loadSessions() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .help("Reload the chat list from the server")
-            }
-        }
     }
 
     /// Mouse activation should paint cached detail immediately. Mark the id

@@ -6,9 +6,33 @@ struct ChatView: View {
     @State private var pendingScrollTask: Task<Void, Never>?
 
     var body: some View {
-        VStack(spacing: 0) {
-            transcript
-            Composer(model: model)
+        transcript
+            // safeAreaInset keeps the last message clear of the composer at
+            // rest while still letting content scroll underneath it, which a
+            // docked VStack row cannot do.
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                Composer(model: model)
+                    .background { Self.composerHalo }
+            }
+        // Declared on the detail, not the sidebar column: only the window
+        // toolbar region groups adjacent items into one shared pill.
+        .toolbar {
+            ToolbarItemGroup {
+                Button {
+                    Task { await model.newChat() }
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .help("New chat")
+                .keyboardShortcut("n", modifiers: .command)
+
+                Button {
+                    Task { await model.loadSessions() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help("Reload the chat list from the server")
+            }
         }
     }
 
@@ -36,7 +60,6 @@ struct ChatView: View {
                 .frame(maxWidth: .infinity)
             }
             .overlay(alignment: .top) { Self.topFade }
-            .scrollEdgeEffectStyle(.soft, for: .bottom)
             .onChange(of: model.messages.last?.text) {
                 guard pendingScrollTask == nil else { return }
                 pendingScrollTask = Task { @MainActor in
@@ -97,6 +120,31 @@ struct ChatView: View {
             .ignoresSafeArea(edges: .top)
             .allowsHitTesting(false)
     }
+
+    /// The soft pocket the composer sits in: a fixed ramp above it, then
+    /// solid material from the capsule down to the window edge. Expressed in
+    /// points rather than gradient stops so the ramp height stays put no
+    /// matter how tall the composer grows.
+    private static var composerHalo: some View {
+        VStack(spacing: 0) {
+            Rectangle()
+                .fill(.ultraThinMaterial)
+                .mask {
+                    LinearGradient(
+                        colors: [.clear, .black],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                }
+                .frame(height: Self.haloRamp)
+            Rectangle()
+                .fill(.ultraThinMaterial)
+        }
+        .padding(.top, -Self.haloRamp)
+        .allowsHitTesting(false)
+    }
+
+    private static let haloRamp: CGFloat = 34
 
     private static let bottomAnchor = "transcript.bottom"
 }

@@ -48,13 +48,20 @@ private struct GlassFrame<Content: View>: View {
             // area for the whole stack, so the transcript stops knowing a
             // titlebar is above it and loses its scroll edge effect.
             .background {
-                Color.clear
-                    .glassEffect(.regular, in: .rect(cornerRadius: 0))
-                    .ignoresSafeArea()
+                ZStack {
+                    Color.clear
+                        .glassEffect(.regular, in: .rect(cornerRadius: 0))
+                    // Frost rides over the glass on purpose: at 0 the glass
+                    // refracts untouched, at 1 the window reads as a frosted
+                    // material. Unlike a mandatory scrim, this is a dial the
+                    // user chooses, and 0 leaves the material intact.
+                    Rectangle()
+                        .fill(.regularMaterial)
+                        .opacity(appearance.windowFrost)
+                }
+                .ignoresSafeArea()
             }
-            // Dimming sits behind the glass, so it darkens the backdrop the
-            // material samples instead of covering the material itself.
-            .containerBackground(.black.opacity(appearance.windowDimming), for: .window)
+            .containerBackground(.clear, for: .window)
             .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
     }
 }

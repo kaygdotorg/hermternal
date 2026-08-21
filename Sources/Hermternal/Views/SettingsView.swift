@@ -19,10 +19,10 @@ struct SettingsView: View {
 private struct AppearanceSettingsView: View {
     @Bindable var appearance: AppearanceSettings
 
-    private var dimmingBinding: Binding<Double> {
+    private var frostBinding: Binding<Double> {
         Binding(
-            get: { appearance.windowDimming },
-            set: { appearance.previewWindowDimming($0) }
+            get: { appearance.windowFrost },
+            set: { appearance.previewWindowFrost($0) }
         )
     }
 
@@ -39,25 +39,25 @@ private struct AppearanceSettingsView: View {
 
             Section("Window") {
                 HStack {
-                    Text("Dimming")
+                    Text("Frost")
                     Slider(
-                        value: dimmingBinding,
+                        value: frostBinding,
                         in: 0...1,
                         onEditingChanged: { editing in
                             if !editing {
-                                appearance.persistWindowDimming()
+                                appearance.persistWindowFrost()
                             }
                         }
                     )
                     Text(
-                        appearance.windowDimming.formatted(
+                        appearance.windowFrost.formatted(
                             .percent.precision(.fractionLength(0))
                         )
                     )
                     .monospacedDigit()
                     .frame(width: 42, alignment: .trailing)
                 }
-                Text("Darkens what shows through the glass. The glass itself stays intact.")
+                Text("0% is clear Liquid Glass. 100% is a frosted material.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
