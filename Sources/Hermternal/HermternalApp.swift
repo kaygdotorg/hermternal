@@ -9,6 +9,9 @@ struct HermternalApp: App {
         Window("Hermternal", id: "main") {
             RootView(model: model)
                 .preferredColorScheme(appearance.mode.colorScheme)
+                // A clear window alone is a transparent hole. The glass
+                // layer over it is what refracts and blurs the desktop.
+                .glassEffect(.regular, in: .rect(cornerRadius: 0))
                 .containerBackground(.clear, for: .window)
                 .task { await model.restoreOrPromptSignIn() }
         }

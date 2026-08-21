@@ -21,6 +21,7 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
         .onChange(of: model.selectedSessionID) { _, newValue in
             if pointerActivatedID == newValue {
                 pointerActivatedID = nil
