@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct ChatView: View {
     @Bindable var model: AppModel
@@ -51,14 +52,30 @@ struct ChatView: View {
 private struct EmptyState: View {
     var body: some View {
         VStack(spacing: 8) {
-            Image(systemName: "bubble.left.and.bubble.right")
-                .font(.system(size: 30, weight: .light))
-                .foregroundStyle(.tertiary)
+            hermesMark
             Text("Ask Hermes anything")
                 .font(.title3.weight(.medium))
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private var hermesMark: some View {
+        if let path = Bundle.main.path(forResource: "HermesIcon", ofType: "png"),
+           let image = NSImage(contentsOfFile: path) {
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 44, height: 44)
+                .accessibilityLabel("Hermes")
+        } else {
+            Text("Hermes")
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(.tertiary)
+                .frame(width: 44, height: 44)
+                .accessibilityLabel("Hermes")
+        }
     }
 }
 

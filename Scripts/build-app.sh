@@ -18,6 +18,7 @@ APP="$ROOT/build/Hermternal.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN/Hermternal" "$APP/Contents/MacOS/Hermternal"
+cp "$ROOT/Resources/HermesIcon.png" "$APP/Contents/Resources/HermesIcon.png"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 
 # Prefer a real codesigning identity when one is installed. A real identity
