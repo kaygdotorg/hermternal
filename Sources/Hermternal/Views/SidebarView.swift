@@ -35,22 +35,31 @@ struct SidebarView: View {
             pendingOpenTask = nil
         }
         .toolbar {
+            // Hiding the toolbar backing to make the titlebar glass also
+            // strips the grouped-item pill, so carry one explicitly.
             ToolbarItem {
-                Button {
-                    Task { await model.newChat() }
-                } label: {
-                    Image(systemName: "plus")
+                HStack(spacing: 2) {
+                    Button {
+                        Task { await model.newChat() }
+                    } label: {
+                        Image(systemName: "plus")
+                            .frame(width: 22, height: 22)
+                    }
+                    .help("New chat")
+                    .keyboardShortcut("n", modifiers: .command)
+
+                    Button {
+                        Task { await model.loadSessions() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .frame(width: 22, height: 22)
+                    }
+                    .help("Reload the chat list from the server")
                 }
-                .help("New chat")
-                .keyboardShortcut("n", modifiers: .command)
-            }
-            ToolbarItem {
-                Button {
-                    Task { await model.loadSessions() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .help("Reload the chat list from the server")
+                .buttonStyle(.plain)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .glassEffect(.regular.interactive(), in: .capsule)
             }
         }
     }

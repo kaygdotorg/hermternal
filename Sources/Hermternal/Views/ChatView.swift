@@ -35,7 +35,7 @@ struct ChatView: View {
                 .frame(maxWidth: 680, alignment: .leading)
                 .frame(maxWidth: .infinity)
             }
-            .scrollEdgeEffectStyle(.soft, for: .top)
+            .overlay(alignment: .top) { Self.topFade }
             .scrollEdgeEffectStyle(.soft, for: .bottom)
             .onChange(of: model.messages.last?.text) {
                 guard pendingScrollTask == nil else { return }
@@ -67,6 +67,24 @@ struct ChatView: View {
                 pendingScrollTask = nil
             }
         }
+    }
+
+    /// Hiding the toolbar backing is what makes the titlebar glass, but it
+    /// also removes the built-in scroll edge effect, so the progressive blur
+    /// is drawn here instead. Stacked bands each blur a little more and fade
+    /// out, which reads as one continuous gradient rather than a hard line.
+    private static var topFade: some View {
+        VStack(spacing: 0) {
+            ForEach(0..<5, id: \.self) { step in
+                Rectangle()
+                    .fill(.clear)
+                    .background(.ultraThinMaterial)
+                    .opacity(1.0 - Double(step) / 5.0)
+                    .frame(height: 15)
+            }
+        }
+        .ignoresSafeArea(edges: .top)
+        .allowsHitTesting(false)
     }
 
     private static let bottomAnchor = "transcript.bottom"

@@ -19,6 +19,13 @@ struct SettingsView: View {
 private struct AppearanceSettingsView: View {
     @Bindable var appearance: AppearanceSettings
 
+    private var dimmingBinding: Binding<Double> {
+        Binding(
+            get: { appearance.windowDimming },
+            set: { appearance.previewWindowDimming($0) }
+        )
+    }
+
     var body: some View {
         Form {
             Section {
@@ -28,6 +35,31 @@ private struct AppearanceSettingsView: View {
                     }
                 }
                 .pickerStyle(.segmented)
+            }
+
+            Section("Window") {
+                HStack {
+                    Text("Dimming")
+                    Slider(
+                        value: dimmingBinding,
+                        in: 0...1,
+                        onEditingChanged: { editing in
+                            if !editing {
+                                appearance.persistWindowDimming()
+                            }
+                        }
+                    )
+                    Text(
+                        appearance.windowDimming.formatted(
+                            .percent.precision(.fractionLength(0))
+                        )
+                    )
+                    .monospacedDigit()
+                    .frame(width: 42, alignment: .trailing)
+                }
+                Text("Darkens what shows through the glass. The glass itself stays intact.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {
