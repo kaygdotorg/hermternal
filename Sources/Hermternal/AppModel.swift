@@ -79,9 +79,12 @@ final class AppModel {
 
         phase = .connecting
         do {
+            Log.info("signIn: starting native PKCE flow against \(url.absoluteString)")
             _ = try await auth.signIn()
+            Log.info("signIn: token exchange succeeded")
             await connect()
         } catch {
+            Log.error("signIn failed: \(error)")
             phase = .failed(error.localizedDescription)
         }
     }
@@ -108,13 +111,16 @@ final class AppModel {
             // A ticket is single-use with a 30s TTL, so mint it immediately
             // before dialing.
             let ticket = try await auth.webSocketTicket()
+            Log.info("connect: minted ws ticket")
             let gateway = GatewayClient()
             self.gateway = gateway
             try await gateway.connect(server: url, ticket: ticket)
+            Log.info("connect: websocket dialed")
             observeEvents(on: gateway)
             phase = .ready
             await loadSessions()
         } catch {
+            Log.error("connect failed: \(error)")
             phase = .failed(error.localizedDescription)
         }
     }
