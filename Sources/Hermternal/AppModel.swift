@@ -98,9 +98,14 @@ final class AppModel {
     func signOut() async {
         eventTask?.cancel()
         eventTask = nil
+        prefetchTask?.cancel()
+        prefetchTask = nil
         await gateway?.disconnect()
         gateway = nil
+        rest = nil
         await auth?.signOut()
+        // Transcripts are another user's data once signed out.
+        await cache.clear()
         liveSessionID = nil
         sessions = []
         messages = []
@@ -122,6 +127,7 @@ final class AppModel {
             self.gateway = gateway
             try await gateway.connect(server: url, ticket: ticket)
             Log.info("connect: websocket dialed")
+            rest = RestClient(server: url, auth: auth)
             observeEvents(on: gateway)
             phase = .ready
             await loadSessions()
@@ -150,9 +156,52 @@ final class AppModel {
             let rows = result["sessions"]?.arrayValue ?? []
             sessions = rows.map(ChatSession.init(from:)).filter { !$0.id.isEmpty }
             Log.info("session.list returned \(sessions.count) sessions")
+            prefetchTranscripts()
         } catch {
             Log.error("session.list failed: \(error)")
             notice = "Could not load sessions: \(error.localizedDescription)"
+        }
+    }
+
+    /// Warm the transcript cache in the background so switching chats never
+    /// waits on the network.
+    ///
+    /// Hydration goes over REST, not `session.resume`: resume registers a
+    /// live server-side session, so warming every row through it would spin
+    /// up one live agent per chat. Concurrency is bounded so a 30-chat list
+    /// does not open 30 simultaneous requests.
+    private func prefetchTranscripts() {
+        guard let rest else { return }
+        let ordered = sessions.map(\.id)
+        prefetchTask?.cancel()
+        prefetchTask = Task { [cache] in
+            let lanes = 4
+            await withTaskGroup(of: Void.self) { group in
+                var next = 0
+                func addTask(_ id: String) {
+                    group.addTask {
+                        guard await !cache.isCached(id) else { return }
+                        guard let rows = try? await rest.sessionMessages(durableID: id)
+                        else { return }
+                        await cache.store(
+                            rows.compactMap(ChatMessage.init(historyRow:)),
+                            for: id
+                        )
+                    }
+                }
+                while next < ordered.count, next < lanes {
+                    addTask(ordered[next])
+                    next += 1
+                }
+                while await group.next() != nil {
+                    if Task.isCancelled { break }
+                    if next < ordered.count {
+                        addTask(ordered[next])
+                        next += 1
+                    }
+                }
+            }
+            Log.info("prefetch: warmed \(ordered.count) transcripts")
         }
     }
 
@@ -172,27 +221,46 @@ final class AppModel {
         }
     }
 
-    /// Open a sidebar row. The durable id must be resumed into a live
-    /// ephemeral id before it can accept prompts.
+    /// Open a sidebar row.
+    ///
+    /// Renders the cached transcript synchronously so the click feels
+    /// instant, then resumes over the socket to bind the live ephemeral id
+    /// that `prompt.submit` requires and to reconcile any drift.
     func open(_ session: ChatSession) async {
         guard let gateway else { return }
+        openGeneration += 1
+        let generation = openGeneration
         selectedSessionID = session.id
-        messages = []
-        Log.info("session.resume requesting durable id \(session.id)")
+
+        if let cached = await cache.messages(for: session.id) {
+            // Only paint if this is still the row the user is looking at.
+            guard generation == openGeneration else { return }
+            messages = cached
+            Log.info("open \(session.id): \(cached.count) messages from cache")
+        } else {
+            messages = []
+        }
+
         do {
             let result = try await gateway.call(
                 "session.resume",
                 params: ["session_id": session.id]
             )
-            liveSessionID = result["session_id"]?.stringValue
             let rows = result["messages"]?.arrayValue ?? []
-            messages = rows.compactMap(ChatMessage.init(historyRow:))
+            let resumed = rows.compactMap(ChatMessage.init(historyRow:))
+            await cache.store(resumed, for: session.id)
+            // A later click won the race; keep its transcript on screen but
+            // let the cache write above stand.
+            guard generation == openGeneration else { return }
+            liveSessionID = result["session_id"]?.stringValue
+            messages = resumed
             Log.info(
                 "session.resume -> live id \(liveSessionID ?? "nil"), "
-                + "\(rows.count) rows, \(messages.count) rendered"
+                + "\(rows.count) rows, \(resumed.count) rendered"
             )
         } catch {
             Log.error("session.resume failed: \(error)")
+            guard generation == openGeneration else { return }
             notice = "Could not open that chat: \(error.localizedDescription)"
         }
     }
@@ -252,8 +320,15 @@ final class AppModel {
                 }
             }
             finishStreaming()
-            // A first turn creates the durable row; refresh so it appears.
-            if selectedSessionID == nil { await loadSessions() }
+            // Keep the cache in step with the completed turn so reopening
+            // this chat does not briefly show a stale transcript.
+            if let id = selectedSessionID {
+                await cache.store(messages, for: id)
+            } else {
+                // A first turn only now creates the durable row; refresh so
+                // it appears in the sidebar.
+                await loadSessions()
+            }
 
         case "error":
             notice = event.text ?? "The agent reported an error."
