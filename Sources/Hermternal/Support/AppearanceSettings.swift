@@ -27,9 +27,9 @@ enum AppearanceMode: String, CaseIterable, Identifiable {
 
 /// User-tunable appearance, persisted in `UserDefaults`.
 ///
-/// Glass intensity is stored per surface because the sidebar and the
-/// transcript want different amounts in practice: a translucent sidebar
-/// reads as chrome, while long-form text needs more opacity to stay legible.
+/// Tahoe owns Liquid Glass for standard components. The public native
+/// sidebar material has no opacity/intensity control, so this model does not
+/// pretend to expose one through custom backgrounds.
 @MainActor
 @Observable
 final class AppearanceSettings {
@@ -37,42 +37,20 @@ final class AppearanceSettings {
         didSet { defaults.set(mode.rawValue, forKey: Keys.mode) }
     }
 
-    /// 0 = fully opaque, 1 = fully translucent.
-    var sidebarGlass: Double {
-        didSet { defaults.set(sidebarGlass, forKey: Keys.sidebarGlass) }
-    }
-
-    var chatGlass: Double {
-        didSet { defaults.set(chatGlass, forKey: Keys.chatGlass) }
-    }
-
-    /// Glass for auxiliary windows. Settings has no reading surface of its
-    /// own to tune, so it splits the difference between the two the user
-    /// actually set and stays visually of a piece with the main window.
-    var auxiliaryGlass: Double {
-        (sidebarGlass + chatGlass) / 2
-    }
 
     private let defaults: UserDefaults
 
     private enum Keys {
         static let mode = "appearance.mode"
-        static let sidebarGlass = "appearance.sidebarGlass"
-        static let chatGlass = "appearance.chatGlass"
     }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         mode = AppearanceMode(rawValue: defaults.string(forKey: Keys.mode) ?? "")
             ?? .system
-        // Chrome leans translucent, reading surface leans opaque.
-        sidebarGlass = defaults.object(forKey: Keys.sidebarGlass) as? Double ?? 0.85
-        chatGlass = defaults.object(forKey: Keys.chatGlass) as? Double ?? 0.35
     }
 
     func resetToDefaults() {
         mode = .system
-        sidebarGlass = 0.85
-        chatGlass = 0.35
     }
 }

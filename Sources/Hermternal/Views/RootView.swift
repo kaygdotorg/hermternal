@@ -2,7 +2,6 @@ import SwiftUI
 
 struct RootView: View {
     @Bindable var model: AppModel
-    @Bindable var appearance: AppearanceSettings
 
     var body: some View {
         switch model.phase {
@@ -11,7 +10,7 @@ struct RootView: View {
         case .connecting:
             ConnectingView()
         case .ready:
-            ChatWindow(model: model, appearance: appearance)
+            ChatWindow(model: model)
         case .failed(let message):
             FailureView(message: message, model: model)
         }
@@ -65,44 +64,17 @@ private struct FailureView: View {
 
 struct ChatWindow: View {
     @Bindable var model: AppModel
-    @Bindable var appearance: AppearanceSettings
-    @State private var isSidebarVisible = true
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     var body: some View {
-        ZStack(alignment: .leading) {
-            // The reading surface owns the whole window, including the
-            // unified titlebar area; this removes the transparent top strip.
-            ChatView(model: model, appearance: appearance)
-                .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
-                .ignoresSafeArea()
-
-            if isSidebarVisible {
-                SidebarView(model: model, appearance: appearance)
-                    .frame(width: 264)
-                    .clipShape(.rect(cornerRadius: 16))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 16)
-                            .strokeBorder(.separator.opacity(0.35), lineWidth: 0.5)
-                    }
-                    .shadow(color: .black.opacity(0.14), radius: 18, y: 8)
-                    .padding(.leading, 12)
-                    .padding(.vertical, 10)
-                    .transition(.move(edge: .leading).combined(with: .opacity))
-            }
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            SidebarView(model: model)
+                .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 340)
+        } detail: {
+            ChatView(model: model)
         }
-        .toolbar {
-            ToolbarItem(placement: .navigation) {
-                Button {
-                    withAnimation(.snappy(duration: 0.24, extraBounce: 0)) {
-                        isSidebarVisible.toggle()
-                    }
-                } label: {
-                    Image(systemName: "sidebar.leading")
-                }
-                .help(isSidebarVisible ? "Hide sidebar" : "Show sidebar")
-                .keyboardShortcut("s", modifiers: [.command, .control])
-            }
-        }
+        // Tahoe supplies the native floating sidebar and default sidebar
+        // toolbar item. No custom material, overlay, or hide/show button.
         .overlay(alignment: .top) {
             if let notice = model.notice {
                 NoticeBanner(text: notice) { model.notice = nil }

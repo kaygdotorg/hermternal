@@ -7,14 +7,11 @@ struct HermternalApp: App {
 
     var body: some Scene {
         Window("Hermternal", id: "main") {
-            RootView(model: model, appearance: appearance)
+            RootView(model: model)
                 .preferredColorScheme(appearance.mode.colorScheme)
-                // Let the glass surfaces read the desktop behind the window
-                // instead of an opaque system backdrop.
-                .containerBackground(.clear, for: .window)
                 .task { await model.restoreOrPromptSignIn() }
         }
-        .windowStyle(.hiddenTitleBar)
+        .windowToolbarStyle(.unified)
         .defaultSize(width: 1_040, height: 720)
         .commands {
             CommandGroup(replacing: .newItem) {
@@ -28,7 +25,6 @@ struct HermternalApp: App {
         Settings {
             SettingsView(appearance: appearance, model: model)
                 .preferredColorScheme(appearance.mode.colorScheme)
-                .containerBackground(.clear, for: .window)
         }
     }
 }

@@ -13,8 +13,6 @@ struct SettingsView: View {
         }
         .frame(width: 460)
         .scenePadding()
-        .clearAppKitBackground()
-        .glassSurface(intensity: appearance.auxiliaryGlass)
     }
 }
 
@@ -32,18 +30,6 @@ private struct AppearanceSettingsView: View {
                 .pickerStyle(.segmented)
             }
 
-            Section("Liquid Glass") {
-                GlassSlider(
-                    title: "Sidebar",
-                    help: "How much the desktop shows through the chat list.",
-                    value: $appearance.sidebarGlass
-                )
-                GlassSlider(
-                    title: "Chat",
-                    help: "Lower this if long messages are hard to read.",
-                    value: $appearance.chatGlass
-                )
-            }
 
             Section {
                 HStack {
@@ -55,8 +41,6 @@ private struct AppearanceSettingsView: View {
             }
         }
         .formStyle(.grouped)
-        // Otherwise the Form's own backing hides the window glass.
-        .scrollContentBackground(.hidden)
     }
 }
 
@@ -122,38 +106,5 @@ private struct CacheSettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .scrollContentBackground(.hidden)
-    }
-}
-
-private struct GlassSlider: View {
-    let title: String
-    let help: String
-    @Binding var value: Double
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(title)
-                Spacer()
-                Text(value.formatted(.percent.precision(.fractionLength(0))))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-            Slider(value: $value, in: 0...1) {
-                EmptyView()
-            } minimumValueLabel: {
-                Image(systemName: "square.fill")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            } maximumValueLabel: {
-                Image(systemName: "square.on.square.dashed")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            Text(help)
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-        }
     }
 }

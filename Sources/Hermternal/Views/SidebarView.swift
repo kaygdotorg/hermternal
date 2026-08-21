@@ -2,72 +2,27 @@ import SwiftUI
 
 struct SidebarView: View {
     @Bindable var model: AppModel
-    @Bindable var appearance: AppearanceSettings
-    @FocusState private var sidebarFocused: Bool
-
-    private func moveSelection(by offset: Int, using proxy: ScrollViewProxy) -> KeyPress.Result {
-        let sessions = model.sessions
-        guard !sessions.isEmpty else { return .handled }
-        let currentIndex = model.selectedSessionID.flatMap { selectedID in
-            sessions.firstIndex { $0.id == selectedID }
-        }
-        let targetIndex: Int
-        if let currentIndex {
-            let nextIndex = currentIndex + offset
-            guard sessions.indices.contains(nextIndex) else { return .handled }
-            targetIndex = nextIndex
-        } else {
-            targetIndex = offset > 0 ? 0 : sessions.count - 1
-        }
-
-        let session = sessions[targetIndex]
-        model.selectedSessionID = session.id
-        Task { await model.open(session) }
-        withAnimation {
-            proxy.scrollTo(session.id, anchor: .center)
-        }
-        return .handled
-    }
+    @State private var pendingOpenTask: Task<Void, Never>?
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2, pinnedViews: [.sectionHeaders]) {
-                    Section {
-                        ForEach(model.sessions) { session in
-                            SessionButton(
-                                session: session,
-                                isSelected: model.selectedSessionID == session.id
-                            ) {
-                                sidebarFocused = true
-                                model.selectedSessionID = session.id
-                                Task { await model.open(session) }
-                            }
-                            .id(session.id)
-                        }
-                    } header: {
-                        Text("Chats")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .textCase(.uppercase)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 7)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(.thinMaterial)
-                    }
+        List(selection: $model.selectedSessionID) {
+            Section("Chats") {
+                ForEach(model.sessions) { session in
+                    SessionRow(session: session)
+                        .tag(session.id)
                 }
-                .padding(.horizontal, 6)
-                .padding(.bottom, 10)
             }
-            .focusable()
-            .focused($sidebarFocused)
-            .onKeyPress(.downArrow) {
-                moveSelection(by: 1, using: proxy)
-            }
-            .onKeyPress(.upArrow) {
-                moveSelection(by: -1, using: proxy)
-            }
-            .glassSurface(intensity: appearance.sidebarGlass)
+        }
+        // Tahoe supplies the inset/floating Liquid Glass sidebar, selection,
+        // focus, scrolling, and keyboard navigation. Do not layer another
+        // background, glass effect, or custom focus system over it.
+        .listStyle(.sidebar)
+        .onChange(of: model.selectedSessionID) { _, newValue in
+            scheduleOpen(for: newValue)
+        }
+        .onDisappear {
+            pendingOpenTask?.cancel()
+            pendingOpenTask = nil
         }
         .toolbar {
             ToolbarItem {
@@ -89,41 +44,48 @@ struct SidebarView: View {
             }
         }
     }
+
+    /// Selection and native scrolling update immediately. Detail work waits
+    /// briefly so key repeat coalesces into one cached paint and one resume.
+    private func scheduleOpen(for id: String?) {
+        pendingOpenTask?.cancel()
+        pendingOpenTask = nil
+        guard let id,
+              let session = model.sessions.first(where: { $0.id == id })
+        else { return }
+
+        pendingOpenTask = Task {
+            do {
+                try await Task.sleep(for: .milliseconds(120))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            await model.open(session)
+        }
+    }
 }
 
-private struct SessionButton: View {
+private struct SessionRow: View {
     let session: ChatSession
-    let isSelected: Bool
-    let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(session.displayTitle)
-                    .lineLimit(1)
-                    .font(.body)
-                HStack(spacing: 5) {
-                    if let startedAt = session.startedAt {
-                        Text(startedAt, format: .relative(presentation: .named))
-                    }
-                    if session.messageCount > 0 {
-                        Text("·")
-                        Text("\(session.messageCount)")
-                    }
+        VStack(alignment: .leading, spacing: 3) {
+            Text(session.displayTitle)
+                .lineLimit(1)
+                .font(.body)
+            HStack(spacing: 5) {
+                if let startedAt = session.startedAt {
+                    Text(startedAt, format: .relative(presentation: .named))
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                if session.messageCount > 0 {
+                    Text("·")
+                    Text("\(session.messageCount)")
+                }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(.rect)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background(
-                isSelected ? AnyShapeStyle(.tint.opacity(0.16)) : AnyShapeStyle(.clear),
-                in: .rect(cornerRadius: 7)
-            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .padding(.vertical, 2)
     }
 }

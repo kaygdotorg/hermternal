@@ -3,7 +3,6 @@ import AppKit
 
 struct ChatView: View {
     @Bindable var model: AppModel
-    @Bindable var appearance: AppearanceSettings
     @State private var pendingScrollTask: Task<Void, Never>?
 
     var body: some View {
@@ -11,7 +10,6 @@ struct ChatView: View {
             transcript
             Composer(model: model)
         }
-        .glassSurface(intensity: appearance.chatGlass)
     }
 
     private var transcript: some View {
