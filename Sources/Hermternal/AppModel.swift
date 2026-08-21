@@ -143,7 +143,9 @@ final class AppModel {
             let result = try await gateway.call("session.list")
             let rows = result["sessions"]?.arrayValue ?? []
             sessions = rows.map(ChatSession.init(from:)).filter { !$0.id.isEmpty }
+            Log.info("session.list returned \(sessions.count) sessions")
         } catch {
+            Log.error("session.list failed: \(error)")
             notice = "Could not load sessions: \(error.localizedDescription)"
         }
     }
@@ -157,7 +159,9 @@ final class AppModel {
             // `session.create` does not persist a row until the first
             // prompt, so there is nothing to select in the sidebar yet.
             selectedSessionID = nil
+            Log.info("session.create -> live id \(liveSessionID ?? "nil")")
         } catch {
+            Log.error("session.create failed: \(error)")
             notice = "Could not start a new chat: \(error.localizedDescription)"
         }
     }
@@ -168,6 +172,7 @@ final class AppModel {
         guard let gateway else { return }
         selectedSessionID = session.id
         messages = []
+        Log.info("session.resume requesting durable id \(session.id)")
         do {
             let result = try await gateway.call(
                 "session.resume",
@@ -176,7 +181,12 @@ final class AppModel {
             liveSessionID = result["session_id"]?.stringValue
             let rows = result["messages"]?.arrayValue ?? []
             messages = rows.compactMap(ChatMessage.init(historyRow:))
+            Log.info(
+                "session.resume -> live id \(liveSessionID ?? "nil"), "
+                + "\(rows.count) rows, \(messages.count) rendered"
+            )
         } catch {
+            Log.error("session.resume failed: \(error)")
             notice = "Could not open that chat: \(error.localizedDescription)"
         }
     }

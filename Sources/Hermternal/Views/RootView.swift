@@ -2,6 +2,7 @@ import SwiftUI
 
 struct RootView: View {
     @Bindable var model: AppModel
+    @Bindable var appearance: AppearanceSettings
 
     var body: some View {
         switch model.phase {
@@ -10,7 +11,7 @@ struct RootView: View {
         case .connecting:
             ConnectingView()
         case .ready:
-            ChatWindow(model: model)
+            ChatWindow(model: model, appearance: appearance)
         case .failed(let message):
             FailureView(message: message, model: model)
         }
@@ -64,13 +65,14 @@ private struct FailureView: View {
 
 struct ChatWindow: View {
     @Bindable var model: AppModel
+    @Bindable var appearance: AppearanceSettings
 
     var body: some View {
         NavigationSplitView {
-            SidebarView(model: model)
+            SidebarView(model: model, appearance: appearance)
                 .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 340)
         } detail: {
-            ChatView(model: model)
+            ChatView(model: model, appearance: appearance)
         }
         .overlay(alignment: .top) {
             if let notice = model.notice {

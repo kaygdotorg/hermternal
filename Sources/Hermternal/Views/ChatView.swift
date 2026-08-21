@@ -2,13 +2,14 @@ import SwiftUI
 
 struct ChatView: View {
     @Bindable var model: AppModel
+    @Bindable var appearance: AppearanceSettings
 
     var body: some View {
         VStack(spacing: 0) {
             transcript
             Composer(model: model)
         }
-        .background(.background)
+        .glassSurface(intensity: appearance.chatGlass)
     }
 
     private var transcript: some View {

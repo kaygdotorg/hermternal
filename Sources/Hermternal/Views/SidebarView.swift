@@ -2,16 +2,13 @@ import SwiftUI
 
 struct SidebarView: View {
     @Bindable var model: AppModel
+    @Bindable var appearance: AppearanceSettings
 
     var body: some View {
-        List(selection: Binding(
-            get: { model.selectedSessionID },
-            set: { id in
-                guard let id, let session = model.sessions.first(where: { $0.id == id })
-                else { return }
-                Task { await model.open(session) }
-            }
-        )) {
+        // Bind selection straight to the model and react in onChange. An
+        // inline Binding(get:set:) here never delivered its setter, so
+        // clicking a row did nothing at all.
+        List(selection: $model.selectedSessionID) {
             Section("Chats") {
                 ForEach(model.sessions) { session in
                     SessionRow(session: session)
@@ -20,26 +17,33 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
-        .safeAreaInset(edge: .bottom) {
-            HStack(spacing: 8) {
+        // Let the glass behind the list show through.
+        .scrollContentBackground(.hidden)
+        .glassSurface(intensity: appearance.sidebarGlass)
+        .onChange(of: model.selectedSessionID) { _, newValue in
+            guard let id = newValue,
+                  let session = model.sessions.first(where: { $0.id == id })
+            else { return }
+            Task { await model.open(session) }
+        }
+        .toolbar {
+            ToolbarItem {
                 Button {
                     Task { await model.newChat() }
                 } label: {
-                    Label("New Chat", systemImage: "plus")
-                        .frame(maxWidth: .infinity)
+                    Image(systemName: "plus")
                 }
-                .buttonStyle(.borderedProminent)
-
+                .help("New chat")
+                .keyboardShortcut("n", modifiers: .command)
+            }
+            ToolbarItem {
                 Button {
                     Task { await model.loadSessions() }
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
-                .help("Refresh chats")
+                .help("Reload the chat list from the server")
             }
-            .padding(10)
-            .glassEffect(.regular, in: .rect(cornerRadius: 12))
-            .padding(10)
         }
     }
 }
