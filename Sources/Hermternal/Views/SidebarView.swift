@@ -35,31 +35,25 @@ struct SidebarView: View {
             pendingOpenTask = nil
         }
         .toolbar {
-            // Hiding the toolbar backing to make the titlebar glass also
-            // strips the grouped-item pill, so carry one explicitly.
-            ToolbarItem {
-                HStack(spacing: 2) {
-                    Button {
-                        Task { await model.newChat() }
-                    } label: {
-                        Image(systemName: "plus")
-                            .frame(width: 22, height: 22)
-                    }
-                    .help("New chat")
-                    .keyboardShortcut("n", modifiers: .command)
-
-                    Button {
-                        Task { await model.loadSessions() }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                            .frame(width: 22, height: 22)
-                    }
-                    .help("Reload the chat list from the server")
+            // The system sidebar toggle keeps its own glass backing when the
+            // toolbar background is hidden; custom items do not, so ask for
+            // the same style explicitly. No frames: system metrics are what
+            // keep these matching the toggle beside them.
+            ToolbarItemGroup {
+                Button {
+                    Task { await model.newChat() }
+                } label: {
+                    Image(systemName: "plus")
                 }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .glassEffect(.regular.interactive(), in: .capsule)
+                .help("New chat")
+                .keyboardShortcut("n", modifiers: .command)
+
+                Button {
+                    Task { await model.loadSessions() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help("Reload the chat list from the server")
             }
         }
     }

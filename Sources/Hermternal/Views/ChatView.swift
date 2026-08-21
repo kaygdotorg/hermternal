@@ -71,20 +71,31 @@ struct ChatView: View {
 
     /// Hiding the toolbar backing is what makes the titlebar glass, but it
     /// also removes the built-in scroll edge effect, so the progressive blur
-    /// is drawn here instead. Stacked bands each blur a little more and fade
-    /// out, which reads as one continuous gradient rather than a hard line.
+    /// is drawn here instead.
+    ///
+    /// One masked material rather than stacked bands: a gradient mask fades
+    /// continuously, so there are no seams between opacity steps. The stops
+    /// are weighted toward the top so the tail is long and the falloff stays
+    /// gentle instead of ending on a visible line.
     private static var topFade: some View {
-        VStack(spacing: 0) {
-            ForEach(0..<5, id: \.self) { step in
-                Rectangle()
-                    .fill(.clear)
-                    .background(.ultraThinMaterial)
-                    .opacity(1.0 - Double(step) / 5.0)
-                    .frame(height: 15)
+        Rectangle()
+            .fill(.ultraThinMaterial)
+            .mask {
+                LinearGradient(
+                    stops: [
+                        .init(color: .black, location: 0),
+                        .init(color: .black.opacity(0.75), location: 0.30),
+                        .init(color: .black.opacity(0.35), location: 0.55),
+                        .init(color: .black.opacity(0.12), location: 0.76),
+                        .init(color: .clear, location: 1)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
             }
-        }
-        .ignoresSafeArea(edges: .top)
-        .allowsHitTesting(false)
+            .frame(height: 130)
+            .ignoresSafeArea(edges: .top)
+            .allowsHitTesting(false)
     }
 
     private static let bottomAnchor = "transcript.bottom"
