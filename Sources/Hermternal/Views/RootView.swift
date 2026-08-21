@@ -68,11 +68,14 @@ struct ChatWindow: View {
     @Bindable var appearance: AppearanceSettings
 
     var body: some View {
-        NavigationSplitView {
+        // NavigationSplitView injects opaque/material column backings above
+        // the window, which visually cover each column's own glass. HSplitView
+        // provides the same draggable divider without adding those surfaces.
+        HSplitView {
             SidebarView(model: model, appearance: appearance)
-                .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 340)
-        } detail: {
+                .frame(minWidth: 200, idealWidth: 250, maxWidth: 340)
             ChatView(model: model, appearance: appearance)
+                .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
         }
         .overlay(alignment: .top) {
             if let notice = model.notice {
