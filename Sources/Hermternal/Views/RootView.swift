@@ -66,16 +66,42 @@ private struct FailureView: View {
 struct ChatWindow: View {
     @Bindable var model: AppModel
     @Bindable var appearance: AppearanceSettings
+    @State private var isSidebarVisible = true
 
     var body: some View {
-        // NavigationSplitView injects opaque/material column backings above
-        // the window, which visually cover each column's own glass. HSplitView
-        // provides the same draggable divider without adding those surfaces.
-        HSplitView {
-            SidebarView(model: model, appearance: appearance)
-                .frame(minWidth: 200, idealWidth: 250, maxWidth: 340)
+        ZStack(alignment: .leading) {
+            // The reading surface owns the whole window, including the
+            // unified titlebar area; this removes the transparent top strip.
             ChatView(model: model, appearance: appearance)
                 .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea()
+
+            if isSidebarVisible {
+                SidebarView(model: model, appearance: appearance)
+                    .frame(width: 264)
+                    .clipShape(.rect(cornerRadius: 16))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 16)
+                            .strokeBorder(.separator.opacity(0.35), lineWidth: 0.5)
+                    }
+                    .shadow(color: .black.opacity(0.14), radius: 18, y: 8)
+                    .padding(.leading, 12)
+                    .padding(.vertical, 10)
+                    .transition(.move(edge: .leading).combined(with: .opacity))
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button {
+                    withAnimation(.snappy(duration: 0.24, extraBounce: 0)) {
+                        isSidebarVisible.toggle()
+                    }
+                } label: {
+                    Image(systemName: "sidebar.leading")
+                }
+                .help(isSidebarVisible ? "Hide sidebar" : "Show sidebar")
+                .keyboardShortcut("s", modifiers: [.command, .control])
+            }
         }
         .overlay(alignment: .top) {
             if let notice = model.notice {
