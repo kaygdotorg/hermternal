@@ -4,6 +4,7 @@ import AppKit
 struct ChatView: View {
     @Bindable var model: AppModel
     @Bindable var appearance: AppearanceSettings
+    @State private var pendingScrollTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -36,12 +37,33 @@ struct ChatView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .onChange(of: model.messages.last?.text) {
-                proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+                guard pendingScrollTask == nil else { return }
+                pendingScrollTask = Task { @MainActor in
+                    do {
+                        try await Task.sleep(for: .milliseconds(20))
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled else { return }
+                    proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+                    pendingScrollTask = nil
+                }
             }
-            .onChange(of: model.messages.count) {
-                withAnimation(.easeOut(duration: 0.18)) {
+            .onChange(of: model.messages.count) { oldCount, newCount in
+                pendingScrollTask?.cancel()
+                pendingScrollTask = nil
+
+                if newCount == oldCount + 1 {
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+                    }
+                } else {
                     proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
                 }
+            }
+            .onDisappear {
+                pendingScrollTask?.cancel()
+                pendingScrollTask = nil
             }
         }
     }
