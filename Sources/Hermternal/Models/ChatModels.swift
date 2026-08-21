@@ -59,13 +59,18 @@ struct ChatMessage: Identifiable, Sendable {
     }
 
     /// Build from a `session.resume` / `session.history` history row.
+    ///
+    /// The gateway's `_history_to_messages` projection emits `text`, not
+    /// `content`; `content` is the shape the OpenAI-compatible API server
+    /// uses. Accept `text` first and fall back so both surfaces parse.
     init?(historyRow value: JSONValue) {
         guard let rawRole = value["role"]?.stringValue else { return nil }
-        // Tool rows carry no user-visible prose; skip them in v1.
+        // Tool rows arrive as {role:"tool", name:…, context:…} and carry no
+        // user-visible prose, so Role rejects them and they are skipped.
         guard let role = Role(rawValue: rawRole) else { return nil }
-        let content = Self.flatten(value["content"]) ?? ""
-        guard !content.isEmpty else { return nil }
-        self.init(role: role, text: content)
+        let body = Self.flatten(value["text"]) ?? Self.flatten(value["content"]) ?? ""
+        guard !body.isEmpty else { return nil }
+        self.init(role: role, text: body)
     }
 
     /// History content is a string on text-only turns and an array of typed
