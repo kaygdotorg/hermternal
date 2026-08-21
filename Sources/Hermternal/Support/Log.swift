@@ -7,7 +7,7 @@ import os
 /// keeps auth and transport failures inspectable after the fact without
 /// attaching a debugger.
 enum Log {
-    private static let logger = Logger(subsystem: "com.tavyg.hermternal", category: "app")
+    private static let logger = Logger(subsystem: "com.kayg.hermternal", category: "app")
 
     /// `~/Library/Logs/Hermternal/hermternal.log`
     static let fileURL: URL = {
@@ -18,7 +18,7 @@ enum Log {
         return directory.appending(path: "hermternal.log")
     }()
 
-    private static let queue = DispatchQueue(label: "com.tavyg.hermternal.log")
+    private static let queue = DispatchQueue(label: "com.kayg.hermternal.log")
 
     // A value-type format style, unlike ISO8601DateFormatter, is Sendable
     // and so usable from a static context under strict concurrency.

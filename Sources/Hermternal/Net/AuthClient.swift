@@ -10,7 +10,7 @@ import Foundation
 /// and exchange the one-time code at `/auth/native/token`.
 actor AuthClient {
     private let server: URL
-    /// Keychain account key — the origin, so switching instances doesn't
+    /// Credential store key — the origin, so switching instances doesn't
     /// clobber another instance's tokens.
     private let account: String
     private let urlSession: URLSession
@@ -21,9 +21,9 @@ actor AuthClient {
         self.urlSession = urlSession
     }
 
-    var storedCredentials: Credentials? { Keychain.load(account: account) }
+    var storedCredentials: Credentials? { CredentialStore.load(account: account) }
 
-    func signOut() { Keychain.delete(account: account) }
+    func signOut() { CredentialStore.delete(account: account) }
 
     // MARK: - Interactive login
 
@@ -58,7 +58,7 @@ actor AuthClient {
         guard callback.state == state else { throw AuthError.stateMismatch }
 
         let credentials = try await exchange(code: callback.code, verifier: pkce.verifier)
-        try Keychain.save(credentials, account: account)
+        try CredentialStore.save(credentials, account: account)
         return credentials
     }
 
@@ -123,7 +123,7 @@ actor AuthClient {
         )
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         if status == 401 {
-            Keychain.delete(account: account)
+            CredentialStore.delete(account: account)
             throw AuthError.sessionExpired
         }
         guard status == 200 else {
@@ -142,7 +142,7 @@ actor AuthClient {
             provider: decoded.provider ?? stored.provider,
             userID: decoded.user_id ?? stored.userID
         )
-        try Keychain.save(rotated, account: account)
+        try CredentialStore.save(rotated, account: account)
         return rotated
     }
 

@@ -7,7 +7,7 @@
 	<key>CFBundleDisplayName</key>
 	<string>Hermternal</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.tavyg.hermternal</string>
+	<string>com.kayg.hermternal</string>
 	<key>CFBundleExecutable</key>
 	<string>Hermternal</string>
 	<key>CFBundlePackageType</key>

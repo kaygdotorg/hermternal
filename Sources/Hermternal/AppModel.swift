@@ -52,7 +52,7 @@ final class AppModel {
 
     // MARK: - Lifecycle
 
-    /// Reconnect silently when a Keychain session is already present, so a
+    /// Reconnect silently when a stored session is already present, so a
     /// relaunch lands straight in the chat.
     func restoreOrPromptSignIn() async {
         guard let url = serverURL else {
