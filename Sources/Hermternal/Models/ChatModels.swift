@@ -37,13 +37,13 @@ struct ChatSession: Identifiable, Hashable, Sendable {
     }
 }
 
-enum Role: String, Sendable {
+enum Role: String, Codable, Sendable {
     case user
     case assistant
     case system
 }
 
-struct ChatMessage: Identifiable, Sendable {
+struct ChatMessage: Identifiable, Codable, Sendable {
     let id: UUID
     var role: Role
     var text: String
@@ -58,18 +58,26 @@ struct ChatMessage: Identifiable, Sendable {
         self.isStreaming = isStreaming
     }
 
-    /// Build from a `session.resume` / `session.history` history row.
+    /// Build from a transcript row.
     ///
-    /// The gateway's `_history_to_messages` projection emits `text`, not
-    /// `content`; `content` is the shape the OpenAI-compatible API server
-    /// uses. Accept `text` first and fall back so both surfaces parse.
+    /// Two projections feed this. The socket's `_history_to_messages` emits
+    /// `{role, text}` and pre-filters scaffolding. The REST route returns raw
+    /// database rows, which use `content` and include rows never meant for
+    /// display, so the filtering the socket does server-side has to happen
+    /// here for parity between the two sources.
     init?(historyRow value: JSONValue) {
         guard let rawRole = value["role"]?.stringValue else { return nil }
         // Tool rows arrive as {role:"tool", name:…, context:…} and carry no
         // user-visible prose, so Role rejects them and they are skipped.
         guard let role = Role(rawValue: rawRole) else { return nil }
-        let body = Self.flatten(value["text"]) ?? Self.flatten(value["content"]) ?? ""
-        guard !body.isEmpty else { return nil }
+        // Model-facing scaffolding: compaction references and interrupted-turn
+        // checkpoints.
+        guard value["display_kind"]?.stringValue != "hidden" else { return nil }
+        guard let body = Self.flatten(value["text"]) ?? Self.flatten(value["content"]),
+              !body.isEmpty
+        else { return nil }
+        // The older hidden-row convention predates display_kind.
+        guard !body.hasPrefix("[System:") else { return nil }
         self.init(role: role, text: body)
     }
 

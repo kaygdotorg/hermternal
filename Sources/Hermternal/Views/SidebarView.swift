@@ -17,8 +17,10 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
-        // Let the glass behind the list show through.
+        // scrollContentBackground only clears the scroll content; the split
+        // view's own sidebar material still paints over the glass.
         .scrollContentBackground(.hidden)
+        .clearAppKitBackground()
         .glassSurface(intensity: appearance.sidebarGlass)
         .onChange(of: model.selectedSessionID) { _, newValue in
             guard let id = newValue,

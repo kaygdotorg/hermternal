@@ -46,6 +46,13 @@ final class AppearanceSettings {
         didSet { defaults.set(chatGlass, forKey: Keys.chatGlass) }
     }
 
+    /// Glass for auxiliary windows. Settings has no reading surface of its
+    /// own to tune, so it splits the difference between the two the user
+    /// actually set and stays visually of a piece with the main window.
+    var auxiliaryGlass: Double {
+        (sidebarGlass + chatGlass) / 2
+    }
+
     private let defaults: UserDefaults
 
     private enum Keys {

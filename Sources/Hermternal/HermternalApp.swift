@@ -28,6 +28,7 @@ struct HermternalApp: App {
         Settings {
             SettingsView(appearance: appearance)
                 .preferredColorScheme(appearance.mode.colorScheme)
+                .containerBackground(.clear, for: .window)
         }
     }
 }

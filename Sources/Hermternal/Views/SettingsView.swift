@@ -10,6 +10,8 @@ struct SettingsView: View {
         }
         .frame(width: 460)
         .scenePadding()
+        .clearAppKitBackground()
+        .glassSurface(intensity: appearance.auxiliaryGlass)
     }
 }
 
@@ -50,6 +52,8 @@ private struct AppearanceSettingsView: View {
             }
         }
         .formStyle(.grouped)
+        // Otherwise the Form's own backing hides the window glass.
+        .scrollContentBackground(.hidden)
     }
 }
 

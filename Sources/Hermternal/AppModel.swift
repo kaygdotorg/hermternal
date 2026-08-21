@@ -33,7 +33,13 @@ final class AppModel {
     private var liveSessionID: String?
     private var auth: AuthClient?
     private var gateway: GatewayClient?
+    private var rest: RestClient?
     private var eventTask: Task<Void, Never>?
+    private let cache = HistoryCache()
+    private var prefetchTask: Task<Void, Never>?
+    /// Guards against a slow resume for an earlier click overwriting the
+    /// transcript the user is now looking at.
+    private var openGeneration = 0
 
     private static let serverKey = "serverURL"
     private static let defaultServer = "https://hermes-dashboard.kayg.org"
