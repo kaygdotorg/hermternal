@@ -81,7 +81,7 @@ final class ChatGlassEffectView: NSGlassEffectView {
     private weak var configuredWindow: NSWindow?
     private var originalIsOpaque: Bool?
     private var originalBackgroundColor: NSColor?
-    private var originalSeparatorStyle: NSWindow.TitlebarSeparatorStyle?
+    private var originalSeparatorStyle: NSTitlebarSeparatorStyle?
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         if newWindow !== window {
