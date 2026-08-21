@@ -405,15 +405,16 @@ final class AppModel {
                 "session.resume",
                 params: ["session_id": session.id]
             )
+            // A superseded arrow-selection request may still receive its RPC
+            // response because GatewayClient.call is continuation-based. Stop
+            // before row projection, encoding, disk I/O, or UI publication.
+            guard generation == openGeneration, !Task.isCancelled else { return }
             let rows = result["messages"]?.arrayValue ?? []
             let resumed = rows.compactMap(ChatMessage.init(historyRow:))
             if cacheEnabled {
                 let result = await cache.store(resumed, for: session.id)
                 applyCacheStore(result)
             }
-            // A later click won the race; keep its transcript on screen but
-            // let the cache write above stand.
-            guard generation == openGeneration else { return }
             liveSessionID = result["session_id"]?.stringValue
             messages = resumed
             Log.info(
