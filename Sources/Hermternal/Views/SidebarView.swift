@@ -3,43 +3,72 @@ import SwiftUI
 struct SidebarView: View {
     @Bindable var model: AppModel
     @Bindable var appearance: AppearanceSettings
+    @FocusState private var sidebarFocused: Bool
+
+    private func moveSelection(by offset: Int, using proxy: ScrollViewProxy) -> KeyPress.Result {
+        let sessions = model.sessions
+        guard !sessions.isEmpty else { return .handled }
+        let currentIndex = model.selectedSessionID.flatMap { selectedID in
+            sessions.firstIndex { $0.id == selectedID }
+        }
+        let targetIndex: Int
+        if let currentIndex {
+            let nextIndex = currentIndex + offset
+            guard sessions.indices.contains(nextIndex) else { return .handled }
+            targetIndex = nextIndex
+        } else {
+            targetIndex = offset > 0 ? 0 : sessions.count - 1
+        }
+
+        let session = sessions[targetIndex]
+        model.selectedSessionID = session.id
+        Task { await model.open(session) }
+        withAnimation {
+            proxy.scrollTo(session.id, anchor: .center)
+        }
+        return .handled
+    }
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 2, pinnedViews: [.sectionHeaders]) {
-                Section {
-                    ForEach(model.sessions) { session in
-                        SessionButton(
-                            session: session,
-                            isSelected: model.selectedSessionID == session.id
-                        ) {
-                            // Direct activation avoids the selection binding
-                            // indirection that previously swallowed clicks.
-                            model.selectedSessionID = session.id
-                            Task { await model.open(session) }
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2, pinnedViews: [.sectionHeaders]) {
+                    Section {
+                        ForEach(model.sessions) { session in
+                            SessionButton(
+                                session: session,
+                                isSelected: model.selectedSessionID == session.id
+                            ) {
+                                sidebarFocused = true
+                                model.selectedSessionID = session.id
+                                Task { await model.open(session) }
+                            }
+                            .id(session.id)
                         }
+                    } header: {
+                        Text("Chats")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .textCase(.uppercase)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(.thinMaterial)
                     }
-                } header: {
-                    Text("Chats")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .textCase(.uppercase)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 7)
-                        // Let content disappear beneath the floating header
-                        // without putting an opaque strip across the glass.
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(.thinMaterial)
                 }
+                .padding(.horizontal, 6)
+                .padding(.bottom, 10)
             }
-            .padding(.horizontal, 6)
-            .padding(.bottom, 10)
+            .focusable()
+            .focused($sidebarFocused)
+            .onKeyPress(.downArrow) {
+                moveSelection(by: 1, using: proxy)
+            }
+            .onKeyPress(.upArrow) {
+                moveSelection(by: -1, using: proxy)
+            }
+            .glassSurface(intensity: appearance.sidebarGlass)
         }
-        // List(.sidebar) is an NSTableView inside an NSVisualEffectView and
-        // paints its own sidebar material regardless of
-        // scrollContentBackground(.hidden). A plain lazy stack has no hidden
-        // AppKit backing, so this glass is the only material in the column.
-        .glassSurface(intensity: appearance.sidebarGlass)
         .toolbar {
             ToolbarItem {
                 Button {
