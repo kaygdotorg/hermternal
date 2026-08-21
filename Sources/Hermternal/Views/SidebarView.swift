@@ -20,9 +20,6 @@ struct SidebarView: View {
                 }
             }
         }
-        // Tahoe supplies the inset/floating Liquid Glass sidebar, selection,
-        // focus, scrolling, and keyboard navigation. Do not layer another
-        // background, glass effect, or custom focus system over it.
         .listStyle(.sidebar)
         .onChange(of: model.selectedSessionID) { _, newValue in
             if pointerActivatedID == newValue {

@@ -132,7 +132,7 @@ private struct CodeBlock: View {
                     .padding(10)
             }
         }
-        .background(.quaternary.opacity(0.4), in: .rect(cornerRadius: 8))
+        .background(.background.secondary, in: .rect(cornerRadius: 8))
         .overlay(
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(.separator, lineWidth: 0.5)

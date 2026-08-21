@@ -3,16 +3,12 @@ import AppKit
 
 struct ChatView: View {
     @Bindable var model: AppModel
-    @Bindable var appearance: AppearanceSettings
     @State private var pendingScrollTask: Task<Void, Never>?
 
     var body: some View {
-        AdjustableChatSurface {
-            VStack(spacing: 0) {
-                transcript
-                Composer(model: model)
-            }
-            .chatOpacityVeil(appearance)
+        VStack(spacing: 0) {
+            transcript
+            Composer(model: model)
         }
     }
 
@@ -36,8 +32,11 @@ struct ChatView: View {
                 }
                 .padding(.horizontal, 22)
                 .padding(.vertical, 20)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: 680, alignment: .leading)
+                .frame(maxWidth: .infinity)
             }
+            .scrollEdgeEffectStyle(.soft, for: .top)
+            .scrollEdgeEffectStyle(.soft, for: .bottom)
             .onChange(of: model.messages.last?.text) {
                 guard pendingScrollTask == nil else { return }
                 pendingScrollTask = Task { @MainActor in
@@ -169,37 +168,37 @@ private struct ThinkingIndicator: View {
 private struct Composer: View {
     @Bindable var model: AppModel
     @FocusState private var isFocused: Bool
+    @Namespace private var glass
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            TextField("Message Hermes…", text: $model.composerText, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...8)
-                .focused($isFocused)
-                .onSubmit { send() }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
+        GlassEffectContainer(spacing: 14) {
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField("Message Hermes…", text: $model.composerText, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1...8)
+                    .focused($isFocused)
+                    .onSubmit { send() }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 11)
+                    .glassEffect(.regular.interactive(), in: .capsule)
+                    .glassEffectID("field", in: glass)
 
-            Button {
-                if model.isAwaitingReply {
-                    Task { await model.interrupt() }
-                } else {
-                    send()
+                Button {
+                    if model.isAwaitingReply {
+                        Task { await model.interrupt() }
+                    } else {
+                        send()
+                    }
+                } label: {
+                    Image(systemName: model.isAwaitingReply ? "stop.fill" : "arrow.up")
+                        .font(.body.weight(.semibold))
+                        .frame(width: 30, height: 30)
                 }
-            } label: {
-                Image(systemName: model.isAwaitingReply ? "stop.fill" : "arrow.up")
-                    .font(.body.weight(.semibold))
-                    .frame(width: 28, height: 28)
+                .buttonStyle(.glassProminent)
+                .clipShape(.circle)
+                .glassEffectID("send", in: glass)
+                .disabled(!model.isAwaitingReply && model.composerText.isEmptyAfterTrim)
             }
-            .buttonStyle(.borderedProminent)
-            .clipShape(.circle)
-            .disabled(!model.isAwaitingReply && model.composerText.isEmptyAfterTrim)
-            .padding(6)
-        }
-        .background(.background, in: .rect(cornerRadius: 22))
-        .overlay {
-            RoundedRectangle(cornerRadius: 22)
-                .strokeBorder(.separator, lineWidth: 0.5)
         }
         .padding(.horizontal, 18)
         .padding(.bottom, 16)

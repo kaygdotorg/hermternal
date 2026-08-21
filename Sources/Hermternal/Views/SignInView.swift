@@ -25,11 +25,8 @@ struct SignInView: View {
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
                 TextField("https://hermes.example.org", text: $model.serverText)
-                    .textFieldStyle(.plain)
+                    .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                    .glassEffect(.regular, in: .rect(cornerRadius: 10))
                     .onSubmit { signIn() }
             }
             .frame(width: 380)
@@ -59,7 +56,6 @@ struct SignInView: View {
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(.background)
     }
 
     private func signIn() {

@@ -7,8 +7,9 @@ struct HermternalApp: App {
 
     var body: some Scene {
         Window("Hermternal", id: "main") {
-            RootView(model: model, appearance: appearance)
+            RootView(model: model)
                 .preferredColorScheme(appearance.mode.colorScheme)
+                .containerBackground(.clear, for: .window)
                 .task { await model.restoreOrPromptSignIn() }
         }
         .windowToolbarStyle(.unified)
