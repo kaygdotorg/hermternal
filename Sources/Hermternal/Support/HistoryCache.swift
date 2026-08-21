@@ -6,6 +6,16 @@ import Foundation
 /// synchronously from memory on the main actor and written back
 /// asynchronously. Entries survive relaunch, so a warm app is instant from
 /// the first click.
+struct CacheStatistics: Sendable {
+    let entryCount: Int
+    let bytes: Int64
+}
+struct CacheStoreResult: Sendable {
+    let addedEntry: Bool
+    let byteDelta: Int64
+}
+
+
 actor HistoryCache {
     /// Bump when `CachedTranscript` changes shape, so stale files are
     /// discarded rather than mis-decoded.
@@ -37,29 +47,106 @@ actor HistoryCache {
     /// allocation-free.
     func messages(for id: String) -> [ChatMessage]? {
         if let hit = memory[id] { return hit }
-        guard let data = try? Data(contentsOf: url(for: id)),
-              let stored = try? JSONDecoder().decode(CachedTranscript.self, from: data),
+        let target = url(for: id)
+        guard let data = try? Data(contentsOf: target) else { return nil }
+        guard let stored = try? JSONDecoder().decode(CachedTranscript.self, from: data),
               stored.version == Self.version
-        else { return nil }
+        else {
+            // A subsequent store must count the replacement as a new valid
+            // entry, so remove the invalid current-path file now.
+            try? FileManager.default.removeItem(at: target)
+            return nil
+        }
         memory[id] = stored.messages
         return stored.messages
     }
 
-    func store(_ messages: [ChatMessage], for id: String) {
-        memory[id] = messages
+    @discardableResult
+    func store(_ messages: [ChatMessage], for id: String) -> CacheStoreResult {
+        guard !Task.isCancelled else {
+            return CacheStoreResult(addedEntry: false, byteDelta: 0)
+        }
         let payload = CachedTranscript(version: Self.version, messages: messages)
-        guard let data = try? JSONEncoder().encode(payload) else { return }
-        try? data.write(to: url(for: id), options: [.atomic])
+        guard let data = try? JSONEncoder().encode(payload), !Task.isCancelled else {
+            return CacheStoreResult(addedEntry: false, byteDelta: 0)
+        }
+
+        let target = url(for: id)
+        let oldSize = (try? target.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let existed = FileManager.default.fileExists(atPath: target.path)
+        guard (try? data.write(to: target, options: [.atomic])) != nil else {
+            return CacheStoreResult(addedEntry: false, byteDelta: 0)
+        }
+        memory[id] = messages
+        return CacheStoreResult(
+            addedEntry: !existed,
+            byteDelta: Int64(data.count - oldSize)
+        )
     }
 
     func isCached(_ id: String) -> Bool {
-        memory[id] != nil || FileManager.default.fileExists(atPath: url(for: id).path)
+        messages(for: id) != nil
     }
 
-    /// Drop everything, including the on-disk copies.
-    func clear() {
-        memory.removeAll()
-        try? FileManager.default.removeItem(at: directory)
+    /// Prune entries for sessions no longer listed, validate every retained
+    /// entry, and promote valid transcripts into memory.
+    ///
+    /// Validation matters for progress: merely finding a file at the current
+    /// path can falsely report 100% when the JSON is corrupt or from an older
+    /// schema. Decoding here costs one startup pass, but also makes every
+    /// subsequent chat switch a memory hit.
+    func reconcile(validIDs: [String]) -> CacheStatistics {
+        let valid = Set(validIDs)
+        memory = memory.filter { valid.contains($0.key) }
+
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return CacheStatistics(entryCount: 0, bytes: 0)
+        }
+
+        let idByPath = Dictionary(
+            uniqueKeysWithValues: validIDs.map { (url(for: $0).path, $0) }
+        )
+        var bytes: Int64 = 0
+        var count = 0
+        for file in files where file.pathExtension == "json" {
+            guard let id = idByPath[file.path] else {
+                try? FileManager.default.removeItem(at: file)
+                continue
+            }
+            guard let data = try? Data(contentsOf: file),
+                  let stored = try? JSONDecoder().decode(CachedTranscript.self, from: data),
+                  stored.version == Self.version
+            else {
+                memory[id] = nil
+                try? FileManager.default.removeItem(at: file)
+                continue
+            }
+            memory[id] = stored.messages
+            count += 1
+            bytes += Int64(data.count)
+        }
+        return CacheStatistics(entryCount: count, bytes: bytes)
+    }
+
+    /// Drop everything, including the on-disk copies. A canceled stale
+    /// control task must not clear after a newer enable/rebuild has won.
+    @discardableResult
+    func clear() -> Bool {
+        guard !Task.isCancelled else { return false }
+        let target = directory
+        do {
+            if FileManager.default.fileExists(atPath: target.path) {
+                try FileManager.default.removeItem(at: target)
+            }
+            memory.removeAll()
+            return true
+        } catch {
+            return false
+        }
     }
 
     private struct CachedTranscript: Codable {
