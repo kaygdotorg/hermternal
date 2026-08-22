@@ -1,16 +1,77 @@
 import SwiftUI
+import HermternalCore
+
+private struct HermternalFindActionKey: FocusedValueKey {
+    typealias Value = @MainActor @Sendable () -> Void
+}
+
+extension FocusedValues {
+    var hermternalFindAction: (@MainActor @Sendable () -> Void)? {
+        get { self[HermternalFindActionKey.self] }
+        set { self[HermternalFindActionKey.self] = newValue }
+    }
+}
 
 @main
 struct HermternalApp: App {
-    @State private var model = AppModel()
+    @State private var model: AppModel
     @State private var appearance = AppearanceSettings()
+    @State private var registry: CapabilityRegistry
+
+    init() {
+        let model = AppModel()
+        _model = State(initialValue: model)
+
+        var registry = CapabilityRegistry()
+        let searchState: CapabilityState = if model.searchQuerying != nil {
+            .available
+        } else {
+            .unavailable(
+                reason: model.searchUnavailableReason
+                    ?? "The local search index could not be opened."
+            )
+        }
+        do {
+            try registry.register(CapabilityDescriptor(
+                id: CapabilityID("search"),
+                name: "Transcript Search",
+                purpose: "Search persisted conversation transcripts.",
+                state: searchState,
+                implementationSource: .builtIn
+            ))
+        } catch {
+            Log.error(
+                "Built-in search capability registration failed for descriptor "
+                    + "search; Modules page will remain empty: \(error)"
+            )
+        }
+        _registry = State(initialValue: registry)
+    }
 
     var body: some Scene {
-        Window("Hermternal", id: "main") {
+        Window("", id: "main") {
             GlassFrame(appearance: appearance) {
                 RootView(model: model)
             }
             .preferredColorScheme(appearance.mode.colorScheme)
+            .background {
+                HiddenWindowTitle()
+            }
+            .onOpenURL { url in
+                guard let link = MessageDeepLink(url: url) else {
+                    model.toastPresenter.error("Unsupported message link")
+                    return
+                }
+                guard let expectedHost = model.configuredGatewayHost,
+                      expectedHost.caseInsensitiveCompare(link.gatewayHost) == .orderedSame
+                else {
+                    model.toastPresenter.error(
+                        "Message belongs to a different gateway"
+                    )
+                    return
+                }
+                Task { await model.openThenScroll(to: link.location) }
+            }
             .task { await model.restoreOrPromptSignIn() }
         }
         .windowToolbarStyle(.unified)
@@ -21,13 +82,37 @@ struct HermternalApp: App {
                     Task { await model.newChat() }
                 }
                 .keyboardShortcut("n", modifiers: .command)
+                Button("Search Messages") {
+                    model.toggleSearch()
+                }
+                .keyboardShortcut("k", modifiers: .command)
+            }
+            CommandGroup(after: .textEditing) {
+                FindCommand()
+            }
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") {
+                    SettingsWindowController.shared.show(
+                        appearance: appearance,
+                        model: model,
+                        registry: registry
+                    )
+                }
+                .keyboardShortcut(",", modifiers: .command)
             }
         }
+}
+}
 
-        Settings {
-            SettingsView(appearance: appearance, model: model)
-                .preferredColorScheme(appearance.mode.colorScheme)
+private struct FindCommand: View {
+    @FocusedValue(\.hermternalFindAction) private var findAction
+
+    var body: some View {
+        Button("Find in Conversation") {
+            findAction?()
         }
+        .keyboardShortcut("f", modifiers: .command)
+        .disabled(findAction == nil)
     }
 }
 
@@ -53,11 +138,12 @@ private struct GlassFrame<Content: View>: View {
                         .glassEffect(.regular, in: .rect(cornerRadius: 0))
                     // Frost rides over the glass on purpose: at 0 the glass
                     // refracts untouched, at 1 the window reads as a frosted
-                    // material. Unlike a mandatory scrim, this is a dial the
-                    // user chooses, and 0 leaves the material intact.
-                    Rectangle()
-                        .fill(.regularMaterial)
-                        .opacity(appearance.windowFrost)
+                    // material. No base blur here — the glass is the blur, and
+                    // a material over it would stop it refracting.
+                    FrostedWindowBackground(
+                        materialOpacity: appearance.windowFrostMaterialOpacity,
+                        includesBaseBlur: false
+                    )
                 }
                 .ignoresSafeArea()
             }

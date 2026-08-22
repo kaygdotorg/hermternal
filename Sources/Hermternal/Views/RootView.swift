@@ -1,18 +1,29 @@
 import SwiftUI
+import AppKit
 
 struct RootView: View {
     @Bindable var model: AppModel
 
     var body: some View {
-        switch model.phase {
-        case .signedOut:
-            SignInView(model: model)
-        case .connecting:
-            ConnectingView()
-        case .ready:
-            ChatWindow(model: model)
-        case .failed(let message):
-            FailureView(message: message, model: model)
+        ZStack {
+            switch model.phase {
+            case .signedOut:
+                SignInView(model: model)
+            case .connecting:
+                ConnectingView()
+            case .ready:
+                ChatWindow(model: model)
+            case .failed(let message):
+                FailureView(message: message, model: model)
+            }
+        }
+        .background {
+            ToolbarChromeVisibility(isHidden: model.isSearchPresented)
+        }
+        .overlay {
+            ToastLayer()
+                .environment(model.toastPresenter)
+                .zIndex(2)
         }
     }
 }
@@ -63,52 +74,182 @@ private struct FailureView: View {
 struct ChatWindow: View {
     @Bindable var model: AppModel
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            SidebarView(model: model)
+            SidebarView(
+                model: model,
+                accountName: model.accountPresentation.title,
+                accountDetail: model.accountPresentation.detail,
+                // The visible title is a truncated account id, so the full
+                // value has to reach the tooltip and VoiceOver label.
+                accountID: model.accountPresentation.accountID
+            )
                 .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 340)
         } detail: {
             ChatView(model: model)
         }
-        .overlay(alignment: .top) {
-            if let notice = model.notice {
-                NoticeBanner(text: notice) { model.notice = nil }
+        // Keep the native titlebar and traffic lights; ChatView conditionally
+        // renders its controls so the toolbar group has no empty capsule.
+        .overlay {
+            ZStack {
+                if model.isSearchPresented, let querying = model.searchQuerying {
+                    SearchPanel(
+                        querying: querying,
+                        activate: { location in
+                            Task {
+                                await model.openThenScroll(to: location)
+                                model.isSearchPresented = false
+                            }
+                        },
+                        dismiss: { model.isSearchPresented = false }
+                    )
+                    .transition(.opacity)
+                    .zIndex(1)
+                }
             }
+            // The overlay and the panel share one animation so material,
+            // panel content, and dismissal remain a single interruptible
+            // gesture when ⌘K/Escape are pressed repeatedly.
+            .animation(
+                SearchPanel.panelAnimation(reduceMotion: reduceMotion),
+                value: model.isSearchPresented
+            )
+        }
+        .onChange(of: model.isSearchPresented) { _, presented in
+            model.toastPresenter.setSuppressed(presented)
+        }
+        .task {
+            model.toastPresenter.setSuppressed(model.isSearchPresented)
         }
     }
 }
 
-/// Transient, dismissible problem report that must not replace the chat.
-private struct NoticeBanner: View {
-    let text: String
-    let dismiss: () -> Void
 
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "exclamationmark.circle.fill")
-                .foregroundStyle(.orange)
-            Text(text)
-                .font(.callout)
-                .textSelection(.enabled)
-            Spacer(minLength: 8)
-            Button {
-                dismiss()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.caption.weight(.semibold))
+private struct ToolbarChromeVisibility: NSViewRepresentable {
+    let isHidden: Bool
+
+    func makeNSView(context: Context) -> ToolbarChromeHost {
+        ToolbarChromeHost()
+    }
+
+    func updateNSView(_ nsView: ToolbarChromeHost, context: Context) {
+        nsView.setHidden(isHidden)
+    }
+}
+
+@MainActor
+private final class ToolbarChromeHost: NSView {
+    private var desiredHidden = false
+    private var savedIdentifiers: [NSToolbarItem.Identifier] = []
+    private var savedTitlebarButtons: [(NSView, Bool)] = []
+
+    func setHidden(_ hidden: Bool) {
+        desiredHidden = hidden
+
+        if hidden {
+            // Hide chrome as soon as the panel appears, but keep restoration
+            // behind the panel's opacity transition so it cannot flash over
+            // the still-fading card and shadow on dismissal.
+            applyVisibility()
+        } else {
+            // The search overlay owns the fade-out. Let the dim remain until
+            // that transition has completed; restoring here would expose a
+            // bright window behind the card for a frame.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                guard let self, !self.desiredHidden else { return }
+                self.applyVisibility()
             }
-            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .frame(maxWidth: 560)
-        .background(.background, in: .rect(cornerRadius: 12))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(.separator, lineWidth: 0.5)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyVisibility()
+    }
+
+    private func applyVisibility() {
+        if desiredHidden {
+            hideTitlebarButtons()
+        } else {
+            restoreTitlebarButtons()
         }
-        .padding(.top, 12)
-        .transition(.move(edge: .top).combined(with: .opacity))
+
+        guard let toolbar = window?.toolbar else { return }
+        if desiredHidden {
+            guard savedIdentifiers.isEmpty else { return }
+            savedIdentifiers = toolbar.items.map(\.itemIdentifier)
+            guard !toolbar.items.isEmpty else { return }
+            for index in stride(from: toolbar.items.count - 1, through: 0, by: -1) {
+                toolbar.removeItem(at: index)
+            }
+        } else {
+            guard !savedIdentifiers.isEmpty else { return }
+            let identifiers = savedIdentifiers
+            savedIdentifiers.removeAll()
+            for (index, identifier) in identifiers.enumerated() {
+                guard !toolbar.items.contains(where: {
+                    $0.itemIdentifier == identifier
+                }) else { continue }
+                toolbar.insertItem(
+                    withItemIdentifier: identifier,
+                    at: min(index, toolbar.items.count)
+                )
+            }
+        }
+    }
+
+    private func hideTitlebarButtons() {
+        guard savedTitlebarButtons.isEmpty, let window else { return }
+        let standardButtons = [
+            window.standardWindowButton(.closeButton),
+            window.standardWindowButton(.miniaturizeButton),
+            window.standardWindowButton(.zoomButton)
+        ].compactMap { $0 }
+        guard let root = window.contentView?.superview else { return }
+        collectTitlebarViews(
+            in: root,
+            insideTitlebar: false,
+            insideStandardButton: false,
+            excluding: standardButtons
+        )
+    }
+
+    private func collectTitlebarViews(
+        in view: NSView,
+        insideTitlebar: Bool,
+        insideStandardButton: Bool,
+        excluding standardButtons: [NSButton]
+    ) {
+        let className = NSStringFromClass(type(of: view))
+        let isTitlebar = insideTitlebar
+            || className.localizedCaseInsensitiveContains("toolbar")
+            || className.localizedCaseInsensitiveContains("titlebar")
+        let isStandardButton = view is NSButton
+            && standardButtons.contains(where: { $0 === view })
+        let isInsideStandardButton = insideStandardButton || isStandardButton
+
+        if isTitlebar, !isInsideStandardButton, view !== window,
+           view.subviews.isEmpty {
+            savedTitlebarButtons.append((view, view.isHidden))
+            view.isHidden = true
+        }
+        for child in view.subviews {
+            collectTitlebarViews(
+                in: child,
+                insideTitlebar: isTitlebar,
+                insideStandardButton: isInsideStandardButton,
+                excluding: standardButtons
+            )
+        }
+    }
+
+    private func restoreTitlebarButtons() {
+        let saved = savedTitlebarButtons
+        savedTitlebarButtons.removeAll()
+        for (button, wasHidden) in saved {
+            button.isHidden = wasHidden
+        }
     }
 }

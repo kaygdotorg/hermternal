@@ -1,0 +1,518 @@
+import Foundation
+
+public struct CacheStatistics: Sendable {
+    public let entryCount: Int
+    public let bytes: Int64
+
+    public init(entryCount: Int, bytes: Int64) {
+        self.entryCount = entryCount
+        self.bytes = bytes
+    }
+}
+
+public struct CacheStoreResult: Sendable {
+    public let addedEntry: Bool
+    public let byteDelta: Int64
+
+    public init(addedEntry: Bool, byteDelta: Int64) {
+        self.addedEntry = addedEntry
+        self.byteDelta = byteDelta
+    }
+}
+
+public enum HistoryCacheFileKind: Equatable, Sendable {
+    case current(String)
+    case legacy(String)
+    case legacyCollision
+    case orphan
+}
+
+/// Core transcript persistence seam. Plain HistoryCache is the no-search
+/// implementation; SearchIndexReconciliation decorates the same boundary.
+public protocol TranscriptPersisting: Sendable {
+    func read(for id: String) async -> (transcript: CachedTranscript?, epoch: UInt64)
+    func currentEpoch() async -> UInt64
+    func store(
+        _ messages: [ChatMessage],
+        snapshot: AuthoritativeTranscriptSnapshot?,
+        title: String,
+        for id: String,
+        expectedEpoch: UInt64?
+    ) async throws -> CacheStoreResult
+    func remove(sessionID: String) async throws -> Bool
+    func clear() async throws -> Bool
+    func reconcile(validIDs: [String]) async throws -> CacheStatistics
+}
+
+public protocol CacheFileSystem: Sendable {
+    func createDirectory(at url: URL) throws
+    func data(at url: URL) throws -> Data
+    func write(_ data: Data, to url: URL) throws
+    func removeItem(at url: URL) throws
+    func fileExists(at url: URL) -> Bool
+    func contentsOfDirectory(at url: URL) throws -> [URL]
+    func fileSize(at url: URL) -> Int64?
+}
+
+public struct LocalCacheFileSystem: CacheFileSystem {
+    public init() {}
+
+    public func createDirectory(at url: URL) throws {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    }
+
+    public func data(at url: URL) throws -> Data { try Data(contentsOf: url) }
+
+    public func write(_ data: Data, to url: URL) throws {
+        try data.write(to: url, options: [.atomic])
+    }
+
+    public func removeItem(at url: URL) throws {
+        try FileManager.default.removeItem(at: url)
+    }
+
+    public func fileExists(at url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: url.path)
+    }
+
+    public func contentsOfDirectory(at url: URL) throws -> [URL] {
+        try FileManager.default.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: [.skipsHiddenFiles]
+        )
+    }
+
+    public func fileSize(at url: URL) -> Int64? {
+        (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init)
+    }
+}
+
+public protocol CacheCodec: Sendable {
+    func encode(_ transcript: CachedTranscript) throws -> Data
+    func decode(_ data: Data) throws -> CachedTranscript
+    /// Validates a serialized cache entry without materializing its transcript.
+    /// Custom codecs retain the old decode-based validation by default.
+    func validate(_ data: Data) throws -> Bool
+}
+
+public extension CacheCodec {
+    func validate(_ data: Data) throws -> Bool {
+        _ = try decode(data)
+        return true
+    }
+}
+
+public struct JSONCacheCodec: CacheCodec {
+    public init() {}
+
+    public func encode(_ transcript: CachedTranscript) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(transcript)
+    }
+
+    public func decode(_ data: Data) throws -> CachedTranscript {
+        try JSONDecoder().decode(CachedTranscript.self, from: data)
+    }
+
+    public func validate(_ data: Data) throws -> Bool {
+        (try? JSONSerialization.jsonObject(with: data)) != nil
+    }
+}
+
+public struct CachedTranscript: Codable, Sendable {
+    public let version: Int
+    public let messages: [ChatMessage]
+    public let snapshot: AuthoritativeTranscriptSnapshot?
+
+    public init(
+        version: Int,
+        messages: [ChatMessage],
+        snapshot: AuthoritativeTranscriptSnapshot?
+    ) {
+        self.version = version
+        self.messages = messages
+        self.snapshot = snapshot
+    }
+}
+
+public actor HistoryCache: TranscriptPersisting {
+    /// Version 3 invalidates files containing the retired content-hash IDs.
+    public static let version = 3
+
+    private let directory: URL?
+    private let fileSystem: any CacheFileSystem
+    private let codec: any CacheCodec
+    private var memory: [String: CachedTranscript] = [:]
+    // A write is valid only if no clear happened after the read it derives
+    // from. The epoch is actor-local so checking it and touching disk are
+    // one atomic operation relative to clear().
+    private var epoch: UInt64 = 0
+
+    /// Returns the app-owned history location under the platform's caches
+    /// directory. On macOS this preserves the existing bundle-specific path.
+    public static func historyDirectory(cachesDirectory: URL) -> URL {
+        cachesDirectory
+            .appending(path: "\(AppIdentity.bundleID)/history", directoryHint: .isDirectory)
+    }
+
+    /// Resolves the platform's caches directory without falling back to a
+    /// home-directory path.
+    public static func defaultDirectory(fileManager: FileManager = .default) -> URL? {
+        guard let cachesDirectory = fileManager
+            .urls(for: .cachesDirectory, in: .userDomainMask)
+            .first
+        else {
+            return nil
+        }
+        return historyDirectory(cachesDirectory: cachesDirectory)
+    }
+
+    public init(
+        directory: URL? = nil,
+        fileSystem: any CacheFileSystem = LocalCacheFileSystem(),
+        codec: any CacheCodec = JSONCacheCodec()
+    ) {
+        self.directory = (directory ?? Self.defaultDirectory())?.resolvingSymlinksInPath()
+        self.fileSystem = fileSystem
+        self.codec = codec
+        if let directory = self.directory {
+            try? fileSystem.createDirectory(at: directory)
+        }
+    }
+
+    public static func classifyCacheFile(
+        at file: URL,
+        in directory: URL,
+        validIDs: [String]
+    ) -> HistoryCacheFileKind {
+        let directory = directory.resolvingSymlinksInPath()
+        let filePath = pathIdentity(file)
+        let currentMatch = validIDs.first { id in
+            pathIdentity(cacheURL(in: directory, filename: encodedFilename(for: id))) == filePath
+        }
+        if let currentMatch {
+            return .current(currentMatch)
+        }
+        let legacyMatches = validIDs.filter { id in
+            pathIdentity(cacheURL(in: directory, filename: legacyFilename(for: id))) == filePath
+        }
+        if legacyMatches.count == 1 {
+            return .legacy(legacyMatches[0])
+        }
+        if !legacyMatches.isEmpty {
+            return .legacyCollision
+        }
+        return .orphan
+    }
+
+    public static func validatesCacheData(
+        _ data: Data,
+        codec: any CacheCodec
+    ) -> Bool {
+        (try? codec.validate(data)) == true
+    }
+
+    private static func pathIdentity(_ url: URL) -> String {
+        url.resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    private static func cacheURL(in directory: URL, filename: String) -> URL {
+        URL(fileURLWithPath: directory.path + "/" + filename + ".json")
+    }
+
+    private static func legacyFilename(for id: String) -> String {
+        id.unicodeScalars
+            .map { CharacterSet.alphanumerics.contains($0) ? Character($0) : "-" }
+            .reduce(into: "") { $0.append($1) }
+    }
+
+    private static func encodedFilename(for id: String) -> String {
+        id.utf8.reduce(into: "") { result, byte in
+            if (byte >= 48 && byte <= 57)
+                || (byte >= 65 && byte <= 90)
+                || (byte >= 97 && byte <= 122) {
+                result.append(Character(UnicodeScalar(byte)))
+            } else {
+                result += String(format: "%%%02X", byte)
+            }
+        }
+    }
+
+    private func url(for id: String) -> URL? {
+        guard let directory else { return nil }
+        return Self.cacheURL(in: directory, filename: Self.encodedFilename(for: id))
+    }
+
+    /// The legacy filename, retained only to migrate caches written before
+    /// punctuation was made injective.
+    private func legacyURL(for id: String) -> URL? {
+        guard let directory else { return nil }
+        return Self.cacheURL(in: directory, filename: Self.legacyFilename(for: id))
+    }
+
+    /// Keep ordinary IDs readable while escaping every other UTF-8 byte.
+    /// Escaping bytes, rather than scalars, makes the mapping injective for
+    /// both punctuation and non-ASCII IDs.
+    private func encodedFilename(for id: String) -> String {
+        Self.encodedFilename(for: id)
+    }
+
+    private enum StoredTranscriptError: Error {
+        case unavailable
+        case invalid
+    }
+
+    private func storedTranscript(at url: URL) throws -> CachedTranscript {
+        let data: Data
+        do {
+            data = try fileSystem.data(at: url)
+        } catch {
+            throw StoredTranscriptError.unavailable
+        }
+        do {
+            let stored = try codec.decode(data)
+            guard stored.version == Self.version else {
+                throw StoredTranscriptError.invalid
+            }
+            return stored
+        } catch let error as StoredTranscriptError {
+            throw error
+        } catch {
+            throw StoredTranscriptError.invalid
+        }
+    }
+
+
+    @discardableResult
+    private func adoptLegacyData(_ data: Data, from legacy: URL, to target: URL) -> Bool {
+        guard (try? fileSystem.write(data, to: target)) != nil else { return false }
+        try? fileSystem.removeItem(at: legacy)
+        return true
+    }
+
+    @discardableResult
+    private func adoptLegacyTranscript(
+        _ stored: CachedTranscript,
+        for id: String,
+        from legacy: URL,
+        to target: URL
+    ) -> Bool {
+        guard let migrated = try? codec.encode(stored),
+              (try? fileSystem.write(migrated, to: target)) != nil
+        else {
+            memory[id] = stored
+            return false
+        }
+        try? fileSystem.removeItem(at: legacy)
+        memory[id] = stored
+        return true
+    }
+
+    public func messages(for id: String) -> [ChatMessage]? {
+        transcript(for: id)?.messages
+    }
+
+    public func snapshot(for id: String) -> AuthoritativeTranscriptSnapshot? {
+        transcript(for: id)?.snapshot
+    }
+
+    public func read(for id: String) -> (transcript: CachedTranscript?, epoch: UInt64) {
+        let observedEpoch = epoch
+        if let hit = memory[id] { return (hit, observedEpoch) }
+        guard let target = url(for: id) else {
+            return (nil, observedEpoch)
+        }
+        if fileSystem.fileExists(at: target) {
+            do {
+                let stored = try storedTranscript(at: target)
+                memory[id] = stored
+                return (stored, observedEpoch)
+            } catch StoredTranscriptError.invalid {
+                // A present file is removed only after a genuine decode or
+                // version failure; a lookup miss must never destroy a cache.
+                try? fileSystem.removeItem(at: target)
+            } catch StoredTranscriptError.unavailable {
+                // Leave unreadable files in place for a later retry.
+            }
+            catch {
+                // Preserve the file if the filesystem reports an unknown read failure.
+            }
+        }
+
+        guard let legacy = legacyURL(for: id), Self.pathIdentity(legacy) != Self.pathIdentity(target) else {
+            return (nil, observedEpoch)
+        }
+        guard fileSystem.fileExists(at: legacy) else {
+            return (nil, observedEpoch)
+        }
+        do {
+            let stored = try storedTranscript(at: legacy)
+            _ = adoptLegacyTranscript(stored, for: id, from: legacy, to: target)
+            return (stored, observedEpoch)
+        } catch StoredTranscriptError.invalid {
+            try? fileSystem.removeItem(at: legacy)
+            return (nil, observedEpoch)
+        } catch StoredTranscriptError.unavailable {
+            return (nil, observedEpoch)
+        }
+        catch {
+            return (nil, observedEpoch)
+        }
+    }
+
+    public func currentEpoch() -> UInt64 { epoch }
+    /// TranscriptPersisting overload; plain cache ignores the title because
+    /// it stores message history only.
+    public func store(
+        _ messages: [ChatMessage],
+        snapshot: AuthoritativeTranscriptSnapshot?,
+        title _: String,
+        for id: String,
+        expectedEpoch: UInt64?
+    ) -> CacheStoreResult {
+        store(messages, snapshot: snapshot, for: id, expectedEpoch: expectedEpoch)
+    }
+
+    @discardableResult
+    public func remove(sessionID: String) -> Bool {
+        memory[sessionID] = nil
+        let targets = [url(for: sessionID), legacyURL(for: sessionID)]
+            .compactMap { $0 }
+            .reduce(into: [String: URL]()) { result, target in
+                result[target.path] = target
+            }
+            .values
+        var success = true
+        for target in targets where fileSystem.fileExists(at: target) {
+            do {
+                try fileSystem.removeItem(at: target)
+            } catch {
+                success = false
+            }
+        }
+        return success
+    }
+
+    public func transcript(for id: String) -> CachedTranscript? {
+        read(for: id).transcript
+    }
+
+    @discardableResult
+    public func store(
+        _ messages: [ChatMessage],
+        snapshot: AuthoritativeTranscriptSnapshot? = nil,
+        for id: String,
+        expectedEpoch: UInt64? = nil
+    ) -> CacheStoreResult {
+        let authorizedEpoch = expectedEpoch ?? epoch
+        guard authorizedEpoch == epoch, !Task.isCancelled else {
+            return CacheStoreResult(addedEntry: false, byteDelta: 0)
+        }
+        if memory[id] == nil {
+            _ = read(for: id)
+        }
+        let payload = CachedTranscript(version: Self.version, messages: messages, snapshot: snapshot)
+        guard let data = try? codec.encode(payload),
+              authorizedEpoch == epoch,
+              !Task.isCancelled
+        else {
+            return CacheStoreResult(addedEntry: false, byteDelta: 0)
+        }
+        guard let target = url(for: id) else {
+            return CacheStoreResult(addedEntry: false, byteDelta: 0)
+        }
+        let oldData = try? fileSystem.data(at: target)
+        let existed = fileSystem.fileExists(at: target)
+        if oldData == data {
+            memory[id] = payload
+            return CacheStoreResult(addedEntry: false, byteDelta: 0)
+        }
+        let oldSize = oldData.map { Int64($0.count) } ?? fileSystem.fileSize(at: target) ?? 0
+        guard authorizedEpoch == epoch,
+              (try? fileSystem.write(data, to: target)) != nil
+        else {
+            return CacheStoreResult(addedEntry: false, byteDelta: 0)
+        }
+        memory[id] = payload
+        return CacheStoreResult(
+            addedEntry: !existed,
+            byteDelta: Int64(data.count) - oldSize
+        )
+    }
+
+    public func isCached(_ id: String) -> Bool { transcript(for: id) != nil }
+
+    public func reconcile(validIDs: [String]) -> CacheStatistics {
+        // Reconcile establishes disk truth, so no stale in-memory transcript survives it.
+        memory.removeAll()
+        guard let directory,
+              let files = try? fileSystem.contentsOfDirectory(at: directory)
+        else {
+            return CacheStatistics(entryCount: 0, bytes: 0)
+        }
+        var bytes: Int64 = 0
+        var count = 0
+        for file in files where file.pathExtension == "json" {
+            let kind = Self.classifyCacheFile(at: file, in: directory, validIDs: validIDs)
+            let id: String
+            let isLegacy: Bool
+            switch kind {
+            case .current(let currentID):
+                id = currentID
+                isLegacy = false
+            case .legacy(let legacyID):
+                id = legacyID
+                isLegacy = true
+                if let target = url(for: id),
+                   Self.pathIdentity(target) == Self.pathIdentity(file) {
+                    continue
+                }
+            case .legacyCollision:
+                // A legacy collision cannot be assigned safely. Keep it for
+                // a direct read rather than deleting a user's only copy.
+                continue
+            case .orphan:
+                try? fileSystem.removeItem(at: file)
+                continue
+            }
+
+            guard let data = try? fileSystem.data(at: file),
+                  Self.validatesCacheData(data, codec: codec)
+            else {
+                try? fileSystem.removeItem(at: file)
+                continue
+            }
+            let size = fileSystem.fileSize(at: file) ?? Int64(data.count)
+            guard size > 0 else {
+                try? fileSystem.removeItem(at: file)
+                continue
+            }
+            if isLegacy, let target = url(for: id) {
+                _ = adoptLegacyData(data, from: file, to: target)
+                bytes += fileSystem.fileSize(at: target) ?? size
+            } else {
+                bytes += size
+            }
+            count += 1
+        }
+        return CacheStatistics(entryCount: count, bytes: bytes)
+    }
+
+    @discardableResult
+    public func clear() -> Bool {
+        epoch &+= 1
+        guard !Task.isCancelled, let directory else { return false }
+        do {
+            if fileSystem.fileExists(at: directory) { try fileSystem.removeItem(at: directory) }
+            memory.removeAll()
+            try fileSystem.createDirectory(at: directory)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+
+}

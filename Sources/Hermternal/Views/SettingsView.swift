@@ -1,18 +1,123 @@
 import SwiftUI
+import HermternalCore
 
 struct SettingsView: View {
     @Bindable var appearance: AppearanceSettings
     @Bindable var model: AppModel
+    let registry: CapabilityRegistry
+
+    @State private var selection: SettingsSection? = .appearance
+
+    init(
+        appearance: AppearanceSettings,
+        model: AppModel,
+        registry: CapabilityRegistry = CapabilityRegistry()
+    ) {
+        self.appearance = appearance
+        self.model = model
+        self.registry = registry
+    }
 
     var body: some View {
-        TabView {
-            AppearanceSettingsView(appearance: appearance)
-                .tabItem { Label("Appearance", systemImage: "paintbrush") }
-            CacheSettingsView(model: model)
-                .tabItem { Label("Cache", systemImage: "internaldrive") }
+        SettingsSplitView(
+            appearance: appearance,
+            model: model,
+            registry: registry,
+            selection: $selection
+        )
+        .frame(
+            minWidth: 700,
+            maxWidth: CGFloat.infinity,
+            maxHeight: CGFloat.infinity,
+            alignment: .topLeading
+        )
+    }
+
+}
+
+enum SettingsSection: String, CaseIterable, Hashable, Identifiable {
+    case appearance
+    case gateway
+    case cache
+    case modules
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .appearance: "Appearance"
+        case .gateway: "Gateway"
+        case .cache: "Cache"
+        case .modules: "Modules"
         }
-        .frame(width: 460)
-        .scenePadding()
+    }
+
+    var systemImage: String {
+        switch self {
+        case .appearance: "paintbrush"
+        case .gateway: "network"
+        case .cache: "internaldrive"
+        case .modules: "puzzlepiece.extension"
+        }
+    }
+}
+
+struct SettingsSourceList: View {
+    @Binding var selection: SettingsSection?
+
+    var body: some View {
+        List(selection: $selection) {
+            ForEach(SettingsSection.allCases) { section in
+                Label(section.title, systemImage: section.systemImage)
+                    .accessibilityLabel(section.title)
+                    .accessibilityValue(selection == section ? "Selected" : "")
+                    .tag(section)
+            }
+        }
+        .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+        // Clear the traffic lights; the hosting controller drops the titlebar
+        // safe area, so this is the only top inset the list gets.
+        .padding(.top, 46)
+    }
+}
+
+struct SettingsDetailView: View {
+    let section: SettingsSection
+    @Bindable var appearance: AppearanceSettings
+    @Bindable var model: AppModel
+    let registry: CapabilityRegistry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(section.title)
+                .font(.title)
+                .fontWeight(.semibold)
+                .padding(.horizontal, 20)
+                .padding(.top, 20)
+
+            detailContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        // Top inset comes from the heading's own padding; the hosting
+        // controller already drops the titlebar safe area.
+    }
+
+    @ViewBuilder
+    private var detailContent: some View {
+        switch section {
+        case .appearance:
+            AppearanceSettingsView(appearance: appearance)
+        case .gateway:
+            GatewaySettingsView(
+                status: model.gatewayStatus,
+                onSelectMethod: model.setAuthenticationMethod
+            )
+        case .cache:
+            CacheSettingsView(model: model)
+        case .modules:
+            ModulesSettingsView(registry: registry)
+        }
     }
 }
 
@@ -37,32 +142,36 @@ private struct AppearanceSettingsView: View {
                 .pickerStyle(.segmented)
             }
 
-            Section("Window") {
-                HStack {
-                    Text("Frost")
-                    Slider(
-                        value: frostBinding,
-                        in: 0...1,
-                        onEditingChanged: { editing in
-                            if !editing {
-                                appearance.persistWindowFrost()
-                            }
-                        }
-                    )
-                    Text(
-                        appearance.windowFrost.formatted(
-                            .percent.precision(.fractionLength(0))
-                        )
-                    )
-                    .monospacedDigit()
-                    .frame(width: 42, alignment: .trailing)
-                }
-                Text("0% is clear Liquid Glass. 100% is a frosted material.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
             Section {
+                LabeledContent {
+                    HStack {
+                        Slider(
+                            value: frostBinding,
+                            in: 0...1,
+                            onEditingChanged: { editing in
+                                if !editing {
+                                    appearance.persistWindowFrost()
+                                }
+                            }
+                        )
+                        Text(
+                            appearance.windowFrost.formatted(
+                                .percent.precision(.fractionLength(0))
+                            )
+                        )
+                        .monospacedDigit()
+                        .frame(width: 42, alignment: .trailing)
+                    }
+                } label: {
+                    Text("Frost")
+                    Text(
+                        "Applies to the chat window only. At 0% the desktop shows through "
+                            + "the window; at 100% the window is a frosted material."
+                    )
+                }
+            } header: {
+                Text("Chat Window")
+            } footer: {
                 HStack {
                     Spacer()
                     Button("Reset to Defaults") {
@@ -70,8 +179,10 @@ private struct AppearanceSettingsView: View {
                     }
                 }
             }
+
         }
         .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
     }
 }
 
@@ -96,13 +207,6 @@ private struct CacheSettingsView: View {
         Form {
             Section {
                 Toggle("Cache chat history locally", isOn: cacheBinding)
-                Text(
-                    model.cacheEnabled
-                        ? "Recent transcripts are stored on this Mac so switching chats is immediate."
-                        : "Chats load from the server each time you open them."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
             }
 
             if model.cacheEnabled {
@@ -137,5 +241,82 @@ private struct CacheSettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+    }
+}
+
+private struct ModulesSettingsView: View {
+    let registry: CapabilityRegistry
+
+    var body: some View {
+        Form {
+            if registry.capabilities.isEmpty {
+                Section {
+                    Text("No optional capability modules are installed.")
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Section {
+                    ForEach(registry.capabilities) { capability in
+                        CapabilityRow(capability: capability)
+                    }
+                } header: {
+                    Text("Optional capabilities")
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+    }
+}
+
+private struct CapabilityRow: View {
+    let capability: CapabilityDescriptor
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            LabeledContent(capability.name) {
+                Text(capability.state.label)
+                    .foregroundStyle(stateColor)
+            }
+
+            Text(capability.purpose)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            LabeledContent("Source", value: capability.implementationSource.rawValue)
+
+            if !capability.dependencies.isEmpty {
+                LabeledContent("Dependencies") {
+                    Text(capability.dependencies.map(\.rawValue).joined(separator: ", "))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let reason = capability.state.reason {
+                LabeledContent("Reason") {
+                    Text(reason)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let relaunchNote = capability.relaunchNote {
+                Label(relaunchNote, systemImage: "arrow.clockwise")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(capability.name), \(capability.state.label)")
+        .accessibilityHint(capability.purpose)
+    }
+
+    private var stateColor: Color {
+        switch capability.state {
+        case .available: .green
+        case .omitted: .secondary
+        case .unavailable: .orange
+        }
     }
 }

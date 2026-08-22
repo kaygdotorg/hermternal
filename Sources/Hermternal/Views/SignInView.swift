@@ -12,6 +12,7 @@ struct SignInView: View {
                 .font(.system(size: 40, weight: .light))
                 .foregroundStyle(.tint)
                 .padding(.bottom, 18)
+                .accessibilityHidden(true)
 
             Text("Hermternal")
                 .font(.system(size: 30, weight: .semibold, design: .rounded))
@@ -29,7 +30,7 @@ struct SignInView: View {
                     .font(.system(.body, design: .monospaced))
                     .onSubmit { signIn() }
             }
-            .frame(width: 380)
+            .frame(maxWidth: 380)
             .padding(.top, 34)
 
             Button {
@@ -39,7 +40,7 @@ struct SignInView: View {
                     if isWorking { ProgressView().controlSize(.small) }
                     Text(isWorking ? "Waiting for browser…" : "Sign In")
                 }
-                .frame(width: 356, height: 22)
+                .frame(maxWidth: 356, minHeight: 44)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)

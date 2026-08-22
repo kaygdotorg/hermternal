@@ -10,6 +10,17 @@
 	<string>kaygdotorg.hermternal</string>
 	<key>CFBundleExecutable</key>
 	<string>Hermternal</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Hermternal message links</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>hermternal</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

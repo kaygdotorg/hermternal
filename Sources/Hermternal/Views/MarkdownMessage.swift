@@ -1,76 +1,6 @@
 import SwiftUI
+import HermternalCore
 
-/// A message body split into prose and fenced-code runs.
-///
-/// `AttributedString(markdown:)` handles inline emphasis and code spans but
-/// renders a fenced block as ordinary inline text, so fences are split out
-/// here and drawn as real blocks. That is the single highest-value piece of
-/// formatting in an agent client.
-enum MarkdownSegment: Identifiable {
-    case prose(id: Int, AttributedString)
-    case code(id: Int, language: String, body: String)
-
-    var id: Int {
-        switch self {
-        case .prose(let id, _): id
-        case .code(let id, _, _): id
-        }
-    }
-
-    static func parse(_ text: String) -> [MarkdownSegment] {
-        var segments: [MarkdownSegment] = []
-        var proseBuffer: [Substring] = []
-        var codeBuffer: [Substring] = []
-        var language = ""
-        var inFence = false
-        var nextID = 0
-
-        func flushProse() {
-            let joined = proseBuffer.joined(separator: "\n")
-            proseBuffer.removeAll()
-            let trimmed = joined.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return }
-            segments.append(.prose(id: nextID, attributed(from: trimmed)))
-            nextID += 1
-        }
-
-        func flushCode() {
-            let body = codeBuffer.joined(separator: "\n")
-            codeBuffer.removeAll()
-            segments.append(.code(id: nextID, language: language, body: body))
-            nextID += 1
-            language = ""
-        }
-
-        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            if line.hasPrefix("```") {
-                if inFence {
-                    flushCode()
-                    inFence = false
-                } else {
-                    flushProse()
-                    language = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
-                    inFence = true
-                }
-                continue
-            }
-            if inFence { codeBuffer.append(line) } else { proseBuffer.append(line) }
-        }
-        // An unterminated fence is normal mid-stream; render what arrived.
-        if inFence { flushCode() } else { flushProse() }
-        return segments
-    }
-
-    private static func attributed(from markdown: String) -> AttributedString {
-        // `.full` keeps hard line breaks, which chat prose relies on.
-        let options = AttributedString.MarkdownParsingOptions(
-            interpretedSyntax: .full,
-            failurePolicy: .returnPartiallyParsedIfPossible
-        )
-        return (try? AttributedString(markdown: markdown, options: options))
-            ?? AttributedString(markdown)
-    }
-}
 
 struct MarkdownMessage: View {
     let text: String
@@ -132,9 +62,12 @@ private struct CodeBlock: View {
                     .padding(10)
             }
         }
-        .background(.background.secondary, in: .rect(cornerRadius: 8))
+        .background(
+            .background.secondary,
+            in: .rect(cornerRadius: AppShapeScale.compact, style: .continuous)
+        )
         .overlay(
-            RoundedRectangle(cornerRadius: 8)
+            RoundedRectangle(cornerRadius: AppShapeScale.compact, style: .continuous)
                 .strokeBorder(.separator, lineWidth: 0.5)
         )
     }

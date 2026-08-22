@@ -1,27 +1,53 @@
 import SwiftUI
+import HermternalCore
 
 struct SidebarView: View {
     @Bindable var model: AppModel
+    let accountName: String
+    let accountDetail: String?
+    let accountID: String?
     @State private var pendingOpenTask: Task<Void, Never>?
     @State private var pointerActivatedID: String?
 
+    init(
+        model: AppModel,
+        accountName: String,
+        accountDetail: String? = nil,
+        accountID: String? = nil
+    ) {
+        self._model = Bindable(model)
+        self.accountName = accountName
+        self.accountDetail = accountDetail
+        self.accountID = accountID
+    }
+
     var body: some View {
-        List(selection: $model.selectedSessionID) {
-            Section("Chats") {
-                ForEach(model.sessions) { session in
-                    SessionRow(session: session)
-                        .contentShape(.rect)
-                        .simultaneousGesture(
-                            TapGesture().onEnded {
-                                openImmediately(session)
-                            }
-                        )
-                        .tag(session.id)
+        ZStack(alignment: .bottom) {
+            List(selection: $model.selectedSessionID) {
+                Section("Chats") {
+                    ForEach(model.sessions) { session in
+                        SessionRow(session: session)
+                            .contentShape(.rect)
+                            .simultaneousGesture(
+                                TapGesture().onEnded {
+                                    openImmediately(session)
+                                }
+                            )
+                            .tag(session.id)
+                    }
                 }
             }
+            .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
+
+            SidebarBottomEdge {
+                SidebarAccountRow(
+                    name: accountName,
+                    detail: accountDetail,
+                    accountID: accountID
+                )
+            }
         }
-        .listStyle(.sidebar)
-        .scrollContentBackground(.hidden)
         .onChange(of: model.selectedSessionID) { _, newValue in
             if pointerActivatedID == newValue {
                 pointerActivatedID = nil
@@ -80,6 +106,7 @@ private struct SessionRow: View {
             Text(session.displayTitle)
                 .lineLimit(1)
                 .font(.body)
+                .help(session.displayTitle)
             HStack(spacing: 5) {
                 if let startedAt = session.startedAt {
                     Text(startedAt, format: .relative(presentation: .named))
