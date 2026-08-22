@@ -1,18 +1,130 @@
 import SwiftUI
+import HermternalCore
 
 struct SettingsView: View {
     @Bindable var appearance: AppearanceSettings
     @Bindable var model: AppModel
+    let registry: CapabilityRegistry
+
+    @State private var selection: SettingsSection? = .appearance
+
+    init(
+        appearance: AppearanceSettings,
+        model: AppModel,
+        registry: CapabilityRegistry = CapabilityRegistry()
+    ) {
+        self.appearance = appearance
+        self.model = model
+        self.registry = registry
+    }
 
     var body: some View {
-        TabView {
-            AppearanceSettingsView(appearance: appearance)
-                .tabItem { Label("Appearance", systemImage: "paintbrush") }
-            CacheSettingsView(model: model)
-                .tabItem { Label("Cache", systemImage: "internaldrive") }
+        HStack(spacing: 0) {
+            SettingsSourceList(selection: $selection)
+                .frame(width: 220)
+
+            SettingsDetailView(
+                section: selection ?? .appearance,
+                appearance: appearance,
+                model: model,
+                registry: registry
+            )
+            .frame(
+                minWidth: 480,
+                maxWidth: .infinity,
+                maxHeight: .infinity,
+                alignment: .topLeading
+            )
         }
-        .frame(width: 460)
-        .scenePadding()
+        .frame(
+            minWidth: 700,
+            maxWidth: .infinity,
+            maxHeight: .infinity,
+            alignment: .topLeading
+        )
+    }
+}
+
+private enum SettingsSection: String, CaseIterable, Hashable, Identifiable {
+    case appearance
+    case gateway
+    case cache
+    case modules
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .appearance: "Appearance"
+        case .gateway: "Gateway"
+        case .cache: "Cache"
+        case .modules: "Modules"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .appearance: "paintbrush"
+        case .gateway: "network"
+        case .cache: "internaldrive"
+        case .modules: "puzzlepiece.extension"
+        }
+    }
+}
+
+private struct SettingsSourceList: View {
+    @Binding var selection: SettingsSection?
+
+    var body: some View {
+        List(selection: $selection) {
+            ForEach(SettingsSection.allCases) { section in
+                Label(section.title, systemImage: section.systemImage)
+                    .accessibilityLabel(section.title)
+                    .accessibilityValue(selection == section ? "Selected" : "")
+                    .tag(section)
+            }
+        }
+        .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+        .background(.clear)
+    }
+}
+
+private struct SettingsDetailView: View {
+    let section: SettingsSection
+    @Bindable var appearance: AppearanceSettings
+    @Bindable var model: AppModel
+    let registry: CapabilityRegistry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(section.title)
+                .font(.largeTitle)
+                .fontWeight(.bold)
+                .padding(.horizontal, 28)
+                .padding(.top, 24)
+                .padding(.bottom, 8)
+
+            detailContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+    }
+
+    @ViewBuilder
+    private var detailContent: some View {
+        switch section {
+        case .appearance:
+            AppearanceSettingsView(appearance: appearance)
+        case .gateway:
+            GatewaySettingsView(
+                status: model.gatewayStatus,
+                onSelectMethod: model.setAuthenticationMethod
+            )
+        case .cache:
+            CacheSettingsView(model: model)
+        case .modules:
+            ModulesSettingsView(registry: registry)
+        }
     }
 }
 
@@ -57,7 +169,7 @@ private struct AppearanceSettingsView: View {
                     .monospacedDigit()
                     .frame(width: 42, alignment: .trailing)
                 }
-                Text("0% is clear Liquid Glass. 100% is a frosted material.")
+                Text("0% is the most transparent. 100% is a frosted material.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -72,6 +184,7 @@ private struct AppearanceSettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
     }
 }
 
@@ -137,5 +250,82 @@ private struct CacheSettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+    }
+}
+
+private struct ModulesSettingsView: View {
+    let registry: CapabilityRegistry
+
+    var body: some View {
+        Form {
+            if registry.capabilities.isEmpty {
+                Section {
+                    Text("No optional capability modules are installed.")
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Section {
+                    ForEach(registry.capabilities) { capability in
+                        CapabilityRow(capability: capability)
+                    }
+                } header: {
+                    Text("Optional capabilities")
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+    }
+}
+
+private struct CapabilityRow: View {
+    let capability: CapabilityDescriptor
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            LabeledContent(capability.name) {
+                Text(capability.state.label)
+                    .foregroundStyle(stateColor)
+            }
+
+            Text(capability.purpose)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            LabeledContent("Source", value: capability.implementationSource.rawValue)
+
+            if !capability.dependencies.isEmpty {
+                LabeledContent("Dependencies") {
+                    Text(capability.dependencies.map(\.rawValue).joined(separator: ", "))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let reason = capability.state.reason {
+                LabeledContent("Reason") {
+                    Text(reason)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let relaunchNote = capability.relaunchNote {
+                Label(relaunchNote, systemImage: "arrow.clockwise")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(capability.name), \(capability.state.label)")
+        .accessibilityHint(capability.purpose)
+    }
+
+    private var stateColor: Color {
+        switch capability.state {
+        case .available: .green
+        case .omitted: .secondary
+        case .unavailable: .orange
+        }
     }
 }

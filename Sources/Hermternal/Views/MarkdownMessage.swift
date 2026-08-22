@@ -62,9 +62,12 @@ private struct CodeBlock: View {
                     .padding(10)
             }
         }
-        .background(.background.secondary, in: .rect(cornerRadius: 8))
+        .background(
+            .background.secondary,
+            in: .rect(cornerRadius: AppShapeScale.compact, style: .continuous)
+        )
         .overlay(
-            RoundedRectangle(cornerRadius: 8)
+            RoundedRectangle(cornerRadius: AppShapeScale.compact, style: .continuous)
                 .strokeBorder(.separator, lineWidth: 0.5)
         )
     }

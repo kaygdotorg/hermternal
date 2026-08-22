@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import HermternalCore
 
 /// Focused command-K message search surface.
@@ -42,14 +43,18 @@ struct SearchPanel: View {
             let maximumHeight = geometry.size.height / 3
 
             ZStack(alignment: .top) {
+                SearchPanelBackdrop()
+                    .opacity(hasAppeared ? 1 : 0)
+                    .ignoresSafeArea()
+
+                // Keep dismissal available without putting an invisible view in
+                // the accessibility or keyboard focus order.
                 Rectangle()
-                    .fill(.black.opacity(contrast == .increased ? 0.76 : 0.62))
-                    .background(.ultraThickMaterial)
+                    .fill(.clear)
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
                     .onTapGesture(perform: dismiss)
                     .accessibilityHidden(true)
-
                 SearchPanelSurface(
                     model: model,
                     fieldFocused: $fieldFocused,
@@ -62,74 +67,203 @@ struct SearchPanel: View {
                 .opacity(hasAppeared ? 1 : 0)
                 .scaleEffect(reduceMotion ? 1 : (hasAppeared ? 1 : 0.985), anchor: .top)
                 .offset(y: reduceMotion ? 0 : (hasAppeared ? 0 : -10))
-            .animation(
-                reduceMotion ? .easeOut(duration: 0.18) : .spring(response: 0.36, dampingFraction: 1),
-                value: hasAppeared
-            )
+            }
+            .animation(panelAnimation, value: hasAppeared)
             .onAppear {
+                // Focus is established before the visual ramp so ⌘K is
+                // immediately ready for typing, including Reduce Motion.
                 fieldFocused = true
                 hasAppeared = true
             }
             .onExitCommand(perform: dismiss)
         }
     }
-}
+
+    private var panelAnimation: Animation {
+        Self.panelAnimation(reduceMotion: reduceMotion)
+    }
+
+    static func panelAnimation(reduceMotion: Bool) -> Animation {
+        reduceMotion
+            ? .easeOut(duration: 0.18)
+            : .spring(response: 0.36, dampingFraction: 1)
+    }
 
 }
+
+private struct SearchPanelBackdrop: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .fullScreenUI
+        view.blendingMode = .withinWindow
+        view.state = .active
+        view.isEmphasized = true
+        return view
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {
+        view.material = .fullScreenUI
+        view.blendingMode = .withinWindow
+        view.state = .active
+        view.isEmphasized = true
+    }
+}
+
 private struct SearchPanelField: View {
     @Bindable var model: SearchPanelModel
     let fieldFocused: FocusState<Bool>.Binding
     let activateSelection: () -> Void
     let dismiss: () -> Void
 
+    private var metadata: SearchFieldMetadata? {
+        guard case .results(let results) = model.state else { return nil }
+        return SearchFieldMetadata(
+            count: results.hits.count,
+            incompleteSessions: results.incompleteSessions
+        )
+    }
+
+    private var metadataReservation: CGFloat {
+        guard let metadata else { return 0 }
+        let countWidth = metadata.count < 100
+            ? 24
+            : max(24, CGFloat(String(metadata.count).count * 8 + 10))
+        let indicatorWidth: CGFloat = metadata.incompleteSessions > 0 ? 28 : 0
+        return countWidth + indicatorWidth + 10
+    }
+
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(.secondary)
+        GlassEffectContainer(spacing: 14) {
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.secondary)
 
-            TextField("Search all messages", text: $model.query)
-                .textFieldStyle(.plain)
-                .font(.system(size: 17, weight: .regular, design: .rounded))
-                .focused(fieldFocused)
-                .submitLabel(.search)
-                .onSubmit(activateSelection)
-                .accessibilityLabel("Search all messages")
-                .accessibilityHint("Type to search the full message text across every chat")
-                .onKeyPress(.downArrow) {
-                    model.moveSelection(.down)
-                    return .handled
+                ZStack(alignment: .trailing) {
+                    TextField("Search all messages", text: $model.query)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 17, weight: .regular, design: .rounded))
+                        .focused(fieldFocused)
+                        .submitLabel(.search)
+                        .onSubmit(activateSelection)
+                        .padding(.trailing, metadataReservation)
+                        .mask {
+                            if metadata != nil {
+                                LinearGradient(
+                                    stops: [
+                                        .init(color: .black, location: 0),
+                                        .init(color: .black, location: 0.78),
+                                        .init(color: .black.opacity(0.72), location: 0.9),
+                                        .init(color: .clear, location: 1)
+                                    ],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            } else {
+                                Rectangle().fill(.black)
+                            }
+                        }
+                        .accessibilityLabel("Search all messages")
+                        .accessibilityHint("Type to search the full message text across every chat")
+                        .onKeyPress(.downArrow) {
+                            model.moveSelection(.down)
+                            return .handled
+                        }
+                        .onKeyPress(.upArrow) {
+                            model.moveSelection(.up)
+                            return .handled
+                        }
+                        .onKeyPress(.escape) {
+                            dismiss()
+                            return .handled
+                        }
+
+                    if let metadata {
+                        SearchFieldMetadataView(metadata: metadata)
+                            .padding(.trailing, 2)
+                    }
                 }
-                .onKeyPress(.upArrow) {
-                    model.moveSelection(.up)
-                    return .handled
-                }
-                .onKeyPress(.escape) {
-                    dismiss()
-                    return .handled
+                .frame(maxWidth: .infinity)
+
+                if !model.query.isEmpty {
+                    Button {
+                        model.query = ""
+                        fieldFocused.wrappedValue = true
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear search")
                 }
 
-            if !model.query.isEmpty {
-                Button {
-                    model.query = ""
-                    fieldFocused.wrappedValue = true
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.tertiary)
+                Button(action: dismiss) {
+                    Image(systemName: "escape")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Clear search")
+                .keyboardShortcut(.cancelAction)
+                .accessibilityLabel("Dismiss search")
             }
-
-            Button(action: dismiss) {
-                Image(systemName: "escape")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .keyboardShortcut(.cancelAction)
-            .accessibilityLabel("Dismiss search")
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+            .glassEffect(.regular.interactive(), in: .capsule)
         }
+    }
+}
+
+private struct SearchFieldMetadata: Sendable {
+    let count: Int
+    let incompleteSessions: Int
+}
+
+private struct SearchFieldMetadataView: View {
+    let metadata: SearchFieldMetadata
+
+    private var countLabel: String {
+        "\(metadata.count) \(metadata.count == 1 ? "message" : "messages")"
+    }
+
+    private var indexingLabel: String {
+        "Older messages in \(metadata.incompleteSessions) chats are not searchable yet"
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("\(metadata.count)")
+                .font(.caption.weight(.semibold).monospacedDigit())
+                .foregroundStyle(.primary)
+                .frame(minWidth: 24, minHeight: 24)
+                .padding(.horizontal, metadata.count < 100 ? 0 : 5)
+                .background(.quaternary, in: Capsule())
+                .overlay {
+                    Capsule()
+                        .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+                }
+                .help(countLabel)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(countLabel)
+
+            if metadata.incompleteSessions > 0 {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 22, height: 22)
+                    .help(indexingLabel)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(indexingLabel)
+            }
+        }
+    }
+}
+
+
+private struct SearchFieldHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 46
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 
@@ -141,25 +275,44 @@ private struct SearchPanelSurface: View {
     let dismiss: () -> Void
 
     @Environment(\.colorSchemeContrast) private var contrast
+    @State private var fieldHeight: CGFloat = SearchFieldHeightKey.defaultValue
+
+    private let fieldMargin: CGFloat = 15
+
+    private var fieldContentInset: CGFloat {
+        fieldHeight + fieldMargin * 2
+    }
+
+
     var body: some View {
-        VStack(spacing: 0) {
+        ZStack(alignment: .top) {
+            content
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+
             SearchPanelField(
                 model: model,
                 fieldFocused: fieldFocused,
                 activateSelection: activateSelection,
                 dismiss: dismiss
             )
+            .frame(maxWidth: .infinity)
+            .background {
+                GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: SearchFieldHeightKey.self,
+                        value: geometry.size.height
+                    )
+                }
+            }
+            .zIndex(1)
             .padding(.horizontal, 18)
-            .padding(.vertical, 15)
-
-            Divider()
-                .opacity(contrast == .increased ? 1 : 0.65)
-
-            content
-                .frame(maxWidth: .infinity, alignment: .topLeading)
+            .padding(.vertical, fieldMargin)
         }
         .frame(maxHeight: maximumHeight, alignment: .top)
-        .background(.thickMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        // The window frost beneath the panel carries the visual weight. A
+        // thin pane keeps the app recognizable through the card instead of
+        // stacking an opaque material over the backdrop.
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .strokeBorder(
@@ -168,6 +321,9 @@ private struct SearchPanelSurface: View {
                 )
         }
         .shadow(color: .black.opacity(0.28), radius: 28, y: 14)
+        .onPreferenceChange(SearchFieldHeightKey.self) { height in
+            fieldHeight = height
+        }
         .onChange(of: model.query) { _, newQuery in
             model.updateQuery(newQuery)
         }
@@ -190,19 +346,24 @@ private struct SearchPanelSurface: View {
         switch model.state {
         case .empty:
             EmptySearchState()
+                .padding(.top, fieldContentInset)
         case .loading:
             LoadingSearchState()
+                .padding(.top, fieldContentInset)
         case .results(let results):
             ResultsSearchState(
                 results: results,
                 selectedIndex: model.selectedIndex,
+                topInset: fieldContentInset,
                 activate: activate
             )
-            .frame(maxHeight: max(80, maximumHeight - 70))
+            .frame(height: maximumHeight)
         case .noResults(let query):
             NoResultsSearchState(query: query)
+                .padding(.top, fieldContentInset)
         case .error(_, let message):
             ErrorSearchState(message: message, retry: model.retry)
+                .padding(.top, fieldContentInset)
         }
     }
 
@@ -210,6 +371,7 @@ private struct SearchPanelSurface: View {
         guard let location = model.selectedLocation() else { return }
         activate(location)
     }
+
 }
 
 private struct EmptySearchState: View {
@@ -249,43 +411,19 @@ private struct LoadingSearchState: View {
 private struct ResultsSearchState: View {
     let results: SearchResults
     let selectedIndex: Int?
+    let topInset: CGFloat
     let activate: (MessageLocation) -> Void
+
+    private static let topFadeHeight: CGFloat = 96
+    // Keep content fully dissolved through the ~31pt card-to-pill gap, then
+    // bring it back gently through the pill so its glass can lens the rows.
+    private static let topFadeClearHeight: CGFloat = 30
+    private static let topFadeSoftHeight: CGFloat = 48
+    private static let topFadeStrongHeight: CGFloat = 72
 
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 8) {
-                    Text("\(results.hits.count) \(results.hits.count == 1 ? "match" : "matches")")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    if results.incompleteSessions > 0 {
-                        Label(
-                            "Some chats still indexing",
-                            systemImage: "clock.arrow.circlepath"
-                        )
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .accessibilityLabel(
-                            "Older messages in \(results.incompleteSessions) chats are not searchable yet"
-                        )
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 11)
-                .padding(.bottom, 5)
-
-                if results.incompleteSessions > 0 {
-                    Text("Older messages in some chats are not searchable yet.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 6)
-                        .accessibilityLabel(
-                            "Older messages in some chats are not searchable yet"
-                        )
-                }
-
                 ForEach(Array(results.hits.enumerated()), id: \.element.location) { index, hit in
                     SearchResultRow(
                         hit: hit,
@@ -296,7 +434,31 @@ private struct ResultsSearchState: View {
                     )
                 }
             }
+            // The list owns its 12pt row inset; the pill owns only the
+            // top content inset, so neither creates a surrounding band.
+            .padding(.horizontal, 12)
+            // This is scroll content inset, not a second field-sized region.
+            // Rows remain in the scroll view and can travel behind the pill.
+            .padding(.top, topInset)
             .padding(.bottom, 8)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .mask {
+            GeometryReader { geometry in
+                let height = max(geometry.size.height, 1)
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0),
+                        .init(color: .clear, location: min(Self.topFadeClearHeight / height, 1)),
+                        .init(color: .black.opacity(0.12), location: min(Self.topFadeSoftHeight / height, 1)),
+                        .init(color: .black.opacity(0.55), location: min(Self.topFadeStrongHeight / height, 1)),
+                        .init(color: .black, location: min(Self.topFadeHeight / height, 1)),
+                        .init(color: .black, location: 1)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
         }
         .scrollIndicators(.visible)
         .accessibilityElement(children: .contain)
@@ -306,6 +468,7 @@ private struct ResultsSearchState: View {
     }
 }
 
+
 private struct SearchResultRow: View {
     let hit: SearchHit
     let index: Int
@@ -313,40 +476,43 @@ private struct SearchResultRow: View {
     let isSelected: Bool
     let activate: () -> Void
 
+    @Environment(\.colorSchemeContrast) private var contrast
+
     var body: some View {
         Button(action: activate) {
-            HStack(alignment: .top, spacing: 11) {
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(isSelected ? Color.accentColor : Color.secondary.opacity(0.28))
-                    .frame(width: 3)
-                    .padding(.vertical, 2)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(hit.excerpt)
+                    .font(.body)
+                    .fontWeight(isSelected ? .semibold : .regular)
+                    .foregroundStyle(.primary)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(hit.excerpt)
-                        .font(.body)
-                        .fontWeight(isSelected ? .semibold : .regular)
-                        .foregroundStyle(.primary)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                    metadata
-                }
+                metadata
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .background(
-                isSelected ? Color.accentColor.opacity(0.12) : Color.clear,
-                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                isSelected
+                    ? Color.accentColor.opacity(contrast == .increased ? 0.24 : 0.12)
+                    : Color.clear,
+                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
             )
+            .overlay {
+                if isSelected && contrast == .increased {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(Color.accentColor, lineWidth: 1)
+                }
+            }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .padding(.horizontal, 6)
         .accessibilityLabel(Text("\(hit.sessionTitle.isEmpty ? "Untitled chat" : hit.sessionTitle), \(hit.role.displayName)"))
         .accessibilityValue(Text("Result \(index + 1) of \(resultCount). \(String(hit.excerpt.characters))"))
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
+
     @ViewBuilder
     private var metadata: some View {
         let title = hit.sessionTitle.isEmpty ? "Untitled chat" : hit.sessionTitle

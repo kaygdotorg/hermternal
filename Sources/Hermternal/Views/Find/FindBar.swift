@@ -116,10 +116,16 @@ struct FindHighlightedMessage: View {
             }
         }
         .padding(.vertical, isActive ? 4 : 0)
-        .background(isActive ? Color.orange.opacity(0.12) : .clear, in: .rect(cornerRadius: 8))
+        // This highlight can contain a code block, so it stays larger than
+        // the nested 8pt code shape and smaller than the 14pt message bubble
+        // it can sit inside; the curves remain concentric.
+        .background(
+            isActive ? Color.orange.opacity(0.12) : .clear,
+            in: .rect(cornerRadius: AppShapeScale.row, style: .continuous)
+        )
         .overlay {
             if isActive {
-                RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous)
                     .strokeBorder(.orange.opacity(0.8), lineWidth: 1)
             }
         }
@@ -164,8 +170,14 @@ private struct FindHighlightedCodeBlock: View {
                     .padding(10)
             }
         }
-        .background(.background.secondary, in: .rect(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.separator, lineWidth: 0.5))
+        .background(
+            .background.secondary,
+            in: .rect(cornerRadius: AppShapeScale.compact, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: AppShapeScale.compact, style: .continuous)
+                .strokeBorder(.separator, lineWidth: 0.5)
+        )
     }
 
     private func copy() {

@@ -313,7 +313,9 @@ struct ToastLayer: View {
                     }
                 }
                 .frame(width: toastWidth, height: min(regionHeight, availableHeight), alignment: .top)
-                .clipped()
+                .clipShape(
+                    RoundedRectangle(cornerRadius: AppShapeScale.card, style: .continuous)
+                )
                 .contentShape(Rectangle())
                 .onHover { hovering in
                     expanded = hovering
@@ -385,9 +387,12 @@ private struct ToastCard: View {
         .padding(.vertical, 11)
         .frame(width: width, alignment: .top)
         .frame(minHeight: 44, alignment: .top)
-        .background(.thickMaterial, in: .rect(cornerRadius: 14, style: .continuous))
+        .background(
+            .thickMaterial,
+            in: .rect(cornerRadius: AppShapeScale.toast, style: .continuous)
+        )
         .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: AppShapeScale.toast, style: .continuous)
                 .strokeBorder(borderColor, lineWidth: borderWidth)
         }
         .shadow(color: .black.opacity(colorScheme == .dark ? 0.42 : 0.18), radius: 14, y: 8)

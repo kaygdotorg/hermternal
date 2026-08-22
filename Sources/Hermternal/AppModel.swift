@@ -31,9 +31,39 @@ final class AppModel {
     /// to the backend that created them.
     var configuredGatewayHost: String? { serverURL?.host }
 
-    /// Non-fatal problems (a failed history load, a dropped socket) surfaced
-    /// without tearing down the whole session.
-    var notice: String?
+    /// The gateway status snapshot used by the settings tab.
+    var gatewayStatus: GatewayStatus {
+        let url = serverURL ?? URL(string: Self.defaultServer)!
+        let connection: GatewayConnectionState = switch phase {
+        case .signedOut: .signedOut
+        case .connecting: .connecting
+        case .ready: .ready
+        case .failed(let message): .failed(message)
+        }
+        let method = AuthMethodStore.load(gateway: url) ?? .browserPKCE
+        return GatewayStatus(
+            url: url,
+            connection: connection,
+            provider: discoveredProvider,
+            method: method,
+            gatewayAdvertisedMethods: gatewayAdvertisedMethods
+        )
+    }
+    var accountPresentation: AccountIdentityPresentation {
+        AccountIdentityResolver.resolve(
+            identity: accountIdentity,
+            provider: discoveredProvider,
+            gateway: gatewayStatus.url
+        )
+    }
+
+    /// The command-K surface is owned by the app model so the command menu
+    /// and the window overlay share one source of truth.
+    var isSearchPresented = false
+
+    let toastPresenter: ToastPresenter
+    private(set) var searchQuerying: (any SearchQuerying)?
+    private(set) var searchUnavailableReason: String?
 
     var cacheEnabled = UserDefaults.standard.object(forKey: "cache.enabled") as? Bool ?? true
     var cacheCachedCount = 0
@@ -58,7 +88,10 @@ final class AppModel {
     /// connection; production builds construct the gateway/rest adapter.
     private let injectedTranscriptSource: (any TranscriptSource)?
     private var eventTask: Task<Void, Never>?
-    private let cache: HistoryCache
+    private let cache: any TranscriptPersisting
+    private var accountIdentity: AccountIdentity?
+    private var discoveredProvider: AuthProvider?
+    private var gatewayAdvertisedMethods = AuthMethod.clientSupported
     private var prefetchTask: Task<Void, Never>?
     private var cacheControlTask: Task<Void, Never>?
     private var cacheControlGeneration = 0
@@ -84,10 +117,33 @@ final class AppModel {
 
     init(
         cache: HistoryCache = HistoryCache(),
-        transcriptSource: (any TranscriptSource)? = nil
+        transcriptSource: (any TranscriptSource)? = nil,
+        toastPresenter: ToastPresenter = ToastPresenter()
     ) {
-        self.cache = cache
         self.injectedTranscriptSource = transcriptSource
+        self.toastPresenter = toastPresenter
+
+        guard let historyDirectory = HistoryCache.defaultDirectory() else {
+            self.cache = cache
+            self.searchQuerying = nil
+            self.searchUnavailableReason = "The system cache directory is unavailable."
+            return
+        }
+
+        let indexURL = historyDirectory
+            .deletingLastPathComponent()
+            .appendingPathComponent("search.sqlite", isDirectory: false)
+        do {
+            let index = try SearchIndex(url: indexURL)
+            self.cache = SearchIndexReconciliation(cache: cache, index: index)
+            self.searchQuerying = index
+            self.searchUnavailableReason = nil
+        } catch {
+            self.cache = cache
+            self.searchQuerying = nil
+            self.searchUnavailableReason = error.localizedDescription
+            Log.error("Search index unavailable; using transcript cache only: \(error)")
+        }
     }
 
     // MARK: - Lifecycle
@@ -99,7 +155,7 @@ final class AppModel {
         // on auth or network success. Recover an interrupted purge before
         // attempting either.
         if !cacheEnabled {
-            let cleared = await cache.clear()
+            let cleared = (try? await cache.clear()) == true
             if !cleared {
                 Log.error("cache: could not finish disabled-on-launch purge")
             }
@@ -115,10 +171,12 @@ final class AppModel {
         }
         let auth = AuthClient(server: url, openURL: { NSWorkspace.shared.open($0) })
         self.auth = auth
+        await refreshGatewayDiscovery(using: auth)
         guard await auth.storedCredentials != nil else {
             phase = .signedOut
             return
         }
+        accountIdentity = await auth.fetchAccountIdentity()
         await connect()
     }
 
@@ -130,11 +188,13 @@ final class AppModel {
         UserDefaults.standard.set(serverText, forKey: Self.serverKey)
         let auth = AuthClient(server: url, openURL: { NSWorkspace.shared.open($0) })
         self.auth = auth
+        await refreshGatewayDiscovery(using: auth)
 
         phase = .connecting
         do {
             Log.info("signIn: starting native PKCE flow against \(url.absoluteString)")
             _ = try await auth.signIn()
+            accountIdentity = await auth.fetchAccountIdentity()
             Log.info("signIn: token exchange succeeded")
             await connect()
         } catch {
@@ -158,18 +218,59 @@ final class AppModel {
         rest = nil
         await auth?.signOut()
         // Transcripts are another user's data once signed out.
-        await cache.clear()
+        _ = try? await cache.clear()
         cacheCachedCount = 0
         cacheTotalCount = 0
         cacheBytes = 0
         isCacheWarming = false
-        liveSessionID = nil
-        sessions = []
+        accountIdentity = nil
+        discoveredProvider = nil
+        gatewayAdvertisedMethods = [.browserPKCE]
         streamingReducer.reset()
         messages = []
         isAwaitingReply = streamingReducer.isAwaitingReply
         selectedSessionID = nil
         phase = .signedOut
+        isSearchPresented = false
+        toastPresenter.setSuppressed(false)
+    }
+    private func refreshGatewayDiscovery(using auth: AuthClient) async {
+        guard let providers = await auth.discoverProviders() else {
+            discoveredProvider = nil
+            // Discovery is optional: the browser flow remains the only
+            // supported client method when the endpoint is unavailable.
+            gatewayAdvertisedMethods = [.browserPKCE]
+            return
+        }
+        discoveredProvider = providers.first
+        // Password auth is not implemented by this client yet.
+        gatewayAdvertisedMethods = [.browserPKCE]
+    }
+
+    func setAuthenticationMethod(_ requested: AuthMethod) {
+        let status = gatewayStatus
+        guard let method = AuthMethod.validatedSelection(
+            requested,
+            from: status.availableMethods
+        ) else {
+            toastPresenter.error(
+                "Authentication method unavailable",
+                detail: "\(requested.displayName) is not supported by this gateway."
+            )
+            return
+        }
+        AuthMethodStore.save(method, gateway: status.url)
+    }
+
+    func toggleSearch() {
+        guard searchQuerying != nil else {
+            toastPresenter.error(
+                "Search unavailable",
+                detail: searchUnavailableReason ?? "The local search index could not be opened."
+            )
+            return
+        }
+        isSearchPresented.toggle()
     }
 
     // MARK: - Connection
@@ -184,7 +285,7 @@ final class AppModel {
             Log.info("connect: minted ws ticket")
             let gateway = GatewayClient()
             self.gateway = gateway
-            try await gateway.connect(server: url, ticket: ticket)
+            try await gateway.connect(server: url, ticket: ticket.ticket)
             Log.info("connect: websocket dialed")
             rest = RestClient(server: url, auth: auth)
             observeEvents(on: gateway)
@@ -220,7 +321,7 @@ final class AppModel {
             prefetchTranscripts()
         } catch {
             Log.error("session.list failed: \(error)")
-            notice = "Could not load sessions: \(error.localizedDescription)"
+            postError("Could not load sessions", detail: error.localizedDescription)
         }
     }
 
@@ -247,8 +348,8 @@ final class AppModel {
             } else {
                 isCacheWarming = false
                 guard generation == cacheControlGeneration, !cacheEnabled else { return }
-                guard await cache.clear() else {
-                    notice = "Could not clear the local chat cache."
+                guard (try? await cache.clear()) == true else {
+                    postError("Could not clear the local chat cache.")
                     Log.error("cache: disable purge failed")
                     return
                 }
@@ -274,8 +375,8 @@ final class AppModel {
         cacheControlTask = Task { [weak self] in
             guard let self else { return }
             guard generation == cacheControlGeneration, cacheEnabled else { return }
-            guard await cache.clear() else {
-                notice = "Could not rebuild the local chat cache."
+            guard (try? await cache.clear()) == true else {
+                postError("Could not rebuild the local chat cache.")
                 Log.error("cache: rebuild clear failed")
                 return
             }
@@ -290,8 +391,8 @@ final class AppModel {
         guard cacheEnabled else {
             // Ensures a disabled cache is eventually purged even if the app
             // was terminated before the toggle's asynchronous clear finished.
-            guard await cache.clear() else {
-                notice = "Could not clear the disabled chat cache."
+            guard (try? await cache.clear()) == true else {
+                postError("Could not clear the disabled chat cache.")
                 Log.error("cache: deferred disabled purge failed")
                 isCacheWarming = false
                 return
@@ -301,7 +402,10 @@ final class AppModel {
             isCacheWarming = false
             return
         }
-        let statistics = await cache.reconcile(validIDs: sessions.map(\.id))
+        guard let statistics = try? await cache.reconcile(validIDs: sessions.map(\.id)) else {
+            postError("Could not reconcile the local chat cache.")
+            return
+        }
         cacheCachedCount = statistics.entryCount
         cacheBytes = statistics.bytes
     }
@@ -328,11 +432,12 @@ final class AppModel {
         prefetchGeneration += 1
         let generation = prefetchGeneration
         let totals = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0.messageCount) })
+        let titles = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0.title) })
         isCacheWarming = true
         prefetchTask = Task { [weak self, cache] in
             let coordinator = BoundedPrefetchCoordinator(limit: 4)
             let results: [CacheStoreResult] = await coordinator.prefetch(ordered) { id in
-                guard await !cache.isCached(id),
+                guard (await cache.read(for: id)).transcript == nil,
                       !Task.isCancelled,
                       let rows = try? await rest.sessionMessages(durableID: id),
                       !Task.isCancelled
@@ -344,7 +449,14 @@ final class AppModel {
                     projectedMessages: projected.count,
                     serverTotal: totals[id]
                 )
-                return await cache.store(projected, snapshot: snapshot, for: id)
+                guard let result = try? await cache.store(
+                    projected,
+                    snapshot: snapshot,
+                    title: titles[id] ?? "",
+                    for: id,
+                    expectedEpoch: nil
+                ) else { return nil }
+                return result
             }
             guard let self,
                   generation == self.prefetchGeneration,
@@ -361,6 +473,10 @@ final class AppModel {
             )
         }
     }
+    private func postError(_ title: String, detail: String? = nil) {
+        toastPresenter.error(title, detail: detail)
+    }
+
 
     private func applyCacheStore(_ result: CacheStoreResult) {
         if result.addedEntry {
@@ -384,7 +500,7 @@ final class AppModel {
             Log.info("session.create -> live id \(liveSessionID ?? "nil")")
         } catch {
             Log.error("session.create failed: \(error)")
-            notice = "Could not start a new chat: \(error.localizedDescription)"
+            postError("Could not start a new chat", detail: error.localizedDescription)
         }
     }
 
@@ -415,7 +531,7 @@ final class AppModel {
     @discardableResult
     func open(_ session: ChatSession) async -> Bool {
         guard let source = transcriptSource(for: session) else {
-            notice = "Could not open chat \(session.id): the gateway is unavailable."
+            postError("Could not open chat \(session.id)", detail: "The gateway is unavailable.")
             return false
         }
 
@@ -441,7 +557,7 @@ final class AppModel {
             messages = result.messages
             isAwaitingReply = streamingReducer.isAwaitingReply
             if let notice = result.notice {
-                self.notice = notice
+                postError("Could not fully open chat \(session.id)", detail: notice)
                 Log.error("open \(session.id): \(notice)")
             }
             if let cacheStore = result.cacheStore {
@@ -462,7 +578,7 @@ final class AppModel {
         guard !location.sessionID.isEmpty,
               let session = sessions.first(where: { $0.id == location.sessionID })
         else {
-            notice = "Could not open that message: the chat no longer exists."
+            postError("Could not open that message", detail: "The chat no longer exists.")
             return
         }
 
@@ -472,7 +588,7 @@ final class AppModel {
         guard selectedSessionID == location.sessionID else { return }
         let targetIdentity = MessageIdentity.server(location.messageID)
         guard messages.contains(where: { $0.id == targetIdentity }) else {
-            notice = "Could not open that message: it is no longer available."
+            postError("Could not open that message", detail: "It is no longer available.")
             return
         }
         pendingMessageLocation = location
@@ -509,7 +625,7 @@ final class AppModel {
             let reduction = streamingReducer.cancel()
             messages = reduction.messages
             isAwaitingReply = reduction.isAwaitingReply
-            notice = "Send failed: \(error.localizedDescription)"
+            postError("Send failed", detail: error.localizedDescription)
         }
     }
     func interrupt() async {
@@ -533,12 +649,19 @@ final class AppModel {
             isAwaitingReply = reduction.isAwaitingReply
             return
         }
+        if event.type == "transport.malformed" {
+            postError(
+                "Malformed gateway response",
+                detail: event.text ?? "The gateway sent an invalid frame."
+            )
+            return
+        }
 
         let reduction = streamingReducer.reduce(event)
         messages = reduction.messages
         isAwaitingReply = reduction.isAwaitingReply
         if let notice = reduction.notice {
-            self.notice = notice
+            postError("The gateway reported an error", detail: notice)
         }
         await reconcileTerminal(reduction.terminal)
     }
@@ -574,7 +697,7 @@ final class AppModel {
         messages = result.messages
         isAwaitingReply = streamingReducer.isAwaitingReply
         if let notice = result.notice {
-            self.notice = notice
+            postError("Transcript reconciliation failed", detail: notice)
             Log.error("terminal transcript reconciliation failed: \(notice)")
         }
         if let cacheStore = result.cacheStore {

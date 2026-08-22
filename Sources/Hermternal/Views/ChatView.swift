@@ -21,31 +21,31 @@ struct ChatView: View {
         // Declared on the detail, not the sidebar column: only the window
         // toolbar region groups adjacent items into one shared pill.
         .toolbar {
-            ToolbarItemGroup {
-                Button {
-                    Task { await model.newChat() }
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .help("New chat")
-                .keyboardShortcut("n", modifiers: .command)
+            // Reserve the native principal slot without drawing a duplicate
+            // window title; the traffic lights and toolbar remain native.
+            ToolbarItem(placement: .principal) {
+                EmptyView()
+            }
+            if !model.isSearchPresented {
+                ToolbarItemGroup {
+                    Button {
+                        Task { await model.newChat() }
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .help("New chat")
+                    .keyboardShortcut("n", modifiers: .command)
 
-                Button {
-                    Task { await model.loadSessions() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
+                    Button {
+                        Task { await model.loadSessions() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .help("Reload the chat list from the server")
                 }
-                .help("Reload the chat list from the server")
-
-                // The field is rendered in the transcript overlay so ⌘F can
-                // focus it without introducing a second window-level surface.
-                Button("Find in Conversation") {
-                    openFind()
-                }
-                .keyboardShortcut("f", modifiers: .command)
-                .hidden()
             }
         }
+        .focusedSceneValue(\.hermternalFindAction, { openFind() })
         .onChange(of: findQuery) {
             activeFindIndex = 0
         }
@@ -338,7 +338,13 @@ private struct MessageRow: View {
                         .textSelection(.enabled)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
-                        .background(.tint.opacity(0.16), in: .rect(cornerRadius: 14))
+                        .background(
+                            .tint.opacity(0.16),
+                            in: .rect(
+                                cornerRadius: AppShapeScale.toast,
+                                style: .continuous
+                            )
+                        )
                 } else {
                     FindHighlightedMessage(
                         text: message.text,
@@ -348,7 +354,13 @@ private struct MessageRow: View {
                     )
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
-                    .background(.tint.opacity(0.16), in: .rect(cornerRadius: 14))
+                    .background(
+                        .tint.opacity(0.16),
+                        in: .rect(
+                            cornerRadius: AppShapeScale.toast,
+                            style: .continuous
+                        )
+                    )
                 }
             }
         case .assistant:
@@ -380,7 +392,13 @@ private struct MessageRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .center)
-                .background(isFindActive ? Color.orange.opacity(0.12) : .clear, in: .rect(cornerRadius: 8))
+                .background(
+                    isFindActive ? Color.orange.opacity(0.12) : .clear,
+                    in: .rect(
+                        cornerRadius: AppShapeScale.compact,
+                        style: .continuous
+                    )
+                )
         }
     }
 }
@@ -449,9 +467,38 @@ private struct Composer: View {
         .padding(.bottom, 16)
         .onAppear { isFocused = true }
     }
-
     private func send() {
         Task { await model.send() }
+    }
+}
+
+/// Hides only the title text while leaving the native titlebar and traffic
+/// lights intact. A hidden-titlebar window style would remove those controls.
+struct HiddenWindowTitle: NSViewRepresentable {
+    func makeNSView(context: Context) -> WindowTitleHider {
+        WindowTitleHider()
+    }
+
+    func updateNSView(_ nsView: WindowTitleHider, context: Context) {
+        nsView.hideTitle()
+    }
+}
+
+final class WindowTitleHider: NSView {
+    fileprivate func hideTitle() {
+        guard let window else { return }
+        window.title = ""
+        window.titleVisibility = .hidden
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        hideTitle()
+        // SwiftUI may install the unified toolbar after the representable
+        // joins the window; re-apply once that titlebar update has settled.
+        DispatchQueue.main.async { [weak self] in
+            self?.hideTitle()
+        }
     }
 }
 
