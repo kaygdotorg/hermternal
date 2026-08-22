@@ -12,26 +12,69 @@ public actor RestClient {
     private let auth: AuthClient
     private let urlSession: URLSession
 
+    /// The server caps each request at 500 rows. One hundred pages bounds a
+    /// malformed or adversarial session at 50,000 rows instead of allowing an
+    /// endless loop when pagination never reports a short page.
+    public static let maximumMessagePages = 100
+
     public init(server: URL, auth: AuthClient, urlSession: URLSession = .shared) {
         self.server = server
         self.auth = auth
         self.urlSession = urlSession
     }
 
-    /// Persisted transcript rows for a durable session id.
+    /// All persisted transcript rows for a durable session id, in server order.
     ///
-    /// Rows come straight from the database, so they carry `content` rather
-    /// than the socket projection's `text`, and include scaffolding the
-    /// socket path filters out.
+    /// The endpoint hard-clamps `limit` to 500. Pages are requested oldest
+    /// first and concatenated without sorting so the database's stable order
+    /// is preserved.
     public func sessionMessages(durableID: String, limit: Int = 500) async throws -> [JSONValue] {
         let credentials = try await auth.validCredentials()
+        let pageLimit = min(max(limit, 1), 500)
+        var rows: [JSONValue] = []
+        rows.reserveCapacity(pageLimit)
+        var offset = 0
 
+        // A full page is not proof of completion: the API exposes no total or
+        // has-more flag, so an exact multiple of 500 pays one empty probe.
+        // TranscriptOpener's AsyncStream onTermination cancels this task, so
+        // these checks stop paging when navigation supersedes an open.
+        for _ in 0..<Self.maximumMessagePages {
+            try Task.checkCancellation()
+            let page = try await fetchMessagePage(
+                durableID: durableID,
+                limit: pageLimit,
+                offset: offset,
+                credentials: credentials
+            )
+            try Task.checkCancellation()
+            rows.append(contentsOf: page.messages)
+
+            let returned = page.pagination?.returned ?? page.messages.count
+            if returned < pageLimit {
+                return rows
+            }
+            offset += pageLimit
+        }
+
+        throw RestError.messagePageLimitExceeded
+    }
+
+    private func fetchMessagePage(
+        durableID: String,
+        limit: Int,
+        offset: Int,
+        credentials: Credentials
+    ) async throws -> MessagesResponse {
         var components = URLComponents(
             url: server.appending(path: "api/sessions/\(durableID)/messages"),
             resolvingAgainstBaseURL: false
         )
-        // The endpoint clamps to 500 per page regardless.
-        components?.queryItems = [.init(name: "limit", value: String(limit))]
+        components?.queryItems = [
+            .init(name: "limit", value: String(limit)),
+            .init(name: "offset", value: String(offset)),
+            .init(name: "order", value: "oldest")
+        ]
         guard let url = components?.url else { throw AuthError.badServerURL }
 
         var request = URLRequest(url: url)
@@ -48,21 +91,30 @@ public actor RestClient {
                 String(decoding: data.prefix(512), as: UTF8.self)
             )
         }
-        return try JSONDecoder().decode(MessagesResponse.self, from: data).messages
+        return try JSONDecoder().decode(MessagesResponse.self, from: data)
     }
 
     private struct MessagesResponse: Decodable {
         let messages: [JSONValue]
+        let pagination: Pagination?
+    }
+
+    private struct Pagination: Decodable {
+        let returned: Int?
     }
 }
 
 public enum RestError: LocalizedError {
     case badStatus(Int, String)
+    case messagePageLimitExceeded
 
     public var errorDescription: String? {
         switch self {
         case .badStatus(let status, let body):
             "Request failed (HTTP \(status)): \(body)"
+        case .messagePageLimitExceeded:
+            "The transcript exceeded the maximum number of REST pages."
         }
     }
 }
+

@@ -60,8 +60,8 @@ func cacheRoundTripPreservesIdentity() async throws {
     #expect(loaded.snapshot?.fetchedRows == snapshot.fetchedRows)
 }
 
-@Test("truncated snapshots never request another REST page")
-func truncatedSnapshotDoesNotRefetch() {
+@Test("incomplete snapshots request another authoritative read")
+func incompleteSnapshotRequestsREST() {
     let snapshot = AuthoritativeTranscriptSnapshot(
         sessionID: "session",
         serverTotal: 834,
@@ -70,10 +70,10 @@ func truncatedSnapshotDoesNotRefetch() {
         truncated: true,
         fetchedAt: Date()
     )
-    #expect(!CacheFirstOpenPolicy.shouldFetchREST(snapshot: snapshot, serverTotal: 834))
+    #expect(CacheFirstOpenPolicy.shouldFetchREST(snapshot: snapshot, serverTotal: 834))
 }
 
-@Test("missing snapshots and known growth request REST")
+@Test("complete snapshots refetch only when resume or server totals grow")
 func cacheOpenRefetchPolicy() {
     #expect(CacheFirstOpenPolicy.shouldFetchREST(snapshot: nil, serverTotal: 0))
     let snapshot = AuthoritativeTranscriptSnapshot(
@@ -84,7 +84,17 @@ func cacheOpenRefetchPolicy() {
         truncated: false,
         fetchedAt: Date()
     )
+    #expect(!CacheFirstOpenPolicy.shouldFetchREST(
+        snapshot: snapshot,
+        serverTotal: 10,
+        resumeMessageCount: 10
+    ))
     #expect(CacheFirstOpenPolicy.shouldFetchREST(snapshot: snapshot, serverTotal: 11))
+    #expect(CacheFirstOpenPolicy.shouldFetchREST(
+        snapshot: snapshot,
+        serverTotal: 10,
+        resumeMessageCount: 11
+    ))
 }
 
 @Test("prefetch coordinator is bounded and deterministic")

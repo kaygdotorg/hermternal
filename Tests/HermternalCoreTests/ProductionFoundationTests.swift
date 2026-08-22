@@ -40,8 +40,7 @@ func openingUsesResumeGrowthAndRESTAuthority() async throws {
         resumed: ResumedTranscript(
             liveSessionID: "live",
             rows: [row(id: 1, role: .assistant, text: "partial")],
-            messageCount: 2,
-            messagesOmitted: 1
+            messageCount: 2
         ),
         authoritative: AuthoritativeTranscript(
             rows: [row(id: 1, role: .assistant, text: "one"), row(id: 2, role: .user, text: "two")],
@@ -49,12 +48,11 @@ func openingUsesResumeGrowthAndRESTAuthority() async throws {
         )
     )
     let cache = HistoryCache(directory: try temporaryDirectory())
-    let generations = OpenGenerationController()
-    let opener = TranscriptOpener(source: source, cache: cache, cacheEnabled: true, generations: generations)
+    let opener = TranscriptOpener(source: source, cache: cache, cacheEnabled: true, generations: OpenGenerationController())
     let result = try #require(await opener.open(
         sessionID: "session",
         serverTotal: 1,
-        generation: generations.begin(),
+        generation: opener.generations.begin(),
         sessionTitle: ""
     ))
     #expect(result.didFetchREST)
@@ -62,10 +60,10 @@ func openingUsesResumeGrowthAndRESTAuthority() async throws {
     #expect((await cache.transcript(for: "session"))?.messages.count == 2)
 }
 
-@Test("truncated cache snapshots do not refetch in a loop")
-func truncatedSnapshotDoesNotRefetch() async throws {
+@Test("incomplete cache snapshots retry the authoritative REST read")
+func incompleteSnapshotRetriesREST() async throws {
     let source = FixtureSource(
-        resumed: ResumedTranscript(liveSessionID: "live", rows: [], messageCount: 834, messagesOmitted: 334),
+        resumed: ResumedTranscript(liveSessionID: "live", rows: [], messageCount: 834),
         authoritative: AuthoritativeTranscript(rows: [], serverTotal: 834)
     )
     let cache = HistoryCache(directory: try temporaryDirectory())
@@ -86,9 +84,9 @@ func truncatedSnapshotDoesNotRefetch() async throws {
         generation: generations.begin(),
         sessionTitle: ""
     ))
-    #expect(!result.didFetchREST)
-    #expect(result.messages.map(\.text) == ["cached"])
-    #expect(await source.authoritativeCalls == 0)
+    #expect(result.didFetchREST)
+    #expect(result.messages.isEmpty)
+    #expect(await source.authoritativeCalls == 1)
 }
 
 @Test("generation changes publish no delayed open result")

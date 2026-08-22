@@ -2,7 +2,7 @@ import Foundation
 import HermternalCore
 import Testing
 
-@Test("known totals make exactly 500 rows complete")
+@Test("successful REST snapshots are complete even at the page boundary")
 func exactlyFiveHundredRowsUseKnownTotal() {
     let rows = (0..<500).map { openStateRow(id: Int64($0)) }
     let complete = CacheFirstOpenPolicy.snapshot(
@@ -18,7 +18,7 @@ func exactlyFiveHundredRowsUseKnownTotal() {
         serverTotal: 501
     )
     #expect(!complete.truncated)
-    #expect(growing.truncated)
+    #expect(!growing.truncated)
     #expect(CacheFirstOpenPolicy.shouldFetchREST(snapshot: complete, serverTotal: 501))
 }
 

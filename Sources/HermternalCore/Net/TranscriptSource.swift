@@ -17,19 +17,15 @@ public struct ResumedTranscript: Sendable {
     public let rows: [JSONValue]
     /// Server-side count, when supplied by the resume response.
     public let messageCount: Int?
-    /// Number of rows omitted by the capped resume response.
-    public let messagesOmitted: Int?
 
     public init(
         liveSessionID: String?,
         rows: [JSONValue],
-        messageCount: Int? = nil,
-        messagesOmitted: Int? = nil
+        messageCount: Int? = nil
     ) {
         self.liveSessionID = liveSessionID
         self.rows = rows
         self.messageCount = messageCount
-        self.messagesOmitted = messagesOmitted
     }
 }
 
@@ -60,8 +56,7 @@ public struct GatewayTranscriptSource: TranscriptSource, Sendable {
         return ResumedTranscript(
             liveSessionID: result["session_id"]?.stringValue,
             rows: result["messages"]?.arrayValue ?? [],
-            messageCount: result["message_count"]?.intValue,
-            messagesOmitted: result["messages_omitted"]?.intValue
+            messageCount: result["message_count"]?.intValue
         )
     }
 }

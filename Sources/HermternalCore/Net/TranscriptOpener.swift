@@ -1,23 +1,22 @@
 import Foundation
 
 public enum CacheFirstOpenPolicy {
-    /// A missing snapshot always requires an authoritative REST read. A
-    /// truncated snapshot is trusted until the next explicit session-list
-    /// refresh; reopening must not repeat the capped request.
+    /// A missing or previously incomplete snapshot requires an authoritative
+    /// REST read. A complete snapshot is refreshed only when the server knows
+    /// that more rows exist than the cache contains.
     public static func shouldFetchREST(
         snapshot: AuthoritativeTranscriptSnapshot?,
         serverTotal: Int?,
-        resumeMessageCount: Int? = nil,
-        resumeMessagesOmitted: Int? = nil
+        resumeMessageCount: Int? = nil
     ) -> Bool {
         guard let snapshot else { return true }
-        guard !snapshot.truncated else { return false }
+        if snapshot.truncated { return true }
         let knownTotal = max(
             serverTotal ?? 0,
             snapshot.serverTotal ?? 0,
             resumeMessageCount ?? 0
         )
-        return knownTotal > snapshot.fetchedRows || (resumeMessagesOmitted ?? 0) > 0
+        return knownTotal > snapshot.fetchedRows
     }
 
     public static func snapshot(
@@ -25,20 +24,15 @@ public enum CacheFirstOpenPolicy {
         rows: [JSONValue],
         projectedMessages: Int,
         serverTotal: Int?,
+        complete: Bool = true,
         fetchedAt: Date = Date()
     ) -> AuthoritativeTranscriptSnapshot {
-        let truncated: Bool
-        if let serverTotal {
-            truncated = serverTotal > rows.count
-        } else {
-            truncated = rows.count >= 500
-        }
-        return AuthoritativeTranscriptSnapshot(
+        AuthoritativeTranscriptSnapshot(
             sessionID: sessionID,
             serverTotal: serverTotal,
             fetchedRows: rows.count,
             projectedMessages: projectedMessages,
-            truncated: truncated,
+            truncated: !complete,
             fetchedAt: fetchedAt
         )
     }
@@ -202,8 +196,7 @@ public struct TranscriptOpener: Sendable {
                 guard CacheFirstOpenPolicy.shouldFetchREST(
                     snapshot: cached?.snapshot,
                     serverTotal: serverTotal,
-                    resumeMessageCount: resumed?.messageCount,
-                    resumeMessagesOmitted: resumed?.messagesOmitted
+                    resumeMessageCount: resumed?.messageCount
                 ) else {
                     continuation.yield(
                         TranscriptOpenResult(
