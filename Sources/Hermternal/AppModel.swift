@@ -20,9 +20,16 @@ final class AppModel {
     var messages: [ChatMessage] = []
     /// Durable id of the sidebar selection.
     var selectedSessionID: String?
+    /// A routed message target waiting for ChatView to consume after the
+    /// transcript has been rendered. The view clears this one-shot value.
+    var pendingMessageLocation: MessageLocation?
+
     var isAwaitingReply = false
     var composerText = ""
     var serverText: String = AppModel.storedServer
+    /// Host of the configured gateway, used to keep deep links authoritative
+    /// to the backend that created them.
+    var configuredGatewayHost: String? { serverURL?.host }
 
     /// Non-fatal problems (a failed history load, a dropped socket) surfaced
     /// without tearing down the whole session.
@@ -405,8 +412,13 @@ final class AppModel {
         if let sessionID, let serverTotal { totals[sessionID] = serverTotal }
         return GatewayTranscriptSource(gateway: gateway, rest: rest, serverTotals: totals)
     }
-    func open(_ session: ChatSession) async {
-        guard let source = transcriptSource(for: session) else { return }
+    @discardableResult
+    func open(_ session: ChatSession) async -> Bool {
+        guard let source = transcriptSource(for: session) else {
+            notice = "Could not open chat \(session.id): the gateway is unavailable."
+            return false
+        }
+
         let generation = openGenerations.begin()
         selectedSessionID = session.id
 
@@ -421,7 +433,7 @@ final class AppModel {
             serverTotal: session.messageCount,
             generation: generation
         ) {
-            guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+            guard openGenerations.isCurrent(generation), !Task.isCancelled else { return false }
             if !result.isCachedPhase {
                 liveSessionID = result.liveSessionID
             }
@@ -440,6 +452,30 @@ final class AppModel {
                 + (result.didFetchREST ? " from REST" : " from cache")
             )
         }
+        return true
+    }
+    /// Opens the target chat and hands a durable target to ChatView only
+    /// after all transcript phases have finished. ChatView consumes and
+    /// clears the target once its row is ready, then performs the animated
+    /// scroll.
+    func openThenScroll(to location: MessageLocation) async {
+        guard !location.sessionID.isEmpty,
+              let session = sessions.first(where: { $0.id == location.sessionID })
+        else {
+            notice = "Could not open that message: the chat no longer exists."
+            return
+        }
+
+        pendingMessageLocation = nil
+        guard await open(session) else { return }
+
+        guard selectedSessionID == location.sessionID else { return }
+        let targetIdentity = MessageIdentity.server(location.messageID)
+        guard messages.contains(where: { $0.id == targetIdentity }) else {
+            notice = "Could not open that message: it is no longer available."
+            return
+        }
+        pendingMessageLocation = location
     }
     // MARK: - Prompting
 
