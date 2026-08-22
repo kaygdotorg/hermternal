@@ -406,10 +406,6 @@ final class AppModel {
                 "session.resume",
                 params: ["session_id": session.id]
             )
-            Log.info(
-                "diagnostic session.resume result keys: "
-                + "\(objectKeys(result))"
-            )
             // A superseded arrow-selection request may still receive its RPC
             // response because GatewayClient.call is continuation-based. Stop
             // before row projection, encoding, disk I/O, or UI publication.
@@ -474,12 +470,6 @@ final class AppModel {
     // MARK: - Events
 
     private func handle(_ event: GatewayEvent) async {
-        if event.type.hasPrefix("message.") {
-            Log.info(
-                "diagnostic \(event.type) payload keys: "
-                + "\(objectKeys(event.payload))"
-            )
-        }
         switch event.type {
         case "message.start":
             messages.append(ChatMessage(role: .assistant, text: "", isStreaming: true))
@@ -526,11 +516,6 @@ final class AppModel {
             break
         }
     }
-    private func objectKeys(_ value: JSONValue?) -> [String] {
-        guard case .object(let fields) = value else { return [] }
-        return fields.keys.sorted()
-    }
-
 
     private var streamingIndex: Int? {
         messages.lastIndex { $0.isStreaming }
