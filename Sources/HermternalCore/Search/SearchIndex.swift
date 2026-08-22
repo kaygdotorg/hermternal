@@ -21,24 +21,32 @@ public struct SearchDocument: Sendable {
     }
 }
 
+/// A single message match in the persisted transcript corpus.
 public struct SearchHit: Sendable {
-    public let sessionID: String
-    public let messageID: ServerMessageID
+    public let location: MessageLocation
     public let sessionTitle: String
-    public let excerpt: String
+    public let excerpt: AttributedString
     public let role: Role
     public let timestamp: Date?
-    public let score: Double
 
-    public init(sessionID: String, messageID: ServerMessageID, sessionTitle: String, excerpt: String, role: Role, timestamp: Date?, score: Double) {
-        self.sessionID = sessionID
-        self.messageID = messageID
+    public init(
+        location: MessageLocation,
+        sessionTitle: String,
+        excerpt: AttributedString,
+        role: Role,
+        timestamp: Date?
+    ) {
+        self.location = location
         self.sessionTitle = sessionTitle
         self.excerpt = excerpt
         self.role = role
         self.timestamp = timestamp
-        self.score = score
     }
+
+    // Compatibility accessors keep callers that only need identity source
+    // compatible while the public contract uses one value object.
+    public var sessionID: String { location.sessionID }
+    public var messageID: ServerMessageID { location.messageID }
 }
 
 public struct SearchResults: Sendable {
@@ -86,14 +94,18 @@ public enum SearchIndexError: Error, LocalizedError, Sendable {
 }
 
 public actor SearchIndex: SearchQuerying {
-    public static let schemaVersion = 1
+    public static let schemaVersion = 2
     public static let defaultLimit = 100
+    /// A chat contributes at most three rows per query. Round-robin diversity
+    /// makes a large transcript useful without letting it exhaust the panel.
+    public static let perSessionHitCap = 3
 
     public nonisolated let url: URL
     private var database: SQLiteConnection?
     private var disabled = false
     private var generation: UInt64 = 0
     private var runningQuery: RunningQuery?
+
 
 
     public init(url: URL) throws {
@@ -233,6 +245,21 @@ public actor SearchIndex: SearchQuerying {
         guard !disabled, let database else { throw SearchIndexError.disabled }
         return try database.withExclusive { Int(try database.messageCount(sessionID: sessionID)) }
     }
+    public func markUnwarmed(sessionIDs: [String]) throws {
+        guard !disabled, let database else { throw SearchIndexError.disabled }
+        try database.withExclusive {
+            try database.begin()
+            do {
+                for sessionID in Set(sessionIDs) { try database.markUnwarmed(sessionID: sessionID) }
+                try database.commit()
+            } catch { database.rollback(); throw error }
+        }
+    }
+
+    public func indexedSessionIDs() throws -> [String] {
+        guard !disabled, let database else { throw SearchIndexError.disabled }
+        return try database.withExclusive { try database.sessionIDs() }
+    }
 
     internal static func compile(query: String) -> String {
         query.split(whereSeparator: { $0.isWhitespace }).map { token in
@@ -301,11 +328,18 @@ private final class SQLiteConnection: @unchecked Sendable {
         var db: OpaquePointer?
         let result = url.path.withCString { api.open($0, &db, SQLiteAPI.readWriteCreate, nil) }
         guard result == SQLiteAPI.ok, let db else {
-            if let db { api.close(db) }
+            // SQLite may return a partially opened handle with a failure code.
+            // Closing that handle is best-effort because the open error is the
+            // authoritative failure we report.
+            if let db { _ = api.close(db) }
             throw SearchIndexError.sqlite(code: result, message: api.errorMessage(db))
         }
+        let timeoutResult = api.busyTimeout(db, 5_000)
+        guard timeoutResult == SQLiteAPI.ok else {
+            _ = api.close(db)
+            throw SearchIndexError.sqlite(code: timeoutResult, message: api.errorMessage(db))
+        }
         handle = db
-        api.busyTimeout(db, 5_000)
     }
 
     // The lease is the lifecycle invariant: one query or one exclusive operation
@@ -379,10 +413,11 @@ private final class SQLiteConnection: @unchecked Sendable {
     func prepareSchema() throws {
         do {
             try execute("CREATE TABLE IF NOT EXISTS hermternal_search_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)")
-            try execute("CREATE TABLE IF NOT EXISTS hermternal_search_sessions (session_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL, incomplete INTEGER NOT NULL)")
+            try execute("CREATE TABLE IF NOT EXISTS hermternal_search_sessions (session_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL, incomplete INTEGER NOT NULL, warmed INTEGER NOT NULL)")
             let version = try scalarString("SELECT value FROM hermternal_search_metadata WHERE key = 'schema_version' LIMIT 1")
             let validFTS = (try? queryRows("SELECT title, body, session_id, message_id, role, timestamp FROM hermternal_search_messages LIMIT 0")) != nil
-            if version != String(SearchIndex.schemaVersion) || !validFTS { try rebuildSchema() }
+            let validMetadata = (try? queryRows("SELECT session_id, digest, incomplete, warmed FROM hermternal_search_sessions LIMIT 0")) != nil
+            if version != String(SearchIndex.schemaVersion) || !validFTS || !validMetadata { try rebuildSchema() }
         } catch { try rebuildSchema() }
     }
 
@@ -396,13 +431,21 @@ private final class SQLiteConnection: @unchecked Sendable {
     func deleteSession(_ id: String) throws { try execute("DELETE FROM hermternal_search_messages WHERE session_id = ?", bindings: [.text(id)]) }
     func deleteSessionMetadata(_ id: String) throws { try execute("DELETE FROM hermternal_search_sessions WHERE session_id = ?", bindings: [.text(id)]) }
     func clearContent() throws { try execute("DELETE FROM hermternal_search_messages"); try execute("DELETE FROM hermternal_search_sessions") }
-    func incompleteSessionCount() throws -> Int { Int(try scalarInt("SELECT count(*) FROM hermternal_search_sessions WHERE incomplete = 1")) }
+    func incompleteSessionCount() throws -> Int {
+        Int(try scalarInt("SELECT count(*) FROM hermternal_search_sessions WHERE warmed = 0 OR incomplete = 1"))
+    }
     func messageCount(sessionID: String?) throws -> Int {
         Int(try scalarInt("SELECT count(*) FROM hermternal_search_messages" + (sessionID == nil ? "" : " WHERE session_id = ?"), bindings: sessionID.map { [.text($0)] } ?? []))
     }
+    func sessionIDs() throws -> [String] {
+        try queryRows("SELECT session_id FROM hermternal_search_sessions ORDER BY session_id").compactMap { $0.text(0) }
+    }
 
     func upsertSessionMetadata(sessionID: String, digest: String, incomplete: Bool) throws {
-        try execute("INSERT INTO hermternal_search_sessions(session_id, digest, incomplete) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET digest = excluded.digest, incomplete = excluded.incomplete", bindings: [.text(sessionID), .text(digest), .int(incomplete ? 1 : 0)])
+        try execute("INSERT INTO hermternal_search_sessions(session_id, digest, incomplete, warmed) VALUES (?, ?, ?, 1) ON CONFLICT(session_id) DO UPDATE SET digest = excluded.digest, incomplete = excluded.incomplete, warmed = 1", bindings: [.text(sessionID), .text(digest), .int(incomplete ? 1 : 0)])
+    }
+    func markUnwarmed(sessionID: String) throws {
+        try execute("INSERT INTO hermternal_search_sessions(session_id, digest, incomplete, warmed) VALUES (?, '', 0, 0) ON CONFLICT(session_id) DO NOTHING", bindings: [.text(sessionID)])
     }
 
     func insert(title: String, body: String, sessionID: String, messageID: Int64, role: String, timestamp: Date?) throws {
@@ -411,16 +454,39 @@ private final class SQLiteConnection: @unchecked Sendable {
 
     func query(ftsQuery: String, limit: Int) throws -> SearchResults {
         guard limit > 0 else { return SearchResults(hits: [], incompleteSessions: try incompleteSessionCount()) }
-        let rows = try queryRows("SELECT session_id, message_id, title, body, role, timestamp, snippet(hermternal_search_messages, -1, '⟦', '⟧', '…', 32), bm25(hermternal_search_messages, ?, ?) FROM hermternal_search_messages WHERE hermternal_search_messages MATCH ? ORDER BY bm25(hermternal_search_messages, ?, ?) LIMIT ?", bindings: [.double(10), .double(1), .text(ftsQuery), .double(10), .double(1), .int(limit)])
-        let hits = rows.map { row -> SearchHit in
-            var excerpt = row.text(6) ?? ""
-            if !excerpt.contains("⟦") {
-                let title = row.text(2) ?? ""
-                excerpt = title.isEmpty ? (row.text(3) ?? "") : "⟦\(title)⟧ \(row.text(3) ?? "")"
+        // Fetch all matching rows before applying diversity. Limiting in SQL
+        // would let a single large chat hide better hits from other chats.
+        let rows = try queryRows("SELECT session_id, message_id, title, body, role, timestamp, snippet(hermternal_search_messages, -1, '⟦', '⟧', '…', 32), bm25(hermternal_search_messages, ?, ?) FROM hermternal_search_messages WHERE hermternal_search_messages MATCH ? ORDER BY bm25(hermternal_search_messages, ?, ?)", bindings: [.double(10), .double(1), .text(ftsQuery), .double(10), .double(1)])
+        let grouped = Dictionary(grouping: rows, by: { $0.text(0) ?? "" }).mapValues { Array($0.prefix(SearchIndex.perSessionHitCap)) }
+        var hits: [SearchHit] = []
+        hits.reserveCapacity(min(limit, rows.count))
+        var round = 0
+        while hits.count < limit {
+            let rankedSessions = grouped.keys.compactMap { key -> (String, Row)? in
+                guard let row = grouped[key], row.indices.contains(round) else { return nil }
+                return (key, row[round])
+            }.sorted { ($0.1.double(7) ?? 0, $0.0) < ($1.1.double(7) ?? 0, $1.0) }
+            if rankedSessions.isEmpty { break }
+            for (_, row) in rankedSessions where hits.count < limit {
+                hits.append(Self.makeHit(row))
             }
-            return SearchHit(sessionID: row.text(0) ?? "", messageID: ServerMessageID(rawValue: row.int64(1)), sessionTitle: row.text(2) ?? "", excerpt: excerpt, role: Role(rawValue: row.text(4) ?? "")!, timestamp: row.double(5).map(Date.init(timeIntervalSince1970:)), score: row.double(7) ?? 0)
+            round += 1
         }
         return SearchResults(hits: hits, incompleteSessions: try incompleteSessionCount())
+    }
+
+    private static func makeHit(_ row: Row) -> SearchHit {
+        let title = row.text(2) ?? ""
+        let body = row.text(3) ?? ""
+        let snippet = row.text(6) ?? ""
+        let excerpt = SearchExcerpt.attributed(snippet: snippet, fallbackTitle: title, body: body)
+        return SearchHit(
+            location: MessageLocation(sessionID: row.text(0) ?? "", messageID: ServerMessageID(rawValue: row.int64(1))),
+            sessionTitle: title,
+            excerpt: excerpt,
+            role: Role(rawValue: row.text(4) ?? "") ?? .user,
+            timestamp: row.double(5).map(Date.init(timeIntervalSince1970:))
+        )
     }
 
     private func rebuildSchema() throws {
@@ -428,9 +494,9 @@ private final class SQLiteConnection: @unchecked Sendable {
         try execute("DROP TABLE IF EXISTS hermternal_search_sessions")
         try execute("DROP TABLE IF EXISTS hermternal_search_metadata")
         try execute("CREATE TABLE hermternal_search_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)")
-        try execute("CREATE TABLE hermternal_search_sessions (session_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL, incomplete INTEGER NOT NULL)")
+        try execute("CREATE TABLE hermternal_search_sessions (session_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL, incomplete INTEGER NOT NULL, warmed INTEGER NOT NULL)")
         try execute("CREATE VIRTUAL TABLE hermternal_search_messages USING fts5(title, body, session_id UNINDEXED, message_id UNINDEXED, role UNINDEXED, timestamp UNINDEXED, tokenize='unicode61 remove_diacritics 2')")
-        try execute("INSERT INTO hermternal_search_metadata(key, value) VALUES ('schema_version', '1')")
+        try execute("INSERT INTO hermternal_search_metadata(key, value) VALUES ('schema_version', '\(SearchIndex.schemaVersion)')")
     }
 
     private enum Binding { case text(String), int(Int), int64(Int64), double(Double), null }
@@ -576,7 +642,7 @@ private final class SQLiteAPI: @unchecked Sendable {
     func columnCount(_ statement: OpaquePointer) -> Int32 { sqlite3_column_count(statement) }
     func columnType(_ statement: OpaquePointer, _ index: Int32) -> Int32 { sqlite3_column_type(statement, index) }
     func columnText(_ statement: OpaquePointer, _ index: Int32) -> UnsafePointer<CChar>? {
-        sqlite3_column_text(statement, index).map { unsafeBitCast($0, to: UnsafePointer<CChar>.self) }
+        sqlite3_column_text(statement, index).map { UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self) }
     }
     func columnInt64(_ statement: OpaquePointer, _ index: Int32) -> Int64 { sqlite3_column_int64(statement, index) }
     func columnDouble(_ statement: OpaquePointer, _ index: Int32) -> Double { sqlite3_column_double(statement, index) }

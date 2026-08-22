@@ -123,13 +123,13 @@ public struct TranscriptReconciliationResult: Sendable {
 /// resume, growth, truncation, REST, or cache branching here.
 public struct TranscriptOpener: Sendable {
     public let source: any TranscriptSource
-    public let cache: HistoryCache
+    public let cache: any TranscriptPersisting
     public let cacheEnabled: Bool
     public let generations: OpenGenerationController
 
     public init(
         source: any TranscriptSource,
-        cache: HistoryCache,
+        cache: any TranscriptPersisting,
         cacheEnabled: Bool,
         generations: OpenGenerationController
     ) {
@@ -147,7 +147,8 @@ public struct TranscriptOpener: Sendable {
     public func openPhases(
         sessionID: String,
         serverTotal: Int?,
-        generation: Int
+        generation: Int,
+        sessionTitle: String = ""
     ) -> AsyncStream<TranscriptOpenResult> {
         AsyncStream { continuation in
             let task = Task {
@@ -232,9 +233,10 @@ public struct TranscriptOpener: Sendable {
                             continuation.finish()
                             return
                         }
-                        cacheStore = await cache.store(
+                        cacheStore = try await cache.store(
                             projected,
                             snapshot: snapshot,
+                            title: sessionTitle,
                             for: sessionID,
                             expectedEpoch: cacheEpoch
                         )
@@ -276,13 +278,15 @@ public struct TranscriptOpener: Sendable {
     public func open(
         sessionID: String,
         serverTotal: Int?,
-        generation: Int
+        generation: Int,
+        sessionTitle: String = ""
     ) async -> TranscriptOpenResult? {
         var final: TranscriptOpenResult?
         for await result in openPhases(
             sessionID: sessionID,
             serverTotal: serverTotal,
-            generation: generation
+            generation: generation,
+            sessionTitle: sessionTitle
         ) {
             final = result
         }
@@ -294,7 +298,8 @@ public struct TranscriptOpener: Sendable {
         sessionID: String?,
         serverTotal: Int?,
         currentMessages: [ChatMessage],
-        generation: Int
+        generation: Int,
+        sessionTitle: String = ""
     ) async -> TranscriptReconciliationResult? {
         guard isCurrent(generation) else { return nil }
         guard let sessionID else {
@@ -318,9 +323,10 @@ public struct TranscriptOpener: Sendable {
             var cacheStore: CacheStoreResult?
             if cacheEnabled {
                 guard isCurrent(generation) else { return nil }
-                cacheStore = await cache.store(
+                cacheStore = try await cache.store(
                     projected,
                     snapshot: snapshot,
+                    title: sessionTitle,
                     for: sessionID,
                     expectedEpoch: cacheEpoch
                 )

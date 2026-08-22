@@ -20,6 +20,23 @@ public struct CacheStoreResult: Sendable {
     }
 }
 
+/// Core transcript persistence seam. Plain HistoryCache is the no-search
+/// implementation; SearchIndexReconciliation decorates the same boundary.
+public protocol TranscriptPersisting: Sendable {
+    func read(for id: String) async -> (transcript: CachedTranscript?, epoch: UInt64)
+    func currentEpoch() async -> UInt64
+    func store(
+        _ messages: [ChatMessage],
+        snapshot: AuthoritativeTranscriptSnapshot?,
+        title: String,
+        for id: String,
+        expectedEpoch: UInt64?
+    ) async throws -> CacheStoreResult
+    func remove(sessionID: String) async throws -> Bool
+    func clear() async throws -> Bool
+    func reconcile(validIDs: [String]) async throws -> CacheStatistics
+}
+
 public protocol CacheFileSystem: Sendable {
     func createDirectory(at url: URL) throws
     func data(at url: URL) throws -> Data
@@ -99,12 +116,11 @@ public struct CachedTranscript: Codable, Sendable {
     }
 }
 
-/// Disk-backed transcript cache keyed by durable session id.
-public actor HistoryCache {
+public actor HistoryCache: TranscriptPersisting {
     /// Version 3 invalidates files containing the retired content-hash IDs.
     public static let version = 3
 
-    private let directory: URL
+    private let directory: URL?
     private let fileSystem: any CacheFileSystem
     private let codec: any CacheCodec
     private var memory: [String: CachedTranscript] = [:]
@@ -113,20 +129,40 @@ public actor HistoryCache {
     // one atomic operation relative to clear().
     private var epoch: UInt64 = 0
 
+    /// Returns the app-owned history location under the platform's caches
+    /// directory. On macOS this preserves the existing bundle-specific path.
+    public static func historyDirectory(cachesDirectory: URL) -> URL {
+        cachesDirectory
+            .appending(path: "\(AppIdentity.bundleID)/history", directoryHint: .isDirectory)
+    }
+
+    /// Resolves the platform's caches directory without falling back to a
+    /// home-directory path.
+    public static func defaultDirectory(fileManager: FileManager = .default) -> URL? {
+        guard let cachesDirectory = fileManager
+            .urls(for: .cachesDirectory, in: .userDomainMask)
+            .first
+        else {
+            return nil
+        }
+        return historyDirectory(cachesDirectory: cachesDirectory)
+    }
+
     public init(
         directory: URL? = nil,
         fileSystem: any CacheFileSystem = LocalCacheFileSystem(),
         codec: any CacheCodec = JSONCacheCodec()
     ) {
-        self.directory = directory ?? FileManager.default
-            .homeDirectoryForCurrentUser
-            .appending(path: "Library/Caches/\(AppIdentity.bundleID)/history", directoryHint: .isDirectory)
+        self.directory = directory ?? Self.defaultDirectory()
         self.fileSystem = fileSystem
         self.codec = codec
-        try? fileSystem.createDirectory(at: self.directory)
+        if let directory = self.directory {
+            try? fileSystem.createDirectory(at: directory)
+        }
     }
 
-    private func url(for id: String) -> URL {
+    private func url(for id: String) -> URL? {
+        guard let directory else { return nil }
         let slug = id.unicodeScalars
             .map { CharacterSet.alphanumerics.contains($0) ? Character($0) : "-" }
             .reduce(into: "") { $0.append($1) }
@@ -144,7 +180,9 @@ public actor HistoryCache {
     public func read(for id: String) -> (transcript: CachedTranscript?, epoch: UInt64) {
         let observedEpoch = epoch
         if let hit = memory[id] { return (hit, observedEpoch) }
-        let target = url(for: id)
+        guard let target = url(for: id) else {
+            return (nil, observedEpoch)
+        }
         guard let data = try? fileSystem.data(at: target),
               let stored = try? codec.decode(data),
               stored.version == Self.version
@@ -157,6 +195,29 @@ public actor HistoryCache {
     }
 
     public func currentEpoch() -> UInt64 { epoch }
+    /// TranscriptPersisting overload; plain cache ignores the title because
+    /// it stores message history only.
+    public func store(
+        _ messages: [ChatMessage],
+        snapshot: AuthoritativeTranscriptSnapshot?,
+        title _: String,
+        for id: String,
+        expectedEpoch: UInt64?
+    ) -> CacheStoreResult {
+        store(messages, snapshot: snapshot, for: id, expectedEpoch: expectedEpoch)
+    }
+
+    @discardableResult
+    public func remove(sessionID: String) -> Bool {
+        memory[sessionID] = nil
+        guard let target = url(for: sessionID), fileSystem.fileExists(at: target) else { return true }
+        do {
+            try fileSystem.removeItem(at: target)
+            return true
+        } catch {
+            return false
+        }
+    }
 
     public func transcript(for id: String) -> CachedTranscript? {
         read(for: id).transcript
@@ -180,7 +241,9 @@ public actor HistoryCache {
         else {
             return CacheStoreResult(addedEntry: false, byteDelta: 0)
         }
-        let target = url(for: id)
+        guard let target = url(for: id) else {
+            return CacheStoreResult(addedEntry: false, byteDelta: 0)
+        }
         let oldData = try? fileSystem.data(at: target)
         let existed = fileSystem.fileExists(at: target)
         if oldData == data {
@@ -205,10 +268,17 @@ public actor HistoryCache {
     public func reconcile(validIDs: [String]) -> CacheStatistics {
         let valid = Set(validIDs)
         memory = memory.filter { valid.contains($0.key) }
-        guard let files = try? fileSystem.contentsOfDirectory(at: directory) else {
+        guard let directory,
+              let files = try? fileSystem.contentsOfDirectory(at: directory)
+        else {
             return CacheStatistics(entryCount: 0, bytes: 0)
         }
-        let idByPath = Dictionary(uniqueKeysWithValues: validIDs.map { (url(for: $0).path, $0) })
+        let idByPath: [String: String] = Dictionary(
+            uniqueKeysWithValues: validIDs.compactMap { id -> (String, String)? in
+                guard let url = url(for: id) else { return nil }
+                return (url.path, id)
+            }
+        )
         var bytes: Int64 = 0
         var count = 0
         for file in files where file.pathExtension == "json" {
@@ -234,7 +304,7 @@ public actor HistoryCache {
     @discardableResult
     public func clear() -> Bool {
         epoch &+= 1
-        guard !Task.isCancelled else { return false }
+        guard !Task.isCancelled, let directory else { return false }
         do {
             if fileSystem.fileExists(at: directory) { try fileSystem.removeItem(at: directory) }
             memory.removeAll()
