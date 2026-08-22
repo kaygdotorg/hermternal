@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build, sign, notarize, staple, and package Hermternal for distribution.
+# Build, sign, notarize, staple, and package Hermternal as a zip for distribution.
 #
 # Run Scripts/setup-signing.sh first: this script needs a Developer ID
 # Application identity in the keychain. Notarization uses ASC_KEY_PATH,
@@ -60,7 +60,6 @@ VERSION="$(
 DIST="$ROOT/dist"
 APP="$ROOT/build/Hermternal.app"
 ZIP="$DIST/Hermternal-$VERSION.zip"
-DMG="$DIST/Hermternal-$VERSION.dmg"
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
 step() { printf '\n==> %s\n' "$1"; }
@@ -115,16 +114,11 @@ xcrun stapler validate "$APP"
 step "Confirming Gatekeeper accepts it"
 spctl --assess --type execute --verbose=2 "$APP"
 
-step "Building distributables"
+step "Building final zip"
 # Re-zip after stapling: the earlier archive predates the ticket.
 rm -f "$ZIP"
 /usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"
-hdiutil create -quiet -fs HFS+ -volname "Hermternal $VERSION" \
-	-srcfolder "$APP" -ov -format UDZO "$DMG"
-codesign --force --timestamp --sign "$CODESIGN_IDENTITY" "$DMG"
-xcrun notarytool submit "$DMG" "${NOTARY_ARGS[@]}" --wait
-xcrun stapler staple "$DMG"
 
 step "Done"
-shasum -a 256 "$ZIP" "$DMG"
+shasum -a 256 "$ZIP"
 printf '\nRelease %s ready in %s\n' "$VERSION" "$DIST"

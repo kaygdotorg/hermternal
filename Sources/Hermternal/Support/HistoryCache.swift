@@ -31,7 +31,7 @@ actor HistoryCache {
             self.directory = FileManager.default
                 .homeDirectoryForCurrentUser
                 .appending(
-                    path: "Library/Caches/com.kayg.hermternal/history",
+                    path: "Library/Caches/\(AppIdentity.bundleID)/history",
                     directoryHint: .isDirectory
                 )
         }
