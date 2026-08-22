@@ -54,6 +54,7 @@ CONFIG=release bash Scripts/build-app.sh
 - [x] System, Light, and Dark appearance modes.
 - [x] Adjustable window frost setting and native Appearance and Cache settings tabs.
 - [x] Persistent server selection and stored sign-in credentials for the selected gateway.
+- [x] Reduce Transparency produces an opaque, legible system fallback across existing glass and material surfaces.
 
 ## Planned work
 
@@ -81,7 +82,6 @@ These items are tracked in Forgejo. The issue descriptions are the source of tru
 - [ ] [Help settings tab](https://git.kayg.org/kayg/hermternal-apple/issues/10).
 - [ ] [App Intents for Siri and Shortcuts](https://git.kayg.org/kayg/hermternal-apple/issues/12).
 - [ ] [Accessibility audit and remediation](https://git.kayg.org/kayg/hermternal-apple/issues/13).
-- [ ] [Reduce Transparency opaque fallback](https://git.kayg.org/kayg/hermternal-apple/issues/26).
 - [ ] [NavigationSplitView divider decision record](https://git.kayg.org/kayg/hermternal-apple/issues/27).
 
 ### Infrastructure
