@@ -78,6 +78,20 @@ else
 		fi
 		exit 1
 	fi
+	# Verify the produced Developer ID signature immediately, before callers
+	# proceed to packaging or notarization.
+	SIGNATURE_INFO="$(codesign -d --verbose=2 "$APP" 2>&1)" ||
+		{ printf '%s\n' "$SIGNATURE_INFO" >&2; exit 1; }
+	SIGNATURE_LINES="$(grep -E '^(CodeDirectory|Signature=|TeamIdentifier)' \
+		<<<"$SIGNATURE_INFO" || true)"
+	if grep -q '^Signature=adhoc$' <<<"$SIGNATURE_INFO" ||
+		! grep -q '^TeamIdentifier=.' <<<"$SIGNATURE_INFO" ||
+		! grep -Eq '^CodeDirectory.*flags=.*\([^)]*runtime[^)]*\)' \
+			<<<"$SIGNATURE_INFO"; then
+		printf '%s\n' "$SIGNATURE_LINES" >&2
+		echo "error: Developer ID signature is ad-hoc, lacks TeamIdentifier, or lacks hardened runtime" >&2
+		exit 1
+	fi
 fi
 
 echo "$APP"

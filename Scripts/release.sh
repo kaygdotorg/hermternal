@@ -76,8 +76,9 @@ esac
 # session can unlock. Over ssh the Security framework cannot prompt and
 # codesign fails with "User interaction is not allowed" -- after the build.
 # Check up front instead.
-security find-identity -v -p codesigning 2>/dev/null |
-	grep -qF "$CODESIGN_IDENTITY" ||
+IDENTITIES="$(security find-identity -v -p codesigning 2>&1)" ||
+	die "cannot inspect signing identities; run this from Terminal.app on the Mac."
+grep -qF "$CODESIGN_IDENTITY" <<<"$IDENTITIES" ||
 	die "codesign cannot reach '$CODESIGN_IDENTITY'. The login keychain is \
 locked or unreadable. Run this from Terminal.app on the Mac, not over ssh; \
 or unlock first with: security unlock-keychain"
@@ -90,10 +91,23 @@ CONFIG=release CODESIGN_IDENTITY="$CODESIGN_IDENTITY" bash Scripts/build-app.sh
 
 step "Verifying signature and hardened runtime"
 codesign --verify --strict --verbose=2 "$APP"
+# Capture diagnostics before parsing: pipefail must not hide codesign output.
+SIGNATURE_INFO="$(codesign -d --verbose=2 "$APP" 2>&1)" ||
+	die "could not inspect the signature"
+SIGNATURE_LINES="$(grep -E '^(CodeDirectory|Signature=|TeamIdentifier)' \
+	<<<"$SIGNATURE_INFO" || true)"
 # Notarization is refused without the runtime flag, so fail here rather than
 # after a multi-minute upload.
-codesign -d --verbose=2 "$APP" 2>&1 | grep -q 'flags=.*runtime' ||
+if ! grep -Eq '^CodeDirectory.*flags=.*\([^)]*runtime[^)]*\)' \
+	<<<"$SIGNATURE_INFO"; then
+	printf '%s\n' "$SIGNATURE_LINES" >&2
 	die "hardened runtime missing from the signature"
+fi
+if grep -q '^Signature=adhoc$' <<<"$SIGNATURE_INFO" ||
+	! grep -q '^TeamIdentifier=.' <<<"$SIGNATURE_INFO"; then
+	printf '%s\n' "$SIGNATURE_LINES" >&2
+	die "signature must be non-ad-hoc and include TeamIdentifier"
+fi
 
 step "Packaging for submission"
 rm -rf "$DIST"
