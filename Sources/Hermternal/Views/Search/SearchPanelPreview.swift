@@ -23,7 +23,7 @@ private enum SearchPanelPreviewData {
                 timestamp: Date().addingTimeInterval(TimeInterval(-index * 3_600))
             )
         }
-        return SearchResults(hits: hits, incompleteSessions: 2)
+        return SearchResults(hits: hits, pendingIndexingSessions: 0, truncatedSessions: 2)
     }
 
     static func highlightedExcerpt(query: String, index: Int) -> AttributedString {

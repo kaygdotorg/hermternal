@@ -547,7 +547,8 @@ final class AppModel {
         for await result in opener.openPhases(
             sessionID: session.id,
             serverTotal: session.messageCount,
-            generation: generation
+            generation: generation,
+            sessionTitle: session.title
         ) {
             guard openGenerations.isCurrent(generation), !Task.isCancelled else { return false }
             if !result.isCachedPhase {
@@ -670,9 +671,13 @@ final class AppModel {
         guard terminal != nil else { return }
         let generation = openGenerations.current()
         let sessionID = selectedSessionID
-        let serverTotal = sessionID.flatMap { id in
-            sessions.first { $0.id == id }?.messageCount
+        let session = sessionID.flatMap { id in
+            sessions.first { $0.id == id }
         }
+        let serverTotal = session?.messageCount
+        // An unavailable session row has no title; the empty title is the
+        // canonical representation used by the index for that absence.
+        let sessionTitle = session?.title ?? ""
         guard let source = transcriptSource(sessionID: sessionID, serverTotal: serverTotal) else {
             if sessionID == nil {
                 await loadSessions()
@@ -690,7 +695,8 @@ final class AppModel {
             sessionID: sessionID,
             serverTotal: serverTotal,
             currentMessages: messages,
-            generation: generation
+            generation: generation,
+            sessionTitle: sessionTitle
         ) else { return }
         guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
         streamingReducer.reset(messages: result.messages)

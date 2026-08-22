@@ -68,9 +68,11 @@ func lifecycleOperations() async throws {
     let index = try makeIndex()
     let url = index.url
     try await index.replace(SearchSessionSnapshot(sessionID: "s", title: "title", documents: [document(1, "body")], truncated: true))
-    #expect(try await index.incompleteSessionCount() == 1)
+    #expect(try await index.pendingIndexingSessionCount() == 0)
+    #expect(try await index.truncatedSessionCount() == 1)
     try await index.remove(sessionID: "s")
-    #expect(try await index.incompleteSessionCount() == 0)
+    #expect(try await index.pendingIndexingSessionCount() == 0)
+    #expect(try await index.truncatedSessionCount() == 0)
     try await index.replace(SearchSessionSnapshot(sessionID: "s", title: "title", documents: [document(1, "body")]))
     try await index.clear()
     #expect(try await index.indexedMessageCount() == 0)
@@ -107,7 +109,24 @@ func truncationMetadata() async throws {
     try await index.replace(SearchSessionSnapshot(sessionID: "complete", title: "", documents: [document(2, "needle")]))
     let results = try await index.search("needle", limit: 1)
     #expect(results.hits.count == 1)
-    #expect(results.incompleteSessions == 1)
+    #expect(results.pendingIndexingSessions == 0)
+    #expect(results.truncatedSessions == 1)
+}
+
+@Test("unwarmed sessions are reported as pending indexing")
+func unwarmedSessionsArePendingIndexing() async throws {
+    let index = try makeIndex()
+    defer { removeIndex(index.url) }
+    try await index.replace(SearchSessionSnapshot(
+        sessionID: "warmed",
+        title: "",
+        documents: [document(1, "needle")]
+    ))
+    try await index.markUnwarmed(sessionIDs: ["cold"])
+
+    let results = try await index.search("needle", limit: 10)
+    #expect(results.pendingIndexingSessions == 1)
+    #expect(results.truncatedSessions == 0)
 }
 
 @Test("rapid queries are latest-wins and recover after cancellation")

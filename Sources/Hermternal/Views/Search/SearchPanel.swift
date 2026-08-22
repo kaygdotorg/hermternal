@@ -119,7 +119,8 @@ private struct SearchPanelField: View {
         guard case .results(let results) = model.state else { return nil }
         return SearchFieldMetadata(
             count: results.hits.count,
-            incompleteSessions: results.incompleteSessions
+            pendingIndexingSessions: results.pendingIndexingSessions,
+            truncatedSessions: results.truncatedSessions
         )
     }
 
@@ -128,8 +129,9 @@ private struct SearchPanelField: View {
         let countWidth = metadata.count < 100
             ? 24
             : max(24, CGFloat(String(metadata.count).count * 8 + 10))
-        let indicatorWidth: CGFloat = metadata.incompleteSessions > 0 ? 28 : 0
-        return countWidth + indicatorWidth + 10
+        let statusWidth: CGFloat = (metadata.pendingIndexingSessions > 0 ? 28 : 0)
+            + (metadata.truncatedSessions > 0 ? 28 : 0)
+        return countWidth + statusWidth + 10
     }
 
     var body: some View {
@@ -209,14 +211,15 @@ private struct SearchPanelField: View {
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 16)
             .padding(.vertical, 11)
-            .glassEffect(.regular.interactive(), in: .capsule)
+            .glassEffect(.clear.interactive(), in: .capsule)
         }
     }
 }
 
 private struct SearchFieldMetadata: Sendable {
     let count: Int
-    let incompleteSessions: Int
+    let pendingIndexingSessions: Int
+    let truncatedSessions: Int
 }
 
 private struct SearchFieldMetadataView: View {
@@ -227,7 +230,11 @@ private struct SearchFieldMetadataView: View {
     }
 
     private var indexingLabel: String {
-        "Older messages in \(metadata.incompleteSessions) chats are not searchable yet"
+        "Older messages in \(metadata.pendingIndexingSessions) chats are still being indexed"
+    }
+
+    private var truncationLabel: String {
+        "Older messages in \(metadata.truncatedSessions) chats are not searchable because the server caps history at 500 messages per chat"
     }
 
     var body: some View {
@@ -246,7 +253,7 @@ private struct SearchFieldMetadataView: View {
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(countLabel)
 
-            if metadata.incompleteSessions > 0 {
+            if metadata.pendingIndexingSessions > 0 {
                 ProgressView()
                     .controlSize(.small)
                     .frame(width: 22, height: 22)
@@ -254,15 +261,32 @@ private struct SearchFieldMetadataView: View {
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel(indexingLabel)
             }
+
+            if metadata.truncatedSessions > 0 {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 22, height: 22)
+                    .help(truncationLabel)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(truncationLabel)
+            }
         }
     }
 }
-
 
 private struct SearchFieldHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 46
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct SearchFieldFrameKey: PreferenceKey {
+    static let defaultValue = CGRect.zero
+
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
         value = nextValue()
     }
 }
@@ -276,6 +300,7 @@ private struct SearchPanelSurface: View {
 
     @Environment(\.colorSchemeContrast) private var contrast
     @State private var fieldHeight: CGFloat = SearchFieldHeightKey.defaultValue
+    @State private var fieldFrame: CGRect = .zero
 
     private let fieldMargin: CGFloat = 15
 
@@ -304,10 +329,22 @@ private struct SearchPanelSurface: View {
                     )
                 }
             }
+            // Measure the glass pill itself before the surrounding padding.
+            // The mask uses this frame to stop concealing exactly at the
+            // pill's top edge, leaving its entire refractive area visible.
+            .background {
+                GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: SearchFieldFrameKey.self,
+                        value: geometry.frame(in: .named("searchPanelSurface"))
+                    )
+                }
+            }
             .zIndex(1)
             .padding(.horizontal, 18)
             .padding(.vertical, fieldMargin)
         }
+        .coordinateSpace(name: "searchPanelSurface")
         .frame(maxHeight: maximumHeight, alignment: .top)
         // The window frost beneath the panel carries the visual weight. A
         // thin pane keeps the app recognizable through the card instead of
@@ -323,6 +360,9 @@ private struct SearchPanelSurface: View {
         .shadow(color: .black.opacity(0.28), radius: 28, y: 14)
         .onPreferenceChange(SearchFieldHeightKey.self) { height in
             fieldHeight = height
+        }
+        .onPreferenceChange(SearchFieldFrameKey.self) { frame in
+            fieldFrame = frame
         }
         .onChange(of: model.query) { _, newQuery in
             model.updateQuery(newQuery)
@@ -355,6 +395,7 @@ private struct SearchPanelSurface: View {
                 results: results,
                 selectedIndex: model.selectedIndex,
                 topInset: fieldContentInset,
+                fieldFrame: fieldFrame,
                 activate: activate
             )
             .frame(height: maximumHeight)
@@ -407,20 +448,16 @@ private struct LoadingSearchState: View {
         .accessibilityLabel("Searching messages")
     }
 }
-
 private struct ResultsSearchState: View {
     let results: SearchResults
     let selectedIndex: Int?
     let topInset: CGFloat
+    let fieldFrame: CGRect
     let activate: (MessageLocation) -> Void
 
-    private static let topFadeHeight: CGFloat = 96
-    // Keep content fully dissolved through the ~31pt card-to-pill gap, then
-    // bring it back gently through the pill so its glass can lens the rows.
-    private static let topFadeClearHeight: CGFloat = 30
-    private static let topFadeSoftHeight: CGFloat = 48
-    private static let topFadeStrongHeight: CGFloat = 72
-
+    // Only the content above the measured glass top is concealed. Once rows
+    // reach the top edge, they remain present for the clear glass to refract.
+    private static let aboveFieldFadeDistance: CGFloat = 24
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 2) {
@@ -445,14 +482,28 @@ private struct ResultsSearchState: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .mask {
             GeometryReader { geometry in
-                let height = max(geometry.size.height, 1)
+                let viewportHeight = max(geometry.size.height, 1)
+                let measuredFieldTop = fieldFrame.height > 0
+                    ? fieldFrame.minY
+                    : 0
+                let fieldTopEdge = min(
+                    max(measuredFieldTop, 0),
+                    viewportHeight
+                )
+                let aboveFieldFadeStart = max(
+                    fieldTopEdge - Self.aboveFieldFadeDistance,
+                    0
+                )
+                // A mask reveals content where it is opaque. The only
+                // transparent region is above the measured field top edge;
+                // from that edge down, rows stay visible behind the glass
+                // and fully legible below it. There is deliberately no
+                // bottom ramp: the pill edge already transitions the rows.
                 LinearGradient(
                     stops: [
                         .init(color: .clear, location: 0),
-                        .init(color: .clear, location: min(Self.topFadeClearHeight / height, 1)),
-                        .init(color: .black.opacity(0.12), location: min(Self.topFadeSoftHeight / height, 1)),
-                        .init(color: .black.opacity(0.55), location: min(Self.topFadeStrongHeight / height, 1)),
-                        .init(color: .black, location: min(Self.topFadeHeight / height, 1)),
+                        .init(color: .clear, location: aboveFieldFadeStart / viewportHeight),
+                        .init(color: .black, location: fieldTopEdge / viewportHeight),
                         .init(color: .black, location: 1)
                     ],
                     startPoint: .top,

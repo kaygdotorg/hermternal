@@ -16,7 +16,8 @@ func terminalReconciliationUsesRESTAuthority() async throws {
         sessionID: "durable",
         serverTotal: 1,
         currentMessages: [ChatMessage(role: .assistant, text: "live")],
-        generation: generation
+        generation: generation,
+        sessionTitle: ""
     ))
     #expect(durable.messages.map(\.text) == ["authoritative"])
     #expect(durable.messages[0].id == .server(ServerMessageID(rawValue: 9)))
@@ -26,7 +27,8 @@ func terminalReconciliationUsesRESTAuthority() async throws {
         sessionID: nil,
         serverTotal: nil,
         currentMessages: [ChatMessage(role: .assistant, text: "live")],
-        generation: generation
+        generation: generation,
+        sessionTitle: ""
     ))
     #expect(firstTurn.requiresSessionRefresh)
     #expect(firstTurn.messages[0].id != durable.messages[0].id)
@@ -52,7 +54,8 @@ func openingUsesResumeGrowthAndRESTAuthority() async throws {
     let result = try #require(await opener.open(
         sessionID: "session",
         serverTotal: 1,
-        generation: generations.begin()
+        generation: generations.begin(),
+        sessionTitle: ""
     ))
     #expect(result.didFetchREST)
     #expect(result.messages.count == 2)
@@ -80,7 +83,8 @@ func truncatedSnapshotDoesNotRefetch() async throws {
     let result = try #require(await opener.open(
         sessionID: "session",
         serverTotal: 834,
-        generation: generations.begin()
+        generation: generations.begin(),
+        sessionTitle: ""
     ))
     #expect(!result.didFetchREST)
     #expect(result.messages.map(\.text) == ["cached"])
@@ -98,7 +102,9 @@ func delayedOpenIsSuperseded() async throws {
     let generations = OpenGenerationController()
     let opener = TranscriptOpener(source: source, cache: cache, cacheEnabled: false, generations: generations)
     let generation = generations.begin()
-    let task = Task { await opener.open(sessionID: "session", serverTotal: 0, generation: generation) }
+    let task = Task {
+        await opener.open(sessionID: "session", serverTotal: 0, generation: generation, sessionTitle: "")
+    }
     try await Task.sleep(nanoseconds: 5_000_000)
     _ = generations.begin()
     #expect(await task.value == nil)
@@ -130,7 +136,8 @@ func restFailureRetainsCache() async throws {
     let result = try #require(await opener.open(
         sessionID: "session",
         serverTotal: 10,
-        generation: generations.begin()
+        generation: generations.begin(),
+        sessionTitle: ""
     ))
     #expect(result.messages.map(\.text) == ["prior"])
     #expect(result.notice != nil)

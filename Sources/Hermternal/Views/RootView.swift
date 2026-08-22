@@ -81,7 +81,10 @@ struct ChatWindow: View {
             SidebarView(
                 model: model,
                 accountName: model.accountPresentation.title,
-                accountDetail: model.accountPresentation.detail
+                accountDetail: model.accountPresentation.detail,
+                // The visible title is a truncated account id, so the full
+                // value has to reach the tooltip and VoiceOver label.
+                accountID: model.accountPresentation.accountID
             )
                 .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 340)
         } detail: {
@@ -144,9 +147,20 @@ private final class ToolbarChromeHost: NSView {
 
     func setHidden(_ hidden: Bool) {
         desiredHidden = hidden
-        applyVisibility()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            self?.applyVisibility()
+
+        if hidden {
+            // Hide chrome as soon as the panel appears, but keep restoration
+            // behind the panel's opacity transition so it cannot flash over
+            // the still-fading card and shadow on dismissal.
+            applyVisibility()
+        } else {
+            // The search overlay owns the fade-out. Let the dim remain until
+            // that transition has completed; restoring here would expose a
+            // bright window behind the card for a frame.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                guard let self, !self.desiredHidden else { return }
+                self.applyVisibility()
+            }
         }
     }
 

@@ -11,7 +11,7 @@ struct SidebarBottomEdge<Content: View>: View {
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        ZStack(alignment: .bottomLeading) {
             Rectangle()
                 .fill(.ultraThinMaterial)
                 .mask {

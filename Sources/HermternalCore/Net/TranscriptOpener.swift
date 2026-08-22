@@ -144,11 +144,14 @@ public struct TranscriptOpener: Sendable {
     /// A provisional phase (cached messages, or empty when unavailable) is
     /// yielded before any resume or REST await. The subsequent result carries
     /// the live session id and, when needed, the authoritative REST projection.
+    /// `sessionTitle` is the authoritative session-list title used by the
+    /// search index digest. Keeping it unchanged avoids an FTS rewrite;
+    /// changing it intentionally refreshes title-bearing rows.
     public func openPhases(
         sessionID: String,
         serverTotal: Int?,
         generation: Int,
-        sessionTitle: String = ""
+        sessionTitle: String
     ) -> AsyncStream<TranscriptOpenResult> {
         AsyncStream { continuation in
             let task = Task {
@@ -279,7 +282,7 @@ public struct TranscriptOpener: Sendable {
         sessionID: String,
         serverTotal: Int?,
         generation: Int,
-        sessionTitle: String = ""
+        sessionTitle: String
     ) async -> TranscriptOpenResult? {
         var final: TranscriptOpenResult?
         for await result in openPhases(
@@ -299,7 +302,7 @@ public struct TranscriptOpener: Sendable {
         serverTotal: Int?,
         currentMessages: [ChatMessage],
         generation: Int,
-        sessionTitle: String = ""
+        sessionTitle: String
     ) async -> TranscriptReconciliationResult? {
         guard isCurrent(generation) else { return nil }
         guard let sessionID else {

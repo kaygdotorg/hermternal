@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// A non-interactive identity summary supplied by the composition root.
-struct SidebarAccountPill: View {
+struct SidebarAccountRow: View {
     let name: String
     let detail: String?
     let accountID: String?
@@ -24,12 +24,16 @@ struct SidebarAccountPill: View {
         return Text(name)
     }
 
+    /// This row deliberately has no surface of its own. `SidebarBottomEdge`
+    /// supplies the masked material that keeps the identity readable while
+    /// scrolling rows pass beneath it.
     private var base: some View {
         Label {
             VStack(alignment: .leading, spacing: 2) {
                 Text(name)
                     .font(.body)
-                    .lineLimit(nil)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                     .fixedSize(horizontal: false, vertical: true)
                     .layoutPriority(1)
 
@@ -37,12 +41,12 @@ struct SidebarAccountPill: View {
                     Text(detail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(nil)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                         .fixedSize(horizontal: false, vertical: true)
                         .layoutPriority(1)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         } icon: {
             Image(systemName: "person.crop.circle")
                 .font(.title3)
@@ -50,8 +54,6 @@ struct SidebarAccountPill: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: AppShapeScale.control)
         .help(accountID ?? name)
     }
 }

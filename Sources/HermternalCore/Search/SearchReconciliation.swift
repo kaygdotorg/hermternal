@@ -1,16 +1,5 @@
 import Foundation
 
-/// Sidebar knowledge needed to report chats that have not been warmed into the
-/// local transcript corpus yet.
-public struct SearchKnownSession: Sendable, Hashable {
-    public let sessionID: String
-    public let title: String
-
-    public init(sessionID: String, title: String = "") {
-        self.sessionID = sessionID
-        self.title = title
-    }
-}
 
 /// Core-owned policy boundary between HistoryCache and SearchIndex.
 ///
@@ -118,19 +107,6 @@ public actor SearchIndexReconciliation: TranscriptPersisting {
         return true
     }
 
-    /// Registers sidebar sessions that have no cache snapshot yet.
-    public func registerKnownSessions(_ sessions: [SearchKnownSession]) async {
-        do {
-            try await index.markUnwarmed(sessionIDs: sessions.map(\.sessionID))
-        } catch {
-            recordIndexFailure(error, operation: "register")
-        }
-    }
-
-    /// Registers the complete sidebar corpus. Entries without a warmed cache
-    public func reconcile(validSessions sessions: [SearchKnownSession]) async {
-        _ = await reconcile(validIDs: sessions.map(\.sessionID))
-    }
 
     public func reconcile(validIDs: [String]) async -> CacheStatistics {
         let statistics = await cache.reconcile(validIDs: validIDs)

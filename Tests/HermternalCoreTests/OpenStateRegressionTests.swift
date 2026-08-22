@@ -50,7 +50,8 @@ func cachedPhasePrecedesResume() async throws {
     var phases = opener.openPhases(
         sessionID: "session",
         serverTotal: 1,
-        generation: generation
+        generation: generation,
+        sessionTitle: ""
     ).makeAsyncIterator()
 
     let first = try #require(await phases.next())
@@ -84,7 +85,8 @@ func cacheMissEmitsEmptyPhase() async throws {
     var phases = opener.openPhases(
         sessionID: "session",
         serverTotal: 1,
-        generation: generation
+        generation: generation,
+        sessionTitle: ""
     ).makeAsyncIterator()
 
     let first = try #require(await phases.next())
@@ -113,7 +115,8 @@ func disabledCacheEmitsEmptyPhase() async throws {
     var phases = opener.openPhases(
         sessionID: "session",
         serverTotal: 1,
-        generation: generation
+        generation: generation,
+        sessionTitle: ""
     ).makeAsyncIterator()
 
     let first = try #require(await phases.next())
@@ -151,7 +154,8 @@ func staleCachePhaseIsDiscarded() async throws {
         for await phase in opener.openPhases(
             sessionID: "session",
             serverTotal: 1,
-            generation: generation
+            generation: generation,
+            sessionTitle: ""
         ) {
             phases.append(phase)
         }
@@ -187,7 +191,8 @@ func delayedResumeCannotRestoreAfterCacheDisable() async throws {
         await opener.open(
             sessionID: "session",
             serverTotal: 1,
-            generation: generation
+            generation: generation,
+            sessionTitle: ""
         )
     }
     while !(await source.resumeStarted) {
@@ -233,7 +238,8 @@ func delayedRESTCannotRestoreAfterCacheDisable() async throws {
         await opener.open(
             sessionID: "session",
             serverTotal: 2,
-            generation: generation
+            generation: generation,
+            sessionTitle: ""
         )
     }
     while await source.authoritativeCalls == 0 {
@@ -269,7 +275,8 @@ func delayedRESTStoreAfterCacheClearIsRejected() async throws {
         await opener.open(
             sessionID: "session",
             serverTotal: 1,
-            generation: generation
+            generation: generation,
+            sessionTitle: ""
         )
     }
     while await source.authoritativeCalls == 0 {
@@ -335,7 +342,8 @@ func staleFirstTurnReconciliationIsDiscarded() async throws {
         sessionID: nil,
         serverTotal: nil,
         currentMessages: [],
-        generation: generation
+        generation: generation,
+        sessionTitle: ""
     ) == nil)
 }
 
@@ -361,7 +369,8 @@ func staleTerminalReconciliationIsDiscarded() async throws {
             sessionID: "session",
             serverTotal: 1,
             currentMessages: [ChatMessage(role: .user, text: "new turn")],
-            generation: generation
+            generation: generation,
+            sessionTitle: ""
         )
     }
     while await source.authoritativeCalls == 0 {

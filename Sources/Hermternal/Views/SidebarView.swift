@@ -41,7 +41,7 @@ struct SidebarView: View {
             .scrollContentBackground(.hidden)
 
             SidebarBottomEdge {
-                SidebarAccountPill(
+                SidebarAccountRow(
                     name: accountName,
                     detail: accountDetail,
                     accountID: accountID

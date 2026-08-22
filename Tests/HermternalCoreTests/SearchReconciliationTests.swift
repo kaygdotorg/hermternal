@@ -52,8 +52,8 @@ func indexFailureLeavesCacheAuthoritative() async throws {
     try? FileManager.default.removeItem(at: root)
 }
 
-@Test("diversity gives each conversation a turn and counts unwarmed sessions")
-func diversityAndIncompleteCorpus() async throws {
+@Test("diversity gives each conversation a turn and counts pending sessions")
+func diversityAndPendingCorpus() async throws {
     let root = FileManager.default.temporaryDirectory.appending(path: "HermternalReconcile-\(UUID().uuidString)")
     let cache = HistoryCache(directory: root.appending(path: "cache"))
     let index = try SearchIndex(url: root.appending(path: "search.sqlite"))
@@ -63,10 +63,11 @@ func diversityAndIncompleteCorpus() async throws {
     }
     _ = await coordinator.store((1...4).map { ChatMessage(id: .server(ServerMessageID(rawValue: Int64($0))), role: .user, text: "common a\($0)") }, snapshot: makeSnapshot("a"), title: "A", for: "a")
     _ = await coordinator.store([ChatMessage(id: .server(ServerMessageID(rawValue: 9)), role: .assistant, text: "common b")], snapshot: makeSnapshot("b"), title: "B", for: "b")
-    await coordinator.registerKnownSessions([SearchKnownSession(sessionID: "a"), SearchKnownSession(sessionID: "b"), SearchKnownSession(sessionID: "cold")])
+    _ = await coordinator.reconcile(validIDs: ["a", "b", "cold"])
     let results = try await index.search("common", limit: 5)
     #expect(results.hits.prefix(2).map(\.location.sessionID).sorted() == ["a", "b"])
-    #expect(results.incompleteSessions == 1)
+    #expect(results.pendingIndexingSessions == 1)
+    #expect(results.truncatedSessions == 0)
     try await index.disable()
     try? FileManager.default.removeItem(at: root)
 }

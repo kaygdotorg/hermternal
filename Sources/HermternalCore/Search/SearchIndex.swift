@@ -51,11 +51,17 @@ public struct SearchHit: Sendable {
 
 public struct SearchResults: Sendable {
     public let hits: [SearchHit]
-    public let incompleteSessions: Int
+    public let pendingIndexingSessions: Int
+    public let truncatedSessions: Int
 
-    public init(hits: [SearchHit], incompleteSessions: Int) {
+    public init(
+        hits: [SearchHit],
+        pendingIndexingSessions: Int,
+        truncatedSessions: Int
+    ) {
         self.hits = hits
-        self.incompleteSessions = incompleteSessions
+        self.pendingIndexingSessions = pendingIndexingSessions
+        self.truncatedSessions = truncatedSessions
     }
 }
 
@@ -200,7 +206,9 @@ public actor SearchIndex: SearchQuerying {
         let requestGeneration = generation
         stopRunningQuery()
         let compiled = Self.compile(query: query)
-        guard !compiled.isEmpty else { return SearchResults(hits: [], incompleteSessions: 0) }
+        guard !compiled.isEmpty else {
+            return SearchResults(hits: [], pendingIndexingSessions: 0, truncatedSessions: 0)
+        }
         let limit = max(0, min(requestedLimit, SearchIndex.defaultLimit))
         let lease = try database.beginQuery()
         let task = Task.detached(priority: .userInitiated) { () throws -> SearchResults in
@@ -236,9 +244,14 @@ public actor SearchIndex: SearchQuerying {
         return try database.withExclusive { try database.sessionDigest(sessionID) }
     }
 
-    public func incompleteSessionCount() throws -> Int {
+    public func pendingIndexingSessionCount() throws -> Int {
         guard !disabled, let database else { throw SearchIndexError.disabled }
-        return try database.withExclusive { Int(try database.incompleteSessionCount()) }
+        return try database.withExclusive { Int(try database.pendingIndexingSessionCount()) }
+    }
+
+    public func truncatedSessionCount() throws -> Int {
+        guard !disabled, let database else { throw SearchIndexError.disabled }
+        return try database.withExclusive { Int(try database.truncatedSessionCount()) }
     }
 
     public func indexedMessageCount(sessionID: String? = nil) throws -> Int {
@@ -431,8 +444,22 @@ private final class SQLiteConnection: @unchecked Sendable {
     func deleteSession(_ id: String) throws { try execute("DELETE FROM hermternal_search_messages WHERE session_id = ?", bindings: [.text(id)]) }
     func deleteSessionMetadata(_ id: String) throws { try execute("DELETE FROM hermternal_search_sessions WHERE session_id = ?", bindings: [.text(id)]) }
     func clearContent() throws { try execute("DELETE FROM hermternal_search_messages"); try execute("DELETE FROM hermternal_search_sessions") }
-    func incompleteSessionCount() throws -> Int {
-        Int(try scalarInt("SELECT count(*) FROM hermternal_search_sessions WHERE warmed = 0 OR incomplete = 1"))
+    func pendingIndexingSessionCount() throws -> Int {
+        Int(try scalarInt("SELECT count(*) FROM hermternal_search_sessions WHERE warmed = 0"))
+    }
+    func truncatedSessionCount() throws -> Int {
+        Int(try scalarInt("SELECT count(*) FROM hermternal_search_sessions WHERE incomplete = 1"))
+    }
+    func sessionStatusCounts() throws -> (pendingIndexing: Int, truncated: Int) {
+        let sql = """
+            SELECT
+                COALESCE(SUM(CASE WHEN warmed = 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN incomplete = 1 THEN 1 ELSE 0 END), 0)
+            FROM hermternal_search_sessions
+            """
+        let rows = try queryRows(sql)
+        let row = rows[0]
+        return (Int(row.int64(0)), Int(row.int64(1)))
     }
     func messageCount(sessionID: String?) throws -> Int {
         Int(try scalarInt("SELECT count(*) FROM hermternal_search_messages" + (sessionID == nil ? "" : " WHERE session_id = ?"), bindings: sessionID.map { [.text($0)] } ?? []))
@@ -451,9 +478,15 @@ private final class SQLiteConnection: @unchecked Sendable {
     func insert(title: String, body: String, sessionID: String, messageID: Int64, role: String, timestamp: Date?) throws {
         try execute("INSERT INTO hermternal_search_messages(title, body, session_id, message_id, role, timestamp) VALUES (?, ?, ?, ?, ?, ?)", bindings: [.text(title), .text(body), .text(sessionID), .int64(messageID), .text(role), timestamp.map { .double($0.timeIntervalSince1970) } ?? .null])
     }
-
     func query(ftsQuery: String, limit: Int) throws -> SearchResults {
-        guard limit > 0 else { return SearchResults(hits: [], incompleteSessions: try incompleteSessionCount()) }
+        let counts = try sessionStatusCounts()
+        guard limit > 0 else {
+            return SearchResults(
+                hits: [],
+                pendingIndexingSessions: counts.pendingIndexing,
+                truncatedSessions: counts.truncated
+            )
+        }
         // Fetch all matching rows before applying diversity. Limiting in SQL
         // would let a single large chat hide better hits from other chats.
         let rows = try queryRows("SELECT session_id, message_id, title, body, role, timestamp, snippet(hermternal_search_messages, -1, '⟦', '⟧', '…', 32), bm25(hermternal_search_messages, ?, ?) FROM hermternal_search_messages WHERE hermternal_search_messages MATCH ? ORDER BY bm25(hermternal_search_messages, ?, ?)", bindings: [.double(10), .double(1), .text(ftsQuery), .double(10), .double(1)])
@@ -472,7 +505,11 @@ private final class SQLiteConnection: @unchecked Sendable {
             }
             round += 1
         }
-        return SearchResults(hits: hits, incompleteSessions: try incompleteSessionCount())
+        return SearchResults(
+            hits: hits,
+            pendingIndexingSessions: counts.pendingIndexing,
+            truncatedSessions: counts.truncated
+        )
     }
 
     private static func makeHit(_ row: Row) -> SearchHit {

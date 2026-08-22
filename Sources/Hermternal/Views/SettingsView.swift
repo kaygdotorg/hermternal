@@ -19,10 +19,13 @@ struct SettingsView: View {
     }
 
     var body: some View {
-        HStack(spacing: 0) {
+        NavigationSplitView(columnVisibility: .constant(.all)) {
             SettingsSourceList(selection: $selection)
-                .frame(width: 220)
-
+                // `.toolbar(removing: .sidebarToggle)` removes SwiftUI's
+                // default toggle while keeping the toolbar and traffic lights.
+                .toolbar(removing: .sidebarToggle)
+                .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
+        } detail: {
             SettingsDetailView(
                 section: selection ?? .appearance,
                 appearance: appearance,
@@ -86,7 +89,6 @@ private struct SettingsSourceList: View {
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
-        .background(.clear)
     }
 }
 
@@ -99,11 +101,11 @@ private struct SettingsDetailView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(section.title)
-                .font(.largeTitle)
-                .fontWeight(.bold)
-                .padding(.horizontal, 28)
-                .padding(.top, 24)
-                .padding(.bottom, 8)
+                .font(.title2)
+                .fontWeight(.semibold)
+                .padding(.horizontal, 20)
+                .padding(.top, 18)
+                .padding(.bottom, 6)
 
             detailContent
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -139,52 +141,58 @@ private struct AppearanceSettingsView: View {
     }
 
     var body: some View {
-        Form {
-            Section {
-                Picker("Theme", selection: $appearance.mode) {
-                    ForEach(AppearanceMode.allCases) { mode in
-                        Text(mode.label).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-            }
-
-            Section("Window") {
-                HStack {
-                    Text("Frost")
-                    Slider(
-                        value: frostBinding,
-                        in: 0...1,
-                        onEditingChanged: { editing in
-                            if !editing {
-                                appearance.persistWindowFrost()
-                            }
+        VStack(spacing: 0) {
+            Form {
+                Section {
+                    Picker("Theme", selection: $appearance.mode) {
+                        ForEach(AppearanceMode.allCases) { mode in
+                            Text(mode.label).tag(mode)
                         }
-                    )
-                    Text(
-                        appearance.windowFrost.formatted(
-                            .percent.precision(.fractionLength(0))
-                        )
-                    )
-                    .monospacedDigit()
-                    .frame(width: 42, alignment: .trailing)
+                    }
+                    .pickerStyle(.segmented)
                 }
-                Text("0% is the most transparent. 100% is a frosted material.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
 
-            Section {
-                HStack {
-                    Spacer()
-                    Button("Reset to Defaults") {
-                        appearance.resetToDefaults()
+                Section("Chat Window") {
+                    LabeledContent {
+                        HStack {
+                            Slider(
+                                value: frostBinding,
+                                in: 0...1,
+                                onEditingChanged: { editing in
+                                    if !editing {
+                                        appearance.persistWindowFrost()
+                                    }
+                                }
+                            )
+                            Text(
+                                appearance.windowFrost.formatted(
+                                    .percent.precision(.fractionLength(0))
+                                )
+                            )
+                            .monospacedDigit()
+                            .frame(width: 42, alignment: .trailing)
+                        }
+                    } label: {
+                        Text("Frost")
+                        Text(
+                            "Applies to the chat window only. At 0% the desktop shows through "
+                                + "the window; at 100% the window is a frosted material."
+                        )
                     }
                 }
             }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+
+            HStack {
+                Spacer()
+                Button("Reset to Defaults") {
+                    appearance.resetToDefaults()
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
         }
-        .formStyle(.grouped)
-        .scrollContentBackground(.hidden)
     }
 }
 
@@ -209,13 +217,6 @@ private struct CacheSettingsView: View {
         Form {
             Section {
                 Toggle("Cache chat history locally", isOn: cacheBinding)
-                Text(
-                    model.cacheEnabled
-                        ? "Recent transcripts are stored on this Mac so switching chats is immediate."
-                        : "Chats load from the server each time you open them."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
             }
 
             if model.cacheEnabled {
