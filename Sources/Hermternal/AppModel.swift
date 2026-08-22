@@ -314,10 +314,18 @@ final class AppModel {
                               let rows = try? await rest.sessionMessages(durableID: id)
                         else { return nil }
                         guard !Task.isCancelled else { return nil }
-                        return await cache.store(
-                            rows.compactMap(ChatMessage.init(historyRow:)),
-                            for: id
-                        )
+                        var occurrences: [ChatMessage.HistoryKey: Int] = [:]
+                        let projected = rows.compactMap { row -> ChatMessage? in
+                            guard let key = ChatMessage.historyKey(from: row) else { return nil }
+                            let occurrence = occurrences[key, default: 0]
+                            occurrences[key] = occurrence + 1
+                            return ChatMessage(
+                                historyRow: row,
+                                sessionID: id,
+                                occurrence: occurrence
+                            )
+                        }
+                        return await cache.store(projected, for: id)
                     }
                 }
                 while next < ordered.count, next < lanes {
@@ -410,7 +418,17 @@ final class AppModel {
             // before row projection, encoding, disk I/O, or UI publication.
             guard generation == openGeneration, !Task.isCancelled else { return }
             let rows = result["messages"]?.arrayValue ?? []
-            let resumed = rows.compactMap(ChatMessage.init(historyRow:))
+            var occurrences: [ChatMessage.HistoryKey: Int] = [:]
+            let resumed = rows.compactMap { row -> ChatMessage? in
+                guard let key = ChatMessage.historyKey(from: row) else { return nil }
+                let occurrence = occurrences[key, default: 0]
+                occurrences[key] = occurrence + 1
+                return ChatMessage(
+                    historyRow: row,
+                    sessionID: session.id,
+                    occurrence: occurrence
+                )
+            }
             if cacheEnabled {
                 let result = await cache.store(resumed, for: session.id)
                 applyCacheStore(result)
@@ -441,6 +459,8 @@ final class AppModel {
         guard let sessionID = liveSessionID else { return }
 
         composerText = ""
+        // Live messages keep random IDs because their text changes per delta;
+        // history projections assign stable IDs when this session is reopened.
         messages.append(ChatMessage(role: .user, text: text))
         isAwaitingReply = true
 

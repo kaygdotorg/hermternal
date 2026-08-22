@@ -11,6 +11,14 @@ let package = Package(
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]
+        ),
+        .testTarget(
+            name: "HermternalTests",
+            dependencies: ["Hermternal"],
+            path: "Tests/HermternalTests",
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
         )
     ]
 )

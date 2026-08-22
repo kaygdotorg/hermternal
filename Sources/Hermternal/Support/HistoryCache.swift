@@ -19,19 +19,26 @@ struct CacheStoreResult: Sendable {
 actor HistoryCache {
     /// Bump when `CachedTranscript` changes shape, so stale files are
     /// discarded rather than mis-decoded.
-    private static let version = 1
+    private static let version = 2
 
+    private let directory: URL
     private var memory: [String: [ChatMessage]] = [:]
 
-    private var directory: URL {
-        let base = FileManager.default
-            .homeDirectoryForCurrentUser
-            .appending(
-                path: "Library/Caches/com.kayg.hermternal/history",
-                directoryHint: .isDirectory
-            )
-        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-        return base
+    init(directory: URL? = nil) {
+        if let directory {
+            self.directory = directory
+        } else {
+            self.directory = FileManager.default
+                .homeDirectoryForCurrentUser
+                .appending(
+                    path: "Library/Caches/com.kayg.hermternal/history",
+                    directoryHint: .isDirectory
+                )
+        }
+        try? FileManager.default.createDirectory(
+            at: self.directory,
+            withIntermediateDirectories: true
+        )
     }
 
     /// Durable ids are timestamp-and-hex slugs, but sanitise anyway so a new
@@ -67,20 +74,28 @@ actor HistoryCache {
             return CacheStoreResult(addedEntry: false, byteDelta: 0)
         }
         let payload = CachedTranscript(version: Self.version, messages: messages)
-        guard let data = try? JSONEncoder().encode(payload), !Task.isCancelled else {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(payload), !Task.isCancelled else {
             return CacheStoreResult(addedEntry: false, byteDelta: 0)
         }
 
         let target = url(for: id)
-        let oldSize = (try? target.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let oldData = try? Data(contentsOf: target)
         let existed = FileManager.default.fileExists(atPath: target.path)
+        if oldData == data {
+            memory[id] = messages
+            return CacheStoreResult(addedEntry: false, byteDelta: 0)
+        }
+        let oldSize = oldData.map { Int64($0.count) }
+            ?? Int64((try? target.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         guard (try? data.write(to: target, options: [.atomic])) != nil else {
             return CacheStoreResult(addedEntry: false, byteDelta: 0)
         }
         memory[id] = messages
         return CacheStoreResult(
             addedEntry: !existed,
-            byteDelta: Int64(data.count - oldSize)
+            byteDelta: Int64(data.count) - oldSize
         )
     }
 

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// A sidebar row, built from `session.list`.
@@ -58,6 +59,42 @@ struct ChatMessage: Identifiable, Codable, Sendable {
         self.isStreaming = isStreaming
     }
 
+    /// Deterministic identity for a message projected from server history.
+    static func stableID(
+        sessionID: String,
+        role: Role,
+        text: String,
+        occurrence: Int
+    ) -> UUID {
+        let material = [
+            sessionID,
+            role.rawValue,
+            text,
+            String(occurrence)
+        ].joined(separator: "\u{001F}")
+        var bytes = Array(SHA256.hash(data: Data(material.utf8)).prefix(16))
+        // RFC 4122 version 5 and variant bits make this a well-formed UUID.
+        bytes[6] = (bytes[6] & 0x0F) | 0x50
+        bytes[8] = (bytes[8] & 0x3F) | 0x80
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
+    }
+
+    /// The parsed identity fields used to count duplicate history rows.
+    struct HistoryKey: Hashable {
+        let role: String
+        let text: String
+    }
+
+    static func historyKey(from value: JSONValue) -> HistoryKey? {
+        guard let (role, body) = historyComponents(from: value) else { return nil }
+        return HistoryKey(role: role.rawValue, text: body)
+    }
+
     /// Build from a transcript row.
     ///
     /// Two projections feed this. The socket's `_history_to_messages` emits
@@ -65,7 +102,21 @@ struct ChatMessage: Identifiable, Codable, Sendable {
     /// database rows, which use `content` and include rows never meant for
     /// display, so the filtering the socket does server-side has to happen
     /// here for parity between the two sources.
-    init?(historyRow value: JSONValue) {
+    init?(historyRow value: JSONValue, sessionID: String, occurrence: Int) {
+        guard let (role, body) = Self.historyComponents(from: value) else { return nil }
+        self.init(
+            id: Self.stableID(
+                sessionID: sessionID,
+                role: role,
+                text: body,
+                occurrence: occurrence
+            ),
+            role: role,
+            text: body
+        )
+    }
+
+    private static func historyComponents(from value: JSONValue) -> (Role, String)? {
         guard let rawRole = value["role"]?.stringValue else { return nil }
         // Tool rows arrive as {role:"tool", name:…, context:…} and carry no
         // user-visible prose, so Role rejects them and they are skipped.
@@ -78,7 +129,7 @@ struct ChatMessage: Identifiable, Codable, Sendable {
         else { return nil }
         // The older hidden-row convention predates display_kind.
         guard !body.hasPrefix("[System:") else { return nil }
-        self.init(role: role, text: body)
+        return (role, body)
     }
 
     /// History content is a string on text-only turns and an array of typed
