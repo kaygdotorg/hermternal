@@ -1,6 +1,6 @@
 import Foundation
 
-enum AuthError: LocalizedError, Sendable {
+public enum AuthError: LocalizedError, Sendable {
     case loopbackUnavailable
     case loginTimedOut
     case malformedCallback
@@ -12,7 +12,7 @@ enum AuthError: LocalizedError, Sendable {
     case notSignedIn
     case badServerURL
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .loopbackUnavailable:
             "Could not open a local port for the sign-in redirect."

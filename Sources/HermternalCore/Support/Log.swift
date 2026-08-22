@@ -6,11 +6,11 @@ import os
 /// The app normally runs via `open`, so stdout goes nowhere. A file sink
 /// keeps auth and transport failures inspectable after the fact without
 /// attaching a debugger.
-enum Log {
+public enum Log {
     private static let logger = Logger(subsystem: AppIdentity.bundleID, category: "app")
 
     /// `~/Library/Logs/Hermternal/hermternal.log`
-    static let fileURL: URL = {
+    public static let fileURL: URL = {
         let directory = FileManager.default
             .homeDirectoryForCurrentUser
             .appending(path: "Library/Logs/Hermternal", directoryHint: .isDirectory)
@@ -24,8 +24,8 @@ enum Log {
     // and so usable from a static context under strict concurrency.
     private static let timestamp = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
 
-    static func info(_ message: String) { write("INFO", message) }
-    static func error(_ message: String) { write("ERROR", message) }
+    public static func info(_ message: String) { write("INFO", message) }
+    public static func error(_ message: String) { write("ERROR", message) }
 
     private static func write(_ level: String, _ message: String) {
         logger.log("\(level, privacy: .public) \(message, privacy: .public)")

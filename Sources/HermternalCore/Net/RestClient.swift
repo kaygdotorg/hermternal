@@ -7,12 +7,12 @@ import Foundation
 /// would spin up 30+ live agents. `GET /api/sessions/{id}/messages` opens the
 /// session database read-only and creates nothing, which is what makes
 /// prefetching safe.
-actor RestClient {
+public actor RestClient {
     private let server: URL
     private let auth: AuthClient
     private let urlSession: URLSession
 
-    init(server: URL, auth: AuthClient, urlSession: URLSession = .shared) {
+    public init(server: URL, auth: AuthClient, urlSession: URLSession = .shared) {
         self.server = server
         self.auth = auth
         self.urlSession = urlSession
@@ -23,7 +23,7 @@ actor RestClient {
     /// Rows come straight from the database, so they carry `content` rather
     /// than the socket projection's `text`, and include scaffolding the
     /// socket path filters out.
-    func sessionMessages(durableID: String, limit: Int = 500) async throws -> [JSONValue] {
+    public func sessionMessages(durableID: String, limit: Int = 500) async throws -> [JSONValue] {
         let credentials = try await auth.validCredentials()
 
         var components = URLComponents(
@@ -56,10 +56,10 @@ actor RestClient {
     }
 }
 
-enum RestError: LocalizedError {
+public enum RestError: LocalizedError {
     case badStatus(Int, String)
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .badStatus(let status, let body):
             "Request failed (HTTP \(status)): \(body)"

@@ -2,17 +2,15 @@ import Foundation
 
 /// The bearer credential set the gateway hands back at
 /// `POST /auth/native/token`.
-struct Credentials: Codable, Sendable {
-    var accessToken: String
-    var refreshToken: String
+public struct Credentials: Codable, Sendable {
+    public var accessToken: String
+    public var refreshToken: String
     /// Absolute Unix expiry of `accessToken`, as reported by the gateway.
-    var expiresAt: Int
-    var provider: String
-    var userID: String
+    public var expiresAt: Int
+    public var provider: String
+    public var userID: String
 
-    /// Treat a token inside the skew window as already dead so a request
-    /// can't lose a race against expiry mid-flight.
-    func isExpired(skew: TimeInterval = 60) -> Bool {
+    public func isExpired(skew: TimeInterval = 60) -> Bool {
         Date().timeIntervalSince1970 + skew >= Double(expiresAt)
     }
 }
@@ -32,7 +30,7 @@ struct Credentials: Codable, Sendable {
 /// prefers a real codesigning identity when one is installed. Once a Developer
 /// ID certificate exists, the ACL becomes stable and this should move back to
 /// the Keychain.
-enum CredentialStore {
+public enum CredentialStore {
     /// `~/Library/Application Support/Hermternal/credentials/`
     private static var directory: URL {
         let base = FileManager.default

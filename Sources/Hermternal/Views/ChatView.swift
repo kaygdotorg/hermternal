@@ -1,4 +1,5 @@
 import SwiftUI
+import HermternalCore
 import AppKit
 
 struct ChatView: View {

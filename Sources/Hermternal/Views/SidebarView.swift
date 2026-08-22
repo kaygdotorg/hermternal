@@ -1,4 +1,5 @@
 import SwiftUI
+import HermternalCore
 
 struct SidebarView: View {
     @Bindable var model: AppModel

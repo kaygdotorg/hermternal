@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import HermternalCore
 import Observation
 
 @MainActor
@@ -45,15 +47,18 @@ final class AppModel {
     private var auth: AuthClient?
     private var gateway: GatewayClient?
     private var rest: RestClient?
+    /// Injectable seam for exercising cache-first opening without a live app
+    /// connection; production builds construct the gateway/rest adapter.
+    private let injectedTranscriptSource: (any TranscriptSource)?
     private var eventTask: Task<Void, Never>?
-    private let cache = HistoryCache()
+    private let cache: HistoryCache
     private var prefetchTask: Task<Void, Never>?
     private var cacheControlTask: Task<Void, Never>?
     private var cacheControlGeneration = 0
     private var prefetchGeneration = 0
-    /// Guards against a slow resume for an earlier click overwriting the
-    /// transcript the user is now looking at.
-    private var openGeneration = 0
+    /// Core-owned generation guard used by opening and terminal reconciliation.
+    private let openGenerations = OpenGenerationController()
+    private var streamingReducer = StreamingEventReducer()
 
     private static let serverKey = "serverURL"
     private static let defaultServer = "https://hermes-dashboard.kayg.org"
@@ -68,6 +73,14 @@ final class AppModel {
             return nil
         }
         return url
+    }
+
+    init(
+        cache: HistoryCache = HistoryCache(),
+        transcriptSource: (any TranscriptSource)? = nil
+    ) {
+        self.cache = cache
+        self.injectedTranscriptSource = transcriptSource
     }
 
     // MARK: - Lifecycle
@@ -93,7 +106,7 @@ final class AppModel {
             phase = .failed(AuthError.badServerURL.localizedDescription)
             return
         }
-        let auth = AuthClient(server: url)
+        let auth = AuthClient(server: url, openURL: { NSWorkspace.shared.open($0) })
         self.auth = auth
         guard await auth.storedCredentials != nil else {
             phase = .signedOut
@@ -108,7 +121,7 @@ final class AppModel {
             return
         }
         UserDefaults.standard.set(serverText, forKey: Self.serverKey)
-        let auth = AuthClient(server: url)
+        let auth = AuthClient(server: url, openURL: { NSWorkspace.shared.open($0) })
         self.auth = auth
 
         phase = .connecting
@@ -124,6 +137,7 @@ final class AppModel {
     }
 
     func signOut() async {
+        _ = openGenerations.begin()
         eventTask?.cancel()
         eventTask = nil
         prefetchTask?.cancel()
@@ -144,7 +158,9 @@ final class AppModel {
         isCacheWarming = false
         liveSessionID = nil
         sessions = []
+        streamingReducer.reset()
         messages = []
+        isAwaitingReply = streamingReducer.isAwaitingReply
         selectedSessionID = nil
         phase = .signedOut
     }
@@ -203,11 +219,13 @@ final class AppModel {
 
     func setCacheEnabled(_ enabled: Bool) {
         guard cacheEnabled != enabled else { return }
+        // Invalidate every opener before beginning the purge. A delayed
+        // opener captured with caching enabled must not write after disable.
+        _ = openGenerations.begin()
         cacheEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "cache.enabled")
         cacheControlGeneration += 1
         let generation = cacheControlGeneration
-
         prefetchTask?.cancel()
         prefetchGeneration += 1
         prefetchTask = nil
@@ -302,54 +320,33 @@ final class AppModel {
         prefetchTask?.cancel()
         prefetchGeneration += 1
         let generation = prefetchGeneration
+        let totals = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0.messageCount) })
         isCacheWarming = true
         prefetchTask = Task { [weak self, cache] in
-            let lanes = 4
-            await withTaskGroup(of: CacheStoreResult?.self) { group in
-                var next = 0
-                func addTask(_ id: String) {
-                    group.addTask {
-                        guard await !cache.isCached(id) else { return nil }
-                        guard !Task.isCancelled,
-                              let rows = try? await rest.sessionMessages(durableID: id)
-                        else { return nil }
-                        guard !Task.isCancelled else { return nil }
-                        let projected = ChatMessage.project(
-                            historyRows: rows,
-                            sessionID: id
-                        )
-                        return await cache.store(projected, for: id)
-                    }
-                }
-                while next < ordered.count, next < lanes {
-                    addTask(ordered[next])
-                    next += 1
-                }
-                while let result = await group.next() {
-                    guard let self,
-                          generation == self.prefetchGeneration,
-                          self.cacheEnabled
-                    else {
-                        group.cancelAll()
-                        return
-                    }
-                    if let result {
-                        self.applyCacheStore(result)
-                    }
-                    if Task.isCancelled {
-                        group.cancelAll()
-                        break
-                    }
-                    if next < ordered.count {
-                        addTask(ordered[next])
-                        next += 1
-                    }
-                }
+            let coordinator = BoundedPrefetchCoordinator(limit: 4)
+            let results: [CacheStoreResult] = await coordinator.prefetch(ordered) { id in
+                guard await !cache.isCached(id),
+                      !Task.isCancelled,
+                      let rows = try? await rest.sessionMessages(durableID: id),
+                      !Task.isCancelled
+                else { return nil }
+                let projected = ChatMessage.projectREST(historyRows: rows)
+                let snapshot = CacheFirstOpenPolicy.snapshot(
+                    sessionID: id,
+                    rows: rows,
+                    projectedMessages: projected.count,
+                    serverTotal: totals[id]
+                )
+                return await cache.store(projected, snapshot: snapshot, for: id)
             }
             guard let self,
                   generation == self.prefetchGeneration,
                   self.cacheEnabled
             else { return }
+            for result in results {
+                guard generation == self.prefetchGeneration, self.cacheEnabled else { return }
+                self.applyCacheStore(result)
+            }
             self.isCacheWarming = false
             Log.info(
                 "prefetch: cached \(self.cacheCachedCount)/\(self.cacheTotalCount) "
@@ -366,11 +363,14 @@ final class AppModel {
     }
 
     func newChat() async {
+        _ = openGenerations.begin()
         guard let gateway else { return }
         do {
             let result = try await gateway.call("session.create")
             liveSessionID = result["session_id"]?.stringValue
+            streamingReducer.reset()
             messages = []
+            isAwaitingReply = streamingReducer.isAwaitingReply
             // `session.create` does not persist a row until the first
             // prompt, so there is nothing to select in the sidebar yet.
             selectedSessionID = nil
@@ -386,52 +386,61 @@ final class AppModel {
     /// Renders the cached transcript synchronously so the click feels
     /// instant, then resumes over the socket to bind the live ephemeral id
     /// that `prompt.submit` requires and to reconcile any drift.
+    private func transcriptSource(for session: ChatSession) -> (any TranscriptSource)? {
+        if let injectedTranscriptSource { return injectedTranscriptSource }
+        guard let gateway, let rest else { return nil }
+        return GatewayTranscriptSource(
+            gateway: gateway,
+            rest: rest,
+            serverTotals: [session.id: session.messageCount]
+        )
+    }
+    private func transcriptSource(
+        sessionID: String?,
+        serverTotal: Int?
+    ) -> (any TranscriptSource)? {
+        if let injectedTranscriptSource { return injectedTranscriptSource }
+        guard let gateway, let rest else { return nil }
+        var totals: [String: Int] = [:]
+        if let sessionID, let serverTotal { totals[sessionID] = serverTotal }
+        return GatewayTranscriptSource(gateway: gateway, rest: rest, serverTotals: totals)
+    }
     func open(_ session: ChatSession) async {
-        guard let gateway else { return }
-        openGeneration += 1
-        let generation = openGeneration
+        guard let source = transcriptSource(for: session) else { return }
+        let generation = openGenerations.begin()
         selectedSessionID = session.id
 
-        if cacheEnabled, let cached = await cache.messages(for: session.id) {
-            // Only paint if this is still the row the user is looking at.
-            guard generation == openGeneration else { return }
-            messages = cached
-            Log.info("open \(session.id): \(cached.count) messages from cache")
-        } else {
-            messages = []
-        }
-
-        do {
-            let result = try await gateway.call(
-                "session.resume",
-                params: ["session_id": session.id]
-            )
-            // A superseded arrow-selection request may still receive its RPC
-            // response because GatewayClient.call is continuation-based. Stop
-            // before row projection, encoding, disk I/O, or UI publication.
-            guard generation == openGeneration, !Task.isCancelled else { return }
-            let rows = result["messages"]?.arrayValue ?? []
-            let resumed = ChatMessage.project(
-                historyRows: rows,
-                sessionID: session.id
-            )
-            if cacheEnabled {
-                let result = await cache.store(resumed, for: session.id)
-                applyCacheStore(result)
+        let opener = TranscriptOpener(
+            source: source,
+            cache: cache,
+            cacheEnabled: cacheEnabled,
+            generations: openGenerations
+        )
+        for await result in opener.openPhases(
+            sessionID: session.id,
+            serverTotal: session.messageCount,
+            generation: generation
+        ) {
+            guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+            if !result.isCachedPhase {
+                liveSessionID = result.liveSessionID
             }
-            liveSessionID = result["session_id"]?.stringValue
-            messages = resumed
+            streamingReducer.reset(messages: result.messages)
+            messages = result.messages
+            isAwaitingReply = streamingReducer.isAwaitingReply
+            if let notice = result.notice {
+                self.notice = notice
+                Log.error("open \(session.id): \(notice)")
+            }
+            if let cacheStore = result.cacheStore {
+                applyCacheStore(cacheStore)
+            }
             Log.info(
-                "session.resume -> live id \(liveSessionID ?? "nil"), "
-                + "\(rows.count) rows, \(resumed.count) rendered"
+                "open \(session.id): \(result.messages.count) messages"
+                + (result.didFetchREST ? " from REST" : " from cache")
             )
-        } catch {
-            Log.error("session.resume failed: \(error)")
-            guard generation == openGeneration else { return }
-            notice = "Could not open that chat: \(error.localizedDescription)"
         }
     }
-
     // MARK: - Prompting
 
     func send() async {
@@ -441,99 +450,103 @@ final class AppModel {
         // A first message with no session yet needs one created first.
         if liveSessionID == nil {
             await newChat()
+            guard !Task.isCancelled else { return }
         }
         guard let sessionID = liveSessionID else { return }
 
         composerText = ""
-        // Live messages keep random IDs because their text changes per delta;
-        // history projections assign stable IDs when this session is reopened.
-        messages.append(ChatMessage(role: .user, text: text))
-        isAwaitingReply = true
+        // A new turn supersedes any terminal reconciliation still awaiting
+        // REST. Its result must not replace this turn or clear its state.
+        let generation = openGenerations.begin()
+        streamingReducer.appendUser(text)
+        messages = streamingReducer.messages
+        isAwaitingReply = streamingReducer.isAwaitingReply
 
         do {
             _ = try await gateway.call(
                 "prompt.submit",
                 params: ["session_id": sessionID, "text": text]
             )
+            guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
         } catch {
-            isAwaitingReply = false
+            guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+            let reduction = streamingReducer.cancel()
+            messages = reduction.messages
+            isAwaitingReply = reduction.isAwaitingReply
             notice = "Send failed: \(error.localizedDescription)"
         }
     }
-
     func interrupt() async {
         guard let gateway, let sessionID = liveSessionID else { return }
+        let generation = openGenerations.current()
         _ = try? await gateway.call("session.interrupt", params: ["session_id": sessionID])
-        finishStreaming()
+        guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+        let reduction = streamingReducer.interrupt()
+        messages = reduction.messages
+        isAwaitingReply = reduction.isAwaitingReply
+        await reconcileTerminal(reduction.terminal)
     }
 
     // MARK: - Events
 
     private func handle(_ event: GatewayEvent) async {
-        switch event.type {
-        case "message.start":
-            messages.append(ChatMessage(role: .assistant, text: "", isStreaming: true))
-
-        case "message.delta":
-            guard let delta = event.text, !delta.isEmpty else { return }
-            appendDelta(delta)
-
-        case "message.complete":
-            // The final frame carries the authoritative full text, which may
-            // differ from the concatenated deltas (post-processing, cleanup).
-            if let full = event.text, !full.isEmpty {
-                if let index = streamingIndex {
-                    messages[index].text = full
-                } else {
-                    messages.append(ChatMessage(role: .assistant, text: full))
-                }
-            }
-            finishStreaming()
-            // Keep the cache in step with the completed turn so reopening
-            // this chat does not briefly show a stale transcript.
-            if let id = selectedSessionID {
-                if cacheEnabled {
-                    let result = await cache.store(messages, for: id)
-                    applyCacheStore(result)
-                }
-            } else {
-                // A first turn only now creates the durable row; refresh so
-                // it appears in the sidebar.
-                await loadSessions()
-            }
-
-        case "error":
-            notice = event.text ?? "The agent reported an error."
-            finishStreaming()
-
-        case "transport.closed":
+        if event.type == "transport.closed" {
             phase = .failed(event.text ?? "The gateway connection closed.")
-            finishStreaming()
-
-        default:
-            // tool.*, thinking.*, reasoning.*, status.* are deliberately
-            // ignored in v1 — chat text only.
-            break
+            let reduction = streamingReducer.cancel()
+            messages = reduction.messages
+            isAwaitingReply = reduction.isAwaitingReply
+            return
         }
+
+        let reduction = streamingReducer.reduce(event)
+        messages = reduction.messages
+        isAwaitingReply = reduction.isAwaitingReply
+        if let notice = reduction.notice {
+            self.notice = notice
+        }
+        await reconcileTerminal(reduction.terminal)
     }
 
-    private var streamingIndex: Int? {
-        messages.lastIndex { $0.isStreaming }
-    }
-
-    private func appendDelta(_ delta: String) {
-        if let index = streamingIndex {
-            messages[index].text += delta
-        } else {
-            // Some turns stream without a preceding message.start.
-            messages.append(ChatMessage(role: .assistant, text: delta, isStreaming: true))
+    private func reconcileTerminal(_ terminal: StreamingTerminal?) async {
+        guard terminal != nil else { return }
+        let generation = openGenerations.current()
+        let sessionID = selectedSessionID
+        let serverTotal = sessionID.flatMap { id in
+            sessions.first { $0.id == id }?.messageCount
         }
-    }
-
-    private func finishStreaming() {
-        if let index = streamingIndex {
-            messages[index].isStreaming = false
+        guard let source = transcriptSource(sessionID: sessionID, serverTotal: serverTotal) else {
+            if sessionID == nil {
+                await loadSessions()
+                guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+            }
+            return
         }
-        isAwaitingReply = false
+        let opener = TranscriptOpener(
+            source: source,
+            cache: cache,
+            cacheEnabled: cacheEnabled,
+            generations: openGenerations
+        )
+        guard let result = await opener.reconcileTerminal(
+            sessionID: sessionID,
+            serverTotal: serverTotal,
+            currentMessages: messages,
+            generation: generation
+        ) else { return }
+        guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+        streamingReducer.reset(messages: result.messages)
+        messages = result.messages
+        isAwaitingReply = streamingReducer.isAwaitingReply
+        if let notice = result.notice {
+            self.notice = notice
+            Log.error("terminal transcript reconciliation failed: \(notice)")
+        }
+        if let cacheStore = result.cacheStore {
+            applyCacheStore(cacheStore)
+        }
+        if result.requiresSessionRefresh {
+            await loadSessions()
+            guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+        }
     }
 }

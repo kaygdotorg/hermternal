@@ -1,5 +1,5 @@
-import AppKit
 import Foundation
+
 
 /// Drives the gateway-brokered RFC 8252 native-app login and keeps the
 /// bearer credential fresh.
@@ -8,28 +8,36 @@ import Foundation
 /// upstream IDP, so we never talk to Authentik/Portal directly: we open the
 /// system browser at `/auth/native/authorize`, catch the loopback redirect,
 /// and exchange the one-time code at `/auth/native/token`.
-actor AuthClient {
+public actor AuthClient {
     private let server: URL
     /// Credential store key — the origin, so switching instances doesn't
     /// clobber another instance's tokens.
     private let account: String
     private let urlSession: URLSession
+    private let openURL: @Sendable (URL) -> Void
 
-    init(server: URL, urlSession: URLSession = .shared) {
+    public init(
+        server: URL,
+        urlSession: URLSession = .shared,
+        openURL: @escaping @Sendable (URL) -> Void = { _ in }
+    ) {
         self.server = server
         self.account = server.absoluteString
         self.urlSession = urlSession
+        self.openURL = openURL
     }
 
-    var storedCredentials: Credentials? { CredentialStore.load(account: account) }
+    public var storedCredentials: Credentials? { CredentialStore.load(account: account) }
 
-    func signOut() { CredentialStore.delete(account: account) }
+    public func signOut() { CredentialStore.delete(account: account) }
+
+
 
     // MARK: - Interactive login
 
     /// Full native login. Opens the system browser and resolves once the
     /// loopback redirect has been exchanged for bearer tokens.
-    func signIn() async throws -> Credentials {
+    public func signIn() async throws -> Credentials {
         let pkce = PKCE()
         let state = PKCE.randomState()
         let loopback = LoopbackServer()
@@ -50,7 +58,7 @@ actor AuthClient {
         ]
         guard let authorizeURL = components.url else { throw AuthError.badServerURL }
 
-        NSWorkspace.shared.open(authorizeURL)
+        openURL(authorizeURL)
 
         let callback = try await loopback.waitForCallback()
         // The gateway echoes our own `state` verbatim; a mismatch means the
@@ -100,7 +108,7 @@ actor AuthClient {
     /// Return a live access token, rotating it first when it is at or past
     /// expiry. Throws `.sessionExpired` when the refresh token is dead, so
     /// the UI can fall back to a fresh interactive login.
-    func validCredentials() async throws -> Credentials {
+    public func validCredentials() async throws -> Credentials {
         guard let stored = storedCredentials else { throw AuthError.notSignedIn }
         guard stored.isExpired() else { return stored }
         guard !stored.refreshToken.isEmpty else { throw AuthError.sessionExpired }
@@ -152,7 +160,7 @@ actor AuthClient {
     ///
     /// The WS gate rejects `Authorization` headers outright, so every
     /// connect (and reconnect) needs a fresh ticket.
-    func webSocketTicket() async throws -> String {
+    public func webSocketTicket() async throws -> String {
         struct Response: Decodable { let ticket: String }
 
         let credentials = try await validCredentials()

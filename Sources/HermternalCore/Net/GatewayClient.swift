@@ -1,22 +1,31 @@
 import Foundation
 
 /// A gateway-pushed event: `{"method":"event","params":{"type":…,"payload":…}}`.
-struct GatewayEvent: Sendable {
-    let type: String
-    let sessionID: String?
-    let payload: JSONValue?
+public struct GatewayEvent: Sendable {
+    public let type: String
+    public let sessionID: String?
+    public let payload: JSONValue?
+    public init(type: String, sessionID: String?, payload: JSONValue?) {
+        self.type = type
+        self.sessionID = sessionID
+        self.payload = payload
+    }
 
-    /// Streaming text lives under `payload.text` for `message.delta`,
-    /// `message.complete`, `thinking.delta`, and `reasoning.delta` alike.
-    var text: String? { payload?["text"]?.stringValue }
+    public var text: String? { payload?["text"]?.stringValue }
+    /// Reserved for a future gateway payload carrying the durable row id.
+    /// Current live events are unverified and therefore remain provisional.
+    public var serverMessageID: ServerMessageID? {
+        guard let raw = (payload?["id"] ?? payload?["row_id"])?.int64Value else { return nil }
+        return ServerMessageID(rawValue: raw)
+    }
 }
 
-enum GatewayError: LocalizedError {
+public enum GatewayError: LocalizedError {
     case notConnected
     case rpc(code: Int, message: String)
     case connectionClosed(String)
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .notConnected: "Not connected to the Hermes gateway."
         case .rpc(let code, let message): "Gateway error \(code): \(message)"
@@ -31,28 +40,26 @@ enum GatewayError: LocalizedError {
 /// The socket is the only transport the dashboard exposes remotely — the
 /// OpenAI-compatible API server binds loopback only — so this carries both
 /// request/response calls and the streaming event feed.
-actor GatewayClient {
-    /// Events in gateway order. `nonisolated` so the UI can attach before
-    /// the first connect without an actor hop.
-    nonisolated let events: AsyncStream<GatewayEvent>
+public actor GatewayClient {
+    public nonisolated let events: AsyncStream<GatewayEvent>
     private nonisolated let eventContinuation: AsyncStream<GatewayEvent>.Continuation
 
     private var task: URLSessionWebSocketTask?
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
     private var receiveLoop: Task<Void, Never>?
+    private var ndjsonParser = NDJSONFrameParser()
 
-    init() {
+    public init() {
         let (stream, continuation) = AsyncStream<GatewayEvent>.makeStream()
         events = stream
         eventContinuation = continuation
     }
-
     /// Dial `wss://host/api/ws?ticket=…`.
     ///
     /// The ticket is single-use with a 30s TTL, so callers must mint a fresh
     /// one immediately before every connect and reconnect.
-    func connect(server: URL, ticket: String) throws {
+    public func connect(server: URL, ticket: String) throws {
         disconnect()
 
         guard var components = URLComponents(
@@ -69,7 +76,7 @@ actor GatewayClient {
         receiveLoop = Task { await self.receiveMessages(on: task) }
     }
 
-    func disconnect() {
+    public func disconnect() {
         receiveLoop?.cancel()
         receiveLoop = nil
         task?.cancel(with: .goingAway, reason: nil)
@@ -80,7 +87,7 @@ actor GatewayClient {
     // MARK: - Calls
 
     /// Issue a JSON-RPC call and await its result.
-    func call(_ method: String, params: [String: Any] = [:]) async throws -> JSONValue {
+    public func call(_ method: String, params: [String: Any] = [:]) async throws -> JSONValue {
         guard let task else { throw GatewayError.notConnected }
 
         let id = nextID
@@ -138,12 +145,9 @@ actor GatewayClient {
 
     /// A single WebSocket message may carry several newline-delimited frames.
     private func ingest(text: String) {
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            guard let data = line.data(using: .utf8) else { continue }
+        for data in ndjsonParser.append(text) {
             guard let frame = try? JSONDecoder().decode(Frame.self, from: data) else {
-                // Surface rather than swallow: an unparseable frame is a
-                // protocol drift we want visible while iterating.
-                emit("transport.malformed", text: String(line.prefix(512)))
+                emit("transport.malformed", text: String(decoding: data.prefix(512), as: UTF8.self))
                 continue
             }
             route(frame)
@@ -161,7 +165,6 @@ actor GatewayClient {
             }
             return
         }
-        // Not a response: an `event` push.
         guard frame.method == "event",
               let params = frame.params,
               let type = params["type"]?.stringValue
