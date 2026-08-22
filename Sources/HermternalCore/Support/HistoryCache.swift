@@ -325,11 +325,20 @@ public actor HistoryCache: TranscriptPersisting {
             return (nil, observedEpoch)
         }
         if fileSystem.fileExists(at: target) {
-            if let stored = storedTranscript(at: target) {
+            do {
+                let stored = try storedTranscript(at: target)
                 memory[id] = stored
                 return (stored, observedEpoch)
+            } catch StoredTranscriptError.invalid {
+                // A present file is removed only after a genuine decode or
+                // version failure; a lookup miss must never destroy a cache.
+                try? fileSystem.removeItem(at: target)
+            } catch StoredTranscriptError.unavailable {
+                // Leave unreadable files in place for a later retry.
             }
-            try? fileSystem.removeItem(at: target)
+            catch {
+                // Preserve the file if the filesystem reports an unknown read failure.
+            }
         }
 
         guard let legacy = legacyURL(for: id), Self.pathIdentity(legacy) != Self.pathIdentity(target) else {
@@ -338,12 +347,19 @@ public actor HistoryCache: TranscriptPersisting {
         guard fileSystem.fileExists(at: legacy) else {
             return (nil, observedEpoch)
         }
-        guard let stored = storedTranscript(at: legacy) else {
+        do {
+            let stored = try storedTranscript(at: legacy)
+            _ = adoptLegacyTranscript(stored, for: id, from: legacy, to: target)
+            return (stored, observedEpoch)
+        } catch StoredTranscriptError.invalid {
             try? fileSystem.removeItem(at: legacy)
             return (nil, observedEpoch)
+        } catch StoredTranscriptError.unavailable {
+            return (nil, observedEpoch)
         }
-        _ = adoptLegacyTranscript(stored, for: id, from: legacy, to: target)
-        return (stored, observedEpoch)
+        catch {
+            return (nil, observedEpoch)
+        }
     }
 
     public func currentEpoch() -> UInt64 { epoch }
@@ -429,6 +445,7 @@ public actor HistoryCache: TranscriptPersisting {
     public func isCached(_ id: String) -> Bool { transcript(for: id) != nil }
 
     public func reconcile(validIDs: [String]) -> CacheStatistics {
+        // Reconcile establishes disk truth, so no stale in-memory transcript survives it.
         memory.removeAll()
         guard let directory,
               let files = try? fileSystem.contentsOfDirectory(at: directory)

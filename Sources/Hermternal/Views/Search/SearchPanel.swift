@@ -455,9 +455,18 @@ private struct ResultsSearchState: View {
     let fieldFrame: CGRect
     let activate: (MessageLocation) -> Void
 
-    // Only the content above the measured glass top is concealed. Once rows
-    // reach the top edge, they remain present for the clear glass to refract.
-    private static let aboveFieldFadeDistance: CGFloat = 24
+    // The mask is a shape-derived falloff around the pill, not a painted
+    // halo. The floor deliberately leaves 30% of the scrolling content under
+    // the clear glass so it can refract rows instead of becoming an empty void.
+    private static let underPillOpacityFloor: Double = 0.30
+    private static let abovePillFadeDistance: CGFloat = 96
+    private static let abovePillSoftStop: CGFloat = 48
+    private static let abovePillFloorStop: CGFloat = 72
+    private static let pillCornerRadius: CGFloat = 23
+    private static let edgeFalloffDistance: CGFloat = 22
+    private static let edgeFalloffBlurRadius: CGFloat = 14
+    private static let fallbackPillTop: CGFloat = 15
+
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 2) {
@@ -482,33 +491,76 @@ private struct ResultsSearchState: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .mask {
             GeometryReader { geometry in
-                let viewportHeight = max(geometry.size.height, 1)
-                let measuredFieldTop = fieldFrame.height > 0
-                    ? fieldFrame.minY
-                    : 0
-                let fieldTopEdge = min(
-                    max(measuredFieldTop, 0),
+                let viewportSize = geometry.size
+                let viewportHeight = max(viewportSize.height, 1)
+                let measuredPillRect = fieldFrame.width > 0 && fieldFrame.height > 0
+                    ? fieldFrame
+                    : CGRect(
+                        x: 18,
+                        y: Self.fallbackPillTop,
+                        width: max(viewportSize.width - 36, 1),
+                        height: 46
+                    )
+                let pillTopEdge = min(
+                    max(measuredPillRect.minY, 0),
                     viewportHeight
                 )
-                let aboveFieldFadeStart = max(
-                    fieldTopEdge - Self.aboveFieldFadeDistance,
+                let fadeStart = max(
+                    pillTopEdge - Self.abovePillFadeDistance,
                     0
                 )
-                // A mask reveals content where it is opaque. The only
-                // transparent region is above the measured field top edge;
-                // from that edge down, rows stay visible behind the glass
-                // and fully legible below it. There is deliberately no
-                // bottom ramp: the pill edge already transitions the rows.
-                LinearGradient(
-                    stops: [
-                        .init(color: .clear, location: 0),
-                        .init(color: .clear, location: aboveFieldFadeStart / viewportHeight),
-                        .init(color: .black, location: fieldTopEdge / viewportHeight),
-                        .init(color: .black, location: 1)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
+                let availableFadeHeight = max(pillTopEdge - fadeStart, 0)
+                let softStop = fadeStart + min(
+                    Self.abovePillSoftStop / Self.abovePillFadeDistance,
+                    1
+                ) * availableFadeHeight
+                let floorStop = fadeStart + min(
+                    Self.abovePillFloorStop / Self.abovePillFadeDistance,
+                    1
+                ) * availableFadeHeight
+                let pillShapeRect = measuredPillRect.insetBy(
+                    dx: -Self.edgeFalloffDistance,
+                    dy: -Self.edgeFalloffDistance
                 )
+
+                ZStack {
+                    // The arriving edge ramps toward the pill. The blurred
+                    // rounded shape then lowers the mask to the partial floor
+                    // inside the pill and fades its sides and bottom edge.
+                    LinearGradient(
+                        stops: [
+                            .init(color: .clear, location: 0),
+                            .init(color: .clear, location: fadeStart / viewportHeight),
+                            .init(
+                                color: .black.opacity(Self.underPillOpacityFloor * 0.35),
+                                location: softStop / viewportHeight
+                            ),
+                            .init(
+                                color: .black.opacity(Self.underPillOpacityFloor),
+                                location: floorStop / viewportHeight
+                            ),
+                            .init(color: .black, location: pillTopEdge / viewportHeight),
+                            .init(color: .black, location: 1)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+
+                    RoundedRectangle(
+                        cornerRadius: Self.pillCornerRadius + Self.edgeFalloffDistance,
+                        style: .continuous
+                    )
+                    .fill(Color.black.opacity(1 - Self.underPillOpacityFloor))
+                    .frame(
+                        width: max(pillShapeRect.width, 1),
+                        height: max(pillShapeRect.height, 1)
+                    )
+                    .position(x: pillShapeRect.midX, y: pillShapeRect.midY)
+                    .blur(radius: Self.edgeFalloffBlurRadius)
+                    .blendMode(.destinationOut)
+                }
+                .compositingGroup()
+                .allowsHitTesting(false)
             }
         }
         .scrollIndicators(.visible)
