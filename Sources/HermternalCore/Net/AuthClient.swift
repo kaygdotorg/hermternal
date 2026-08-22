@@ -15,22 +15,36 @@ public actor AuthClient {
     private let account: String
     private let urlSession: URLSession
     private let openURL: @Sendable (URL) -> Void
+    private let credentialStore: any CredentialStoring
+    private var refreshTask: Task<Credentials, Error>?
+    private var refreshGeneration = 0
+    private var refreshRejected = false
 
     public init(
         server: URL,
         urlSession: URLSession = .shared,
-        openURL: @escaping @Sendable (URL) -> Void = { _ in }
+        openURL: @escaping @Sendable (URL) -> Void = { _ in },
+        credentialStore: (any CredentialStoring)? = nil
     ) {
         self.server = server
         self.account = server.absoluteString
         self.urlSession = urlSession
         self.openURL = openURL
+        self.credentialStore = credentialStore ?? FacadeCredentialStore()
     }
 
-    public var storedCredentials: Credentials? { CredentialStore.load(account: account) }
+    public var storedCredentials: Credentials? {
+        try? credentialStore.load(account: account)
+    }
 
-    public func signOut() { CredentialStore.delete(account: account) }
+    public func signOut() {
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshRejected = false
+        try? credentialStore.delete(account: account)
+    }
     // MARK: - Provider discovery
+
 
     /// Fetch provider capabilities without making discovery a prerequisite
     /// for sign-in. Older/self-hosted gateways may not expose this endpoint.
@@ -138,7 +152,7 @@ public actor AuthClient {
         guard callback.state == state else { throw AuthError.stateMismatch }
 
         let credentials = try await exchange(code: callback.code, verifier: pkce.verifier)
-        try CredentialStore.save(credentials, account: account)
+        try credentialStore.save(credentials, account: account)
         return credentials
     }
 
@@ -177,13 +191,52 @@ public actor AuthClient {
 
     // MARK: - Refresh
 
-    /// Return a live access token, rotating it first when it is at or past
-    /// expiry. Throws `.sessionExpired` when the refresh token is dead, so
-    /// the UI can fall back to a fresh interactive login.
-    public func validCredentials() async throws -> Credentials {
+    public func validCredentials(forceRefresh: Bool = false) async throws -> Credentials {
+        if refreshRejected { throw AuthError.sessionExpired }
         guard let stored = storedCredentials else { throw AuthError.notSignedIn }
-        guard stored.isExpired() else { return stored }
-        guard !stored.refreshToken.isEmpty else { throw AuthError.sessionExpired }
+        if !forceRefresh, stored.isExpired() == false {
+            return stored
+        }
+        return try await refreshCredentials()
+    }
+
+    /// Force one refresh after a server rejects an otherwise unexpired bearer.
+    /// Concurrent callers share this task, while a rejected refresh is sticky
+    /// until sign-out so lifecycle reconnects fail fast instead of hammering.
+    public func refreshCredentials() async throws -> Credentials {
+        if refreshRejected { throw AuthError.sessionExpired }
+        if let existing = refreshTask {
+            do {
+                return try await existing.value
+            } catch {
+                if case AuthError.sessionExpired = error { refreshRejected = true }
+                throw error
+            }
+        }
+
+        refreshGeneration += 1
+        let generation = refreshGeneration
+        let task = Task { try await self.performRefresh() }
+        refreshTask = task
+        do {
+            let result = try await task.value
+            if refreshGeneration == generation { refreshTask = nil }
+            return result
+        } catch {
+            if refreshGeneration == generation { refreshTask = nil }
+            if case AuthError.sessionExpired = error { refreshRejected = true }
+            throw error
+        }
+    }
+
+    private func performRefresh() async throws -> Credentials {
+        guard let stored = storedCredentials else { throw AuthError.notSignedIn }
+        guard !stored.refreshToken.isEmpty else {
+            // Treat a damaged/legacy credential as signed out so the next
+            // lifecycle pass presents sign-in instead of retrying forever.
+            try? credentialStore.delete(account: account)
+            throw AuthError.sessionExpired
+        }
 
         struct Body: Encodable {
             let refresh_token: String
@@ -203,7 +256,7 @@ public actor AuthClient {
         )
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         if status == 401 {
-            CredentialStore.delete(account: account)
+            try? credentialStore.delete(account: account)
             throw AuthError.sessionExpired
         }
         guard status == 200 else {
@@ -222,31 +275,67 @@ public actor AuthClient {
             provider: decoded.provider ?? stored.provider,
             userID: decoded.user_id ?? stored.userID
         )
-        try CredentialStore.save(rotated, account: account)
+        try credentialStore.save(rotated, account: account)
         return rotated
     }
+
 
     // MARK: - WebSocket ticket
 
     /// Mint a single-use 30s ticket for the `/api/ws` upgrade.
     ///
     /// The WS gate rejects `Authorization` headers outright, so every
-    /// connect (and reconnect) needs a fresh ticket.
+    /// connect (and reconnect) needs a fresh ticket. A stale bearer can still
+    /// be rejected even when its local expiry is in the future; in that case
+    /// refresh once and retry the ticket request once.
     public func webSocketTicket() async throws -> WebSocketTicket {
         let credentials = try await validCredentials()
+        let first = try await requestWebSocketTicket(using: credentials)
+        guard first.status == 401 else {
+            return try JSONDecoder().decode(WebSocketTicket.self, from: first.data)
+        }
+
+        let refreshed = try await refreshCredentials()
+        let retry = try await requestWebSocketTicket(using: refreshed)
+        guard retry.status == 200 else {
+            throw AuthError.ticketFailed(
+                status: retry.status,
+                body: String(decoding: retry.data, as: UTF8.self)
+            )
+        }
+        return try JSONDecoder().decode(WebSocketTicket.self, from: retry.data)
+    }
+
+    private func requestWebSocketTicket(
+        using credentials: Credentials
+    ) async throws -> (data: Data, status: Int) {
         var request = URLRequest(url: server.appendingPathComponent("api/auth/ws-ticket"))
         request.httpMethod = "POST"
         request.setValue("Bearer \(credentials.accessToken)", forHTTPHeaderField: "Authorization")
 
         let (data, response) = try await urlSession.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-        guard status == 200 else {
+        guard status == 200 || status == 401 else {
             throw AuthError.ticketFailed(
                 status: status,
                 body: String(decoding: data, as: UTF8.self)
             )
         }
-        return try JSONDecoder().decode(WebSocketTicket.self, from: data)
+        return (data, status)
+    }
+
+    private struct FacadeCredentialStore: CredentialStoring {
+        func save(_ credentials: Credentials, account: String) throws {
+            try CredentialStore.save(credentials, account: account)
+        }
+
+        func load(account: String) throws -> Credentials? {
+            try CredentialStore.loadThrowing(account: account)
+        }
+
+        func delete(account: String) throws {
+            try CredentialStore.deleteThrowing(account: account)
+        }
     }
 
     // MARK: - Plumbing

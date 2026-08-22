@@ -29,7 +29,8 @@ public actor RestClient {
     /// first and concatenated without sorting so the database's stable order
     /// is preserved.
     public func sessionMessages(durableID: String, limit: Int = 500) async throws -> [JSONValue] {
-        let credentials = try await auth.validCredentials()
+        var credentials = try await auth.validCredentials()
+        var hasRefreshedAfterUnauthorized = false
         let pageLimit = min(max(limit, 1), 500)
         var rows: [JSONValue] = []
         rows.reserveCapacity(pageLimit)
@@ -41,12 +42,33 @@ public actor RestClient {
         // these checks stop paging when navigation supersedes an open.
         for _ in 0..<Self.maximumMessagePages {
             try Task.checkCancellation()
-            let page = try await fetchMessagePage(
-                durableID: durableID,
-                limit: pageLimit,
-                offset: offset,
-                credentials: credentials
-            )
+            let page: MessagesResponse
+            do {
+                page = try await fetchMessagePage(
+                    durableID: durableID,
+                    limit: pageLimit,
+                    offset: offset,
+                    credentials: credentials
+                )
+            } catch {
+                guard case RestError.badStatus(let status, _) = error,
+                      status == 401,
+                      hasRefreshedAfterUnauthorized == false
+                else {
+                    throw error
+                }
+                hasRefreshedAfterUnauthorized = true
+                // The local expiry can lag server-side revocation. Refresh
+                // once, then retry this page with the new bearer; a refresh
+                // failure is sessionExpired and escapes without a loop.
+                credentials = try await auth.refreshCredentials()
+                page = try await fetchMessagePage(
+                    durableID: durableID,
+                    limit: pageLimit,
+                    offset: offset,
+                    credentials: credentials
+                )
+            }
             try Task.checkCancellation()
             rows.append(contentsOf: page.messages)
 
