@@ -163,10 +163,60 @@ public actor HistoryCache: TranscriptPersisting {
 
     private func url(for id: String) -> URL? {
         guard let directory else { return nil }
+        return URL(fileURLWithPath: directory.path + "/" + encodedFilename(for: id) + ".json")
+    }
+
+    /// The legacy filename, retained only to migrate caches written before
+    /// punctuation was made injective.
+    private func legacyURL(for id: String) -> URL? {
+        guard let directory else { return nil }
         let slug = id.unicodeScalars
             .map { CharacterSet.alphanumerics.contains($0) ? Character($0) : "-" }
             .reduce(into: "") { $0.append($1) }
-        return directory.appending(path: "\(slug).json")
+        return URL(fileURLWithPath: directory.path + "/" + slug + ".json")
+    }
+
+    /// Keep ordinary IDs readable while escaping every other UTF-8 byte.
+    /// Escaping bytes, rather than scalars, makes the mapping injective for
+    /// both punctuation and non-ASCII IDs.
+    private func encodedFilename(for id: String) -> String {
+        id.utf8.reduce(into: "") { result, byte in
+            if (byte >= 48 && byte <= 57)
+                || (byte >= 65 && byte <= 90)
+                || (byte >= 97 && byte <= 122) {
+                result.append(Character(UnicodeScalar(byte)))
+            } else {
+                result += String(format: "%%%02X", byte)
+            }
+        }
+    }
+
+    private func storedTranscript(at url: URL) -> CachedTranscript? {
+        guard let data = try? fileSystem.data(at: url),
+              let stored = try? codec.decode(data),
+              stored.version == Self.version
+        else {
+            return nil
+        }
+        return stored
+    }
+
+    @discardableResult
+    private func adoptLegacyTranscript(
+        _ stored: CachedTranscript,
+        for id: String,
+        from legacy: URL,
+        to target: URL
+    ) -> Bool {
+        guard let migrated = try? codec.encode(stored),
+              (try? fileSystem.write(migrated, to: target)) != nil
+        else {
+            memory[id] = stored
+            return false
+        }
+        try? fileSystem.removeItem(at: legacy)
+        memory[id] = stored
+        return true
     }
 
     public func messages(for id: String) -> [ChatMessage]? {
@@ -183,14 +233,20 @@ public actor HistoryCache: TranscriptPersisting {
         guard let target = url(for: id) else {
             return (nil, observedEpoch)
         }
-        guard let data = try? fileSystem.data(at: target),
-              let stored = try? codec.decode(data),
-              stored.version == Self.version
-        else {
-            try? fileSystem.removeItem(at: target)
+        if let stored = storedTranscript(at: target) {
+            memory[id] = stored
+            return (stored, observedEpoch)
+        }
+        try? fileSystem.removeItem(at: target)
+
+        guard let legacy = legacyURL(for: id), legacy.path != target.path else {
             return (nil, observedEpoch)
         }
-        memory[id] = stored
+        guard let stored = storedTranscript(at: legacy) else {
+            try? fileSystem.removeItem(at: legacy)
+            return (nil, observedEpoch)
+        }
+        _ = adoptLegacyTranscript(stored, for: id, from: legacy, to: target)
         return (stored, observedEpoch)
     }
 
@@ -210,13 +266,21 @@ public actor HistoryCache: TranscriptPersisting {
     @discardableResult
     public func remove(sessionID: String) -> Bool {
         memory[sessionID] = nil
-        guard let target = url(for: sessionID), fileSystem.fileExists(at: target) else { return true }
-        do {
-            try fileSystem.removeItem(at: target)
-            return true
-        } catch {
-            return false
+        let targets = [url(for: sessionID), legacyURL(for: sessionID)]
+            .compactMap { $0 }
+            .reduce(into: [String: URL]()) { result, target in
+                result[target.path] = target
+            }
+            .values
+        var success = true
+        for target in targets where fileSystem.fileExists(at: target) {
+            do {
+                try fileSystem.removeItem(at: target)
+            } catch {
+                success = false
+            }
         }
+        return success
     }
 
     public func transcript(for id: String) -> CachedTranscript? {
@@ -233,6 +297,9 @@ public actor HistoryCache: TranscriptPersisting {
         let authorizedEpoch = expectedEpoch ?? epoch
         guard authorizedEpoch == epoch, !Task.isCancelled else {
             return CacheStoreResult(addedEntry: false, byteDelta: 0)
+        }
+        if memory[id] == nil {
+            _ = read(for: id)
         }
         let payload = CachedTranscript(version: Self.version, messages: messages, snapshot: snapshot)
         guard let data = try? codec.encode(payload),
@@ -279,13 +346,39 @@ public actor HistoryCache: TranscriptPersisting {
                 return (url.path, id)
             }
         )
+        let legacyIDsByPath = Dictionary(
+            grouping: validIDs.compactMap { id -> (String, String)? in
+                guard let legacy = legacyURL(for: id) else { return nil }
+                return (legacy.path, id)
+            },
+            by: { $0.0 }
+        )
+        let filePaths = Set(files.map(\.path))
         var bytes: Int64 = 0
         var count = 0
         for file in files where file.pathExtension == "json" {
-            guard let id = idByPath[file.path] else {
+            let id: String
+            let isLegacy: Bool
+            if let currentID = idByPath[file.path] {
+                id = currentID
+                isLegacy = false
+            } else if let candidates = legacyIDsByPath[file.path], candidates.count == 1 {
+                id = candidates[0].1
+                isLegacy = true
+                guard let target = url(for: id) else { continue }
+                if filePaths.contains(target.path) {
+                    try? fileSystem.removeItem(at: file)
+                    continue
+                }
+            } else if legacyIDsByPath[file.path] != nil {
+                // A legacy collision cannot be assigned safely. Keep it for
+                // a direct read rather than deleting a user's only copy.
+                continue
+            } else {
                 try? fileSystem.removeItem(at: file)
                 continue
             }
+
             guard let data = try? fileSystem.data(at: file),
                   let stored = try? codec.decode(data),
                   stored.version == Self.version
@@ -294,9 +387,14 @@ public actor HistoryCache: TranscriptPersisting {
                 try? fileSystem.removeItem(at: file)
                 continue
             }
-            memory[id] = stored
+            if isLegacy, let target = url(for: id) {
+                _ = adoptLegacyTranscript(stored, for: id, from: file, to: target)
+                bytes += fileSystem.fileSize(at: target) ?? Int64(data.count)
+            } else {
+                memory[id] = stored
+                bytes += Int64(data.count)
+            }
             count += 1
-            bytes += Int64(data.count)
         }
         return CacheStatistics(entryCount: count, bytes: bytes)
     }

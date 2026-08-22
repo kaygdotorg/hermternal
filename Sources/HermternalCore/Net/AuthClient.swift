@@ -30,6 +30,78 @@ public actor AuthClient {
     public var storedCredentials: Credentials? { CredentialStore.load(account: account) }
 
     public func signOut() { CredentialStore.delete(account: account) }
+    // MARK: - Provider discovery
+
+    /// Fetch provider capabilities without making discovery a prerequisite
+    /// for sign-in. Older/self-hosted gateways may not expose this endpoint.
+    public func discoverProviders() async -> [AuthProvider]? {
+        var request = URLRequest(url: server.appendingPathComponent("api/auth/providers"))
+        request.httpMethod = "GET"
+
+        do {
+            let (data, response) = try await urlSession.data(for: request)
+            return Self.decodeProviderResponse(
+                data: data,
+                statusCode: (response as? HTTPURLResponse)?.statusCode ?? -1
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    /// Fetch the authenticated account without making identity a prerequisite
+    /// for sign-in. Missing/older endpoints, expired sessions, transport
+    /// failures, and malformed responses are all represented as `nil`.
+    public func fetchAccountIdentity() async -> AccountIdentity? {
+        guard let credentials = try? await validCredentials() else { return nil }
+        return await fetchAccountIdentity(using: credentials)
+    }
+
+    /// Fetch the authenticated account with an already-issued bearer token.
+    /// This overload lets composition fetch identity immediately after a
+    /// successful sign-in without coupling the optional request to sign-in's
+    /// error path.
+    public func fetchAccountIdentity(using credentials: Credentials) async -> AccountIdentity? {
+        var request = URLRequest(url: server.appendingPathComponent("api/auth/me"))
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(credentials.accessToken)", forHTTPHeaderField: "Authorization")
+
+        do {
+            let (data, response) = try await urlSession.data(for: request)
+            return Self.decodeAccountIdentityResponse(
+                data: data,
+                statusCode: (response as? HTTPURLResponse)?.statusCode ?? -1
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    /// Decodes a successful account response. Non-success responses and
+    /// malformed/absent endpoints intentionally produce `nil`.
+    public static func decodeAccountIdentityResponse(
+        data: Data,
+        statusCode: Int
+    ) -> AccountIdentity? {
+        guard statusCode == 200 else { return nil }
+        return try? JSONDecoder().decode(AccountIdentity.self, from: data)
+    }
+
+    /// Decodes a successful provider response. Non-success responses and
+    /// malformed/absent endpoints intentionally produce `nil`.
+    public static func decodeProviderResponse(
+        data: Data,
+        statusCode: Int
+    ) -> [AuthProvider]? {
+        guard statusCode == 200 else { return nil }
+        return try? JSONDecoder().decode(ProviderResponse.self, from: data).providers
+    }
+
+    private struct ProviderResponse: Decodable {
+        let providers: [AuthProvider]
+    }
+
+
 
 
 
@@ -160,9 +232,7 @@ public actor AuthClient {
     ///
     /// The WS gate rejects `Authorization` headers outright, so every
     /// connect (and reconnect) needs a fresh ticket.
-    public func webSocketTicket() async throws -> String {
-        struct Response: Decodable { let ticket: String }
-
+    public func webSocketTicket() async throws -> WebSocketTicket {
         let credentials = try await validCredentials()
         var request = URLRequest(url: server.appendingPathComponent("api/auth/ws-ticket"))
         request.httpMethod = "POST"
@@ -176,7 +246,7 @@ public actor AuthClient {
                 body: String(decoding: data, as: UTF8.self)
             )
         }
-        return try JSONDecoder().decode(Response.self, from: data).ticket
+        return try JSONDecoder().decode(WebSocketTicket.self, from: data)
     }
 
     // MARK: - Plumbing

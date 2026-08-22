@@ -24,12 +24,16 @@ public enum GatewayError: LocalizedError {
     case notConnected
     case rpc(code: Int, message: String)
     case connectionClosed(String)
+    case malformedFrame(String)
+    case unroutableFrame(String)
 
     public var errorDescription: String? {
         switch self {
         case .notConnected: "Not connected to the Hermes gateway."
         case .rpc(let code, let message): "Gateway error \(code): \(message)"
         case .connectionClosed(let reason): "Gateway connection closed: \(reason)"
+        case .malformedFrame(let detail): "Malformed gateway frame: \(detail)"
+        case .unroutableFrame(let detail): "Unroutable gateway frame: \(detail)"
         }
     }
 }
@@ -48,7 +52,6 @@ public actor GatewayClient {
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
     private var receiveLoop: Task<Void, Never>?
-    private var ndjsonParser = NDJSONFrameParser()
 
     public init() {
         let (stream, continuation) = AsyncStream<GatewayEvent>.makeStream()
@@ -143,19 +146,82 @@ public actor GatewayClient {
         }
     }
 
-    /// A single WebSocket message may carry several newline-delimited frames.
+    /// A WebSocket message is already a complete transport frame. The gateway
+    /// may batch newline-delimited frames in one message, but it omits the
+    /// trailing newline when sending one frame.
     private func ingest(text: String) {
-        for data in ndjsonParser.append(text) {
-            guard let frame = try? JSONDecoder().decode(Frame.self, from: data) else {
-                emit("transport.malformed", text: String(decoding: data.prefix(512), as: UTF8.self))
-                continue
+        for data in Self.webSocketFrames(from: text) {
+            do {
+                let frame = try JSONDecoder().decode(Frame.self, from: data)
+                route(frame)
+            } catch {
+                let detail = String(decoding: data.prefix(512), as: UTF8.self)
+                let decodeError = GatewayError.malformedFrame(
+                    "\(error.localizedDescription): \(detail)"
+                )
+                Log.error("gateway frame decode failed: \(decodeError)")
+                failAllPending(with: decodeError)
+                emit("transport.malformed", text: decodeError.localizedDescription)
             }
-            route(frame)
         }
     }
 
+    /// Splits the complete JSON messages carried by one WebSocket message.
+    /// Unlike a byte-stream parser, this must flush a single object without a
+    /// trailing newline.
+    public static func webSocketFrames(from text: String) -> [Data] {
+        text.split(separator: "\n", omittingEmptySubsequences: true)
+            .compactMap { $0.data(using: .utf8) }
+    }
+
+    /// Validates complete WebSocket frames without hiding malformed input.
+    /// Production receive handling emits a transport event with the same
+    /// detail so the app can surface it through its toast path.
+    public static func validateWebSocketFrames(from text: String) throws -> [Data] {
+        let frames = webSocketFrames(from: text)
+        for data in frames {
+            let frame: Frame
+            do {
+                frame = try JSONDecoder().decode(Frame.self, from: data)
+            } catch {
+                let detail = String(decoding: data.prefix(512), as: UTF8.self)
+                throw GatewayError.malformedFrame("\(error.localizedDescription): \(detail)")
+            }
+            try validateRoutingShape(of: frame)
+        }
+        return frames
+    }
+
+    private static func validateRoutingShape(of frame: Frame) throws {
+        if let id = frame.id, id.intValue == nil {
+            throw GatewayError.unroutableFrame(
+                "response id has type \(String(describing: id)); "
+                + "decoded shape: \(shape(of: frame))"
+            )
+        }
+        if frame.id == nil, frame.result != nil || frame.error != nil {
+            throw GatewayError.unroutableFrame(
+                "response has no id; decoded shape: \(shape(of: frame))"
+            )
+        }
+    }
+
+    private static func shape(of frame: Frame) -> String {
+        "id=\(String(describing: frame.id)), method=\(frame.method ?? "nil"), "
+            + "hasResult=\(frame.result != nil), hasParams=\(frame.params != nil), "
+            + "hasError=\(frame.error != nil)"
+    }
+
     private func route(_ frame: Frame) {
-        if let id = frame.id, let continuation = pending.removeValue(forKey: id) {
+        if let rawID = frame.id {
+            guard let id = rawID.intValue else {
+                rejectUnroutable(frame, reason: "response id is not an integer")
+                return
+            }
+            guard let continuation = pending.removeValue(forKey: id) else {
+                rejectUnroutable(frame, reason: "no pending call matches response id \(id)")
+                return
+            }
             if let error = frame.error {
                 continuation.resume(
                     throwing: GatewayError.rpc(code: error.code, message: error.message)
@@ -163,6 +229,10 @@ public actor GatewayClient {
             } else {
                 continuation.resume(returning: frame.result ?? .null)
             }
+            return
+        }
+        if frame.result != nil || frame.error != nil {
+            rejectUnroutable(frame, reason: "response has no id")
             return
         }
         guard frame.method == "event",
@@ -178,6 +248,14 @@ public actor GatewayClient {
         )
     }
 
+    private func rejectUnroutable(_ frame: Frame, reason: String) {
+        let detail = "\(reason); decoded shape: \(Self.shape(of: frame))"
+        let error = GatewayError.unroutableFrame(detail)
+        Log.error("gateway frame could not be routed: \(detail)")
+        failAllPending(with: error)
+        emit("transport.malformed", text: error.localizedDescription)
+    }
+
     private func emit(_ type: String, text: String) {
         eventContinuation.yield(
             GatewayEvent(
@@ -187,9 +265,8 @@ public actor GatewayClient {
             )
         )
     }
-
     private struct Frame: Decodable {
-        let id: Int?
+        let id: JSONValue?
         let method: String?
         let result: JSONValue?
         let params: JSONValue?
