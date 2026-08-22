@@ -81,6 +81,7 @@ private struct SessionRow: View {
             Text(session.displayTitle)
                 .lineLimit(1)
                 .font(.body)
+                .help(session.displayTitle)
             HStack(spacing: 5) {
                 if let startedAt = session.startedAt {
                     Text(startedAt, format: .relative(presentation: .named))

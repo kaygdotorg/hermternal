@@ -31,31 +31,48 @@ public struct Credentials: Codable, Sendable {
 /// ID certificate exists, the ACL becomes stable and this should move back to
 /// the Keychain.
 public enum CredentialStore {
-    /// `~/Library/Application Support/Hermternal/credentials/`
-    private static var directory: URL {
-        let base = FileManager.default
-            .homeDirectoryForCurrentUser
-            .appending(path: "Library/Application Support/Hermternal/credentials", directoryHint: .isDirectory)
-        try? FileManager.default.createDirectory(
-            at: base,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        return base
+    public enum StorageError: Error, Equatable {
+        case applicationSupportDirectoryUnavailable
     }
 
-    /// Origin-derived filename so pointing the app at another instance does
-    /// not clobber the previous instance's tokens.
-    private static func url(for account: String) -> URL {
+    /// Returns the app-owned credential location under the platform's
+    /// application-support directory. On macOS this preserves the existing
+    /// `Application Support/Hermternal/credentials` location.
+    public static func credentialsDirectory(applicationSupportDirectory: URL) -> URL {
+        applicationSupportDirectory
+            .appending(path: "Hermternal/credentials", directoryHint: .isDirectory)
+    }
+
+    /// Resolves the platform's application-support directory without falling
+    /// back to a home-directory path.
+    public static func defaultDirectory(fileManager: FileManager = .default) -> URL? {
+        guard let applicationSupportDirectory = fileManager
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first
+        else {
+            return nil
+        }
+        return credentialsDirectory(applicationSupportDirectory: applicationSupportDirectory)
+    }
+
+    private static func url(for account: String, directory: URL) -> URL {
         let slug = account.unicodeScalars
             .map { CharacterSet.alphanumerics.contains($0) ? Character($0) : "-" }
             .reduce(into: "") { $0.append($1) }
         return directory.appending(path: "\(slug).json")
     }
 
-    static func save(_ credentials: Credentials, account: String) throws {
+    public static func save(_ credentials: Credentials, account: String, directory override: URL? = nil) throws {
+        guard let directory = override ?? defaultDirectory() else {
+            throw StorageError.applicationSupportDirectoryUnavailable
+        }
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
         let data = try JSONEncoder().encode(credentials)
-        let target = url(for: account)
+        let target = url(for: account, directory: directory)
         try data.write(to: target, options: [.atomic])
         // .atomic replaces the file, so permissions must be applied after.
         try FileManager.default.setAttributes(
@@ -64,12 +81,15 @@ public enum CredentialStore {
         )
     }
 
-    static func load(account: String) -> Credentials? {
-        guard let data = try? Data(contentsOf: url(for: account)) else { return nil }
+    public static func load(account: String, directory override: URL? = nil) -> Credentials? {
+        guard let directory = override ?? defaultDirectory() else { return nil }
+        guard let data = try? Data(contentsOf: url(for: account, directory: directory)) else { return nil }
         return try? JSONDecoder().decode(Credentials.self, from: data)
     }
 
-    static func delete(account: String) {
-        try? FileManager.default.removeItem(at: url(for: account))
+    public static func delete(account: String, directory override: URL? = nil) {
+        guard let directory = override ?? defaultDirectory() else { return }
+        try? FileManager.default.removeItem(at: url(for: account, directory: directory))
     }
 }
+
