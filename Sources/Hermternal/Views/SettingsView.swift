@@ -141,58 +141,57 @@ private struct AppearanceSettingsView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            Form {
-                Section {
-                    Picker("Theme", selection: $appearance.mode) {
-                        ForEach(AppearanceMode.allCases) { mode in
-                            Text(mode.label).tag(mode)
-                        }
+        Form {
+            Section {
+                Picker("Theme", selection: $appearance.mode) {
+                    ForEach(AppearanceMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
                     }
-                    .pickerStyle(.segmented)
                 }
+                .pickerStyle(.segmented)
+            }
 
-                Section("Chat Window") {
-                    LabeledContent {
-                        HStack {
-                            Slider(
-                                value: frostBinding,
-                                in: 0...1,
-                                onEditingChanged: { editing in
-                                    if !editing {
-                                        appearance.persistWindowFrost()
-                                    }
+            Section {
+                LabeledContent {
+                    HStack {
+                        Slider(
+                            value: frostBinding,
+                            in: 0...1,
+                            onEditingChanged: { editing in
+                                if !editing {
+                                    appearance.persistWindowFrost()
                                 }
-                            )
-                            Text(
-                                appearance.windowFrost.formatted(
-                                    .percent.precision(.fractionLength(0))
-                                )
-                            )
-                            .monospacedDigit()
-                            .frame(width: 42, alignment: .trailing)
-                        }
-                    } label: {
-                        Text("Frost")
-                        Text(
-                            "Applies to the chat window only. At 0% the desktop shows through "
-                                + "the window; at 100% the window is a frosted material."
+                            }
                         )
+                        Text(
+                            appearance.windowFrost.formatted(
+                                .percent.precision(.fractionLength(0))
+                            )
+                        )
+                        .monospacedDigit()
+                        .frame(width: 42, alignment: .trailing)
+                    }
+                } label: {
+                    Text("Frost")
+                    Text(
+                        "Applies to the chat window only. At 0% the desktop shows through "
+                            + "the window; at 100% the window is a frosted material."
+                    )
+                }
+            } header: {
+                Text("Chat Window")
+            } footer: {
+                HStack {
+                    Spacer()
+                    Button("Reset to Defaults") {
+                        appearance.resetToDefaults()
                     }
                 }
             }
-            .formStyle(.grouped)
-            .scrollContentBackground(.hidden)
 
-            HStack {
-                Spacer()
-                Button("Reset to Defaults") {
-                    appearance.resetToDefaults()
-                }
-            }
-            .padding(.horizontal, 20)
-            .padding(.top, 12)
         }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
     }
 }
 
