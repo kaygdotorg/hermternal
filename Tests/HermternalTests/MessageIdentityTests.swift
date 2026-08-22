@@ -61,22 +61,16 @@ func stableIDIncludesEveryInput() {
 
 @Test("identical ping messages use occurrence to get distinct IDs")
 func identicalHistoryMessagesAreDistinct() throws {
-    let first = try #require(
-        ChatMessage(
-            historyRow: historyRow(role: .user, text: "ping"),
-            sessionID: "session-ping",
-            occurrence: 0
-        )
-    )
-    let second = try #require(
-        ChatMessage(
-            historyRow: historyRow(role: .user, text: "ping"),
-            sessionID: "session-ping",
-            occurrence: 1
-        )
+    let projected = ChatMessage.project(
+        historyRows: [
+            historyRow(role: .user, text: "ping"),
+            historyRow(role: .user, text: "ping")
+        ],
+        sessionID: "session-ping"
     )
 
-    #expect(first.id != second.id)
+    #expect(projected.count == 2)
+    #expect(projected[0].id != projected[1].id)
 }
 
 @Test("projecting history twice produces the same ID sequence")
@@ -86,8 +80,14 @@ func historyProjectionIsRepeatable() throws {
         historyRow(role: .assistant, text: "pong"),
         historyRow(role: .user, text: "ping")
     ]
-    let firstProjection = try project(rows, sessionID: "session-repeatable")
-    let secondProjection = try project(rows, sessionID: "session-repeatable")
+    let firstProjection = ChatMessage.project(
+        historyRows: rows,
+        sessionID: "session-repeatable"
+    )
+    let secondProjection = ChatMessage.project(
+        historyRows: rows,
+        sessionID: "session-repeatable"
+    )
 
     #expect(firstProjection.map(\.id) == secondProjection.map(\.id))
 }
@@ -155,13 +155,6 @@ private func historyRow(role: Role, text: String) -> JSONValue {
     ])
 }
 
-private func project(_ rows: [JSONValue], sessionID: String) throws -> [ChatMessage] {
-    try rows.enumerated().map { index, row in
-        try #require(
-            ChatMessage(historyRow: row, sessionID: sessionID, occurrence: index)
-        )
-    }
-}
 
 private func makeTemporaryDirectory() throws -> URL {
     let directory = FileManager.default.temporaryDirectory

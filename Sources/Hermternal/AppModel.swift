@@ -314,17 +314,10 @@ final class AppModel {
                               let rows = try? await rest.sessionMessages(durableID: id)
                         else { return nil }
                         guard !Task.isCancelled else { return nil }
-                        var occurrences: [ChatMessage.HistoryKey: Int] = [:]
-                        let projected = rows.compactMap { row -> ChatMessage? in
-                            guard let key = ChatMessage.historyKey(from: row) else { return nil }
-                            let occurrence = occurrences[key, default: 0]
-                            occurrences[key] = occurrence + 1
-                            return ChatMessage(
-                                historyRow: row,
-                                sessionID: id,
-                                occurrence: occurrence
-                            )
-                        }
+                        let projected = ChatMessage.project(
+                            historyRows: rows,
+                            sessionID: id
+                        )
                         return await cache.store(projected, for: id)
                     }
                 }
@@ -418,17 +411,10 @@ final class AppModel {
             // before row projection, encoding, disk I/O, or UI publication.
             guard generation == openGeneration, !Task.isCancelled else { return }
             let rows = result["messages"]?.arrayValue ?? []
-            var occurrences: [ChatMessage.HistoryKey: Int] = [:]
-            let resumed = rows.compactMap { row -> ChatMessage? in
-                guard let key = ChatMessage.historyKey(from: row) else { return nil }
-                let occurrence = occurrences[key, default: 0]
-                occurrences[key] = occurrence + 1
-                return ChatMessage(
-                    historyRow: row,
-                    sessionID: session.id,
-                    occurrence: occurrence
-                )
-            }
+            let resumed = ChatMessage.project(
+                historyRows: rows,
+                sessionID: session.id
+            )
             if cacheEnabled {
                 let result = await cache.store(resumed, for: session.id)
                 applyCacheStore(result)

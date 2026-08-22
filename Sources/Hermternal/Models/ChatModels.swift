@@ -84,36 +84,31 @@ struct ChatMessage: Identifiable, Codable, Sendable {
         ))
     }
 
-    /// The parsed identity fields used to count duplicate history rows.
-    struct HistoryKey: Hashable {
-        let role: String
-        let text: String
-    }
+    /// Project server history rows into messages with deterministic identity.
+    /// Each row is parsed exactly once.
+    static func project(historyRows rows: [JSONValue], sessionID: String) -> [ChatMessage] {
+        struct Components: Hashable {
+            let role: Role
+            let text: String
+        }
 
-    static func historyKey(from value: JSONValue) -> HistoryKey? {
-        guard let (role, body) = historyComponents(from: value) else { return nil }
-        return HistoryKey(role: role.rawValue, text: body)
-    }
-
-    /// Build from a transcript row.
-    ///
-    /// Two projections feed this. The socket's `_history_to_messages` emits
-    /// `{role, text}` and pre-filters scaffolding. The REST route returns raw
-    /// database rows, which use `content` and include rows never meant for
-    /// display, so the filtering the socket does server-side has to happen
-    /// here for parity between the two sources.
-    init?(historyRow value: JSONValue, sessionID: String, occurrence: Int) {
-        guard let (role, body) = Self.historyComponents(from: value) else { return nil }
-        self.init(
-            id: Self.stableID(
-                sessionID: sessionID,
+        var occurrences: [Components: Int] = [:]
+        return rows.compactMap { row in
+            guard let (role, text) = historyComponents(from: row) else { return nil }
+            let components = Components(role: role, text: text)
+            let occurrence = occurrences[components, default: 0]
+            occurrences[components] = occurrence + 1
+            return ChatMessage(
+                id: stableID(
+                    sessionID: sessionID,
+                    role: role,
+                    text: text,
+                    occurrence: occurrence
+                ),
                 role: role,
-                text: body,
-                occurrence: occurrence
-            ),
-            role: role,
-            text: body
-        )
+                text: text
+            )
+        }
     }
 
     private static func historyComponents(from value: JSONValue) -> (Role, String)? {
