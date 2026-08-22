@@ -188,6 +188,26 @@ TOTAL_STAGES=6
 
 banner "Hermternal — code signing and notarization setup"
 
+# This wizard is interactive: every stage reads a pasted value. Without a TTY
+# `read` returns empty immediately and each stage fails for the wrong reason,
+# so require one up front. `ssh host 'cmd'` has no TTY; `ssh -t` and
+# Terminal.app on the Mac both do.
+if [[ ! -t 0 ]]; then
+  warn "No terminal attached, so nothing you paste can be read."
+  say "Run this from Terminal.app on the Mac, or over 'ssh -t'."
+  exit 1
+fi
+
+# Keychain lock state is per-user, not per-session, so an unlocked login
+# keychain is reachable even over ssh. A locked one cannot be unlocked from a
+# remote shell, because the Security framework has nowhere to draw the prompt.
+if security show-keychain-info ~/Library/Keychains/login.keychain-db 2>&1 |
+   grep -q "User interaction is not allowed"; then
+  warn "The login keychain is locked and cannot be unlocked from here."
+  say "Unlock it on the Mac (log in, or open Keychain Access) and re-run."
+  exit 1
+fi
+
 # ── 1. Team ID ────────────────────────────────────────────────────────────
 stage "Apple Developer — Team ID"
 say "Notarization is tied to your developer team, so we need its ID."

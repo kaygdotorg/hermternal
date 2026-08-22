@@ -35,6 +35,16 @@ case "$CODESIGN_IDENTITY" in
 	*) die "CODESIGN_IDENTITY must be a 'Developer ID Application' certificate; \
 Apple rejects anything else for notarized distribution. Got: $CODESIGN_IDENTITY" ;;
 esac
+
+# The private key lives in the login keychain, which only the Mac's own login
+# session can unlock. Over ssh the Security framework cannot prompt and
+# codesign fails with "User interaction is not allowed" -- after the build.
+# Check up front instead.
+security find-identity -v -p codesigning 2>/dev/null |
+	grep -qF "$CODESIGN_IDENTITY" ||
+	die "codesign cannot reach '$CODESIGN_IDENTITY'. The login keychain is \
+locked or unreadable. Run this from Terminal.app on the Mac, not over ssh; \
+or unlock first with: security unlock-keychain"
 xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1 ||
 	die "no notarytool profile '$NOTARY_PROFILE'. Run Scripts/setup-signing.sh."
 

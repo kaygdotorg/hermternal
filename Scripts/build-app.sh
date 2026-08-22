@@ -52,8 +52,32 @@ SIGN_ARGS=(--force --options runtime
 if [[ "$IDENTITY" == "-" ]]; then
 	codesign "${SIGN_ARGS[@]}" --sign - "$APP" >/dev/null
 else
-	codesign "${SIGN_ARGS[@]}" --timestamp --sign "$IDENTITY" "$APP" >/dev/null ||
-		codesign "${SIGN_ARGS[@]}" --sign "$IDENTITY" "$APP" >/dev/null
+	# Try with a trusted timestamp, then without: `--timestamp` needs the
+	# network and should not break an offline local build.
+	if ! ERR="$(codesign "${SIGN_ARGS[@]}" --timestamp --sign "$IDENTITY" "$APP" 2>&1)" &&
+	   ! ERR="$(codesign "${SIGN_ARGS[@]}" --sign "$IDENTITY" "$APP" 2>&1)"; then
+		printf '%s\n' "$ERR" >&2
+		# errSecInternalComponent here is almost always the private key's ACL
+		# refusing a non-interactive caller, not a broken certificate.
+		if [[ "$ERR" == *errSecInternalComponent* ]]; then
+			cat >&2 <<-'HINT'
+
+			codesign could not use the private key. This is the usual result of
+			signing from a shell with no window server -- an ssh session -- since
+			the key's ACL wants a confirmation dialog it cannot draw.
+
+			Either run this from Terminal.app on the Mac, or grant codesign
+			non-interactive access to the key once:
+
+			  security unlock-keychain ~/Library/Keychains/login.keychain-db
+			  security set-key-partition-list \
+			      -S apple-tool:,apple:,codesign: -s \
+			      -k "<your login password>" \
+			      ~/Library/Keychains/login.keychain-db
+			HINT
+		fi
+		exit 1
+	fi
 fi
 
 echo "$APP"
