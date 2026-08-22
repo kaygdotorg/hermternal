@@ -19,13 +19,19 @@ struct SettingsView: View {
     }
 
     var body: some View {
-        NavigationSplitView(columnVisibility: .constant(.all)) {
+        HSplitView {
+            // Tahoe's NavigationSplitView sidebar is inset with its own
+            // radius in this window. Sixteen probes failed to reach flush,
+            // including transplanting the chat window's own SidebarView.
+            // HSplitView keeps Settings geometry consistent with the chat window.
             SettingsSourceList(selection: $selection)
-                // `.toolbar(removing: .sidebarToggle)` removes SwiftUI's
-                // default toggle while keeping the toolbar and traffic lights.
-                .toolbar(removing: .sidebarToggle)
-                .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
-        } detail: {
+                .frame(
+                    minWidth: 180,
+                    idealWidth: 220,
+                    maxWidth: 280,
+                    maxHeight: .infinity
+                )
+
             SettingsDetailView(
                 section: selection ?? .appearance,
                 appearance: appearance,
