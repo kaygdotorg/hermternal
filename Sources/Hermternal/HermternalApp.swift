@@ -90,33 +90,18 @@ struct HermternalApp: App {
             CommandGroup(after: .textEditing) {
                 FindCommand()
             }
-        }
-
-        Settings {
-            SettingsView(
-                appearance: appearance,
-                model: model,
-                registry: registry
-            )
-                .containerBackground(for: .window) {
-                    // Settings intentionally stays at the clear end of the
-                    // frost range; the appearance dial governs the chat
-                    // window only, because full frost makes Settings muddy.
-                    FrostedWindowBackground(
-                        materialOpacity: 0,
-                        includesBaseBlur: true
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") {
+                    SettingsWindowController.shared.show(
+                        appearance: appearance,
+                        model: model,
+                        registry: registry
                     )
                 }
-                .background {
-                    HiddenWindowTitle()
-                }
-                .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
-                .preferredColorScheme(appearance.mode.colorScheme)
+                .keyboardShortcut(",", modifiers: .command)
+            }
         }
-        .windowToolbarStyle(.unified)
-        .defaultSize(width: 720, height: 460)
-        .windowResizability(.contentSize)
-    }
+}
 }
 
 private struct FindCommand: View {

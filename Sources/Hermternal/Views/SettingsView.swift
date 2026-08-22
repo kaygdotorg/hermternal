@@ -19,42 +19,23 @@ struct SettingsView: View {
     }
 
     var body: some View {
-        HSplitView {
-            // Tahoe's NavigationSplitView sidebar is inset with its own
-            // radius in this window. Sixteen probes failed to reach flush,
-            // including transplanting the chat window's own SidebarView.
-            // HSplitView keeps Settings geometry consistent with the chat window.
-            SettingsSourceList(selection: $selection)
-                .frame(
-                    minWidth: 180,
-                    idealWidth: 220,
-                    maxWidth: 280,
-                    maxHeight: .infinity
-                )
-
-            SettingsDetailView(
-                section: selection ?? .appearance,
-                appearance: appearance,
-                model: model,
-                registry: registry
-            )
-            .frame(
-                minWidth: 480,
-                maxWidth: .infinity,
-                maxHeight: .infinity,
-                alignment: .topLeading
-            )
-        }
+        SettingsSplitView(
+            appearance: appearance,
+            model: model,
+            registry: registry,
+            selection: $selection
+        )
         .frame(
             minWidth: 700,
-            maxWidth: .infinity,
-            maxHeight: .infinity,
+            maxWidth: CGFloat.infinity,
+            maxHeight: CGFloat.infinity,
             alignment: .topLeading
         )
     }
+
 }
 
-private enum SettingsSection: String, CaseIterable, Hashable, Identifiable {
+enum SettingsSection: String, CaseIterable, Hashable, Identifiable {
     case appearance
     case gateway
     case cache
@@ -81,7 +62,7 @@ private enum SettingsSection: String, CaseIterable, Hashable, Identifiable {
     }
 }
 
-private struct SettingsSourceList: View {
+struct SettingsSourceList: View {
     @Binding var selection: SettingsSection?
 
     var body: some View {
@@ -95,10 +76,13 @@ private struct SettingsSourceList: View {
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
+        // Clear the traffic lights; the hosting controller drops the titlebar
+        // safe area, so this is the only top inset the list gets.
+        .padding(.top, 46)
     }
 }
 
-private struct SettingsDetailView: View {
+struct SettingsDetailView: View {
     let section: SettingsSection
     @Bindable var appearance: AppearanceSettings
     @Bindable var model: AppModel
@@ -107,15 +91,16 @@ private struct SettingsDetailView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(section.title)
-                .font(.title2)
+                .font(.title)
                 .fontWeight(.semibold)
                 .padding(.horizontal, 20)
-                .padding(.top, 18)
-                .padding(.bottom, 6)
+                .padding(.top, 20)
 
             detailContent
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
+        // Top inset comes from the heading's own padding; the hosting
+        // controller already drops the titlebar safe area.
     }
 
     @ViewBuilder
