@@ -29,6 +29,9 @@ cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 # which is why credentials live in CredentialStore rather than the Keychain:
 # an ad-hoc binary cannot hold a durable "Always Allow" grant.
 IDENTITY="${CODESIGN_IDENTITY:-}"
+if [[ -z "$IDENTITY" && -f "$ROOT/.env" ]]; then
+	IDENTITY="$(sed -n 's/^CODESIGN_IDENTITY=//p' "$ROOT/.env" | tail -1)"
+fi
 if [[ -z "$IDENTITY" ]]; then
 	IDENTITY="$(
 		security find-identity -v -p codesigning 2>/dev/null |
@@ -40,8 +43,17 @@ if [[ -z "$IDENTITY" ]]; then
 	echo "note: no codesigning identity found; signing ad-hoc" >&2
 fi
 
-codesign --force --sign "$IDENTITY" \
-	--entitlements "$ROOT/Resources/Hermternal.entitlements" \
-	"$APP" >/dev/null
+# Hardened runtime and a trusted timestamp are both prerequisites for
+# notarization, and harmless for local ad-hoc builds. `--timestamp` needs the
+# network, so fall back to an untrusted signature when offline rather than
+# failing a local build.
+SIGN_ARGS=(--force --options runtime
+	--entitlements "$ROOT/Resources/Hermternal.entitlements")
+if [[ "$IDENTITY" == "-" ]]; then
+	codesign "${SIGN_ARGS[@]}" --sign - "$APP" >/dev/null
+else
+	codesign "${SIGN_ARGS[@]}" --timestamp --sign "$IDENTITY" "$APP" >/dev/null ||
+		codesign "${SIGN_ARGS[@]}" --sign "$IDENTITY" "$APP" >/dev/null
+fi
 
 echo "$APP"
