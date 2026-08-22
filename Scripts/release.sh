@@ -12,10 +12,44 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# shellcheck disable=SC1091
-[[ -f .env ]] && set -a && . ./.env && set +a
+# Do not source .env: a signing identity legitimately contains parentheses, so
+# .env cannot be assumed to be valid shell.
+load_env() {
+	local file="$1" line trimmed key value first last
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		trimmed="${line#"${line%%[!$' \t\r\n']*}"}"
+		[[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
+		[[ "$trimmed" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+		key="${BASH_REMATCH[1]}"
+		value="${BASH_REMATCH[2]}"
+		if [[ -z "${!key+x}" ]]; then
+			if (( ${#value} >= 2 )); then
+				first="${value:0:1}"
+				last="${value: -1}"
+				if [[ ( "$first" == "'" && "$last" == "'" ) ||
+					( "$first" == '"' && "$last" == '"' ) ]]; then
+					value="${value:1:${#value}-2}"
+				fi
+			fi
+			export "$key=$value"
+		fi
+	done < "$file"
+}
+
+[[ -f .env ]] && load_env .env
 
 NOTARY_PROFILE="${NOTARY_PROFILE:-hermternal}"
+if [[ "${ASC_KEY_PATH:-}" == "~/"* ]]; then
+	ASC_KEY_PATH="$HOME/${ASC_KEY_PATH#~/}"
+	export ASC_KEY_PATH
+fi
+if [[ -n "${ASC_KEY_PATH:-}" && -n "${ASC_KEY_ID:-}" &&
+	-n "${ASC_ISSUER_ID:-}" && -f "$ASC_KEY_PATH" ]]; then
+	NOTARY_ARGS=(--key "$ASC_KEY_PATH" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID")
+else
+	NOTARY_ARGS=(--keychain-profile "$NOTARY_PROFILE")
+fi
+
 VERSION="$(
 	/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
 		Resources/Info.plist
@@ -45,8 +79,9 @@ security find-identity -v -p codesigning 2>/dev/null |
 	die "codesign cannot reach '$CODESIGN_IDENTITY'. The login keychain is \
 locked or unreadable. Run this from Terminal.app on the Mac, not over ssh; \
 or unlock first with: security unlock-keychain"
-xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1 ||
-	die "no notarytool profile '$NOTARY_PROFILE'. Run Scripts/setup-signing.sh."
+xcrun notarytool history "${NOTARY_ARGS[@]}" >/dev/null 2>&1 ||
+	die "no usable notarytool credentials. Store profile '$NOTARY_PROFILE' with \
+Scripts/setup-signing.sh, or set ASC_KEY_PATH/ASC_KEY_ID/ASC_ISSUER_ID in .env."
 
 step "Building release $VERSION"
 CONFIG=release CODESIGN_IDENTITY="$CODESIGN_IDENTITY" bash Scripts/build-app.sh
@@ -67,7 +102,7 @@ mkdir -p "$DIST"
 
 step "Submitting to Apple (this blocks until they answer)"
 xcrun notarytool submit "$ZIP" \
-	--keychain-profile "$NOTARY_PROFILE" \
+	"${NOTARY_ARGS[@]}" \
 	--wait
 
 step "Stapling the ticket"
@@ -84,7 +119,7 @@ rm -f "$ZIP"
 hdiutil create -quiet -fs HFS+ -volname "Hermternal $VERSION" \
 	-srcfolder "$APP" -ov -format UDZO "$DMG"
 codesign --force --timestamp --sign "$CODESIGN_IDENTITY" "$DMG"
-xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+xcrun notarytool submit "$DMG" "${NOTARY_ARGS[@]}" --wait
 xcrun stapler staple "$DMG"
 
 step "Done"

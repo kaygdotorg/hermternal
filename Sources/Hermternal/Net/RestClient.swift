@@ -48,7 +48,18 @@ actor RestClient {
                 String(decoding: data.prefix(512), as: UTF8.self)
             )
         }
-        return try JSONDecoder().decode(MessagesResponse.self, from: data).messages
+        let rows = try JSONDecoder().decode(MessagesResponse.self, from: data).messages
+        Log.info("diagnostic REST first row keys: \(objectKeys(rows.first))")
+        Log.info(
+            "diagnostic REST union row keys: "
+            + "\(Set(rows.flatMap { objectKeys($0) }).sorted())"
+        )
+        return rows
+    }
+
+    private func objectKeys(_ value: JSONValue?) -> [String] {
+        guard case .object(let fields) = value else { return [] }
+        return fields.keys.sorted()
     }
 
     private struct MessagesResponse: Decodable {
