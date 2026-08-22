@@ -1,6 +1,9 @@
 # Working Agreement
 
-- Treat the main session as orchestrator: decompose first, delegate genuine independent research, implementation, and review slices aggressively; retain product, scope, and interface decisions; validate the integrated output once.
+- The main session is an orchestrator, planner, and scheduler — not an implementer. Delegation is mandatory, not a preference: when a task arrives, decompose it and hand every slice to a subagent. Doing the work in the main session is a process failure even when it would be faster.
+- Pick a specific agent type per slice, never the default worker by reflex: `scout` for read-only investigation, `librarian` for external library and API facts, `reviewer` and `security-reviewer` for review passes, `designer` for UI and visual work, `sonic` for mechanical edits, `task` only when no specialist fits. State the choice and why.
+- What the orchestrator keeps: product, scope, and interface decisions; the decomposition itself; cross-slice contracts; and one integrated validation at the end. What it delegates: research, implementation, and review.
+- Fact-finding is delegated too. During `grilling`, a frontier question that needs an environment fact goes to a `scout`, and unblocked questions are asked in the same round rather than waiting on it.
 - Before any big feature implementation, run the `grilling` skill in rounds until the design-tree frontier is empty and the user confirms shared understanding.
 - Make performance priority one. Request performance-reviewer passes for substantial UI, cache, or network work; add deterministic regression contracts where valuable, while keeping noisy network/UI profiling out of per-commit hard gates.
 - Native-first: use standard SwiftUI/AppKit components and system materials, checking official Apple documentation before deviating. A custom surface requires explicit user approval and measured need.
