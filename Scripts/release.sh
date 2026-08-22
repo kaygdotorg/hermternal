@@ -2,7 +2,10 @@
 # Build, sign, notarize, staple, and package Hermternal for distribution.
 #
 # Run Scripts/setup-signing.sh first: this script needs a Developer ID
-# Application identity in the keychain and a stored notarytool profile.
+# Application identity in the keychain. Notarization uses ASC_KEY_PATH,
+# ASC_KEY_ID, and ASC_ISSUER_ID from .env when present, or falls back to
+# the stored notarytool profile. Run codesign in the Mac's own login session;
+# the private-key ACL cannot prompt over ssh.
 #
 # Notarization uploads the app to Apple and blocks until they answer, so this
 # takes minutes, not seconds. Stapling writes the resulting ticket into the
