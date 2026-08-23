@@ -1,5 +1,13 @@
 import Foundation
 
+/// One page of durable dashboard sessions returned by the REST API.
+public struct SessionListPage: Sendable {
+    public let sessions: [JSONValue]
+    public let total: Int
+    public let limit: Int
+    public let offset: Int
+}
+
 /// Authenticated REST calls against the dashboard.
 ///
 /// Used for read-only transcript hydration. `session.resume` over the socket
@@ -124,11 +132,198 @@ public actor RestClient {
     private struct Pagination: Decodable {
         let returned: Int?
     }
+
+    /// Lists durable dashboard sessions without opening or resuming live sessions.
+    ///
+    /// The server appends every matching pinned row to every page, ignoring
+    /// `limit` and `offset`, ordered by `started_at DESC`. Pinned rows therefore
+    /// repeat across pages, and `total` does not count them. Any caller that
+    /// pages MUST de-duplicate by `id`.
+    public func sessionList(
+        limit: Int = 100,
+        offset: Int = 0,
+        order: String = "recent",
+        archived: String = "exclude",
+        profile: String? = nil
+    ) async throws -> SessionListPage {
+        var credentials = try await auth.validCredentials()
+        // The server clamps limit to 100 and rejects a negative offset with 422,
+        // so both are clamped here rather than sending a request that cannot succeed.
+        let pageLimit = min(max(limit, 1), 100)
+        let pageOffset = max(offset, 0)
+
+        do {
+            return try await fetchSessionListPage(
+                limit: pageLimit,
+                offset: pageOffset,
+                order: order,
+                archived: archived,
+                profile: profile,
+                credentials: credentials
+            )
+        } catch {
+            guard case RestError.badStatus(let status, _) = error, status == 401 else {
+                throw error
+            }
+            credentials = try await auth.refreshCredentials()
+            return try await fetchSessionListPage(
+                limit: pageLimit,
+                offset: pageOffset,
+                order: order,
+                archived: archived,
+                profile: profile,
+                credentials: credentials
+            )
+        }
+    }
+
+    /// Updates a durable session by id without needing a live session or resume.
+    ///
+    /// This endpoint takes the DURABLE session id, needs no live session and no
+    /// resume. A title written here records `user` provenance so later
+    /// automatic titling cannot overwrite it.
+    public func patchSession(
+        durableID: String,
+        title: String? = nil,
+        pinned: Bool? = nil,
+        archived: Bool? = nil,
+        profile: String? = nil
+    ) async throws -> JSONValue {
+        guard title != nil || pinned != nil || archived != nil else {
+            throw RestError.noMutableFields
+        }
+
+        var body: [String: JSONValue] = [:]
+        if let title {
+            body["title"] = .string(title)
+        }
+        if let pinned {
+            body["pinned"] = .bool(pinned)
+        }
+        if let archived {
+            body["archived"] = .bool(archived)
+        }
+        // The server routes the write to a profile's own database, so a session
+        // that belongs to a named profile must carry it or the write lands in
+        // the default database.
+        if let profile {
+            body["profile"] = .string(profile)
+        }
+        let encodedBody = try Self.bodyEncoder.encode(JSONValue.object(body))
+
+        var credentials = try await auth.validCredentials()
+        do {
+            return try await fetchPatchedSession(
+                durableID: durableID,
+                body: encodedBody,
+                credentials: credentials
+            )
+        } catch {
+            guard case RestError.badStatus(let status, _) = error, status == 401 else {
+                throw error
+            }
+            credentials = try await auth.refreshCredentials()
+            return try await fetchPatchedSession(
+                durableID: durableID,
+                body: encodedBody,
+                credentials: credentials
+            )
+        }
+    }
+
+    private static let bodyEncoder = JSONEncoder()
+
+    private func fetchSessionListPage(
+        limit: Int,
+        offset: Int,
+        order: String,
+        archived: String,
+        profile: String?,
+        credentials: Credentials
+    ) async throws -> SessionListPage {
+        var components = URLComponents(
+            url: server.appending(path: "api/sessions"),
+            resolvingAgainstBaseURL: false
+        )
+        var queryItems: [URLQueryItem] = [
+            .init(name: "limit", value: String(limit)),
+            .init(name: "offset", value: String(offset)),
+            .init(name: "order", value: order),
+            .init(name: "archived", value: archived)
+        ]
+        if let profile {
+            queryItems.append(.init(name: "profile", value: profile))
+        }
+        components?.queryItems = queryItems
+        guard let url = components?.url else { throw AuthError.badServerURL }
+
+        var request = URLRequest(url: url)
+        request.setValue(
+            "Bearer \(credentials.accessToken)",
+            forHTTPHeaderField: "Authorization"
+        )
+
+        let (data, response) = try await urlSession.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        guard status == 200 else {
+            throw RestError.badStatus(
+                status,
+                String(decoding: data.prefix(512), as: UTF8.self)
+            )
+        }
+
+        let envelope = try JSONDecoder().decode(SessionListResponse.self, from: data)
+        return SessionListPage(
+            sessions: envelope.sessions,
+            total: envelope.total ?? envelope.sessions.count,
+            limit: envelope.limit,
+            offset: envelope.offset
+        )
+    }
+
+    private func fetchPatchedSession(
+        durableID: String,
+        body: Data,
+        credentials: Credentials
+    ) async throws -> JSONValue {
+        let url = server.appending(path: "api/sessions/\(durableID)")
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.setValue(
+            "Bearer \(credentials.accessToken)",
+            forHTTPHeaderField: "Authorization"
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+
+        let (data, response) = try await urlSession.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        if status == 404 {
+            throw RestError.sessionNotFound
+        }
+        guard status == 200 else {
+            throw RestError.badStatus(
+                status,
+                String(decoding: data.prefix(512), as: UTF8.self)
+            )
+        }
+        return try JSONDecoder().decode(JSONValue.self, from: data)
+    }
+
+    private struct SessionListResponse: Decodable {
+        let sessions: [JSONValue]
+        let total: Int?
+        let limit: Int
+        let offset: Int
+    }
+
 }
 
-public enum RestError: LocalizedError {
+public enum RestError: LocalizedError, Sendable {
     case badStatus(Int, String)
     case messagePageLimitExceeded
+    case noMutableFields
+    case sessionNotFound
 
     public var errorDescription: String? {
         switch self {
@@ -136,6 +331,10 @@ public enum RestError: LocalizedError {
             "Request failed (HTTP \(status)): \(body)"
         case .messagePageLimitExceeded:
             "The transcript exceeded the maximum number of REST pages."
+        case .noMutableFields:
+            "At least one mutable session field must be supplied."
+        case .sessionNotFound:
+            "The durable session does not exist."
         }
     }
 }

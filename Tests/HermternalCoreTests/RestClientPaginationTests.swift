@@ -91,14 +91,14 @@ func restPagingEnforcesPageBound() async throws {
     defer { cleanup() }
 
     do {
-        try await client.sessionMessages(durableID: fixture.id)
+        _ = try await client.sessionMessages(durableID: fixture.id)
         Issue.record("page bound did not throw")
     } catch let error as RestError {
         switch error {
         case .messagePageLimitExceeded:
             break
-        case .badStatus:
-            Issue.record("unexpected REST status error")
+        case .badStatus, .noMutableFields, .sessionNotFound:
+            Issue.record("unexpected REST error: \(error)")
         }
     } catch {
         Issue.record("unexpected error: \(error)")

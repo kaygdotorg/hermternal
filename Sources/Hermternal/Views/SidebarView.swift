@@ -101,12 +101,24 @@ struct SidebarView: View {
 private struct SessionRow: View {
     let session: ChatSession
 
+    /// An empty value reads as no value, so this avoids a conditional branch that
+    /// would give the row two identities and churn it when the count crosses zero.
+    private var accessibilityCount: String {
+        switch session.messageCount {
+        case ..<1: ""
+        case 1: "1 message"
+        default: "\(session.messageCount) messages"
+        }
+    }
+
     var body: some View {
+        // `displayTitle` is stored on the session, so reading it costs nothing.
+        let title = session.displayTitle
         VStack(alignment: .leading, spacing: 3) {
-            Text(session.displayTitle)
+            Text(title)
                 .lineLimit(1)
                 .font(.body)
-                .help(session.displayTitle)
+                .help(title)
             HStack(spacing: 5) {
                 if let startedAt = session.startedAt {
                     Text(startedAt, format: .relative(presentation: .named))
@@ -120,5 +132,9 @@ private struct SessionRow: View {
             .foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityValue(accessibilityCount)
+        .accessibilityIdentifier("session-row-\(session.id)")
     }
 }

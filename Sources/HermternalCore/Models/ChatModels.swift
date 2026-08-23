@@ -1,25 +1,58 @@
 import Foundation
 
-/// A sidebar row, built from `session.list`.
+/// A sidebar row, built from the dashboard REST session list.
+///
+/// Every field is immutable, and `displayTitle` is derived once when the row is
+/// decoded. A sidebar redraw therefore does no string work: it reads a stored
+/// value instead of trimming and scanning the preview on every body evaluation.
 public struct ChatSession: Identifiable, Hashable, Sendable {
     public let id: String
-    public var title: String
-    public var preview: String
-    public var startedAt: Date?
-    public var messageCount: Int
+    public let title: String
+    public let preview: String
+    public let startedAt: Date?
+    public let lastActive: Date?
+    public let pinned: Bool
+    public let source: String
+    public let profile: String?
+    public let messageCount: Int
 
-    public var displayTitle: String {
-        if !title.isEmpty { return title }
-        if !preview.isEmpty { return String(preview.prefix(60)) }
-        return "New Chat"
-    }
+    /// The row label. Cheap to read, because it is computed at decode time.
+    public let displayTitle: String
 
     public init(from value: JSONValue) {
         id = value["id"]?.stringValue ?? ""
-        title = value["title"]?.stringValue ?? ""
-        preview = value["preview"]?.stringValue ?? ""
+        let title = value["title"]?.stringValue ?? ""
+        let preview = value["preview"]?.stringValue ?? ""
+        self.title = title
+        self.preview = preview
         messageCount = value["message_count"]?.intValue ?? 0
         startedAt = DateParser.date(from: value["started_at"])
+        lastActive = DateParser.date(from: value["last_active"])
+        pinned = value["pinned"]?.boolValue ?? false
+        source = value["source"]?.stringValue ?? ""
+        profile = value["profile"]?.stringValue
+        displayTitle = Self.deriveDisplayTitle(title: title, preview: preview)
+    }
+
+    /// Picks the row label, preferring the server title over the preview.
+    ///
+    /// A title-less chat can carry a machine prompt as its preview, and showing
+    /// that as a title is misleading. A preview is rejected when it is blank,
+    /// spans lines, or opens with a Markdown heading marker. A value that is
+    /// only marker characters is rejected too, because it carries no title text.
+    private static func deriveDisplayTitle(title: String, preview: String) -> String {
+        // `contains(where:)` short-circuits and allocates nothing, unlike
+        // trimming a copy only to test whether it is empty.
+        if title.contains(where: { !$0.isWhitespace }) { return title }
+        guard let start = preview.firstIndex(where: { !$0.isWhitespace }),
+              !preview.contains(where: { $0 == "\n" || $0 == "\r" })
+        else { return "New Chat" }
+        let body = preview[start...]
+        if body.hasPrefix("###") {
+            let afterMarker = body.drop(while: { $0 == "#" })
+            guard let next = afterMarker.first, !next.isWhitespace else { return "New Chat" }
+        }
+        return String(body.prefix(60))
     }
 }
 
