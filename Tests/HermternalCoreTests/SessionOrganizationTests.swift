@@ -130,6 +130,210 @@ func organizationEncodingIsStable() throws {
     #expect(first == second)
 }
 
+@Test("Folder mutations persist through reload")
+func folderMutationsRoundTrip() async throws {
+    let directory = try makeOrganizationTestDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = SessionOrganizationStore(directory: directory)
+
+    let work = try await store.createFolder(name: "Work")
+    let home = try await store.createFolder(name: "Home")
+    try await store.renameFolder(id: work.id, name: "Renamed")
+    try await store.reorderFolders(ids: [home.id, work.id])
+    try await store.assignChat(sessionID: "session-1", toFolderID: work.id, gatewayHost: "gateway-a")
+
+    var reloaded = try await SessionOrganizationStore(directory: directory).load()
+    #expect(reloaded.folders.map(\.id) == [home.id, work.id])
+    #expect(reloaded.folders.map(\.order) == [0, 1])
+    #expect(reloaded.folders[1].name == "Renamed")
+    #expect(reloaded.gateways["gateway-a"]?.folderMembership == ["session-1": work.id])
+
+    try await store.clearChatAssignment(sessionID: "session-1", gatewayHost: "gateway-a")
+    reloaded = try await SessionOrganizationStore(directory: directory).load()
+    #expect(reloaded.gateways["gateway-a"]?.folderMembership == [:])
+}
+
+@Test("Deleting a folder removes only its memberships and keeps order contiguous")
+func deletingFolderRemovesItsMemberships() async throws {
+    let directory = try makeOrganizationTestDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = SessionOrganizationStore(directory: directory)
+    let organization = SessionOrganization(
+        folders: [
+            Folder(id: "work", name: "Work", order: 0),
+            Folder(id: "home", name: "Home", order: 1),
+            Folder(id: "later", name: "Later", order: 2)
+        ],
+        gateways: [
+            "gateway-a": .init(folderMembership: [
+                "work-session": "work",
+                "home-session": "home",
+                "unfiled-session": "missing"
+            ]),
+            "gateway-b": .init(folderMembership: ["other-work-session": "work"])
+        ]
+    )
+    try await store.save(organization)
+
+    let removed = try await store.deleteFolder(id: "work")
+    let reloaded = try await SessionOrganizationStore(directory: directory).load()
+
+    #expect(removed.sorted() == ["other-work-session", "work-session"])
+    #expect(reloaded.folders.map(\.id) == ["home", "later"])
+    #expect(reloaded.folders.map(\.order) == [0, 1])
+    #expect(reloaded.gateways["gateway-a"]?.folderMembership == [
+        "home-session": "home",
+        "unfiled-session": "missing"
+    ])
+    #expect(reloaded.gateways["gateway-b"]?.folderMembership.isEmpty == true)
+    #expect(reloaded.gateways.values.allSatisfy { gateway in
+        !gateway.folderMembership.values.contains("work")
+    })
+}
+
+@Test("Unknown folder IDs fail clearly")
+func unknownFolderIDsFailClearly() async throws {
+    let directory = try makeOrganizationTestDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = SessionOrganizationStore(directory: directory)
+    try await store.save(SessionOrganization(folders: [
+        Folder(id: "known", name: "Known", order: 0)
+    ]))
+
+    await expectFolderNotFound("missing") {
+        try await store.renameFolder(id: "missing", name: "Nope")
+    }
+    await expectFolderNotFound("missing") {
+        _ = try await store.deleteFolder(id: "missing")
+    }
+    await expectFolderNotFound("missing") {
+        try await store.assignChat(sessionID: "session", toFolderID: "missing", gatewayHost: "gateway")
+    }
+}
+
+@Test("Gateway membership mutations stay scoped to their host")
+func gatewayMembershipIsScoped() async throws {
+    let directory = try makeOrganizationTestDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = SessionOrganizationStore(directory: directory)
+    try await store.save(SessionOrganization(
+        folders: [Folder(id: "work", name: "Work", order: 0)],
+        gateways: [
+            "gateway-a": .init(folderMembership: ["a-session": "work"]),
+            "gateway-b": .init(folderMembership: ["b-session": "work"])
+        ]
+    ))
+
+@Test("Duplicate folder names receive distinct stable IDs")
+func duplicateFolderNamesHaveDistinctIDs() async throws {
+    let directory = try makeOrganizationTestDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = SessionOrganizationStore(directory: directory)
+
+    let first = try await store.createFolder(name: "Same")
+    let second = try await store.createFolder(name: "Same")
+    let reloaded = try await SessionOrganizationStore(directory: directory).load()
+
+    #expect(first.id != second.id)
+    #expect(first.name == second.name)
+    #expect(reloaded.folders.map(\.id) == [first.id, second.id])
+}
+
+    try await store.assignChat(sessionID: "new-session", toFolderID: "work", gatewayHost: "gateway-a")
+    try await store.clearChatAssignment(sessionID: "a-session", gatewayHost: "gateway-a")
+    let reloaded = try await SessionOrganizationStore(directory: directory).load()
+
+    #expect(reloaded.gateways["gateway-a"]?.folderMembership == ["new-session": "work"])
+    #expect(reloaded.gateways["gateway-b"]?.folderMembership == ["b-session": "work"])
+}
+
+@Test("Reassigning a chat replaces its folder")
+func reassigningChatReplacesMembership() async throws {
+    let directory = try makeOrganizationTestDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = SessionOrganizationStore(directory: directory)
+    try await store.save(SessionOrganization(folders: [
+        Folder(id: "work", name: "Work", order: 0),
+        Folder(id: "home", name: "Home", order: 1)
+    ]))
+
+    try await store.assignChat(sessionID: "session", toFolderID: "work", gatewayHost: "gateway")
+    try await store.assignChat(sessionID: "session", toFolderID: "home", gatewayHost: "gateway")
+    let reloaded = try await SessionOrganizationStore(directory: directory).load()
+
+    #expect(reloaded.gateways["gateway"]?.folderMembership == ["session": "home"])
+}
+
+@Test("No-change folder mutation performs no write")
+func noChangeFolderMutationSkipsWrite() async throws {
+    let directory = try makeOrganizationTestDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let fileSystem = CountingOrganizationFileSystem()
+    let store = SessionOrganizationStore(directory: directory, fileSystem: fileSystem)
+    try await store.save(SessionOrganization(folders: [
+        Folder(id: "work", name: "Work", order: 0)
+    ]))
+    let writesAfterInitialSave = fileSystem.atomicWriteCount
+
+    try await store.renameFolder(id: "work", name: "Work")
+    try await store.assignChat(sessionID: "session", toFolderID: "work", gatewayHost: "gateway")
+    let writesAfterAssignment = fileSystem.atomicWriteCount
+    try await store.assignChat(sessionID: "session", toFolderID: "work", gatewayHost: "gateway")
+    try await store.clearChatAssignment(sessionID: "missing", gatewayHost: "gateway")
+    try await store.setGrouping(byDate: true)
+    try await store.setSortMode(.lastActivity)
+
+    #expect(writesAfterInitialSave == 1)
+    #expect(writesAfterAssignment == 2)
+    #expect(fileSystem.atomicWriteCount == writesAfterAssignment)
+}
+
+@Test("Reordering requires the complete folder permutation")
+func reorderRequiresPermutation() async throws {
+    let directory = try makeOrganizationTestDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = SessionOrganizationStore(directory: directory)
+    try await store.save(SessionOrganization(folders: [
+        Folder(id: "work", name: "Work", order: 0),
+        Folder(id: "home", name: "Home", order: 1)
+    ]))
+
+    do {
+        try await store.reorderFolders(ids: ["work"])
+        Issue.record("A partial folder order was accepted")
+    } catch let error as SessionOrganizationError {
+        #expect(error == .invalidFolderOrder)
+    }
+}
+
+@Test("Sort and grouping settings persist")
+func sortAndGroupingPersist() async throws {
+    let directory = try makeOrganizationTestDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = SessionOrganizationStore(directory: directory)
+
+    try await store.setSortMode(.created)
+    try await store.setGrouping(byDate: false)
+    let reloaded = try await SessionOrganizationStore(directory: directory).load()
+
+    #expect(reloaded.sort == .init(mode: .created))
+    #expect(reloaded.grouping == .init(byDate: false))
+}
+
+private func expectFolderNotFound(
+    _ expectedID: String,
+    operation: () async throws -> Void
+) async {
+    do {
+        try await operation()
+        Issue.record("Unknown folder ID was accepted")
+    } catch let error as SessionOrganizationError {
+        #expect(error == .folderNotFound(expectedID))
+    } catch {
+        Issue.record("Unexpected error: \(error)")
+    }
+}
+
 private func makeOrganizationTestDirectory() throws -> URL {
     let directory = FileManager.default.temporaryDirectory
         .appending(path: "SessionOrganizationTests-\(UUID().uuidString)", directoryHint: .isDirectory)

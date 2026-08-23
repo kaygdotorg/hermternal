@@ -55,6 +55,7 @@ public actor SessionOrganizationStore: SessionOrganizationPersisting {
     private let fileSystem: any SessionOrganizationFileSystem
     private var storedDigest: UInt64?
     private var hasLoaded = false
+    private var organization = SessionOrganization()
 
     public init(
         directory: URL? = nil,
@@ -75,7 +76,8 @@ public actor SessionOrganizationStore: SessionOrganizationPersisting {
         guard fileSystem.fileExists(at: fileURL) else {
             hasLoaded = true
             storedDigest = nil
-            return SessionOrganization()
+            organization = SessionOrganization()
+            return organization
         }
 
         let data: Data
@@ -84,12 +86,12 @@ public actor SessionOrganizationStore: SessionOrganizationPersisting {
         } catch {
             throw SessionOrganizationError.fileReadFailed("Could not read \(fileURL.path): \(error)")
         }
-
         do {
-            let organization = try JSONDecoder().decode(SessionOrganization.self, from: data)
+            let decodedOrganization = try JSONDecoder().decode(SessionOrganization.self, from: data)
             hasLoaded = true
             storedDigest = ContentDigest.value(for: data)
-            return organization
+            organization = decodedOrganization
+            return decodedOrganization
         } catch let error as SessionOrganizationError {
             throw error
         } catch {
@@ -116,15 +118,149 @@ public actor SessionOrganizationStore: SessionOrganizationPersisting {
         }
 
         let digest = ContentDigest.value(for: data)
-        guard digest != storedDigest else { return }
+        let unchangedMissingFile = storedDigest == nil
+            && self.organization == organization
+            && !fileSystem.fileExists(at: fileURL)
+        guard digest != storedDigest && !unchangedMissingFile else {
+            self.organization = organization
+            return
+        }
 
         do {
             try fileSystem.createDirectory(at: directory)
             try fileSystem.atomicWrite(data, to: fileURL)
             storedDigest = digest
             hasLoaded = true
+            self.organization = organization
         } catch {
             throw SessionOrganizationError.fileWriteFailed("Could not write \(fileURL.path): \(error)")
+        }
+    }
+
+    public func createFolder(name: String) async throws -> Folder {
+        let current = try await loadedOrganization()
+        let folder = Folder(id: UUID().uuidString, name: name, order: current.folders.count)
+        let folders = reindexed(current.folders + [folder])
+        try await save(updated(current, folders: folders))
+        return folders[folders.count - 1]
+    }
+
+    public func renameFolder(id: String, name: String) async throws {
+        let current = try await loadedOrganization()
+        guard current.folders.contains(where: { $0.id == id }) else {
+            throw SessionOrganizationError.folderNotFound(id)
+        }
+        let folders = current.folders.map { folder in
+            folder.id == id ? Folder(id: folder.id, name: name, order: folder.order) : folder
+        }
+        try await save(updated(current, folders: folders))
+    }
+
+    @discardableResult
+    public func deleteFolder(id: String) async throws -> [String] {
+        let current = try await loadedOrganization()
+        guard current.folders.contains(where: { $0.id == id }) else {
+            throw SessionOrganizationError.folderNotFound(id)
+        }
+
+        var removedSessionIDs: [String] = []
+        var gateways = current.gateways
+        for (host, gateway) in current.gateways {
+            let removed = gateway.folderMembership.filter { $0.value == id }.map(\.key)
+            removedSessionIDs.append(contentsOf: removed)
+            guard !removed.isEmpty else { continue }
+            var membership = gateway.folderMembership
+            for sessionID in removed {
+                membership.removeValue(forKey: sessionID)
+            }
+            gateways[host] = .init(folderMembership: membership)
+        }
+        let folders = reindexed(current.folders.filter { $0.id != id })
+        try await save(updated(current, folders: folders, gateways: gateways))
+        return removedSessionIDs.sorted()
+    }
+
+    public func reorderFolders(ids: [String]) async throws {
+        let current = try await loadedOrganization()
+        let foldersByID = Dictionary(uniqueKeysWithValues: current.folders.map { ($0.id, $0) })
+        guard ids.count == current.folders.count,
+              Set(ids).count == ids.count
+        else {
+            throw SessionOrganizationError.invalidFolderOrder
+        }
+        guard Set(ids) == Set(foldersByID.keys) else {
+            let unknownID = ids.first(where: { foldersByID[$0] == nil }) ?? "folder order"
+            throw SessionOrganizationError.folderNotFound(unknownID)
+        }
+        let folders = reindexed(ids.map { foldersByID[$0]! })
+        try await save(updated(current, folders: folders))
+    }
+
+    public func assignChat(
+        sessionID: String,
+        toFolderID folderID: String,
+        gatewayHost: String
+    ) async throws {
+        let current = try await loadedOrganization()
+        guard current.folders.contains(where: { $0.id == folderID }) else {
+            throw SessionOrganizationError.folderNotFound(folderID)
+        }
+        var gateways = current.gateways
+        var membership = gateways[gatewayHost]?.folderMembership ?? [:]
+        membership[sessionID] = folderID
+        gateways[gatewayHost] = .init(folderMembership: membership)
+        try await save(updated(current, gateways: gateways))
+    }
+
+    public func clearChatAssignment(sessionID: String, gatewayHost: String) async throws {
+        let current = try await loadedOrganization()
+        guard var membership = current.gateways[gatewayHost]?.folderMembership,
+              membership.removeValue(forKey: sessionID) != nil
+        else {
+            try await save(current)
+            return
+        }
+        var gateways = current.gateways
+        gateways[gatewayHost] = .init(folderMembership: membership)
+        try await save(updated(current, gateways: gateways))
+    }
+
+    public func setSortMode(_ mode: SortMode) async throws {
+        let current = try await loadedOrganization()
+        try await save(updated(current, sort: .init(mode: mode)))
+    }
+
+    public func setGrouping(byDate: Bool) async throws {
+        let current = try await loadedOrganization()
+        try await save(updated(current, grouping: .init(byDate: byDate)))
+    }
+
+    private func loadedOrganization() async throws -> SessionOrganization {
+        if !hasLoaded {
+            _ = try await load()
+        }
+        return organization
+    }
+
+    private func updated(
+        _ current: SessionOrganization,
+        grouping: SessionOrganization.Grouping? = nil,
+        sort: SessionOrganization.Sort? = nil,
+        folders: [Folder]? = nil,
+        gateways: [String: SessionOrganization.Gateway]? = nil
+    ) -> SessionOrganization {
+        SessionOrganization(
+            grouping: grouping ?? current.grouping,
+            sort: sort ?? current.sort,
+            folders: folders ?? current.folders,
+            gateways: gateways ?? current.gateways
+        )
+    }
+
+    /// Folder order is the array position. Reindexing keeps it contiguous.
+    private func reindexed(_ folders: [Folder]) -> [Folder] {
+        folders.enumerated().map { index, folder in
+            Folder(id: folder.id, name: folder.name, order: index)
         }
     }
 }

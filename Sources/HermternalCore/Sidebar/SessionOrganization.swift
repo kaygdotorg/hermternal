@@ -136,4 +136,6 @@ public enum SessionOrganizationError: Error, Equatable, Sendable {
     case malformedConfiguration(String)
     case fileReadFailed(String)
     case fileWriteFailed(String)
+    case folderNotFound(String)
+    case invalidFolderOrder
 }
