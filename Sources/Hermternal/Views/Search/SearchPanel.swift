@@ -230,7 +230,7 @@ private struct SearchFieldMetadataView: View {
     }
 
     private var indexingLabel: String {
-        "Older messages in \(metadata.pendingIndexingSessions) chats are still being indexed"
+        "Older messages in \(metadata.pendingIndexingSessions) chats are queued for indexing"
     }
 
     private var truncationLabel: String {
@@ -254,8 +254,9 @@ private struct SearchFieldMetadataView: View {
                 .accessibilityLabel(countLabel)
 
             if metadata.pendingIndexingSessions > 0 {
-                ProgressView()
-                    .controlSize(.small)
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
                     .frame(width: 22, height: 22)
                     .help(indexingLabel)
                     .accessibilityElement(children: .ignore)

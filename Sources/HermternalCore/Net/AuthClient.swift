@@ -1,5 +1,16 @@
 import Foundation
 
+public enum AuthCredentialError: LocalizedError, Equatable, Sendable {
+    case loadFailed(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .loadFailed(let reason):
+            "Could not load saved credentials: \(reason)"
+        }
+    }
+}
+
 
 /// Drives the gateway-brokered RFC 8252 native-app login and keeps the
 /// bearer credential fresh.
@@ -16,6 +27,9 @@ public actor AuthClient {
     private let urlSession: URLSession
     private let openURL: @Sendable (URL) -> Void
     private let credentialStore: any CredentialStoring
+    private var cachedCredentials: Credentials?
+    private var credentialLoadError: AuthCredentialError?
+    private var credentialsCacheLoaded = false
     private var refreshTask: Task<Credentials, Error>?
     private var refreshGeneration = 0
     private var refreshRejected = false
@@ -33,8 +47,8 @@ public actor AuthClient {
         self.credentialStore = credentialStore ?? FacadeCredentialStore()
     }
 
-    public var storedCredentials: Credentials? {
-        try? credentialStore.load(account: account)
+    public func loadStoredCredentials() throws -> Credentials? {
+        try loadCachedCredentials()
     }
 
     public func signOut() {
@@ -42,6 +56,7 @@ public actor AuthClient {
         refreshTask = nil
         refreshRejected = false
         try? credentialStore.delete(account: account)
+        invalidateCredentialCache()
     }
     // MARK: - Provider discovery
 
@@ -153,6 +168,9 @@ public actor AuthClient {
 
         let credentials = try await exchange(code: callback.code, verifier: pkce.verifier)
         try credentialStore.save(credentials, account: account)
+        cachedCredentials = credentials
+        credentialLoadError = nil
+        credentialsCacheLoaded = true
         return credentials
     }
 
@@ -193,7 +211,7 @@ public actor AuthClient {
 
     public func validCredentials(forceRefresh: Bool = false) async throws -> Credentials {
         if refreshRejected { throw AuthError.sessionExpired }
-        guard let stored = storedCredentials else { throw AuthError.notSignedIn }
+        guard let stored = try loadCachedCredentials() else { throw AuthError.notSignedIn }
         if !forceRefresh, stored.isExpired() == false {
             return stored
         }
@@ -230,11 +248,15 @@ public actor AuthClient {
     }
 
     private func performRefresh() async throws -> Credentials {
-        guard let stored = storedCredentials else { throw AuthError.notSignedIn }
+        // Refresh is an explicit authoritative read. This also picks up a
+        // credential written by another AuthClient instance since the last
+        // cached read.
+        guard let stored = try reloadCredentials() else { throw AuthError.notSignedIn }
         guard !stored.refreshToken.isEmpty else {
             // Treat a damaged/legacy credential as signed out so the next
             // lifecycle pass presents sign-in instead of retrying forever.
             try? credentialStore.delete(account: account)
+            invalidateCredentialCache()
             throw AuthError.sessionExpired
         }
 
@@ -257,6 +279,7 @@ public actor AuthClient {
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         if status == 401 {
             try? credentialStore.delete(account: account)
+            invalidateCredentialCache()
             throw AuthError.sessionExpired
         }
         guard status == 200 else {
@@ -276,7 +299,45 @@ public actor AuthClient {
             userID: decoded.user_id ?? stored.userID
         )
         try credentialStore.save(rotated, account: account)
+        cachedCredentials = rotated
+        credentialLoadError = nil
+        credentialsCacheLoaded = true
         return rotated
+    }
+
+    private func loadCachedCredentials() throws -> Credentials? {
+        if credentialsCacheLoaded {
+            if let credentialLoadError { throw credentialLoadError }
+            return cachedCredentials
+        }
+        credentialsCacheLoaded = true
+        do {
+            cachedCredentials = try credentialStore.load(account: account)
+            return cachedCredentials
+        } catch {
+            let loadError = AuthCredentialError.loadFailed(error.localizedDescription)
+            credentialLoadError = loadError
+            throw loadError
+        }
+    }
+
+    private func reloadCredentials() throws -> Credentials? {
+        credentialsCacheLoaded = true
+        credentialLoadError = nil
+        do {
+            cachedCredentials = try credentialStore.load(account: account)
+            return cachedCredentials
+        } catch {
+            let loadError = AuthCredentialError.loadFailed(error.localizedDescription)
+            credentialLoadError = loadError
+            throw loadError
+        }
+    }
+
+    private func invalidateCredentialCache() {
+        cachedCredentials = nil
+        credentialLoadError = nil
+        credentialsCacheLoaded = false
     }
 
 

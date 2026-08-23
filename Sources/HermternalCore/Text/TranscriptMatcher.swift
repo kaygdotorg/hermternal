@@ -23,9 +23,13 @@ public struct TranscriptMatch: Hashable, Sendable {
 /// all term occurrences are returned in transcript order. Matching ignores
 /// case and diacritics while retaining the global FTS word-prefix behavior.
 public enum TranscriptMatcher {
+    @TaskLocal
+    internal static var _scanHook: (@Sendable () -> Void)?
+
     public static func matches(in messages: [String], query: String) -> [TranscriptMatch] {
         let terms = normalizedTerms(query)
         guard !terms.isEmpty else { return [] }
+        _scanHook?()
 
         return messages.enumerated().flatMap { messageIndex, text in
             matches(in: text, terms: terms).map {

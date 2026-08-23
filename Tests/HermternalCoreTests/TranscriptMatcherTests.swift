@@ -49,3 +49,47 @@ func transcriptOrdering() {
         TranscriptMatch(messageIndex: 2, range: 0..<5)
     ])
 }
+
+@Test("find scans a transcript once before row projection")
+func transcriptProjectionScansOnceForLargeTranscripts() {
+    let counter = MatcherInvocationCounter()
+    TranscriptMatcher.$_scanHook.withValue({ counter.increment() }) {
+        for messageCount in [500, 5_000] {
+            let messages = (0..<messageCount).map { index in
+                index.isMultiple(of: 97)
+                    ? "row \(index) target token"
+                    : "row \(index) filler"
+            }
+            let expected = TranscriptMatcher.matches(in: messages, query: "target")
+            let rangesByMessage = Dictionary(
+                grouping: expected,
+                by: \.messageIndex
+            ).mapValues { $0.map(\.range) }
+            let projected = messages.indices.flatMap { index in
+                rangesByMessage[index, default: []].map {
+                    TranscriptMatch(messageIndex: index, range: $0)
+                }
+            }
+
+            #expect(projected == expected)
+            #expect(counter.value == (messageCount == 500 ? 1 : 2))
+        }
+    }
+}
+
+private final class MatcherInvocationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+}

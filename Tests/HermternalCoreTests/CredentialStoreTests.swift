@@ -41,6 +41,57 @@ private func temporaryDirectory() throws -> URL {
     return directory
 }
 
+@Test("missing file credentials are absent")
+func missingFileCredentialsAreAbsent() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    #expect(try FileCredentialStore(directory: directory).load(account: "https://missing.example") == nil)
+}
+
+@Test("corrupt current credential file throws")
+func corruptCurrentCredentialFileThrows() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let account = "https://gateway.example"
+    let current = FileCredentialStore.credentialFileURL(account: account, directory: directory)
+    try Data("not-json".utf8).write(to: current)
+    let legacy = directory.appending(path: "https---gateway-example.json")
+    try JSONEncoder().encode(testCredentials).write(to: legacy)
+    do {
+        _ = try FileCredentialStore(directory: directory).load(account: account)
+        Issue.record("corrupt current credentials were accepted")
+    } catch {}
+}
+
+@Test("unreadable current credential file throws")
+func unreadableCurrentCredentialFileThrows() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let account = "https://gateway.example"
+    let current = FileCredentialStore.credentialFileURL(account: account, directory: directory)
+    try FileManager.default.createDirectory(at: current, withIntermediateDirectories: false)
+    do {
+        _ = try FileCredentialStore(directory: directory).load(account: account)
+        Issue.record("unreadable current credentials were accepted")
+    } catch {}
+}
+
+@Test("corrupt legacy credential file throws")
+func corruptLegacyCredentialFileThrows() throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let account = "https://gateway.example"
+    let legacyName = account.unicodeScalars
+        .map { CharacterSet.alphanumerics.contains($0) ? Character($0) : "-" }
+        .reduce(into: "") { $0.append($1) }
+    let legacy = directory.appending(path: "\(legacyName).json")
+    try Data("not-json".utf8).write(to: legacy)
+    do {
+        _ = try FileCredentialStore(directory: directory).load(account: account)
+        Issue.record("corrupt legacy credentials were accepted")
+    } catch {}
+}
+
 @Test("keychain credentials round-trip and delete")
 func keychainRoundTrip() throws {
     let keychain = FakeKeychain()

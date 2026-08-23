@@ -20,20 +20,25 @@ struct HermternalApp: App {
     private let fixtureMode: Bool
 
     init() {
+        #if DEBUG
         let fixtureMode = SidebarFixtures.isEnabled
-        self.fixtureMode = fixtureMode
-        let model = fixtureMode
-            ? AppModel(transcriptSource: SidebarFixtures.transcriptSource)
-            : AppModel()
-        if fixtureMode {
+        let model: AppModel = {
+            guard fixtureMode else { return AppModel() }
             // Keep fixture authority in memory only. Never write it to the
             // production server setting or credential stores.
+            let model = AppModel(transcriptSource: SidebarFixtures.transcriptSource)
             model.serverText = SidebarFixtures.gatewayURL.absoluteString
             model.sessions = SidebarFixtures.sessions
             model.selectedSessionID = SidebarFixtures.transcriptSessionID
             model.messages = SidebarFixtures.transcriptMessages
             model.phase = .ready
-        }
+            return model
+        }()
+        #else
+        let fixtureMode = false
+        let model = AppModel()
+        #endif
+        self.fixtureMode = fixtureMode
         _model = State(initialValue: model)
 
         var registry = CapabilityRegistry()

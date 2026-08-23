@@ -189,11 +189,16 @@ final class AppModel {
         }
         let auth = AuthClient(server: url, openURL: { NSWorkspace.shared.open($0) })
         self.auth = auth
-        await refreshGatewayDiscovery(using: auth)
-        guard await auth.storedCredentials != nil else {
-            phase = .signedOut
+        do {
+            guard try await auth.loadStoredCredentials() != nil else {
+                phase = .signedOut
+                return
+            }
+        } catch {
+            phase = .failed(error.localizedDescription)
             return
         }
+        await refreshGatewayDiscovery(using: auth)
         accountIdentity = await auth.fetchAccountIdentity()
         await connect()
     }
@@ -797,6 +802,10 @@ final class AppModel {
         let titles = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0.title) })
         isCacheWarming = true
         prefetchTask = Task { [weak self, cache] in
+            // Capture the cache epoch before any REST request. A clear or
+            // rebuild that completes while warming is in flight must reject
+            // every store derived from this prefetch batch.
+            let expectedEpoch = await cache.currentEpoch()
             let coordinator = BoundedPrefetchCoordinator(limit: 4)
             let results: [CacheStoreResult] = await coordinator.prefetch(ordered) { id in
                 guard (await cache.read(for: id)).transcript == nil,
@@ -816,7 +825,7 @@ final class AppModel {
                     snapshot: snapshot,
                     title: titles[id] ?? "",
                     for: id,
-                    expectedEpoch: nil
+                    expectedEpoch: expectedEpoch
                 ) else { return nil }
                 return result
             }

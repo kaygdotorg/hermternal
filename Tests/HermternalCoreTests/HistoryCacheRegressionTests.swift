@@ -110,6 +110,66 @@ func reconcilePrunesOrphanedAndCorruptFiles() async throws {
     #expect(await reader.messages(for: "other")?.first?.text == "other")
 }
 
+@Test("prefetch stores from before a clear are rejected")
+func delayedPrefetchStoreCannotResurrectClearedCache() async throws {
+    let directory = try historyCacheTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let cache = HistoryCache(directory: directory)
+    let expectedEpoch = await cache.currentEpoch()
+    let gate = PrefetchGate()
+    let prefetch = Task {
+        await BoundedPrefetchCoordinator(limit: 1).prefetch(["session"]) { id in
+            await gate.markStarted()
+            await gate.waitForRelease()
+            let result = await cache.store(
+                [ChatMessage(role: .assistant, text: "stale")],
+                for: id,
+                expectedEpoch: expectedEpoch
+            )
+            return result.addedEntry ? result : nil
+        }
+    }
+
+    await gate.waitForStart()
+    #expect(await cache.clear())
+    await gate.release()
+    let results = await prefetch.value
+
+    #expect(results.isEmpty)
+    #expect(!FileManager.default.fileExists(
+        atPath: directory.appending(path: "session.json").path
+    ))
+}
+
+@Test("reconcile scales across 5000 current files")
+func reconcile5000FilesUsesOneLookupPerFile() async throws {
+    let directory = try historyCacheTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let codec = JSONCacheCodec()
+    let data = try codec.encode(
+        CachedTranscript(
+            version: HistoryCache.version,
+            messages: [ChatMessage(role: .assistant, text: "cached")],
+            snapshot: nil
+        )
+    )
+    let count = 5_000
+    let validIDs = (0..<count).map { "session-\($0)" }
+    for id in validIDs {
+        let encodedFilename = id.replacingOccurrences(of: "-", with: "%2D")
+        let file = URL(fileURLWithPath: directory.path + "/\(encodedFilename).json")
+        try data.write(to: file)
+    }
+
+    let fileSystem = CountingCacheFileSystem()
+    let cache = HistoryCache(directory: directory, fileSystem: fileSystem)
+    let statistics = await cache.reconcile(validIDs: validIDs)
+
+    #expect(statistics.entryCount == count)
+    #expect(statistics.bytes == Int64(data.count * count))
+    #expect(fileSystem.dataReadCount == count)
+}
+
 @Test("cache file recognition and validation stay independent")
 func cacheFileRecognitionAndValidationAreIndependent() throws {
     let directory = try historyCacheTemporaryDirectory()
@@ -128,6 +188,8 @@ func cacheFileRecognitionAndValidationAreIndependent() throws {
     let malformedURL = directory.appending(path: "malformed.json")
     let corruptURL = directory.appending(path: "corrupt.json")
     let orphanURL = directory.appending(path: "orphan.json")
+    let legacyURL = directory.appending(path: "legacy-session.json")
+    let collisionURL = directory.appending(path: "collision-id.json")
     try validData.write(to: validURL)
     try malformedData.write(to: malformedURL)
     try corruptEnvelope.write(to: corruptURL)
@@ -164,6 +226,54 @@ func cacheFileRecognitionAndValidationAreIndependent() throws {
             validIDs: ["valid", "malformed", "corrupt"]
         ) == .orphan
     )
+    #expect(
+        HistoryCache.classifyCacheFile(
+            at: legacyURL,
+            in: directory,
+            validIDs: ["legacy.session"]
+        ) == .legacy("legacy.session")
+    )
+    #expect(
+        HistoryCache.classifyCacheFile(
+            at: collisionURL,
+            in: directory,
+            validIDs: ["collision.id", "collision-id"]
+        ) == .legacyCollision
+    )
+}
+private actor PrefetchGate {
+    private var started = false
+    private var released = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func markStarted() {
+        started = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func waitForStart() async {
+        guard !started else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func waitForRelease() async {
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
 }
 
 private final class DecodeCountingCacheCodec: CacheCodec, @unchecked Sendable {

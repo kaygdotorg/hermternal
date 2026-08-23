@@ -115,22 +115,31 @@ public struct FileCredentialStore: CredentialStoring, Sendable {
 
     /// Returns the exact encoded credential bytes. Legacy files are adopted
     /// without re-encoding, preserving fields from newer app versions.
-    func loadData(account: String) -> Data? {
-        guard let directory = resolvedDirectory else { return nil }
+    func loadData(account: String) throws -> Data? {
+        guard let directory = resolvedDirectory else {
+            throw StorageError.applicationSupportDirectoryUnavailable
+        }
+        let fileManager = FileManager.default
         let current = Self.credentialFileURL(account: account, directory: directory)
-        if let data = Self.validData(at: current) { return data }
+        if fileManager.fileExists(atPath: current.path) {
+            let data = try Data(contentsOf: current)
+            _ = try JSONDecoder().decode(Credentials.self, from: data)
+            return data
+        }
 
         let legacy = Self.legacyCredentialFileURL(account: account, directory: directory)
-        guard let data = Self.validData(at: legacy) else { return nil }
-        if (try? Self.adopt(data: data, to: current, fileManager: .default)) != nil {
-            try? FileManager.default.removeItem(at: legacy)
+        guard fileManager.fileExists(atPath: legacy.path) else { return nil }
+        let data = try Data(contentsOf: legacy)
+        _ = try JSONDecoder().decode(Credentials.self, from: data)
+        if (try? Self.adopt(data: data, to: current, fileManager: fileManager)) != nil {
+            try? fileManager.removeItem(at: legacy)
         }
         return data
     }
 
     public func load(account: String) throws -> Credentials? {
-        guard let data = loadData(account: account) else { return nil }
-        return try? JSONDecoder().decode(Credentials.self, from: data)
+        guard let data = try loadData(account: account) else { return nil }
+        return try JSONDecoder().decode(Credentials.self, from: data)
     }
 
     public func delete(account: String) throws {
@@ -139,13 +148,6 @@ public struct FileCredentialStore: CredentialStoring, Sendable {
         let legacy = Self.legacyCredentialFileURL(account: account, directory: directory)
         try? FileManager.default.removeItem(at: current)
         if legacy != current { try? FileManager.default.removeItem(at: legacy) }
-    }
-
-    private static func validData(at url: URL) -> Data? {
-        guard let data = try? Data(contentsOf: url),
-              (try? JSONDecoder().decode(Credentials.self, from: data)) != nil
-        else { return nil }
-        return data
     }
 
     private static func adopt(data: Data, to target: URL, fileManager: FileManager) throws {

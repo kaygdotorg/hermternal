@@ -52,6 +52,7 @@ public actor GatewayClient {
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
     private var receiveLoop: Task<Void, Never>?
+    private let frameDecoder = JSONDecoder()
 
     public init() {
         let (stream, continuation) = AsyncStream<GatewayEvent>.makeStream()
@@ -152,7 +153,7 @@ public actor GatewayClient {
     private func ingest(text: String) {
         for data in Self.webSocketFrames(from: text) {
             do {
-                let frame = try JSONDecoder().decode(Frame.self, from: data)
+                let frame = try frameDecoder.decode(Frame.self, from: data)
                 route(frame)
             } catch {
                 let detail = String(decoding: data.prefix(512), as: UTF8.self)
@@ -179,10 +180,11 @@ public actor GatewayClient {
     /// detail so the app can surface it through its toast path.
     public static func validateWebSocketFrames(from text: String) throws -> [Data] {
         let frames = webSocketFrames(from: text)
+        let decoder = JSONDecoder()
         for data in frames {
             let frame: Frame
             do {
-                frame = try JSONDecoder().decode(Frame.self, from: data)
+                frame = try decoder.decode(Frame.self, from: data)
             } catch {
                 let detail = String(decoding: data.prefix(512), as: UTF8.self)
                 throw GatewayError.malformedFrame("\(error.localizedDescription): \(detail)")

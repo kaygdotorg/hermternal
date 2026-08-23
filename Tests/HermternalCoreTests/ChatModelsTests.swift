@@ -47,6 +47,19 @@ func chatSessionParsesFractionalLastActive() {
     #expect(session.lastActive == Date(timeIntervalSince1970: 1_700_000_000.25))
 }
 
+@Test("DateParser preserves fractional and whole-second ISO8601 timestamps")
+func dateParserParsesISO8601Forms() {
+    let fractional = DateParser.date(
+        from: .string("2023-11-14T22:13:20.125Z")
+    )
+    let wholeSecond = DateParser.date(
+        from: .string("2023-11-14T22:13:20Z")
+    )
+
+    #expect(fractional == Date(timeIntervalSince1970: 1_700_000_000.125))
+    #expect(wholeSecond == Date(timeIntervalSince1970: 1_700_000_000))
+}
+
 @Test("A normal preview is capped at 60 characters")
 func chatSessionCapsNormalPreview() {
     let preview = String(repeating: "x", count: 80)

@@ -105,9 +105,13 @@ public struct KeychainCredentialStore: CredentialStoring, Sendable {
 
         // A missing Keychain item is normal on first launch. Adopt an existing
         // file's exact bytes and remove it only after the Keychain write succeeds.
-        guard let data = fileStore.loadData(account: account),
-              let credentials = try? JSONDecoder().decode(Credentials.self, from: data)
-        else { return nil }
+        guard let data = try fileStore.loadData(account: account) else { return nil }
+        let credentials: Credentials
+        do {
+            credentials = try JSONDecoder().decode(Credentials.self, from: data)
+        } catch {
+            throw KeychainError.invalidData
+        }
         try client.write(KeychainSecret(account: account, data: data, kind: .bearerTokens))
         try fileStore.delete(account: account)
         return credentials

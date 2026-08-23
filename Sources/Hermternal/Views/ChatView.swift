@@ -58,18 +58,6 @@ struct ChatView: View {
         }
     }
 
-    private var findMatches: [TranscriptMatch] {
-        TranscriptMatcher.matches(
-            in: model.messages.map(\.text),
-            query: findQuery
-        )
-    }
-
-    private var activeFindMatch: TranscriptMatch? {
-        guard findMatches.indices.contains(activeFindIndex) else { return nil }
-        return findMatches[activeFindIndex]
-    }
-
     private var initialMessageTarget: MessageIdentity? {
         if messageTargetActive {
             // A nil write-back means the user has scrolled away. Do not fall
@@ -85,6 +73,7 @@ struct ChatView: View {
         // needed after the transcript has painted.
         return .server(location.messageID)
     }
+
 
     private var hasPositionedMessageTarget: Bool {
         messageTargetActive
@@ -125,38 +114,66 @@ struct ChatView: View {
         activeFindIndex = 0
     }
 
-    private func advanceFind(by delta: Int) {
-        let count = findMatches.count
+    private func advanceFind(by delta: Int, matches: [TranscriptMatch]) {
+        let count = matches.count
         guard count > 0 else { return }
         activeFindIndex = (activeFindIndex + delta + count) % count
     }
 
-    private func activateFindMatch(using proxy: ScrollViewProxy) {
-        guard isFindPresented, let match = activeFindMatch,
-              model.messages.indices.contains(match.messageIndex)
+    private func activateFindMatch(
+        using proxy: ScrollViewProxy,
+        matches: [TranscriptMatch],
+        messages: [ChatMessage]
+    ) {
+        guard isFindPresented,
+              matches.indices.contains(activeFindIndex),
+              messages.indices.contains(matches[activeFindIndex].messageIndex)
         else { return }
         pendingScrollTask?.cancel()
         pendingScrollTask = nil
         withAnimation(.easeInOut(duration: 0.28)) {
-            proxy.scrollTo(model.messages[match.messageIndex].id, anchor: .center)
+            proxy.scrollTo(
+                messages[matches[activeFindIndex].messageIndex].id,
+                anchor: .center
+            )
         }
     }
 
     private var transcript: some View {
-        ScrollViewReader { proxy in
+        let messages = model.messages
+        let query = isFindPresented ? findQuery : ""
+        let matches = query.isEmpty
+            ? []
+            : TranscriptMatcher.matches(in: messages.map(\.text), query: query)
+        let rangesByMessageID = Dictionary(
+            grouping: matches,
+            by: { messages[$0.messageIndex].id }
+        ).mapValues { $0.map(\.range) }
+        let activeMatch = matches.indices.contains(activeFindIndex)
+            ? matches[activeFindIndex]
+            : nil
+        let activeMessageID = activeMatch.map {
+            messages[$0.messageIndex].id
+        }
+        let selectedMatchNumber = activeMatch.flatMap {
+            matches.firstIndex(of: $0).map { $0 + 1 }
+        }
+        return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 18) {
-                    if model.messages.isEmpty {
+                    if messages.isEmpty {
                         EmptyState()
                             .padding(.top, 80)
                     }
-                    ForEach(Array(model.messages.enumerated()), id: \.element.id) { index, message in
+                    ForEach(Array(messages.enumerated()), id: \.element.id) { _, message in
+                        let matchRanges = rangesByMessageID[message.id] ?? []
                         MessageRow(
                             message: message,
                             sessionID: model.selectedSessionID,
                             gatewayHost: model.configuredGatewayHost,
-                            findQuery: isFindPresented ? findQuery : "",
-                            isFindActive: isFindPresented && activeFindMatch?.messageIndex == index
+                            findQuery: query,
+                            matchRanges: matchRanges,
+                            isFindActive: activeMessageID == message.id
                         )
                         .id(message.id)
                     }
@@ -182,10 +199,10 @@ struct ChatView: View {
                 if isFindPresented {
                     FindBar(
                         query: $findQuery,
-                        matchCount: findMatches.count,
-                        selectedMatchNumber: activeFindMatch.map { findMatches.firstIndex(of: $0)! + 1 },
-                        next: { advanceFind(by: 1) },
-                        previous: { advanceFind(by: -1) },
+                        matchCount: matches.count,
+                        selectedMatchNumber: selectedMatchNumber,
+                        next: { advanceFind(by: 1, matches: matches) },
+                        previous: { advanceFind(by: -1, matches: matches) },
                         close: closeFind
                     )
                     .padding(.top, 12)
@@ -201,13 +218,13 @@ struct ChatView: View {
                 }
             }
             .onChange(of: isFindPresented) {
-                activateFindMatch(using: proxy)
+                activateFindMatch(using: proxy, matches: matches, messages: messages)
             }
             .onChange(of: findQuery) {
-                activateFindMatch(using: proxy)
+                activateFindMatch(using: proxy, matches: matches, messages: messages)
             }
             .onChange(of: activeFindIndex) {
-                activateFindMatch(using: proxy)
+                activateFindMatch(using: proxy, matches: matches, messages: messages)
             }
             .onChange(of: model.messages.last?.text) {
                 guard model.pendingMessageLocation == nil else { return }
@@ -344,8 +361,8 @@ private struct MessageRow: View {
     let sessionID: String?
     let gatewayHost: String?
     let findQuery: String
+    let matchRanges: [Range<Int>]
     let isFindActive: Bool
-
     var body: some View {
         rowContent
             .contextMenu {
@@ -389,7 +406,7 @@ private struct MessageRow: View {
                     FindHighlightedMessage(
                         text: message.text,
                         isStreaming: false,
-                        query: findQuery,
+                        matchRanges: matchRanges,
                         isActive: isFindActive
                     )
                     .padding(.horizontal, 14)
@@ -417,7 +434,7 @@ private struct MessageRow: View {
                         FindHighlightedMessage(
                             text: message.text,
                             isStreaming: message.isStreaming,
-                            query: findQuery,
+                            matchRanges: matchRanges,
                             isActive: isFindActive
                         )
                     }

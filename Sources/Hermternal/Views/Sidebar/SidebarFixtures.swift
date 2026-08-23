@@ -1,10 +1,11 @@
 import SwiftUI
 import HermternalCore
 
+#if DEBUG
 /// Fixed sidebar data for local visual checks without a gateway.
 ///
 /// The launch path is enabled only when `HERMTERNAL_FIXTURES` is exactly `1`.
-/// Ordinary launches do not enter this path.
+/// Release builds do not compile the environment-controlled fixture path.
 enum SidebarFixtures {
     static let isEnabled = ProcessInfo.processInfo.environment["HERMTERNAL_FIXTURES"] == "1"
     /// Fixture authority is deliberately non-production so labels and copied
@@ -251,6 +252,11 @@ enum SidebarFixtures {
         ]))
     }
 }
+#else
+enum SidebarFixtures {
+    static let isEnabled = false
+}
+#endif
 
 #if DEBUG
 #Preview("Sidebar — fixtures") {

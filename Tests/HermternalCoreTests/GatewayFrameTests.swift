@@ -27,6 +27,22 @@ func newlineSeparatedWebSocketMessagesRemainSeparate() throws {
     #expect(frames.count == 2)
 }
 
+@Test("strict frame decoding remains active across a batch")
+func strictBatchFrameDecodingRemainsActive() throws {
+    let text = #"{"jsonrpc":"2.0","id":1,"result":{"sessions":[]}}"#
+        + "\n"
+        + #"{"jsonrpc":"2.0","id":2,"result":{"sessions":[}}"#
+
+    do {
+        _ = try GatewayClient.validateWebSocketFrames(from: text)
+        Issue.record("malformed frame in a batch was accepted")
+    } catch let error as GatewayError {
+        #expect(error.localizedDescription.contains("Malformed gateway frame"))
+    } catch {
+        Issue.record("unexpected error: \(error)")
+    }
+}
+
 @Test("malformed WebSocket input surfaces a decoding error")
 func malformedWebSocketMessageIsNotSilent() throws {
     do {

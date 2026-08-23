@@ -41,6 +41,11 @@ public protocol TranscriptPersisting: Sendable {
     ) async throws -> CacheStoreResult
     func remove(sessionID: String) async throws -> Bool
     func clear() async throws -> Bool
+    /// Destructively reconciles disk and index state against `validIDs`.
+    ///
+    /// Callers MUST pass an authoritative, complete session list. A partial
+    /// list can delete valid cache entries and search rows that are absent
+    /// only because the list was paginated or failed to load completely.
     func reconcile(validIDs: [String]) async throws -> CacheStatistics
 }
 
@@ -182,29 +187,59 @@ public actor HistoryCache: TranscriptPersisting {
         }
     }
 
+    private struct ReconciliationIndex {
+        let currentIDsByPath: [String: String]
+        let legacyIDsByPath: [String: [String]]
+
+        init(directory: URL, validIDs: [String]) {
+            var currentIDsByPath: [String: String] = [:]
+            var legacyIDsByPath: [String: [String]] = [:]
+            for id in validIDs {
+                let currentPath = HistoryCache.pathIdentity(
+                    HistoryCache.cacheURL(
+                        in: directory,
+                        filename: HistoryCache.encodedFilename(for: id)
+                    )
+                )
+                if currentIDsByPath[currentPath] == nil {
+                    // Preserve validIDs.first semantics for duplicate current paths.
+                    currentIDsByPath[currentPath] = id
+                }
+
+                let legacyPath = HistoryCache.pathIdentity(
+                    HistoryCache.cacheURL(
+                        in: directory,
+                        filename: HistoryCache.legacyFilename(for: id)
+                    )
+                )
+                legacyIDsByPath[legacyPath, default: []].append(id)
+            }
+            self.currentIDsByPath = currentIDsByPath
+            self.legacyIDsByPath = legacyIDsByPath
+        }
+
+        func classify(filePath: String) -> HistoryCacheFileKind {
+            if let currentID = currentIDsByPath[filePath] {
+                return .current(currentID)
+            }
+            guard let legacyIDs = legacyIDsByPath[filePath] else {
+                return .orphan
+            }
+            if legacyIDs.count == 1 {
+                return .legacy(legacyIDs[0])
+            }
+            return .legacyCollision
+        }
+    }
+
     public static func classifyCacheFile(
         at file: URL,
         in directory: URL,
         validIDs: [String]
     ) -> HistoryCacheFileKind {
         let directory = directory.resolvingSymlinksInPath()
-        let filePath = pathIdentity(file)
-        let currentMatch = validIDs.first { id in
-            pathIdentity(cacheURL(in: directory, filename: encodedFilename(for: id))) == filePath
-        }
-        if let currentMatch {
-            return .current(currentMatch)
-        }
-        let legacyMatches = validIDs.filter { id in
-            pathIdentity(cacheURL(in: directory, filename: legacyFilename(for: id))) == filePath
-        }
-        if legacyMatches.count == 1 {
-            return .legacy(legacyMatches[0])
-        }
-        if !legacyMatches.isEmpty {
-            return .legacyCollision
-        }
-        return .orphan
+        let index = ReconciliationIndex(directory: directory, validIDs: validIDs)
+        return index.classify(filePath: pathIdentity(file))
     }
 
     public static func validatesCacheData(
@@ -452,10 +487,14 @@ public actor HistoryCache: TranscriptPersisting {
         else {
             return CacheStatistics(entryCount: 0, bytes: 0)
         }
+        let reconciliationIndex = ReconciliationIndex(
+            directory: directory,
+            validIDs: validIDs
+        )
         var bytes: Int64 = 0
         var count = 0
         for file in files where file.pathExtension == "json" {
-            let kind = Self.classifyCacheFile(at: file, in: directory, validIDs: validIDs)
+            let kind = reconciliationIndex.classify(filePath: Self.pathIdentity(file))
             let id: String
             let isLegacy: Bool
             switch kind {

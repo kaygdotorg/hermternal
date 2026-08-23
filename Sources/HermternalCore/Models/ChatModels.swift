@@ -322,15 +322,17 @@ public enum DateParser {
         return Date(timeIntervalSince1970: seconds)
     }
 
+    // These value-type styles are safe to share across concurrent REST
+    // projections and avoid constructing a formatter per field.
+    private static let fractionalISO8601 = Date.ISO8601FormatStyle(
+        includingFractionalSeconds: true
+    )
+    private static let wholeISO8601 = Date.ISO8601FormatStyle()
+
     private static func date(fromISO8601 string: String) -> Date? {
-        let fractionalFormatter = ISO8601DateFormatter()
-        fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractionalFormatter.date(from: string) {
+        if let date = try? fractionalISO8601.parse(string) {
             return date
         }
-
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: string)
+        return try? wholeISO8601.parse(string)
     }
 }

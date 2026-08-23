@@ -215,21 +215,32 @@ private struct CacheSettingsView: View {
                         Text("\(model.cacheCachedCount) of \(model.cacheTotalCount) chats")
                             .monospacedDigit()
                     }
-                    ProgressView(value: model.cacheProgress)
-                        .accessibilityLabel("Chat cache progress")
-                        .accessibilityValue(
-                            "\(model.cacheCachedCount) of \(model.cacheTotalCount) chats"
-                        )
+                    if model.cacheTotalCount > 0 {
+                        ProgressView(value: model.cacheProgress)
+                            .accessibilityLabel("Chat cache progress")
+                            .accessibilityValue(
+                                "\(model.cacheCachedCount) of \(model.cacheTotalCount) chats"
+                            )
+                    } else {
+                        Text("No chats are available to cache yet.")
+                            .foregroundStyle(.secondary)
+                    }
                     LabeledContent("Disk usage", value: sizeText)
                 }
 
                 Section {
                     HStack {
-                        if model.isCacheWarming {
+                        if model.isCacheWarming && model.cacheTotalCount > 0 {
                             ProgressView()
                                 .controlSize(.small)
-                            Text("Caching in the background…")
-                                .foregroundStyle(.secondary)
+                        }
+                        if model.isCacheWarming {
+                            Text(
+                                model.cacheTotalCount > 0
+                                    ? "Caching in the background…"
+                                    : "Caching will begin after chats load."
+                            )
+                            .foregroundStyle(.secondary)
                         }
                         Spacer()
                         Button("Rebuild Cache") {
