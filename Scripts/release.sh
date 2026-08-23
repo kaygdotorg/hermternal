@@ -128,29 +128,9 @@ fi
 
 EPHEMERAL_KEYCHAIN=""
 KEYCHAIN_DIR=""
+CODESIGN_SELECTOR=""
 ORIGINAL_KEYCHAIN_BYTES=""
 declare -a ORIGINAL_KEYCHAINS=()
-restore_keychain() {
-	local restored
-	[[ -z "$EPHEMERAL_KEYCHAIN" ]] && return 0
-	if (( ${#ORIGINAL_KEYCHAINS[@]} > 0 )); then
-		security list-keychains -s "${ORIGINAL_KEYCHAINS[@]}" >/dev/null 2>&1 || {
-			printf 'error: could not restore the keychain search list\n' >&2
-			return 1
-		}
-		restored="$(security list-keychains 2>/dev/null)" || {
-			printf 'error: could not read the restored keychain search list\n' >&2
-			return 1
-		}
-		if [[ "$restored" != "$ORIGINAL_KEYCHAIN_BYTES" ]]; then
-			printf 'error: keychain search list was not restored byte-identically\n' >&2
-			return 1
-		fi
-	fi
-	security delete-keychain "$EPHEMERAL_KEYCHAIN" >/dev/null 2>&1 || true
-	[[ -z "$KEYCHAIN_DIR" || ! -d "$KEYCHAIN_DIR" ]] || rm -rf "$KEYCHAIN_DIR"
-	EPHEMERAL_KEYCHAIN=""
-}
 cleanup_signing_keychain() {
 	local status=$?
 	trap - EXIT INT TERM
@@ -162,8 +142,26 @@ cleanup_signing_keychain() {
 	fi
 	exit "$status"
 }
+restore_keychain() {
+	local restored
+	[[ -z "$EPHEMERAL_KEYCHAIN" ]] && return 0
+	security list-keychains -s "${ORIGINAL_KEYCHAINS[@]}" >/dev/null 2>&1 || {
+		printf 'error: could not restore the keychain search list\n' >&2
+		return 1
+	}
+	restored="$(security list-keychains 2>/dev/null)" || {
+		printf 'error: could not read the restored keychain search list\n' >&2
+		return 1
+	}
+	if [[ "$restored" != "$ORIGINAL_KEYCHAIN_BYTES" ]]; then
+		printf 'error: keychain search list was not restored byte-identically\n' >&2
+		return 1
+	fi
+	security delete-keychain "$EPHEMERAL_KEYCHAIN" >/dev/null 2>&1 || true
+	[[ -z "$KEYCHAIN_DIR" || ! -d "$KEYCHAIN_DIR" ]] || rm -rf "$KEYCHAIN_DIR"
+	EPHEMERAL_KEYCHAIN=""
+}
 setup_signing_keychain() {
-	local keychain_list keychain
 	[[ -n "${CODESIGN_IDENTITY:-}" ]] || fail 'CODESIGN_IDENTITY is unset; a person at the Mac must configure signing credentials before release.'
 	case "$CODESIGN_IDENTITY" in
 		"Developer ID Application"*) ;;
@@ -182,7 +180,8 @@ setup_signing_keychain() {
 		NEXT_ACTION='A person at the Mac must provide one signing .p12 and its password file, then rerun Scripts/ship.sh.'
 		fail 'portable signing credentials are missing'
 	fi
-	ORIGINAL_KEYCHAIN_BYTES="$(security list-keychains 2>&1)" ||
+	local keychain
+	ORIGINAL_KEYCHAIN_BYTES="$(security list-keychains 2>/dev/null)" ||
 		fail 'cannot capture the keychain search list'
 	while IFS= read -r keychain; do
 		keychain="${keychain#"${keychain%%[!$' \t\r\n']*}"}"
@@ -209,21 +208,38 @@ setup_signing_keychain() {
 	security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" \
 		"$EPHEMERAL_KEYCHAIN" >/dev/null 2>&1 || fail 'could not grant codesign access to the temporary keychain'
 	unset keychain_password
-	security list-keychains -s "${ORIGINAL_KEYCHAINS[@]}" "$EPHEMERAL_KEYCHAIN" >/dev/null 2>&1 ||
+	security list-keychains -s "$EPHEMERAL_KEYCHAIN" "${ORIGINAL_KEYCHAINS[@]}" >/dev/null 2>&1 ||
 		fail 'could not add the temporary signing keychain to the search list'
-	trap cleanup_signing_keychain EXIT
-	trap 'exit 130' INT
-	trap 'exit 143' TERM
-	local identities
-	identities="$(security find-identity -v -p codesigning 2>&1)" || fail 'cannot inspect identities in the temporary signing keychain'
-	grep -qF "$CODESIGN_IDENTITY" <<<"$identities" || fail 'portable signing identity is unavailable'
+	local identities selector_info selector_count selector
+	identities="$(security find-identity -v -p codesigning "$EPHEMERAL_KEYCHAIN" 2>&1)" ||
+		fail 'cannot inspect identities in the temporary signing keychain'
+	selector_info="$(
+		sed -n 's/^[[:space:]]*[0-9]*)[[:space:]]*\([[:xdigit:]]\{40\}\)[[:space:]]*"\(.*\)"$/\1\t\2/p' \
+			<<<"$identities" |
+			awk -F '\t' -v identity="$CODESIGN_IDENTITY" \
+				'$2 == identity { count++; selector = $1 } END { print count "\t" selector }'
+	)"
+	selector_count="${selector_info%%$'\t'*}"
+	selector="${selector_info#*$'\t'}"
+	if [[ "$selector_count" != 1 || ! "$selector" =~ ^[[:xdigit:]]{40}$ ]]; then
+		fail 'portable signing identity is unavailable or ambiguous'
+	fi
+	CODESIGN_SELECTOR="$selector"
 }
 
 run_build() {
 	setup_signing_keychain
 	step "Building release $VERSION"
-	CONFIG=release CODESIGN_IDENTITY="$CODESIGN_IDENTITY" bash Scripts/build-app.sh ||
-		fail 'the signed release build failed'
+	if (( PORTABLE_SIGNING )); then
+		CONFIG=release CODESIGN_IDENTITY="$CODESIGN_SELECTOR" \
+			CODESIGN_KEYCHAIN="$EPHEMERAL_KEYCHAIN" bash Scripts/build-app.sh ||
+			fail 'the signed release build failed'
+	else
+		(
+			unset CODESIGN_KEYCHAIN
+			CONFIG=release CODESIGN_IDENTITY="$CODESIGN_IDENTITY" bash Scripts/build-app.sh
+		) || fail 'the signed release build failed'
+	fi
 }
 run_notarize() {
 	[[ -f "$APP/Contents/Info.plist" ]] || fail 'signed app is missing; run the build stage first'
@@ -288,7 +304,4 @@ case "$STAGE" in
 	;;
 esac
 
-if [[ "$STAGE" == build || "$STAGE" == all ]]; then
-	restore_keychain || fail 'keychain search list restoration failed'
-fi
 printf 'Release stage complete: %s\n' "$STAGE"

@@ -28,15 +28,28 @@ cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 # Ad-hoc (`--sign -`) is the fallback and gets a fresh cdhash on every build,
 # which is why credentials live in CredentialStore rather than the Keychain:
 # an ad-hoc binary cannot hold a durable "Always Allow" grant.
+CODESIGN_KEYCHAIN="${CODESIGN_KEYCHAIN:-}"
+if [[ -n "$CODESIGN_KEYCHAIN" && ! -f "$CODESIGN_KEYCHAIN" ]]; then
+	echo "error: CODESIGN_KEYCHAIN does not point to a keychain file" >&2
+	exit 1
+fi
+
 IDENTITY="${CODESIGN_IDENTITY:-}"
 if [[ -z "$IDENTITY" && -f "$ROOT/.env" ]]; then
 	IDENTITY="$(sed -n 's/^CODESIGN_IDENTITY=//p' "$ROOT/.env" | tail -1)"
 fi
 if [[ -z "$IDENTITY" ]]; then
-	IDENTITY="$(
-		security find-identity -v -p codesigning 2>/dev/null |
-			sed -n 's/.*"\(.*\)".*/\1/p' | head -1
-	)"
+	if [[ -n "$CODESIGN_KEYCHAIN" ]]; then
+		IDENTITY="$(
+			security find-identity -v -p codesigning "$CODESIGN_KEYCHAIN" 2>/dev/null |
+				sed -n 's/^[[:space:]]*[0-9]*)[[:space:]]*\([[:xdigit:]]\{40\}\).*/\1/p' | head -1
+		)"
+	else
+		IDENTITY="$(
+			security find-identity -v -p codesigning 2>/dev/null |
+				sed -n 's/.*"\(.*\)".*/\1/p' | head -1
+		)"
+	fi
 fi
 if [[ -z "$IDENTITY" ]]; then
 	if [[ "${ALLOW_ADHOC:-0}" != 1 ]]; then
@@ -59,10 +72,16 @@ SIGN_ARGS=(--force --options runtime
 if [[ "$IDENTITY" == "-" ]]; then
 	codesign "${SIGN_ARGS[@]}" --sign - "$APP" >/dev/null
 else
+	CODESIGN_KEYCHAIN_ARGS=()
+	if [[ -n "$CODESIGN_KEYCHAIN" ]]; then
+		CODESIGN_KEYCHAIN_ARGS=(--keychain "$CODESIGN_KEYCHAIN")
+	fi
 	# Try with a trusted timestamp, then without: `--timestamp` needs the
 	# network and should not break an offline local build.
-	if ! ERR="$(codesign "${SIGN_ARGS[@]}" --timestamp --sign "$IDENTITY" "$APP" 2>&1)" &&
-	   ! ERR="$(codesign "${SIGN_ARGS[@]}" --sign "$IDENTITY" "$APP" 2>&1)"; then
+	if ! ERR="$(codesign "${SIGN_ARGS[@]}" "${CODESIGN_KEYCHAIN_ARGS[@]}" \
+		--timestamp --sign "$IDENTITY" "$APP" 2>&1)" &&
+	   ! ERR="$(codesign "${SIGN_ARGS[@]}" "${CODESIGN_KEYCHAIN_ARGS[@]}" \
+		--sign "$IDENTITY" "$APP" 2>&1)"; then
 		printf '%s\n' "$ERR" >&2
 		# errSecInternalComponent here is almost always the private key's ACL
 		# refusing a non-interactive caller, not a broken certificate.
