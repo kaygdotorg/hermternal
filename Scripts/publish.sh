@@ -77,7 +77,6 @@ ZIP="$ROOT/dist/Hermternal-$VERSION.zip"
 [[ -f "$ZIP" ]] ||
 	die "release artifact is missing: dist/Hermternal-$VERSION.zip; run Scripts/release.sh first"
 # Validate the app extracted from the exact archive before any tag or upload.
-#
 # The stapled ticket lives inside the app bundle, not beside the archive.
 VERIFY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hermternal-publish.XXXXXX")"
 trap 'rm -rf "$VERIFY_DIR"' EXIT
