@@ -54,6 +54,28 @@ public struct ChatSession: Identifiable, Hashable, Sendable {
         }
         return String(body.prefix(60))
     }
+
+    /// `displayTitle` is excluded because it is a pure function of `title` and
+    /// `preview`, which are both compared already. Including it would add a
+    /// String compare and a String hash with no discriminating power, on a path
+    /// that `List` diffing walks for every visible row on every update.
+    public static func == (lhs: ChatSession, rhs: ChatSession) -> Bool {
+        lhs.id == rhs.id
+            && lhs.pinned == rhs.pinned
+            && lhs.messageCount == rhs.messageCount
+            && lhs.lastActive == rhs.lastActive
+            && lhs.startedAt == rhs.startedAt
+            && lhs.title == rhs.title
+            && lhs.preview == rhs.preview
+            && lhs.source == rhs.source
+            && lhs.profile == rhs.profile
+    }
+
+    /// Hashes the durable id only. It is unique per session, so a wider hash
+    /// costs work without reducing collisions.
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
 }
 
 public enum Role: String, Codable, Sendable {

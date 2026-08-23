@@ -19,6 +19,10 @@ public actor RestClient {
     private let server: URL
     private let auth: AuthClient
     private let urlSession: URLSession
+    /// One decoder per client. `fetchMessagePage` runs inside a loop bounded at
+    /// 100 pages, so a per-call decoder allocated up to 100 strategy caches for
+    /// a single transcript open.
+    private let responseDecoder = JSONDecoder()
 
     /// The server caps each request at 500 rows. One hundred pages bounds a
     /// malformed or adversarial session at 50,000 rows instead of allowing an
@@ -121,7 +125,7 @@ public actor RestClient {
                 String(decoding: data.prefix(512), as: UTF8.self)
             )
         }
-        return try JSONDecoder().decode(MessagesResponse.self, from: data)
+        return try responseDecoder.decode(MessagesResponse.self, from: data)
     }
 
     private struct MessagesResponse: Decodable {
@@ -272,7 +276,7 @@ public actor RestClient {
             )
         }
 
-        let envelope = try JSONDecoder().decode(SessionListResponse.self, from: data)
+        let envelope = try responseDecoder.decode(SessionListResponse.self, from: data)
         return SessionListPage(
             sessions: envelope.sessions,
             total: envelope.total ?? envelope.sessions.count,
@@ -307,7 +311,7 @@ public actor RestClient {
                 String(decoding: data.prefix(512), as: UTF8.self)
             )
         }
-        return try JSONDecoder().decode(JSONValue.self, from: data)
+        return try responseDecoder.decode(JSONValue.self, from: data)
     }
 
     private struct SessionListResponse: Decodable {
