@@ -151,6 +151,7 @@ public actor RestClient {
         offset: Int = 0,
         order: String = "recent",
         archived: String = "exclude",
+        excludeSources: [String] = [],
         profile: String? = nil
     ) async throws -> SessionListPage {
         var credentials = try await auth.validCredentials()
@@ -165,6 +166,7 @@ public actor RestClient {
                 offset: pageOffset,
                 order: order,
                 archived: archived,
+                excludeSources: excludeSources,
                 profile: profile,
                 credentials: credentials
             )
@@ -178,6 +180,7 @@ public actor RestClient {
                 offset: pageOffset,
                 order: order,
                 archived: archived,
+                excludeSources: excludeSources,
                 profile: profile,
                 credentials: credentials
             )
@@ -193,6 +196,7 @@ public actor RestClient {
     public func allSessions(
         order: String = "recent",
         archived: String = "exclude",
+        excludeSources: [String] = [],
         profile: String? = nil
     ) async throws -> [JSONValue] {
         let pageLimit = 100
@@ -208,6 +212,7 @@ public actor RestClient {
                 offset: offset,
                 order: order,
                 archived: archived,
+                excludeSources: excludeSources,
                 profile: profile
             )
             var added = 0
@@ -286,6 +291,7 @@ public actor RestClient {
         offset: Int,
         order: String,
         archived: String,
+        excludeSources: [String],
         profile: String?,
         credentials: Credentials
     ) async throws -> SessionListPage {
@@ -299,6 +305,14 @@ public actor RestClient {
             .init(name: "order", value: order),
             .init(name: "archived", value: archived)
         ]
+        // Filtering here means the server never sends a row the sidebar would
+        // discard. Subagent rows outnumber real chats several times over, so
+        // dropping them client-side would waste transfer and mapping work.
+        if !excludeSources.isEmpty {
+            queryItems.append(
+                .init(name: "exclude_sources", value: excludeSources.joined(separator: ","))
+            )
+        }
         if let profile {
             queryItems.append(.init(name: "profile", value: profile))
         }

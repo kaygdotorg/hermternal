@@ -316,10 +316,15 @@ final class AppModel {
         guard let rest else { return }
         sessionsLoadedCompletely = false
         do {
-            let rows = try await rest.allSessions()
+            // The gateway already denies tool and kanban rows. Subagent rows are
+            // machine sessions, not chats, and they outnumber real chats several
+            // times over, so the server excludes them rather than sending rows
+            // the sidebar would discard.
+            let rows = try await rest.allSessions(excludeSources: Self.nonChatSources)
             sessions = rows.compactMap { row in
                 let session = ChatSession(from: row)
-                return session.id.isEmpty ? nil : session
+                guard !session.id.isEmpty else { return nil }
+                return session
             }
             sessions.sort(by: Self.sessionComesBefore)
             sessionsLoadedCompletely = true
@@ -332,6 +337,12 @@ final class AppModel {
             postError("Could not load sessions", detail: error.localizedDescription)
         }
     }
+
+    /// Sources whose sessions are machine work rather than chats.
+    ///
+    /// The gateway denies `tool` and `kanban` itself, so naming them here would
+    /// be redundant.
+    private static let nonChatSources = ["subagent"]
 
     private static func sessionComesBefore(_ lhs: ChatSession, _ rhs: ChatSession) -> Bool {
         switch (lhs.lastActive, rhs.lastActive) {

@@ -34,6 +34,140 @@ func sidebarRowsKeepPinnedAndFolderRows() {
     #expect(sections[0].rows[0].sessionID == sections[1].rows[0].sessionID)
 }
 
+@Test("Cron sessions appear in Schedules and not in date buckets")
+func sidebarRowsPartitionCronSessionsFromDateBuckets() {
+    let cron = testSession(
+        id: "cron",
+        title: "Scheduled",
+        startedAt: 900,
+        lastActive: 900,
+        source: "cron"
+    )
+    let chat = testSession(id: "chat", title: "Chat", startedAt: 800, lastActive: 800)
+
+    let sections = sidebarRows(
+        sessions: [cron, chat],
+        folders: [],
+        membership: [:],
+        sortMode: .lastActivity,
+        groupByDate: true,
+        calendar: Calendar(identifier: .gregorian),
+        now: Date(timeIntervalSince1970: 1_000)
+    )
+
+    #expect(sections.map(\.kind) == [.schedules, .bucket(.today)])
+    #expect(sections[0].rows.map(\.sessionID) == ["cron"])
+    #expect(sections[1].rows.map(\.sessionID) == ["chat"])
+}
+
+@Test("Schedules is first and absent when no cron sessions exist")
+func sidebarRowsScheduleSectionPresence() {
+    let withoutCron = sidebarRows(
+        sessions: [testSession(id: "chat", title: "Chat", startedAt: 100, lastActive: 100)],
+        folders: [],
+        membership: [:],
+        sortMode: .lastActivity,
+        groupByDate: false,
+        calendar: Calendar(identifier: .gregorian),
+        now: Date(timeIntervalSince1970: 200)
+    )
+    #expect(withoutCron.map(\.kind) == [.ungrouped])
+
+    let withCron = sidebarRows(
+        sessions: [
+            testSession(id: "chat", title: "Chat", startedAt: 100, lastActive: 100),
+            testSession(id: "cron", title: "Cron", startedAt: 100, lastActive: 100, source: "cron")
+        ],
+        folders: [],
+        membership: [:],
+        sortMode: .lastActivity,
+        groupByDate: false,
+        calendar: Calendar(identifier: .gregorian),
+        now: Date(timeIntervalSince1970: 200)
+    )
+    #expect(withCron.map(\.kind) == [.schedules, .ungrouped])
+}
+
+@Test("Section order is Schedules, Pinned, folders, then date buckets")
+func sidebarRowsOrderAllSectionKinds() {
+    let folder = Folder(id: "work", name: "Work", order: 0)
+    let sections = sidebarRows(
+        sessions: [
+            testSession(id: "cron", title: "Cron", startedAt: 100, lastActive: 100, source: "cron"),
+            testSession(id: "pinned", title: "Pinned", startedAt: 100, lastActive: 100, pinned: true),
+            testSession(id: "filed", title: "Filed", startedAt: 100, lastActive: 100),
+            testSession(id: "chat", title: "Chat", startedAt: 100, lastActive: 100)
+        ],
+        folders: [folder],
+        membership: ["filed": "work"],
+        sortMode: .lastActivity,
+        groupByDate: true,
+        calendar: Calendar(identifier: .gregorian),
+        now: Date(timeIntervalSince1970: 200)
+    )
+
+    #expect(sections.map(\.kind) == [
+        .schedules,
+        .pinned,
+        .folder(id: "work", name: "Work"),
+        .bucket(.today)
+    ])
+}
+
+@Test("A pinned cron session belongs only to Schedules")
+func sidebarRowsPinnedCronSessionUsesSchedules() {
+    let sections = sidebarRows(
+        sessions: [
+            testSession(
+                id: "cron",
+                title: "Cron",
+                startedAt: 100,
+                lastActive: 100,
+                pinned: true,
+                source: "cron"
+            )
+        ],
+        folders: [],
+        membership: [:],
+        sortMode: .lastActivity,
+        groupByDate: true,
+        calendar: Calendar(identifier: .gregorian),
+        now: Date(timeIntervalSince1970: 200)
+    )
+
+    #expect(sections.map(\.kind) == [.schedules])
+    #expect(sections[0].rows.map(\.sessionID) == ["cron"])
+}
+
+@Test("Schedules honors every sort mode")
+func sidebarRowsSchedulesSortModes() {
+    let sessions = [
+        testSession(id: "last", title: "Bravo", startedAt: 100, lastActive: 300, source: "cron"),
+        testSession(id: "created", title: "Charlie", startedAt: 300, lastActive: 100, source: "cron"),
+        testSession(id: "title", title: "Alpha", startedAt: 200, lastActive: 200, source: "cron")
+    ]
+    let calendar = Calendar(identifier: .gregorian)
+    let expected: [(SortMode, [String])] = [
+        (.lastActivity, ["last", "title", "created"]),
+        (.created, ["created", "title", "last"]),
+        (.title, ["title", "last", "created"])
+    ]
+
+    for (sortMode, ids) in expected {
+        let sections = sidebarRows(
+            sessions: sessions,
+            folders: [],
+            membership: [:],
+            sortMode: sortMode,
+            groupByDate: false,
+            calendar: calendar,
+            now: Date(timeIntervalSince1970: 400)
+        )
+        #expect(sections.map(\.kind) == [.schedules])
+        #expect(sections[0].rows.map(\.sessionID) == ids)
+    }
+}
+
 @Test("Ungrouped mode keeps pinned and folders before one ungrouped section")
 func sidebarRowsCollapseDateBuckets() {
     let pinned = testSession(id: "pinned", title: "Pinned", startedAt: 10, lastActive: 30, pinned: true)
@@ -175,12 +309,14 @@ func sidebarRowsPerformanceContract() {
     let now = Date(timeIntervalSince1970: 2_000_000)
 
     for count in [200, 1_000, 5_000] {
+        let cronCount = (count + 19) / 20
         let sessions = (0..<count).map { index in
             testSession(
                 id: "session-\(index)",
                 title: "Synthetic \(index)",
                 startedAt: Double(index),
-                lastActive: Double(index + count)
+                lastActive: Double(index + count),
+                source: index % 20 == 0 ? "cron" : nil
             )
         }
         let start = ContinuousClock.now
@@ -196,8 +332,17 @@ func sidebarRowsPerformanceContract() {
         let elapsed = start.duration(to: .now)
         let milliseconds = Double(elapsed.components.seconds) * 1_000
             + Double(elapsed.components.attoseconds) / 1_000_000_000_000_000
-        #expect(sections.count == 1)
-        #expect(sections[0].rows.count == count)
+        // A performance contract measures cost. It asserts only invariants that
+        // hold for any `now`, because pinning an exact bucket would make the
+        // measurement fail whenever a boundary rule changes. The dedicated
+        // ordering tests own exact section sequences.
+        #expect(sections.first?.kind == .schedules)
+        #expect(sections[0].rows.count == cronCount)
+        let placed = sections.reduce(into: Set<String>()) { ids, section in
+            for row in section.rows { ids.insert(row.sessionID) }
+        }
+        #expect(placed.count == count)
+        #expect(sections.dropFirst().reduce(0) { $0 + $1.rows.count } == count - cronCount)
         measurements.append("\(count)=\(String(format: "%.3f", milliseconds))ms")
     }
 
@@ -213,7 +358,8 @@ private func testSession(
     title: String,
     startedAt: TimeInterval? = nil,
     lastActive: TimeInterval? = nil,
-    pinned: Bool = false
+    pinned: Bool = false,
+    source: String? = nil
 ) -> ChatSession {
     var value: [String: JSONValue] = [
         "id": .string(id),
@@ -221,6 +367,7 @@ private func testSession(
         "pinned": .bool(pinned)
     ]
     if let startedAt { value["started_at"] = .number(startedAt) }
+    if let source { value["source"] = .string(source) }
     if let lastActive { value["last_active"] = .number(lastActive) }
     return ChatSession(from: .object(value))
 }

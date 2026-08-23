@@ -19,6 +19,7 @@ public struct Folder: Identifiable, Hashable, Sendable {
 }
 
 public enum SidebarSectionKind: Hashable, Sendable {
+    case schedules
     case pinned
     case folder(id: String, name: String)
     case bucket(DateBucket)
@@ -80,6 +81,8 @@ public func sidebarRows(
     var prepared = [PreparedSidebarSession]()
     prepared.reserveCapacity(sessions.count)
 
+    var scheduledIndexes = [Int]()
+    scheduledIndexes.reserveCapacity(sessions.count)
     var pinnedIndexes = [Int]()
     pinnedIndexes.reserveCapacity(sessions.count)
     var unfiledIndexes = [Int]()
@@ -99,15 +102,22 @@ public func sidebarRows(
     for session in sessions {
         let index = prepared.count
         prepared.append(PreparedSidebarSession(session: session))
+        let isScheduled = session.source == SidebarOrderingConstants.cronSource
 
-        if session.pinned {
+        if isScheduled {
+            scheduledIndexes.append(index)
+        }
+
+        // A scheduled session is more informative than its pin, so Schedules
+        // wins and the session is not repeated in Pinned.
+        if session.pinned && !isScheduled {
             pinnedIndexes.append(index)
         }
 
         if let folderID = membership[session.id],
            let folderIndex = folderIndexByID[folderID] {
             folderIndexes[folderIndex].append(index)
-        } else if !session.pinned {
+        } else if !session.pinned && !isScheduled {
             unfiledIndexes.append(index)
         }
     }
@@ -121,7 +131,20 @@ public func sidebarRows(
     }
 
     var sections = [SidebarSection]()
-    sections.reserveCapacity(1 + folders.count + DateBucket.allCases.count)
+    sections.reserveCapacity(2 + folders.count + DateBucket.allCases.count)
+
+    if !scheduledIndexes.isEmpty {
+        let kind = SidebarSectionKind.schedules
+        sections.append(SidebarSection(
+            id: kind,
+            kind: kind,
+            rows: makeRows(
+                indexes: sortedIndexes(scheduledIndexes, prepared: prepared, sortMode: sortMode),
+                kind: kind,
+                prepared: prepared
+            )
+        ))
+    }
 
     if !pinnedIndexes.isEmpty {
         let kind = SidebarSectionKind.pinned
@@ -189,6 +212,7 @@ public func sidebarRows(
 
 private enum SidebarOrderingConstants {
     static let titleLocale = Locale(identifier: "en_US_POSIX")
+    static let cronSource = "cron"
 }
 
 private struct PreparedSidebarSession {

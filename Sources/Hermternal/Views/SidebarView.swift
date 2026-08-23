@@ -26,25 +26,16 @@ struct SidebarView: View {
             List(selection: $model.selectedSessionID) {
                 Section("Chats") {
                     ForEach(model.sessions) { session in
-                        SessionRow(session: session)
-                            .contentShape(.rect)
-                            .simultaneousGesture(
-                                TapGesture().onEnded {
-                                    openImmediately(session)
-                                }
-                            )
-                            .tag(session.id)
-                            // Labels and identifiers are declared here, on the
-                            // view the List treats as the row. Verified on
-                            // macOS 26.6.2: the resulting AXRow still reports no
-                            // label and no children, so a sidebar row is opaque
-                            // to accessibility. Tracked by issue #13; the
-                            // declarations stay because they are correct and
-                            // cost nothing, and `children: .ignore` was removed
-                            // because it would strip the row's own text.
-                            .accessibilityLabel(session.displayTitle)
-                            .accessibilityValue(messageCountLabel(session.messageCount))
-                            .accessibilityIdentifier("session-row-\(session.id)")
+                        Button {
+                            openImmediately(session)
+                        } label: {
+                            SessionRow(session: session)
+                        }
+                        .buttonStyle(.plain)
+                        .tag(session.id)
+                        .accessibilityLabel(session.displayTitle)
+                        .accessibilityValue(messageCountLabel(session.messageCount))
+                        .accessibilityIdentifier("session-row-\(session.id)")
                     }
                 }
             }
