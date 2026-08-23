@@ -17,9 +17,16 @@ struct HermternalApp: App {
     @State private var model: AppModel
     @State private var appearance = AppearanceSettings()
     @State private var registry: CapabilityRegistry
+    private let fixtureMode: Bool
 
     init() {
+        let fixtureMode = SidebarFixtures.isEnabled
+        self.fixtureMode = fixtureMode
         let model = AppModel()
+        if fixtureMode {
+            model.sessions = SidebarFixtures.sessions
+            model.phase = .ready
+        }
         _model = State(initialValue: model)
 
         var registry = CapabilityRegistry()
@@ -72,7 +79,10 @@ struct HermternalApp: App {
                 }
                 Task { await model.openThenScroll(to: link.location) }
             }
-            .task { await model.restoreOrPromptSignIn() }
+            .task {
+                guard !fixtureMode else { return }
+                await model.restoreOrPromptSignIn()
+            }
         }
         .windowToolbarStyle(.unified)
         .defaultSize(width: 1_040, height: 720)
