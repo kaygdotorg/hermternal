@@ -17,6 +17,11 @@ final class AppModel {
 
     var phase: Phase = .signedOut
     var sessions: [ChatSession] = []
+    /// Sidebar organization uses in-memory defaults until config persistence is wired.
+    var sortMode: SortMode = .lastActivity
+    var groupByDate = true
+    var folders: [Folder] = []
+    var membership: [String: String] = [:]
     var messages: [ChatMessage] = []
     /// Durable id of the sidebar selection.
     var selectedSessionID: String?
