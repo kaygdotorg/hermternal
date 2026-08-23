@@ -88,7 +88,10 @@ struct ChatWindow: View {
             )
                 .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 340)
         } detail: {
-            ChatView(model: model)
+            ChatView(
+                model: model,
+                isReadOnly: model.isViewingArchivedTranscript
+            )
         }
         // Keep the native titlebar and traffic lights; ChatView conditionally
         // renders its controls so the toolbar group has no empty capsule.

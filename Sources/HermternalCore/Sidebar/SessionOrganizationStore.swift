@@ -158,26 +158,50 @@ public actor SessionOrganizationStore: SessionOrganizationPersisting {
 
     @discardableResult
     public func deleteFolder(id: String) async throws -> [String] {
-        let current = try await loadedOrganization()
-        guard current.folders.contains(where: { $0.id == id }) else {
-            throw SessionOrganizationError.folderNotFound(id)
+        try await deleteFolders(ids: [id]).affectedSessionIDs
+    }
+
+    /// Deletes a validated folder set and clears its memberships in one organization write.
+    @discardableResult
+    public func deleteFolders(ids: [String]) async throws -> SessionOrganizationFolderDeletionResult {
+        guard !ids.isEmpty else {
+            return SessionOrganizationFolderDeletionResult(deletedFolderIDs: [], affectedSessionIDs: [])
         }
 
-        var removedSessionIDs: [String] = []
-        var gateways = current.gateways
-        for (host, gateway) in current.gateways {
-            let removed = gateway.folderMembership.filter { $0.value == id }.map(\.key)
-            removedSessionIDs.append(contentsOf: removed)
-            guard !removed.isEmpty else { continue }
-            var membership = gateway.folderMembership
-            for sessionID in removed {
-                membership.removeValue(forKey: sessionID)
-            }
-            gateways[host] = .init(folderMembership: membership)
+        guard Set(ids).count == ids.count else {
+            throw SessionOrganizationError.invalidFolderDeletion("Folder IDs must be unique")
         }
-        let folders = reindexed(current.folders.filter { $0.id != id })
-        try await save(updated(current, folders: folders, gateways: gateways))
-        return removedSessionIDs.sorted()
+
+        let current = try await loadedOrganization()
+        let folderIDs = Set(current.folders.map(\.id))
+        guard let missingID = ids.first(where: { !folderIDs.contains($0) }) else {
+            let selectedFolderIDs = Set(ids)
+            var affectedSessionIDs = Set<String>()
+            var gateways = current.gateways
+
+            for (host, gateway) in current.gateways {
+                let removedSessionIDs = gateway.folderMembership.compactMap { sessionID, folderID in
+                    selectedFolderIDs.contains(folderID) ? sessionID : nil
+                }
+                affectedSessionIDs.formUnion(removedSessionIDs)
+                guard !removedSessionIDs.isEmpty else { continue }
+
+                var membership = gateway.folderMembership
+                for sessionID in removedSessionIDs {
+                    membership.removeValue(forKey: sessionID)
+                }
+                gateways[host] = .init(folderMembership: membership)
+            }
+
+            let folders = reindexed(current.folders.filter { !selectedFolderIDs.contains($0.id) })
+            try await save(updated(current, folders: folders, gateways: gateways))
+            return SessionOrganizationFolderDeletionResult(
+                deletedFolderIDs: current.folders.compactMap { selectedFolderIDs.contains($0.id) ? $0.id : nil },
+                affectedSessionIDs: affectedSessionIDs.sorted()
+            )
+        }
+
+        throw SessionOrganizationError.folderNotFound(missingID)
     }
 
     public func reorderFolders(ids: [String]) async throws {
@@ -224,6 +248,65 @@ public actor SessionOrganizationStore: SessionOrganizationPersisting {
         gateways[gatewayHost] = .init(folderMembership: membership)
         try await save(updated(current, gateways: gateways))
     }
+
+    /// Reconciles a confirmed permanent purge in one organization write:
+    /// confirmed chat assignments are removed from the current gateway only
+    /// and only the caller-approved folders are deleted globally. Failed or
+    /// unconfirmed chat IDs remain untouched.
+    ///
+    /// - Returns: `true` when assignments or folders changed.
+    @discardableResult
+    public func reconcilePurge(
+        confirmedSessionIDs: Set<String>,
+        folderIDs: Set<String>,
+        gatewayHost: String
+    ) async throws -> Bool {
+        let confirmed = Set(confirmedSessionIDs.filter { !$0.isEmpty })
+        let selectedFolders = Set(folderIDs.filter { !$0.isEmpty })
+        guard !confirmed.isEmpty || !selectedFolders.isEmpty else { return false }
+
+        let current = try await loadedOrganization()
+        if let missingFolderID = selectedFolders.first(where: { folderID in
+            !current.folders.contains(where: { folder in folder.id == folderID })
+        }) {
+            throw SessionOrganizationError.folderNotFound(missingFolderID)
+        }
+
+        var gateways = current.gateways
+        var changed = false
+        if let gateway = current.gateways[gatewayHost] {
+            let membership = gateway.folderMembership
+            let filtered = membership.filter {
+                !confirmed.contains($0.key) && !selectedFolders.contains($0.value)
+            }
+            if filtered.count != membership.count {
+                gateways[gatewayHost] = .init(folderMembership: filtered)
+                changed = true
+            }
+        }
+        if !selectedFolders.isEmpty {
+            for (host, gateway) in gateways {
+                let membership = gateway.folderMembership
+                let filtered = membership.filter { !selectedFolders.contains($0.value) }
+                guard filtered.count != membership.count else { continue }
+                gateways[host] = .init(folderMembership: filtered)
+                changed = true
+            }
+        }
+        let folders: [Folder]
+        if selectedFolders.isEmpty {
+            folders = current.folders
+        } else {
+            folders = reindexed(current.folders.filter { !selectedFolders.contains($0.id) })
+        }
+        if folders != current.folders {
+            changed = true
+        }
+        guard changed else { return false }
+        try await save(updated(current, folders: folders, gateways: gateways))
+        return true
+    }
+
 
     public func setSortMode(_ mode: SortMode) async throws {
         let current = try await loadedOrganization()

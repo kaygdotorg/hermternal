@@ -1,4 +1,10 @@
 import Foundation
+/// Controls which archived durable sessions a session-list request returns.
+public enum SessionArchiveFilter: String, Sendable {
+    case exclude
+    case include
+    case only
+}
 
 /// One page of durable dashboard sessions returned by the REST API.
 public struct SessionListPage: Sendable {
@@ -7,6 +13,69 @@ public struct SessionListPage: Sendable {
     public let limit: Int
     public let offset: Int
 }
+
+/// The exact confirmation value required by the destructive purge endpoint.
+public enum SessionPurgeConfirmation {
+    public static let requiredValue = "delete"
+
+    public static func isExact(_ value: String) -> Bool {
+        value == requiredValue
+    }
+}
+
+public struct SessionPurgeRequest: Encodable, Equatable, Sendable {
+    public let ids: [String]
+    public let confirm: String
+
+    public init(ids: [String], confirm: String = SessionPurgeConfirmation.requiredValue) {
+        self.ids = ids
+        self.confirm = confirm
+    }
+}
+
+public struct SessionPurgeFailure: Decodable, Equatable, Sendable {
+    public let id: String
+    public let code: String
+    public let message: String
+    public init(id: String, code: String, message: String) {
+        self.id = id
+        self.code = code
+        self.message = message
+    }
+}
+
+public struct SessionPurgeResult: Decodable, Equatable, Sendable {
+    public let object: String
+    public let complete: Bool
+    public let purged: [String]
+    public let retainedBranches: [String]
+    public let failed: [SessionPurgeFailure]
+
+    public var successfulIDs: Set<String> { Set(purged) }
+
+    enum CodingKeys: String, CodingKey {
+        case object
+        case complete
+        case purged
+        case retainedBranches = "retained_branches"
+        case failed
+    }
+    public init(
+        object: String,
+        complete: Bool,
+        purged: [String],
+        retainedBranches: [String],
+        failed: [SessionPurgeFailure]
+    ) {
+        self.object = object
+        self.complete = complete
+        self.purged = purged
+        self.retainedBranches = retainedBranches
+        self.failed = failed
+    }
+
+}
+
 
 /// Authenticated REST calls against the dashboard.
 ///
@@ -150,7 +219,7 @@ public actor RestClient {
         limit: Int = 100,
         offset: Int = 0,
         order: String = "recent",
-        archived: String = "exclude",
+        archived: SessionArchiveFilter = .exclude,
         excludeSources: [String] = [],
         profile: String? = nil
     ) async throws -> SessionListPage {
@@ -195,7 +264,7 @@ public actor RestClient {
     /// size, not by the number of newly added rows.
     public func allSessions(
         order: String = "recent",
-        archived: String = "exclude",
+        archived: SessionArchiveFilter = .exclude,
         excludeSources: [String] = [],
         profile: String? = nil
     ) async throws -> [JSONValue] {
@@ -228,6 +297,90 @@ public actor RestClient {
         }
 
         throw RestError.sessionPageLimitExceeded
+    }
+
+    /// Permanently removes application state through the advertised REST
+    /// endpoint. There is intentionally no DELETE or WebSocket fallback.
+    public func purgeSessions(
+        ids: [String],
+        capability: SessionPurgeCapability,
+        profile: String? = nil,
+        confirmation: String = SessionPurgeConfirmation.requiredValue
+    ) async throws -> SessionPurgeResult {
+        var seen = Set<String>()
+        let uniqueIDs = ids.filter { !$0.isEmpty && seen.insert($0).inserted }
+        guard !uniqueIDs.isEmpty else { throw RestError.purgeEmptyIDs }
+        guard uniqueIDs.count <= capability.maxBatch else {
+            throw RestError.purgeBatchTooLarge(max: capability.maxBatch)
+        }
+        guard SessionPurgeConfirmation.isExact(confirmation) else {
+            throw RestError.purgeInvalidConfirmation
+        }
+        guard capability.method == "POST", capability.path == "/api/sessions/purge" else {
+            throw RestError.purgeUnsupportedEndpoint
+        }
+
+        let body = try Self.bodyEncoder.encode(
+            SessionPurgeRequest(ids: uniqueIDs, confirm: confirmation)
+        )
+        var credentials = try await auth.validCredentials()
+        do {
+            return try await fetchPurge(
+                body: body,
+                path: capability.path,
+                profile: profile,
+                credentials: credentials
+            )
+        } catch {
+            guard case RestError.purgeHTTPError(let status) = error, status == 401 else {
+                throw error
+            }
+            credentials = try await auth.refreshCredentials()
+            return try await fetchPurge(
+                body: body,
+                path: capability.path,
+                profile: profile,
+                credentials: credentials
+            )
+        }
+    }
+
+    private func fetchPurge(
+        body: Data,
+        path: String,
+        profile: String?,
+        credentials: Credentials
+    ) async throws -> SessionPurgeResult {
+        var components = URLComponents(
+            url: server.appending(path: String(path.dropFirst(path.hasPrefix("/") ? 1 : 0))),
+            resolvingAgainstBaseURL: false
+        )
+        if let profile {
+            components?.queryItems = [.init(name: "profile", value: profile)]
+        }
+        guard let url = components?.url else { throw AuthError.badServerURL }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(credentials.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+
+        let (data, response) = try await urlSession.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        do {
+            let result = try responseDecoder.decode(SessionPurgeResult.self, from: data)
+            guard result.object == "hermes.session.purge_result" else {
+                throw RestError.purgeMalformedResponse
+            }
+            // The gateway uses 409/500 for incomplete typed results, so keep
+            // the per-id failures instead of discarding the response.
+            return result
+        } catch let error as RestError {
+            throw error
+        } catch {
+            guard status == 200 else { throw RestError.purgeHTTPError(status) }
+            throw RestError.purgeMalformedResponse
+        }
     }
 
     /// Updates a durable session by id without needing a live session or resume.
@@ -290,7 +443,7 @@ public actor RestClient {
         limit: Int,
         offset: Int,
         order: String,
-        archived: String,
+        archived: SessionArchiveFilter,
         excludeSources: [String],
         profile: String?,
         credentials: Credentials
@@ -303,7 +456,7 @@ public actor RestClient {
             .init(name: "limit", value: String(limit)),
             .init(name: "offset", value: String(offset)),
             .init(name: "order", value: order),
-            .init(name: "archived", value: archived)
+            .init(name: "archived", value: archived.rawValue)
         ]
         // Filtering here means the server never sends a row the sidebar would
         // discard. Subagent rows outnumber real chats several times over, so
@@ -387,6 +540,12 @@ public enum RestError: LocalizedError, Sendable {
     case sessionPageLimitExceeded
     case noMutableFields
     case sessionNotFound
+    case purgeEmptyIDs
+    case purgeBatchTooLarge(max: Int)
+    case purgeInvalidConfirmation
+    case purgeUnsupportedEndpoint
+    case purgeHTTPError(Int)
+    case purgeMalformedResponse
 
     public var errorDescription: String? {
         switch self {
@@ -400,6 +559,18 @@ public enum RestError: LocalizedError, Sendable {
             "At least one mutable session field must be supplied."
         case .sessionNotFound:
             "The durable session does not exist."
+        case .purgeEmptyIDs:
+            "At least one chat must be selected."
+        case .purgeBatchTooLarge(let max):
+            "The gateway accepts at most \(max) chats per deletion request."
+        case .purgeInvalidConfirmation:
+            "Type delete exactly to confirm permanent deletion."
+        case .purgeUnsupportedEndpoint:
+            "Complete deletion is unavailable on this gateway."
+        case .purgeHTTPError(let status):
+            "Permanent deletion failed (HTTP \(status))."
+        case .purgeMalformedResponse:
+            "The gateway returned an invalid permanent deletion result."
         }
     }
 }

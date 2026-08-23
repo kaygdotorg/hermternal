@@ -19,6 +19,9 @@ final class AppModel {
     var sessions: [ChatSession] = []
     var sortMode: SortMode = .lastActivity
     var groupByDate = true
+    var archivedSessions: [ChatSession] = []
+    var archivedSessionsLoading = false
+    var archivedSessionsError: String?
     var folders: [Folder] = []
     var membership: [String: String] = [:]
     var messages: [ChatMessage] = []
@@ -29,6 +32,10 @@ final class AppModel {
     var pendingMessageLocation: MessageLocation? { pendingMessageRoute?.location }
 
     var isAwaitingReply = false
+    /// Reserved for the read-only archived transcript route. It remains nil
+    /// until the transcript host can gate the composer and send actions.
+    var viewingArchivedSessionID: String?
+    var isViewingArchivedTranscript: Bool { viewingArchivedSessionID != nil }
     var composerText = ""
     var serverText: String = AppModel.storedServer
     /// Host of the configured gateway, used to keep deep links authoritative
@@ -53,6 +60,11 @@ final class AppModel {
             gatewayAdvertisedMethods: gatewayAdvertisedMethods
         )
     }
+    /// Capability state is composed once by the connected gateway module.
+    var sessionPurgeCapability: SessionPurgeCapability?
+    var sessionPurgeUnavailableReason: String = "Complete deletion is unavailable on this gateway."
+    var canPurgeSessions: Bool { sessionPurgeCapability != nil }
+
     var accountPresentation: AccountIdentityPresentation {
         AccountIdentityResolver.resolve(
             identity: accountIdentity,
@@ -88,6 +100,7 @@ final class AppModel {
     private var auth: AuthClient?
     private var gateway: GatewayClient?
     private var rest: RestClient?
+    private var capabilityModule: GatewayCapabilityModule?
     private let organizationStore: SessionOrganizationStore
     private var organizationSnapshot: SessionOrganization?
     private var organizationLoaded = false
@@ -106,6 +119,9 @@ final class AppModel {
     private var cacheControlTask: Task<Void, Never>?
     private var cacheControlGeneration = 0
     private var prefetchGeneration = 0
+    private var accountGeneration = 0
+    private var archivedLoadGeneration = 0
+    private var purgePreparationGeneration = 0
     /// Core-owned generation guard used to invalidate superseded opens.
     private struct PendingMessageRoute: Equatable {
         let location: MessageLocation
@@ -113,7 +129,7 @@ final class AppModel {
     }
     private var pendingMessageRoute: PendingMessageRoute?
     private var pendingExternalRoute = PendingRouteCoordinator()
-    private var programmaticSelectionID: String?
+
     private let openGenerations = OpenGenerationController()
     private var streamingReducer = StreamingEventReducer()
 
@@ -242,6 +258,7 @@ final class AppModel {
     }
 
     func signIn() async {
+        accountGeneration += 1
         await loadOrganizationIfNeeded()
         guard let url = serverURL else {
             phase = .failed(AuthError.badServerURL.localizedDescription)
@@ -268,7 +285,20 @@ final class AppModel {
     func signOut() async {
         pendingExternalRoute.clearPending()
         _ = openGenerations.begin()
+        accountGeneration += 1
+        archivedLoadGeneration += 1
+        purgePreparationGeneration += 1
+        pendingExternalRoute.clearPending()
         pendingMessageRoute = nil
+        sessionsLoadedCompletely = false
+        // Clear all account-owned rows before the first suspension point.
+        sessions = []
+        archivedSessions = []
+        archivedSessionsLoading = false
+        archivedSessionsError = nil
+        selectedSessionID = nil
+        viewingArchivedSessionID = nil
+        phase = .signedOut
         eventTask?.cancel()
         eventTask = nil
         prefetchTask?.cancel()
@@ -293,10 +323,12 @@ final class AppModel {
         streamingReducer.reset()
         messages = []
         isAwaitingReply = streamingReducer.isAwaitingReply
-        selectedSessionID = nil
-        phase = .signedOut
+        sessionsLoadedCompletely = false
         isSearchPresented = false
         toastPresenter.setSuppressed(false)
+        capabilityModule = nil
+        sessionPurgeCapability = nil
+        sessionPurgeUnavailableReason = "Complete deletion is unavailable on this gateway."
     }
     private func refreshGatewayDiscovery(using auth: AuthClient) async {
         guard let providers = await auth.discoverProviders() else {
@@ -344,8 +376,6 @@ final class AppModel {
         guard let auth, let url = serverURL else { return }
         phase = .connecting
         do {
-            // A ticket is single-use with a 30s TTL, so mint it immediately
-            // before dialing.
             let ticket = try await auth.webSocketTicket()
             Log.info("connect: minted ws ticket")
             let gateway = GatewayClient()
@@ -353,9 +383,17 @@ final class AppModel {
             try await gateway.connect(server: url, ticket: ticket.ticket)
             Log.info("connect: websocket dialed")
             rest = RestClient(server: url, auth: auth)
+            let capabilities = GatewayCapabilityModule(server: url, auth: auth)
+            capabilityModule = capabilities
+            let snapshot = try await capabilities.snapshot()
+            sessionPurgeCapability = snapshot.sessionPurge
+            sessionPurgeUnavailableReason = snapshot.unavailableReason
+                ?? "Complete deletion is unavailable on this gateway."
             observeEvents(on: gateway)
             phase = .ready
             await loadSessions()
+        } catch is CancellationError {
+            return
         } catch {
             Log.error("connect failed: \(error)")
             phase = .failed(error.localizedDescription)
@@ -389,6 +427,11 @@ final class AppModel {
                 return session
             }
             sessions.sort(by: Self.sessionComesBefore)
+            if viewingArchivedSessionID == nil,
+               let selectedSessionID,
+               !sessions.contains(where: { $0.id == selectedSessionID }) {
+                clearActiveTranscriptIfNeeded(selectedSessionID)
+            }
             sessionsLoadedCompletely = true
             drainPendingExternalRouteIfReady()
             cacheTotalCount = sessions.count
@@ -400,17 +443,117 @@ final class AppModel {
             postError("Could not load sessions", detail: error.localizedDescription)
         }
     }
+    func loadArchivedSessions() async {
+        archivedLoadGeneration += 1
+        let loadGeneration = archivedLoadGeneration
+        let requestAccountGeneration = accountGeneration
+        archivedSessions = []
+        archivedSessionsError = nil
+        archivedSessionsLoading = true
+        defer {
+            if archivedLoadGeneration == loadGeneration,
+               accountGeneration == requestAccountGeneration {
+                archivedSessionsLoading = false
+            }
+        }
+        guard let rest else {
+            archivedSessionsError = "The server connection is unavailable."
+            return
+        }
+        do {
+            let rows = try await rest.allSessions(
+                archived: .only,
+                excludeSources: Self.nonChatSources
+            )
+            guard archivedLoadGeneration == loadGeneration,
+                  accountGeneration == requestAccountGeneration,
+                  !Task.isCancelled
+            else { return }
+            archivedSessions = rows.compactMap { row in
+                let session = ChatSession(from: row)
+                return session.id.isEmpty ? nil : session
+            }
+            archivedSessions.sort(by: Self.sessionComesBefore)
+        } catch is CancellationError {
+            return
+        } catch {
+            guard archivedLoadGeneration == loadGeneration,
+                  accountGeneration == requestAccountGeneration
+            else { return }
+            archivedSessions = []
+            archivedSessionsError = error.localizedDescription
+        }
+    }
+    func restoreArchived(_ selected: [ChatSession]) async {
+        pendingExternalRoute.clearPending()
+        let generation = openGenerations.begin()
+        pendingMessageRoute = nil
+        let previewID = viewingArchivedSessionID
+        await setArchived(selected, archived: false)
+        guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+        await loadArchivedSessions()
+        guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+        guard let previewID,
+              selected.contains(where: { $0.id == previewID }),
+              let restored = sessions.first(where: { $0.id == previewID })
+        else { return }
+        viewingArchivedSessionID = nil
+        guard openGenerations.isCurrent(generation) else { return }
+        _ = await open(restored)
+    }
+    func restoreArchived(_ session: ChatSession) async {
+        pendingExternalRoute.clearPending()
+        let generation = openGenerations.begin()
+        pendingMessageRoute = nil
+        guard let rest else {
+            postError("Could not restore chat", detail: "The server connection is unavailable.")
+            return
+        }
+        do {
+            _ = try await rest.patchSession(
+                durableID: session.id,
+                archived: false,
+                profile: session.profile
+            )
+        } catch {
+            guard openGenerations.isCurrent(generation) else { return }
+            postError("Could not restore chat", detail: error.localizedDescription)
+            return
+        }
+        guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+        await loadSessions()
+        guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+        await loadArchivedSessions()
+        guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+        viewingArchivedSessionID = nil
+        let restored = sessions.first(where: { $0.id == session.id })
+            ?? session.withArchived(false)
+        guard openGenerations.isCurrent(generation) else { return }
+        _ = await open(restored)
+    }
+
     // MARK: - Sidebar organization
 
     func copyDeepLink(for session: ChatSession) {
-        guard let host = configuredGatewayHost,
-              let link = MessageDeepLink(gatewayHost: host, sessionID: session.id)
-        else {
-            postError("Could not copy deep link", detail: "The gateway address is unavailable.")
+        copyDeepLinks(for: [session])
+    }
+
+    /// Writes all links in visible order with one pasteboard transaction.
+    /// There is deliberately no success toast: the pasteboard is the result.
+    func copyDeepLinks(for sessions: [ChatSession]) {
+        guard let host = configuredGatewayHost else {
+            postError("Could not copy deep links", detail: "The gateway address is unavailable.")
+            return
+        }
+        let links = sessions.compactMap {
+            MessageDeepLink(gatewayHost: host, sessionID: $0.id)?.url.absoluteString
+        }
+        guard !links.isEmpty else {
+            postError("Could not copy deep links", detail: "No valid chat links were available.")
             return
         }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(link.url.absoluteString, forType: .string)
+        NSPasteboard.general.setString(links.joined(separator: "\n"), forType: .string)
     }
 
     func createFolder(named name: String) async {
@@ -432,11 +575,16 @@ final class AppModel {
     }
 
     func deleteFolder(id: String) async {
+        await deleteFolders(ids: [id])
+    }
+
+    func deleteFolders(ids: [String]) async {
+        guard !ids.isEmpty else { return }
         do {
-            _ = try await organizationStore.deleteFolder(id: id)
+            _ = try await organizationStore.deleteFolders(ids: ids)
             try await refreshOrganizationAfterMutation()
         } catch {
-            postError("Could not delete folder", detail: error.localizedDescription)
+            postError("Could not delete folders", detail: error.localizedDescription)
         }
     }
     func reorderFolders(ids: [String]) async {
@@ -448,6 +596,303 @@ final class AppModel {
         }
     }
 
+    /// Deletes selected folders locally without touching their chats.
+    func deleteFoldersOnly(ids: [String]) async {
+        guard !ids.isEmpty else { return }
+        do {
+            _ = try await organizationStore.deleteFolders(ids: uniqueIDs(ids))
+            try await refreshOrganizationAfterMutation()
+        } catch {
+            postError("Could not delete folders", detail: error.localizedDescription)
+        }
+    }
+
+    /// Resolves an immutable purge plan from complete server rows and local
+    /// organization membership. The plan is the only input accepted by
+    /// execution, so membership changes after confirmation cannot add chats.
+    func preparePurge(
+        selectedChatIDs: [String],
+        selectedFolderIDs: [String],
+        mode: SessionPurgeActionMode
+    ) async -> SessionPurgePlan? {
+        purgePreparationGeneration += 1
+        let preparationGeneration = purgePreparationGeneration
+        let requestAccountGeneration = accountGeneration
+        guard let rest else {
+            postError("Complete deletion unavailable", detail: sessionPurgeUnavailableReason)
+            return nil
+        }
+        do {
+            let rows = try await rest.allSessions(
+                archived: .include,
+                excludeSources: Self.nonChatSources
+            )
+            guard purgePreparationGeneration == preparationGeneration,
+                  accountGeneration == requestAccountGeneration,
+                  !Task.isCancelled
+            else { return nil }
+            let organization = try await organizationStore.load()
+            guard purgePreparationGeneration == preparationGeneration,
+                  accountGeneration == requestAccountGeneration,
+                  !Task.isCancelled
+            else { return nil }
+            let authoritativeSessions = rows.compactMap { row -> ChatSession? in
+                let session = ChatSession(from: row)
+                return session.id.isEmpty ? nil : session
+            }
+            let host = serverURL?.host
+            let completeMembership = host
+                .flatMap { organization.gateways[$0]?.folderMembership }
+                ?? [:]
+            let folderIDs = Set(organization.folders.map(\.id))
+            let requestedFolders = selectedFolderIDs.filter { folderIDs.contains($0) }
+            return SessionPurgePolicy.plan(
+                selectedChatIDs: selectedChatIDs,
+                selectedFolderIDs: requestedFolders,
+                mode: mode,
+                membership: completeMembership,
+                visibleChatIDs: authoritativeSessions.map(\.id),
+                activeSessionID: selectedSessionID,
+                isStreaming: isAwaitingReply,
+                authoritativeSessions: authoritativeSessions
+            )
+        } catch is CancellationError {
+            return nil
+        } catch {
+            guard purgePreparationGeneration == preparationGeneration,
+                  accountGeneration == requestAccountGeneration
+            else { return nil }
+            postError("Could not prepare deletion", detail: error.localizedDescription)
+            return nil
+        }
+    }
+
+    /// Executes the exact immutable plan shown by the confirmation surface.
+    func purge(plan: SessionPurgePlan) async {
+        guard !Task.isCancelled else { return }
+        let requestAccountGeneration = accountGeneration
+        guard !plan.blockedByActiveStream else {
+            postError("Cannot delete the active chat", detail: "Wait for its response to finish.")
+            return
+        }
+        guard !plan.isEmpty else {
+            postError("Nothing to delete", detail: "The selected chats and folders are no longer available.")
+            return
+        }
+
+        if plan.chatIDs.isEmpty {
+            do {
+                _ = try await organizationStore.deleteFolders(ids: plan.folderIDs)
+                guard accountGeneration == requestAccountGeneration, !Task.isCancelled else { return }
+                try await refreshOrganizationAfterMutation()
+            } catch is CancellationError {
+                return
+            } catch {
+                guard accountGeneration == requestAccountGeneration else { return }
+                postError("Could not delete folders", detail: error.localizedDescription)
+            }
+            return
+        }
+
+        guard let rest else {
+            postError("Complete deletion unavailable", detail: sessionPurgeUnavailableReason)
+            return
+        }
+        var groups = plan.profileGroups
+        if groups.isEmpty {
+            groups = [SessionPurgeProfileGroup(profile: nil, chatIDs: plan.chatIDs)]
+        }
+        var confirmed = Set<String>()
+        var failed = Set(plan.chatIDs)
+        var groupFailures = 0
+        for group in groups {
+            guard accountGeneration == requestAccountGeneration, !Task.isCancelled else { return }
+            let capability: SessionPurgeCapability?
+            if let capabilityModule {
+                do {
+                    let snapshot = try await capabilityModule.snapshot(profile: group.profile)
+                    guard accountGeneration == requestAccountGeneration, !Task.isCancelled else { return }
+                    capability = snapshot.sessionPurge
+                } catch is CancellationError {
+                    return
+                } catch {
+                    capability = nil
+                }
+            } else {
+                capability = sessionPurgeCapability
+            }
+            guard accountGeneration == requestAccountGeneration, !Task.isCancelled else { return }
+            guard let capability else {
+                groupFailures += group.chatIDs.count
+                continue
+            }
+            for batch in batches(group.chatIDs, maxCount: capability.maxBatch) {
+                do {
+                    let result = try await rest.purgeSessions(
+                        ids: batch,
+                        capability: capability,
+                        profile: group.profile
+                    )
+                    guard accountGeneration == requestAccountGeneration, !Task.isCancelled else { return }
+                    let accepted = Set(result.purged).intersection(Set(batch))
+                    confirmed.formUnion(accepted)
+                    failed.subtract(accepted)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    groupFailures += batch.count
+                }
+            }
+        }
+        guard accountGeneration == requestAccountGeneration, !Task.isCancelled else { return }
+
+        guard !confirmed.isEmpty else {
+            postError(
+                "No chats were deleted",
+                detail: groupFailures > 0
+                    ? "The gateway did not confirm any selected chat."
+                    : sessionPurgeUnavailableReason
+            )
+            return
+        }
+
+        // The server result reconciles rows even when local storage fails.
+        _ = openGenerations.begin()
+        pendingMessageRoute = nil
+        prefetchTask?.cancel()
+        prefetchGeneration += 1
+        prefetchTask = nil
+        var cleanupFailures: [String] = []
+        for id in confirmed.sorted() {
+            do {
+                let result = try await cache.remove(sessionID: id)
+                guard accountGeneration == requestAccountGeneration, !Task.isCancelled else { return }
+                if !result.succeeded {
+                    cleanupFailures.append(
+                        "\(id): cache \(result.cache), index \(result.index)"
+                    )
+                }
+            } catch {
+                guard accountGeneration == requestAccountGeneration else { return }
+                cleanupFailures.append("\(id): \(error.localizedDescription)")
+            }
+        }
+        sessions.removeAll { confirmed.contains($0.id) }
+        archivedSessions.removeAll { confirmed.contains($0.id) }
+        if let selectedSessionID, confirmed.contains(selectedSessionID) {
+            self.selectedSessionID = nil
+            viewingArchivedSessionID = nil
+            liveSessionID = nil
+            messages = []
+            streamingReducer.reset()
+            isAwaitingReply = streamingReducer.isAwaitingReply
+        }
+
+        let reconciliation = SessionPurgePolicy.reconcile(
+            requestedIDs: plan.chatIDs,
+            result: SessionPurgeResult(
+                object: "hermes.session.purge_result",
+                complete: failed.isEmpty,
+                purged: Array(confirmed),
+                retainedBranches: [],
+                failed: []
+            ),
+            folderIDs: Set(plan.folderIDs),
+            membership: plan.folderMembership
+        )
+        var organizationChanged = false
+        guard let gatewayHost = configuredGatewayHost else {
+            return
+        }
+        do {
+            organizationChanged = try await organizationStore.reconcilePurge(
+                confirmedSessionIDs: confirmed,
+                folderIDs: reconciliation.removableFolderIDs,
+                gatewayHost: gatewayHost
+            )
+            guard accountGeneration == requestAccountGeneration, !Task.isCancelled else { return }
+        } catch {
+            guard accountGeneration == requestAccountGeneration else { return }
+            cleanupFailures.append("organization: \(error.localizedDescription)")
+        }
+        if organizationChanged {
+            do {
+                try await refreshOrganizationAfterMutation()
+                guard accountGeneration == requestAccountGeneration, !Task.isCancelled else { return }
+            } catch {
+                guard accountGeneration == requestAccountGeneration else { return }
+                cleanupFailures.append("organization refresh: \(error.localizedDescription)")
+            }
+        }
+        let retainedDetail = failed.isEmpty ? nil : "\(failed.count) selected chat(s) were retained."
+        let detail: String?
+        if cleanupFailures.isEmpty {
+            detail = retainedDetail
+        } else {
+            detail = [retainedDetail, "Local cleanup is incomplete.", cleanupFailures.joined(separator: "; ")]
+                .compactMap { $0 }
+                .joined(separator: " ")
+        }
+        toastPresenter.post(
+            ToastMessage(
+                id: ToastID("purge-\(UUID().uuidString)"),
+                title: cleanupFailures.isEmpty
+                    ? "Deleted \(confirmed.count) chat(s) permanently"
+                    : "Deleted \(confirmed.count) chat(s), but local cleanup is incomplete",
+                detail: detail,
+                severity: cleanupFailures.isEmpty
+
+                    ? (failed.isEmpty ? .success : .warning)
+                    : .error
+            )
+        )
+    }
+    private func clearActiveTranscriptIfNeeded(_ sessionID: String) {
+        guard selectedSessionID == sessionID else { return }
+        selectedSessionID = nil
+        viewingArchivedSessionID = nil
+        liveSessionID = nil
+        pendingMessageRoute = nil
+        messages = []
+        streamingReducer.reset()
+        isAwaitingReply = streamingReducer.isAwaitingReply
+    }
+    /// Leaves the archived transcript preview without opening another session.
+    /// Invalidating the open generation prevents a delayed cache/REST phase
+    /// from restoring read-only state after explicit Chats navigation.
+    func leaveArchivedView() {
+        _ = openGenerations.begin()
+        pendingExternalRoute.clearPending()
+        pendingMessageRoute = nil
+        viewingArchivedSessionID = nil
+        selectedSessionID = nil
+        liveSessionID = nil
+        messages = []
+        composerText = ""
+        streamingReducer.reset()
+        isAwaitingReply = streamingReducer.isAwaitingReply
+    }
+
+    
+
+    private func uniqueIDs(_ ids: [String]) -> [String] {
+        var seen = Set<String>()
+        return ids.filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+
+
+    private func batches(_ ids: [String], maxCount: Int) -> [[String]] {
+        guard maxCount > 0 else { return [] }
+        var result: [[String]] = []
+        result.reserveCapacity((ids.count + maxCount - 1) / maxCount)
+        var index = 0
+        while index < ids.count {
+            let end = min(index + maxCount, ids.count)
+            result.append(Array(ids[index..<end]))
+            index = end
+        }
+        return result
+    }
 
     func assign(_ session: ChatSession, toFolder folderID: String) async {
         guard let host = configuredGatewayHost else {
@@ -481,6 +926,59 @@ final class AppModel {
             postError("Could not remove chat from folder", detail: error.localizedDescription)
         }
     }
+    /// Moves or unfiles a selection with one organization refresh. Each
+    /// request is independent so a failed chat remains truthful.
+    func assign(_ selected: [ChatSession], toFolder folderID: String?) async {
+        guard let host = configuredGatewayHost else {
+            postError(
+                folderID == nil ? "Could not remove chats from folder" : "Could not move chats",
+                detail: "The gateway address is unavailable."
+            )
+            return
+        }
+        var unique = [ChatSession]()
+        var seen = Set<String>()
+        for session in selected where seen.insert(session.id).inserted {
+            unique.append(session)
+        }
+        guard !unique.isEmpty else { return }
+
+        var failures = 0
+        for session in unique {
+            do {
+                if let folderID {
+                    try await organizationStore.assignChat(
+                        sessionID: session.id,
+                        toFolderID: folderID,
+                        gatewayHost: host
+                    )
+                } else {
+                    try await organizationStore.clearChatAssignment(
+                        sessionID: session.id,
+                        gatewayHost: host
+                    )
+                }
+            } catch {
+                failures += 1
+            }
+        }
+        if failures < unique.count {
+            do {
+                try await refreshOrganizationAfterMutation()
+            } catch {
+                postError("Could not refresh folders", detail: error.localizedDescription)
+                return
+            }
+        }
+        if failures > 0 {
+            postError(
+                folderID == nil
+                    ? "Could not remove \(failures) of \(unique.count) chats"
+                    : "Could not move \(failures) of \(unique.count) chats",
+                detail: "The remaining \(unique.count - failures) chat(s) were updated."
+            )
+        }
+    }
 
     func setSortMode(_ mode: SortMode) async {
         do {
@@ -490,7 +988,6 @@ final class AppModel {
             postError("Could not save sidebar sorting", detail: error.localizedDescription)
         }
     }
-
     func setGroupByDate(_ enabled: Bool) async {
         do {
             try await organizationStore.setGrouping(byDate: enabled)
@@ -535,6 +1032,64 @@ final class AppModel {
                 sessions.sort(by: Self.sessionComesBefore)
             }
             postError("Could not update pin", detail: error.localizedDescription)
+        }
+    }
+
+    /// Changes the server pin state for a selection. The local optimistic
+    /// update is rolled back per failed request.
+    func setPinned(_ selected: [ChatSession], pinned: Bool) async {
+        var unique = [ChatSession]()
+        var seen = Set<String>()
+        for session in selected where seen.insert(session.id).inserted {
+            guard sessions.contains(where: { $0.id == session.id }) else { continue }
+            unique.append(session)
+        }
+        guard !unique.isEmpty else { return }
+
+        var previous = [String: ChatSession](minimumCapacity: unique.count)
+        for session in unique {
+            guard let index = sessions.firstIndex(where: { $0.id == session.id }) else { continue }
+            previous[session.id] = sessions[index]
+            sessions[index] = sessions[index].withPinned(pinned)
+        }
+        sessions.sort(by: Self.sessionComesBefore)
+
+        guard let rest else {
+            for session in unique {
+                if let old = previous[session.id],
+                   let index = sessions.firstIndex(where: { $0.id == session.id }) {
+                    sessions[index] = old
+                }
+            }
+            sessions.sort(by: Self.sessionComesBefore)
+            postError("Could not update pins", detail: "The server connection is unavailable.")
+            return
+        }
+
+        var failures = 0
+        for session in unique {
+            do {
+                _ = try await rest.patchSession(
+                    durableID: session.id,
+                    pinned: pinned,
+                    profile: session.profile
+                )
+            } catch {
+                failures += 1
+                if let restError = error as? RestError, case .sessionNotFound = restError {
+                    sessions.removeAll { $0.id == session.id }
+                } else if let old = previous[session.id],
+                          let index = sessions.firstIndex(where: { $0.id == session.id }) {
+                    sessions[index] = old
+                }
+            }
+        }
+        sessions.sort(by: Self.sessionComesBefore)
+        if failures > 0 {
+            postError(
+                "Could not update \(failures) of \(unique.count) pins",
+                detail: "The remaining \(unique.count - failures) chat(s) were updated."
+            )
         }
     }
 
@@ -621,6 +1176,9 @@ final class AppModel {
                 archived: archived,
                 profile: session.profile
             )
+            if archived {
+                clearActiveTranscriptIfNeeded(session.id)
+            }
             guard archived else { return }
             toastPresenter.post(
                 ToastMessage(
@@ -654,6 +1212,124 @@ final class AppModel {
             postError(
                 archived ? "Could not archive chat" : "Could not restore chat",
                 detail: error.localizedDescription
+            )
+        }
+    }
+    /// Archives or restores a selection with one operation-level outcome.
+    /// Archive keeps one persistent Undo that retries only successful writes.
+    func setArchived(_ selected: [ChatSession], archived: Bool) async {
+        var unique = [ChatSession]()
+        var seen = Set<String>()
+        for session in selected where seen.insert(session.id).inserted {
+            unique.append(session)
+        }
+        guard !unique.isEmpty else { return }
+        guard let rest else {
+            postError(
+                archived ? "Could not archive chats" : "Could not restore chats",
+                detail: "The server connection is unavailable."
+            )
+            return
+        }
+
+        let previous = Dictionary(unique.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        if archived {
+            sessions.removeAll { previous[$0.id] != nil }
+        }
+
+        var successful = [ChatSession]()
+        var failed = [ChatSession]()
+        for session in unique {
+            do {
+                _ = try await rest.patchSession(
+                    durableID: session.id,
+                    archived: archived,
+                    profile: session.profile
+                )
+                successful.append(session)
+            } catch {
+                failed.append(session)
+                if !archived, let index = sessions.firstIndex(where: { $0.id == session.id }) {
+                    sessions.remove(at: index)
+                }
+            }
+        }
+
+        if archived {
+            for session in failed where !sessions.contains(where: { $0.id == session.id }) {
+                sessions.append(session)
+            }
+            sessions.sort(by: Self.sessionComesBefore)
+            if let selectedSessionID,
+               successful.contains(where: { $0.id == selectedSessionID }) {
+                clearActiveTranscriptIfNeeded(selectedSessionID)
+            }
+            guard !successful.isEmpty else {
+                let noun = failed.count == 1 ? "chat" : "chats"
+                postError(
+                    "Could not archive \(failed.count) \(noun)",
+                    detail: "No selected chat was archived."
+                )
+                return
+            }
+            let detail = failed.isEmpty
+                ? nil
+                : "\(failed.count) of \(unique.count) chats could not be archived."
+            toastPresenter.post(
+                ToastMessage(
+                    id: ToastID("archive-selection-\(UUID().uuidString)"),
+                    title: "Archived \(successful.count) chats",
+                    detail: detail,
+                    severity: failed.isEmpty ? .success : .warning,
+                    action: ToastAction(label: "Undo"),
+                    isPersistent: true
+                ),
+                action: { [weak self] in
+                    guard let self else { return }
+                    Task { @MainActor in
+                        await self.restoreArchivedSessions(successful)
+                    }
+                }
+            )
+        } else {
+            for session in successful where !sessions.contains(where: { $0.id == session.id }) {
+                sessions.append(session.withArchived(false))
+            }
+            sessions.sort(by: Self.sessionComesBefore)
+            if !failed.isEmpty {
+                postError(
+                    "Could not restore \(failed.count) of \(unique.count) chats",
+                    detail: "The remaining \(successful.count) chat(s) were restored."
+                )
+            }
+        }
+    }
+
+    private func restoreArchivedSessions(_ archived: [ChatSession]) async {
+        guard let rest else {
+            postError("Could not restore archived chats", detail: "The server connection is unavailable.")
+            return
+        }
+        var failed = 0
+        for session in archived {
+            do {
+                _ = try await rest.patchSession(
+                    durableID: session.id,
+                    archived: false,
+                    profile: session.profile
+                )
+                if !sessions.contains(where: { $0.id == session.id }) {
+                    sessions.append(session.withArchived(false))
+                }
+            } catch {
+                failed += 1
+            }
+        }
+        sessions.sort(by: Self.sessionComesBefore)
+        if failed > 0 {
+            postError(
+                "Could not restore \(failed) of \(archived.count) chats",
+                detail: "The remaining \(archived.count - failed) chat(s) were restored."
             )
         }
     }
@@ -863,6 +1539,7 @@ final class AppModel {
         pendingExternalRoute.clearPending()
         _ = openGenerations.begin()
         pendingMessageRoute = nil
+        viewingArchivedSessionID = nil
         guard let gateway else { return }
         do {
             let result = try await gateway.call("session.create")
@@ -908,6 +1585,7 @@ final class AppModel {
     /// Routes a validated external destination after session authority exists.
     /// A route received during restore replaces any older queued destination.
     func route(_ destination: MessageDeepLink.Destination) {
+
         let generation = openGenerations.begin()
         pendingMessageRoute = nil
         let decision = pendingExternalRoute.route(
@@ -929,19 +1607,7 @@ final class AppModel {
         pendingExternalRoute.clearPending()
         _ = openGenerations.begin()
         pendingMessageRoute = nil
-        programmaticSelectionID = nil
     }
-    func consumeProgrammaticSelection(_ id: String?) -> Bool {
-        guard let id, programmaticSelectionID == id else { return false }
-        programmaticSelectionID = nil
-        return true
-    }
-    func hasProgrammaticSelection(_ id: String?) -> Bool {
-        guard let id else { return false }
-        return programmaticSelectionID == id
-    }
-
-
 
     private var pendingRoutePhase: PendingRouteCoordinator.Phase {
         switch phase {
@@ -993,18 +1659,18 @@ final class AppModel {
         else { return }
         switch destination {
         case .chat(let sessionID):
-            programmaticSelectionID = sessionID
             await openChat(sessionID: sessionID, generation: generation)
         case .message(let location):
-            programmaticSelectionID = location.sessionID
             await open(at: location, generation: generation)
         }
     }
+
     @discardableResult
     func open(_ session: ChatSession) async -> Bool {
         pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
         pendingMessageRoute = nil
+        viewingArchivedSessionID = nil
         return await open(session, generation: generation)
     }
 
@@ -1049,7 +1715,81 @@ final class AppModel {
         }
         return true
     }
-    /// Opens the target chat at its newest message.
+    /// Opens an archived transcript from cache, then refreshes it from REST.
+    /// This path never resumes a live gateway session.
+    @discardableResult
+    func openArchived(_ session: ChatSession) async -> Bool {
+        pendingExternalRoute.clearPending()
+        let generation = openGenerations.begin()
+        pendingMessageRoute = nil
+        guard let source = transcriptSource(for: session) else {
+            postError(
+                "Could not open archived chat \(session.id)",
+                detail: "The gateway is unavailable."
+            )
+            return false
+        }
+
+        viewingArchivedSessionID = session.id
+        selectedSessionID = session.id
+        liveSessionID = nil
+        let cached: CachedTranscript?
+        let cacheEpoch: UInt64?
+        if cacheEnabled {
+            let read = await cache.read(for: session.id)
+            cached = read.transcript
+            cacheEpoch = read.epoch
+        } else {
+            cached = nil
+            cacheEpoch = nil
+        }
+        guard openGenerations.isCurrent(generation), !Task.isCancelled else { return false }
+        streamingReducer.reset(messages: cached?.messages ?? [])
+        messages = cached?.messages ?? []
+        isAwaitingReply = streamingReducer.isAwaitingReply
+        Log.info("open archived \(session.id): \(messages.count) messages from cache")
+
+        let authoritative: AuthoritativeTranscript
+        do {
+            authoritative = try await source.fetchAuthoritative(sessionID: session.id)
+        } catch {
+            guard openGenerations.isCurrent(generation), !Task.isCancelled else { return false }
+            postError(
+                "Could not fully open archived chat \(session.id)",
+                detail: error.localizedDescription
+            )
+            Log.error("open archived \(session.id): \(error)")
+            return false
+        }
+        guard openGenerations.isCurrent(generation), !Task.isCancelled else { return false }
+
+        let projected = ChatMessage.projectREST(historyRows: authoritative.rows)
+        let snapshot = CacheFirstOpenPolicy.snapshot(
+            sessionID: session.id,
+            rows: authoritative.rows,
+            projectedMessages: projected.count,
+            serverTotal: authoritative.serverTotal ?? session.messageCount
+        )
+        var cacheStore: CacheStoreResult?
+        if cacheEnabled {
+            cacheStore = try? await cache.store(
+                projected,
+                snapshot: snapshot,
+                title: session.title,
+                for: session.id,
+                expectedEpoch: cacheEpoch
+            )
+            guard openGenerations.isCurrent(generation), !Task.isCancelled else { return false }
+        }
+        streamingReducer.reset(messages: projected)
+        messages = projected
+        isAwaitingReply = streamingReducer.isAwaitingReply
+        if let cacheStore {
+            applyCacheStore(cacheStore)
+        }
+        Log.info("open archived \(session.id): \(messages.count) messages from REST")
+        return true
+    }
     func openChat(sessionID: String) async {
         pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
@@ -1057,6 +1797,7 @@ final class AppModel {
     }
 
     private func openChat(sessionID: String, generation: Int) async {
+        viewingArchivedSessionID = nil
         pendingMessageRoute = nil
         guard let session = sessions.first(where: { $0.id == sessionID }) else {
             postError("Could not open chat", detail: "The chat no longer exists.")
@@ -1064,8 +1805,6 @@ final class AppModel {
         }
         _ = await open(session, generation: generation)
     }
-
-    /// Opens a chat with a message target available during its first layout.
     func open(at location: MessageLocation) async {
         pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
@@ -1074,6 +1813,7 @@ final class AppModel {
 
     private func open(at location: MessageLocation, generation: Int) async {
         pendingMessageRoute = nil
+        viewingArchivedSessionID = nil
         guard !location.sessionID.isEmpty,
               let session = sessions.first(where: { $0.id == location.sessionID })
         else {
@@ -1103,6 +1843,7 @@ final class AppModel {
     // MARK: - Prompting
 
     func send() async {
+        guard !isViewingArchivedTranscript else { return }
         let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isAwaitingReply, let gateway else { return }
 
@@ -1136,6 +1877,7 @@ final class AppModel {
         }
     }
     func interrupt() async {
+        guard !isViewingArchivedTranscript else { return }
         guard let gateway, let sessionID = liveSessionID else { return }
         let generation = openGenerations.current()
         _ = try? await gateway.call("session.interrupt", params: ["session_id": sessionID])
@@ -1149,6 +1891,7 @@ final class AppModel {
     // MARK: - Events
 
     private func handle(_ event: GatewayEvent) async {
+        guard !isViewingArchivedTranscript else { return }
         if event.type == "transport.closed" {
             phase = .failed(event.text ?? "The gateway connection closed.")
             let reduction = streamingReducer.cancel()
@@ -1174,7 +1917,7 @@ final class AppModel {
     }
 
     private func reconcileTerminal(_ terminal: StreamingTerminal?) async {
-        guard terminal != nil else { return }
+        guard !isViewingArchivedTranscript, terminal != nil else { return }
         let generation = openGenerations.current()
         let sessionID = selectedSessionID
         let session = sessionID.flatMap { id in

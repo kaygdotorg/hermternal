@@ -18,13 +18,18 @@ struct SidebarSchedulesPane: View {
     let rows: [SidebarRow]
     let folders: [Folder]
     let membership: [String: String]
-    @Binding var selection: String?
+    let sessionsByID: [String: ChatSession]
+    let scheduledIDs: Set<String>
+    @Binding var selection: Set<SidebarSelectionID>
     let onOpen: (ChatSession) -> Void
-    let onPin: (ChatSession) -> Void
-    let onArchive: (ChatSession) -> Void
+    let onPin: ([ChatSession], Bool) -> Void
+    let onArchive: ([ChatSession]) -> Void
     let onRename: (ChatSession) -> Void
-    let onCopyDeepLink: (ChatSession) -> Void
-    let onMove: (ChatSession, String?) -> Void
+    let onCopyDeepLinks: ([ChatSession]) -> Void
+    let onPurge: ([String], [String], SessionPurgeActionMode) -> Void
+    let purgeAvailable: Bool
+    let purgeUnavailableReason: String
+    let onMove: ([ChatSession], String?) -> Void
 
     /// Height of the pane list's own scrollable content, reported by the
     /// scroll geometry. It is the real height of every row plus the list's
@@ -34,7 +39,8 @@ struct SidebarSchedulesPane: View {
     @State private var contentHeight: CGFloat?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let visibleOrder = rows.map { SidebarSelectionID.chat($0.sessionID) }
+        return VStack(alignment: .leading, spacing: 0) {
             // The divider that separates the pane from the chat list is
             // owned by the column layout, so the pane draws none of its own.
             HStack(spacing: 4) {
@@ -46,21 +52,28 @@ struct SidebarSchedulesPane: View {
             .sidebarSectionHeader(topGap: SidebarMetrics.paneHeaderGap)
             .padding(.leading, SidebarMetrics.headerLeadingInset)
             .padding(.trailing, SidebarMetrics.headerTrailingInset)
-
             List(selection: $selection) {
                 ForEach(rows) { row in
                     SessionRowItem(
                         session: row.session,
                         folders: folders,
-                        currentFolderID: membership[row.sessionID],
-                        onMoveToFolder: onMove,
+                        membership: membership,
+                        sessionsByID: sessionsByID,
+                        selection: selection,
+                        visibleOrder: visibleOrder,
+                        scheduledIDs: scheduledIDs,
                         onOpen: onOpen,
                         onPin: onPin,
                         onArchive: onArchive,
                         onRename: onRename,
-                        onCopyDeepLink: onCopyDeepLink
+                        onCopyDeepLinks: onCopyDeepLinks,
+                        onPurge: onPurge,
+                        purgeAvailable: purgeAvailable,
+                        purgeUnavailableReason: purgeUnavailableReason,
+                        onMove: onMove
                     )
-                    .tag(row.sessionID)
+                    .tag(SidebarSelectionID.chat(row.sessionID))
+                    .selectionDisabled(false)
                 }
             }
             .listStyle(.sidebar)

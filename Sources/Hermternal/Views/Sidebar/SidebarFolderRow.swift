@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 import HermternalCore
@@ -16,32 +17,78 @@ import HermternalCore
 /// one of them parses to `nil` and changes nothing, which is also what any
 /// text dragged in from another application does.
 enum SidebarDragPayload {
-    /// `NSString` registers plain text, and `.text` is what a drop asks for.
+    /// `NSString` keeps the proven item-provider drag/drop route working in a
+    /// sidebar List. The envelope is versioned and carries one typed batch.
     static let carrier = UTType.text
 
-    private static let sessionPrefix = "hermternal-sidebar-session:"
-    private static let folderPrefix = "hermternal-sidebar-folder:"
+    private static let envelopePrefix = "hermternal-sidebar:v2:"
+    private static let version = 2
+
+    private struct Envelope: Codable {
+        let version: Int
+        let kind: Kind
+        let ids: [String]
+
+        enum Kind: String, Codable, Equatable {
+            case chat
+            case folder
+        }
+    }
 
     static func provider(sessionID: String) -> NSItemProvider {
-        NSItemProvider(object: (sessionPrefix + sessionID) as NSString)
+        provider(sessionIDs: [sessionID])
     }
 
     static func provider(folderID: String) -> NSItemProvider {
-        NSItemProvider(object: (folderPrefix + folderID) as NSString)
+        provider(folderIDs: [folderID])
+    }
+
+    static func provider(sessionIDs: [String]) -> NSItemProvider {
+        provider(envelope: Envelope(version: version, kind: .chat, ids: unique(sessionIDs)))
+    }
+
+    static func provider(folderIDs: [String]) -> NSItemProvider {
+        provider(envelope: Envelope(version: version, kind: .folder, ids: unique(folderIDs)))
     }
 
     static func sessionID(from payload: String) -> String? {
-        id(from: payload, prefix: sessionPrefix)
+        sessionIDs(from: payload)?.first
     }
 
     static func folderID(from payload: String) -> String? {
-        id(from: payload, prefix: folderPrefix)
+        folderIDs(from: payload)?.first
     }
 
-    private static func id(from payload: String, prefix: String) -> String? {
-        guard payload.hasPrefix(prefix) else { return nil }
-        let id = payload.dropFirst(prefix.count)
-        return id.isEmpty ? nil : String(id)
+    static func sessionIDs(from payload: String) -> [String]? {
+        ids(from: payload, kind: .chat)
+    }
+
+    static func folderIDs(from payload: String) -> [String]? {
+        ids(from: payload, kind: .folder)
+    }
+
+    private static func provider(envelope: Envelope) -> NSItemProvider {
+        guard !envelope.ids.isEmpty,
+              let data = try? JSONEncoder().encode(envelope)
+        else { return NSItemProvider(object: "" as NSString) }
+        let payload = envelopePrefix + data.base64EncodedString()
+        return NSItemProvider(object: payload as NSString)
+    }
+
+    private static func ids(from payload: String, kind: Envelope.Kind) -> [String]? {
+        guard payload.hasPrefix(envelopePrefix),
+              let data = Data(base64Encoded: String(payload.dropFirst(envelopePrefix.count))),
+              let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
+              envelope.version == version,
+              envelope.kind == kind
+        else { return nil }
+        let ids = unique(envelope.ids)
+        return ids.isEmpty ? nil : ids
+    }
+
+    private static func unique(_ ids: [String]) -> [String] {
+        var seen = Set<String>()
+        return ids.filter { !$0.isEmpty && seen.insert($0).inserted }
     }
 }
 
@@ -52,81 +99,59 @@ enum SidebarDragPayload {
 /// string crosses the boundary; no view or model closure ever does. `parse`
 /// decides which kind of id is wanted and rejects everything else.
 @MainActor
+private func sidebarPayload(from provider: NSItemProvider) async -> String? {
+    let data = await withCheckedContinuation { (continuation: CheckedContinuation<Data?, Never>) in
+        provider.loadDataRepresentation(
+            forTypeIdentifier: SidebarDragPayload.carrier.identifier
+        ) { data, _ in
+            continuation.resume(returning: data)
+        }
+    }
+    return data.flatMap { String(data: $0, encoding: .utf8) }
+}
+
+@MainActor
 func sidebarDraggedIDs(
     _ providers: [NSItemProvider],
-    parse: (String) -> String?
+    parse: (String) -> [String]?
 ) async -> [String] {
     var ids = [String]()
-    ids.reserveCapacity(providers.count)
-    var seen = Set<String>(minimumCapacity: providers.count)
+    var seen = Set<String>()
     for provider in providers {
-        guard let payload = await provider.sidebarText(),
-              let id = parse(payload),
-              seen.insert(id).inserted
+        guard let payload = await sidebarPayload(from: provider),
+              let parsed = parse(payload)
         else { continue }
-        ids.append(id)
+        for id in parsed where seen.insert(id).inserted {
+            ids.append(id)
+        }
     }
     return ids
 }
 
-private extension NSItemProvider {
-    /// The provider's text. The completion closure captures the continuation
-    /// and nothing else, so an answer arriving off the main queue cannot
-    /// touch view state.
-    @MainActor
-    func sidebarText() async -> String? {
-        await withCheckedContinuation { continuation in
-            _ = loadObject(ofClass: NSString.self) { object, _ in
-                continuation.resume(returning: (object as? NSString) as String?)
-            }
-        }
-    }
-}
-
-/// One folder as a flat List row: a disclosure caret, then the folder.
+/// One folder, as one flat list row.
 ///
-/// A row rather than a `Section`, because a drop attaches to a view and a
-/// `Section` cannot receive one. Dragging a chat onto a folder is the gesture
-/// a sidebar is for, so the folder has to be something that can be dropped
-/// on.
-///
-/// The chats of the folder are NOT children of this view. The Folders section
-/// places them after this row as siblings, each with one small leading inset.
-/// A `DisclosureGroup` nested them instead, and a nested row makes the whole
-/// List an outline: every other row in the sidebar, including Pinned and the
-/// date buckets, then carries an indentation column it never asked for, and
-/// sits right of the same rows in the schedules pane. No public API reduces
-/// that column.
-///
-/// The drop is `onDrop` and the drag is `onDrag`, not `dropDestination` and
-/// `draggable`. That is measured, not preferred: in a live build the modern
-/// `Transferable` pair started no drag session at all on a
-/// `.listStyle(.sidebar)` row, while the item-provider pair worked on the
-/// first attempt with every other variable held fixed. Both are Apple APIs;
-/// only one of them works here.
-///
-/// Reordering rides the same route, for the same measured reason: `onMove` on
-/// the flat folder `ForEach` did nothing at three different drag speeds, in
-/// the build where a chat drop already worked. So a folder is draggable
-/// itself, and dropping one folder on another gives the dragged folder that
-/// row's place. That is a whole position rather than a gap between two rows,
-/// which is the honest limit of what these APIs can express here, and it
-/// beats a reorder gesture that silently does nothing.
-///
-/// The caret is the one thing this row draws, and it is the same glyph, scale
-/// and rotation the section headers use, so the sidebar keeps one disclosure
-/// vocabulary. The row's highlight still belongs to the platform.
+/// The chats of the folder are NOT children of this view. The Folders
+/// section places them after this row as siblings, each with its own small
+/// leading inset. A `DisclosureGroup` would nest them instead, and a nested
+/// row makes the whole List an outline: every other row in the sidebar,
+/// including Pinned and the date buckets, then carries an indentation
+/// column it never asked for.
 struct SidebarFolderRow: View {
     let target: SidebarFolderTarget
     @Binding var isExpanded: Bool
+    let selection: Set<SidebarSelectionID>
+    let visibleOrder: [SidebarSelectionID]
+    let foldersByID: [String: SidebarFolderTarget]
     let onRename: (SidebarFolderTarget) -> Void
-    let onDelete: (SidebarFolderTarget) -> Void
+    let onPurge: ([String], [String], SessionPurgeActionMode) -> Void
+    let purgeAvailable: Bool
+    let purgeUnavailableReason: String
+    let onDelete: ([SidebarFolderTarget]) -> Void
     /// The dropped session ids, with the folder they were dropped on.
     let onDropSessions: ([String], String) -> Void
-    /// A folder dragged onto this one: the dragged id, then this row's id.
-    let onDropFolder: (String, String) -> Void
+    /// A block of folders dragged onto this one.
+    let onDropFolders: ([String], String) -> Void
 
-    /// Held here, so a drag over one folder redraws that folder alone.
     @State private var isTargeted = false
 
     var body: some View {
@@ -134,25 +159,19 @@ struct SidebarFolderRow: View {
             disclosure
             label
         }
-        // A folder is not a chat, so it must not become the List selection
-        // and clear the open conversation. The chats of the folder are
-        // sibling rows now and state their own rule.
-        .selectionDisabled()
+        .tag(SidebarSelectionID.folder(target.id))
+        .selectionDisabled(false)
         .contextMenu {
-            FolderCommands(
-                target: target,
-                onRename: onRename,
-                onDelete: onDelete
-            )
+            folderContextMenu
         }
     }
 
     /// The folder's caret, always visible.
     ///
     /// A section header may keep its caret for hover, because the header
-    /// title is part of the same button. A folder title is the drop target,
-    /// so the caret is the only control that opens the folder and it has to
-    /// be there before the pointer is.
+    /// title is part of the same button. A folder title selects the folder
+    /// instead, so the caret is the only control that opens the folder and it
+    /// has to be there before the pointer is.
     private var disclosure: some View {
         Button {
             isExpanded.toggle()
@@ -173,15 +192,41 @@ struct SidebarFolderRow: View {
         )
     }
 
-    /// The drop lands on the label and not on the caret's gutter, so the
-    /// control that opens the folder is never also its drop target.
+    private var folderTargets: [SidebarFolderTarget] {
+        let targets = SidebarSelectionPolicy.contextTargets(
+            clicked: .folder(target.id),
+            selected: selection
+        )
+        var seen = Set<String>()
+        return visibleOrder.compactMap { item in
+            guard case let .folder(id) = item,
+                  targets.contains(item),
+                  seen.insert(id).inserted
+            else { return nil }
+            return foldersByID[id]
+        }
+    }
+
+    @ViewBuilder
+    private var folderContextMenu: some View {
+        let targets = folderTargets
+        Button("Rename Folder…", systemImage: "pencil") {
+            if targets.count == 1, let target = targets.first { onRename(target) }
+        }
+        .disabled(targets.count != 1)
+        Button("Delete \(targets.count) Folders…", systemImage: "trash", role: .destructive) {
+            onDelete(targets)
+        }
+        Button("Delete Folders and Chats Permanently", systemImage: "trash.fill", role: .destructive) {
+            onPurge([], targets.map(\.id), .foldersAndChats)
+        }
+        .disabled(!purgeAvailable)
+        .help(purgeAvailable ? "Permanently delete chats in these folders" : purgeUnavailableReason)
+    }
     private var label: some View {
         Label {
             Text(target.name)
                 .lineLimit(1)
-                // Emphasis, not a plate. Accent text and a filled folder are
-                // the platform's own vocabulary for "this is where it goes",
-                // and neither draws a shape.
                 .foregroundStyle(isTargeted ? Color.accentColor : Color.primary)
         } icon: {
             Image(systemName: "folder")
@@ -190,37 +235,32 @@ struct SidebarFolderRow: View {
         }
         .font(.body)
         .help(target.name)
-        // Layout only: the drop target is the row's full width, so aiming at
-        // a short folder name is not required.
         .frame(maxWidth: .infinity, alignment: .leading)
         .onDrag {
-            SidebarDragPayload.provider(folderID: target.id)
+            let ids = SidebarSelectionPolicy.applicableDragTargets(
+                dragged: .folder(target.id),
+                selected: selection,
+                visibleOrder: visibleOrder
+            ).compactMap { if case let .folder(id) = $0 { id } else { nil } }
+            return SidebarDragPayload.provider(folderIDs: ids)
         }
         .onDrop(of: [SidebarDragPayload.carrier], isTargeted: $isTargeted) { providers in
             let targetID = target.id
             Task {
-                // A folder arriving means reordering; a chat arriving means
-                // filing. The payload says which, so neither case has to
-                // guess what a bare string was supposed to mean, and text
-                // from anywhere else parses to nothing.
                 let folderIDs = await sidebarDraggedIDs(
                     providers,
-                    parse: SidebarDragPayload.folderID
+                    parse: SidebarDragPayload.folderIDs
                 )
-                if let dragged = folderIDs.first {
-                    onDropFolder(dragged, targetID)
+                if !folderIDs.isEmpty {
+                    onDropFolders(folderIDs, targetID)
                     return
                 }
                 let sessionIDs = await sidebarDraggedIDs(
                     providers,
-                    parse: SidebarDragPayload.sessionID
+                    parse: SidebarDragPayload.sessionIDs
                 )
-                // An id the sidebar does not currently render changes
-                // nothing: the caller resolves ids against the rows it has.
                 guard !sessionIDs.isEmpty else { return }
                 onDropSessions(sessionIDs, targetID)
-                // A chat that lands in a collapsed folder would otherwise
-                // vanish without saying where it went.
                 isExpanded = true
             }
             return true

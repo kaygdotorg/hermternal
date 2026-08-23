@@ -175,45 +175,68 @@ enum SidebarFixtures {
         )
     }
 
+    static let archivedTranscriptMessages: [ChatMessage] = [
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: 2_001)),
+            role: .user,
+            text: "Archived fixture question: which research findings shipped?",
+            timestamp: Date(timeIntervalSince1970: 2_001)
+        ),
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: 2_002)),
+            role: .assistant,
+            text: "Archived fixture answer: the interview themes and retention notes shipped.",
+            timestamp: Date(timeIntervalSince1970: 2_002)
+        ),
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: 2_003)),
+            role: .user,
+            text: "Archived fixture follow-up: keep this transcript read-only.",
+            timestamp: Date(timeIntervalSince1970: 2_003)
+        )
+    ]
+
     static let transcriptSource: any TranscriptSource = FixtureTranscriptSource(
-        sessionID: transcriptSessionID,
-        messages: transcriptMessages
+        messagesBySessionID: [
+            transcriptSessionID: transcriptMessages,
+            "fixture-archived": archivedTranscriptMessages
+        ]
     )
 
     private struct FixtureTranscriptSource: TranscriptSource, Sendable {
-        let sessionID: String
-        let rows: [JSONValue]
+        let rowsBySessionID: [String: [JSONValue]]
 
-        init(sessionID: String, messages: [ChatMessage]) {
-            self.sessionID = sessionID
-            self.rows = messages.map { message in
-                let rawID: Int64
-                if case .server(let serverID) = message.id {
-                    rawID = serverID.rawValue
-                } else {
-                    rawID = 0
+        init(messagesBySessionID: [String: [ChatMessage]]) {
+            self.rowsBySessionID = messagesBySessionID.mapValues { messages in
+                messages.map { message in
+                    let rawID: Int64
+                    if case .server(let serverID) = message.id {
+                        rawID = serverID.rawValue
+                    } else {
+                        rawID = 0
+                    }
+                    return .object([
+                        "id": .integer(rawID),
+                        "role": .string(message.role.rawValue),
+                        "text": .string(message.text),
+                        "timestamp": .number(message.timestamp?.timeIntervalSince1970 ?? 0)
+                    ])
                 }
-                return .object([
-                    "id": .integer(rawID),
-                    "role": .string(message.role.rawValue),
-                    "text": .string(message.text),
-                    "timestamp": .number(message.timestamp?.timeIntervalSince1970 ?? 0)
-                ])
             }
         }
 
         func fetchAuthoritative(sessionID: String) async throws -> AuthoritativeTranscript {
-            guard sessionID == self.sessionID else {
-                return AuthoritativeTranscript(rows: [], serverTotal: 0)
-            }
+            let rows = rowsBySessionID[sessionID] ?? []
             return AuthoritativeTranscript(rows: rows, serverTotal: rows.count)
         }
 
         func resume(sessionID: String) async throws -> ResumedTranscript {
-            ResumedTranscript(
-                liveSessionID: sessionID == self.sessionID ? "fixture-live-session" : nil,
+            let rows = rowsBySessionID[SidebarFixtures.transcriptSessionID] ?? []
+            let isActiveFixture = sessionID == SidebarFixtures.transcriptSessionID
+            return ResumedTranscript(
+                liveSessionID: isActiveFixture ? "fixture-live-session" : nil,
                 rows: [],
-                messageCount: sessionID == self.sessionID ? rows.count : 0
+                messageCount: isActiveFixture ? rows.count : 0
             )
         }
     }
@@ -222,7 +245,8 @@ enum SidebarFixtures {
     static func previewModel() -> AppModel {
         let model = AppModel()
         model.serverText = gatewayURL.absoluteString
-        model.sessions = sessions
+        model.sessions = sessions.filter { !$0.archived }
+        model.archivedSessions = sessions.filter(\.archived)
         model.phase = .ready
         return model
     }

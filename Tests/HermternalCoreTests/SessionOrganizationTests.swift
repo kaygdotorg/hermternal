@@ -300,6 +300,71 @@ func noChangeMutationOnMissingFileSkipsWrite() async throws {
     #expect(fileSystem.atomicWriteCount == 0)
 }
 
+@Test("Purge reconciliation removes chats and approved folders in one write")
+func reconcilePurgeWritesOnceAndPreservesOthers() async throws {
+    let directory = try makeOrganizationTestDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let fileSystem = CountingOrganizationFileSystem()
+    let store = SessionOrganizationStore(directory: directory, fileSystem: fileSystem)
+    try await store.save(SessionOrganization(
+        folders: [
+            Folder(id: "work", name: "Work", order: 0),
+            Folder(id: "home", name: "Home", order: 1)
+        ],
+        gateways: [
+            "gateway-a": .init(folderMembership: [
+                "purged": "work",
+                "retained": "home"
+            ]),
+            "gateway-b": .init(folderMembership: ["purged-elsewhere": "home"])
+        ]
+    ))
+    let initialWrites = fileSystem.atomicWriteCount
+
+    #expect(try await store.reconcilePurge(
+        confirmedSessionIDs: ["purged", "purged-elsewhere"],
+        folderIDs: ["work"],
+        gatewayHost: "gateway-a"
+    ))
+    #expect(fileSystem.atomicWriteCount == initialWrites + 1)
+    let reloaded = try await SessionOrganizationStore(directory: directory).load()
+    #expect(reloaded.folders.map(\.id) == ["home"])
+    #expect(reloaded.gateways["gateway-a"]?.folderMembership == ["retained": "home"])
+    #expect(reloaded.gateways["gateway-b"]?.folderMembership == ["purged-elsewhere": "home"])
+    #expect(try await store.reconcilePurge(
+        confirmedSessionIDs: ["purged"],
+        folderIDs: [],
+        gatewayHost: "gateway-a"
+    ) == false)
+    #expect(fileSystem.atomicWriteCount == initialWrites + 1)
+}
+
+@Test("Purge reconciliation preserves failed assignments and folders")
+func reconcilePurgePreservesFailedFolder() async throws {
+    let directory = try makeOrganizationTestDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = SessionOrganizationStore(directory: directory)
+    try await store.save(SessionOrganization(
+        folders: [Folder(id: "work", name: "Work", order: 0)],
+        gateways: [
+            "gateway": .init(folderMembership: [
+                "purged": "work",
+                "failed": "work"
+            ])
+        ]
+    ))
+
+    #expect(try await store.reconcilePurge(
+        confirmedSessionIDs: ["purged"],
+        folderIDs: [],
+        gatewayHost: "gateway"
+    ))
+    let reloaded = try await SessionOrganizationStore(directory: directory).load()
+    #expect(reloaded.folders.map(\.id) == ["work"])
+    #expect(reloaded.gateways["gateway"]?.folderMembership == ["failed": "work"])
+}
+
+
 @Test("Reordering requires the complete folder permutation")
 func reorderRequiresPermutation() async throws {
     let directory = try makeOrganizationTestDirectory()

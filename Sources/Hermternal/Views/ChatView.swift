@@ -4,21 +4,21 @@ import AppKit
 
 struct ChatView: View {
     @Bindable var model: AppModel
+    let isReadOnly: Bool
     @State private var pendingScrollTask: Task<Void, Never>?
     @State private var isFindPresented = false
     @State private var findQuery = ""
     @State private var activeFindIndex = 0
     @State private var scrollPosition: MessageIdentity?
     @State private var messageTargetActive = false
-
     var body: some View {
         transcript
-            // safeAreaInset keeps the last message clear of the composer at
-            // rest while still letting content scroll underneath it, which a
-            // docked VStack row cannot do.
+            // The archived transcript has no bottom editing surface.
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                Composer(model: model)
-                    .background { Self.composerHalo }
+                if !isReadOnly {
+                    Composer(model: model)
+                        .background { Self.composerHalo }
+                }
             }
         // Declared on the detail, not the sidebar column: only the window
         // toolbar region groups adjacent items into one shared pill.
@@ -29,21 +29,43 @@ struct ChatView: View {
                 EmptyView()
             }
             if !model.isSearchPresented {
-                ToolbarItemGroup {
-                    Button {
-                        Task { await model.newChat() }
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                    .help("New chat")
-                    .keyboardShortcut("n", modifiers: .command)
+                if isReadOnly {
+                    ToolbarItemGroup {
+                        Button {
+                            guard let session = archivedSession else { return }
+                            Task { await model.restoreArchived(session) }
+                        } label: {
+                            Image(systemName: "archivebox")
+                        }
+                        .help("Restore chat")
+                        .disabled(archivedSession == nil)
 
-                    Button {
-                        Task { await model.loadSessions() }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
+                        Button {
+                            guard let session = archivedSession else { return }
+                            model.copyDeepLink(for: session)
+                        } label: {
+                            Image(systemName: "link")
+                        }
+                        .help("Copy chat link")
+                        .disabled(archivedSession == nil)
                     }
-                    .help("Reload the chat list from the server")
+                } else {
+                    ToolbarItemGroup {
+                        Button {
+                            Task { await model.newChat() }
+                        } label: {
+                            Image(systemName: "plus")
+                        }
+                        .help("New chat")
+                        .keyboardShortcut("n", modifiers: .command)
+
+                        Button {
+                            Task { await model.loadSessions() }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .help("Reload the chat list from the server")
+                    }
                 }
             }
         }
@@ -58,6 +80,22 @@ struct ChatView: View {
         }
     }
 
+    private var archivedSession: ChatSession? {
+        guard let id = model.viewingArchivedSessionID else { return nil }
+        return model.archivedSessions.first(where: { $0.id == id })
+    }
+
+    private var findMatches: [TranscriptMatch] {
+        TranscriptMatcher.matches(
+            in: model.messages.map(\.text),
+            query: findQuery
+        )
+    }
+
+    private var activeFindMatch: TranscriptMatch? {
+        guard findMatches.indices.contains(activeFindIndex) else { return nil }
+        return findMatches[activeFindIndex]
+    }
     private var initialMessageTarget: MessageIdentity? {
         if messageTargetActive {
             // A nil write-back means the user has scrolled away. Do not fall

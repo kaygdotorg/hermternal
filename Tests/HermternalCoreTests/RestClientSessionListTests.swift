@@ -17,6 +17,24 @@ func restSessionListDeduplicatesPinnedRows() async throws {
     #expect(sessionIDs(rows) == ["recent-1", "recent-2", "pinned"])
     #expect(Set(sessionIDs(rows)).count == rows.count)
     #expect(fixture.offsets == [0, 100, 200])
+    #expect(fixture.archivedFilters == ["exclude", "exclude", "exclude"])
+}
+
+@Test("REST session list sends the typed archived-only filter on every page")
+func restSessionListSendsArchivedOnlyOnEveryPage() async throws {
+    let pages = [
+        SessionListPageFixture(rows: [sessionRow(id: "recent-1")]),
+        SessionListPageFixture(rows: [sessionRow(id: "pinned"), sessionRow(id: "recent-1")]),
+        SessionListPageFixture(rows: [sessionRow(id: "pinned"), sessionRow(id: "recent-2")])
+    ]
+    let (client, fixture, cleanup) = try makeSessionListClient(pages: pages)
+    defer { cleanup() }
+
+    let rows = try await client.allSessions(archived: .only)
+
+    #expect(sessionIDs(rows) == ["recent-1", "pinned", "recent-2"])
+    #expect(fixture.offsets == [0, 100, 200, 300])
+    #expect(fixture.archivedFilters == ["only", "only", "only", "only"])
 }
 
 @Test("REST session list stops when a page adds no new id")
@@ -49,7 +67,9 @@ func restSessionListEnforcesPageBound() async throws {
         switch error {
         case .sessionPageLimitExceeded:
             break
-        case .badStatus, .messagePageLimitExceeded, .noMutableFields, .sessionNotFound:
+        case .badStatus, .messagePageLimitExceeded, .noMutableFields, .sessionNotFound,
+             .purgeEmptyIDs, .purgeBatchTooLarge, .purgeInvalidConfirmation,
+             .purgeUnsupportedEndpoint, .purgeHTTPError, .purgeMalformedResponse:
             Issue.record("unexpected REST error: \(error)")
         }
     } catch {
@@ -76,7 +96,9 @@ func restSessionListFailureDoesNotReturnPartialRows() async throws {
         case .badStatus(let status, _):
             #expect(status == 503)
         case .messagePageLimitExceeded, .sessionPageLimitExceeded,
-             .noMutableFields, .sessionNotFound:
+             .noMutableFields, .sessionNotFound, .purgeEmptyIDs,
+             .purgeBatchTooLarge, .purgeInvalidConfirmation,
+             .purgeUnsupportedEndpoint, .purgeHTTPError, .purgeMalformedResponse:
             Issue.record("unexpected REST error: \(error)")
         }
     } catch {
@@ -100,6 +122,7 @@ private final class SessionListFixture: @unchecked Sendable {
     private let pages: [SessionListPageFixture]
     private let lock = NSLock()
     private var requests: [Int] = []
+    private var archivedRequests: [String] = []
     private var nextPage = 0
 
     init(pages: [SessionListPageFixture]) {
@@ -112,13 +135,20 @@ private final class SessionListFixture: @unchecked Sendable {
         return requests
     }
 
+    var archivedFilters: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return archivedRequests
+    }
+
     func response(for request: URLRequest) -> (Int, Data) {
         let components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
         let offset = Int(
             components.queryItems!.first { $0.name == "offset" }!.value!
         )!
+        let archived = components.queryItems!.first { $0.name == "archived" }!.value!
         lock.lock()
         requests.append(offset)
+        archivedRequests.append(archived)
         let page = pages[min(nextPage, pages.count - 1)]
         nextPage += 1
         lock.unlock()

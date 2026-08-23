@@ -43,76 +43,143 @@ private func sessionRowDetail(_ session: ChatSession) -> Text {
 struct SessionRowItem: View {
     let session: ChatSession
     let folders: [Folder]
-    let currentFolderID: String?
-    let onMoveToFolder: (ChatSession, String?) -> Void
+    let membership: [String: String]
+    let sessionsByID: [String: ChatSession]
+    let selection: Set<SidebarSelectionID>
+    let visibleOrder: [SidebarSelectionID]
+    let scheduledIDs: Set<String>
     let onOpen: (ChatSession) -> Void
-    let onPin: (ChatSession) -> Void
-    let onArchive: (ChatSession) -> Void
+    let onPin: ([ChatSession], Bool) -> Void
+    let onArchive: ([ChatSession]) -> Void
     let onRename: (ChatSession) -> Void
-    let onCopyDeepLink: (ChatSession) -> Void
+    let onCopyDeepLinks: ([ChatSession]) -> Void
+    let onPurge: ([String], [String], SessionPurgeActionMode) -> Void
+    let purgeAvailable: Bool
+    let purgeUnavailableReason: String
+    let onMove: ([ChatSession], String?) -> Void
+
     var body: some View {
-        Button {
-            onOpen(session)
-        } label: {
-            SessionRow(session: session)
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(session.displayTitle)
-        .accessibilityValue(sessionRowDetail(session))
-        .accessibilityIdentifier("session-row-\(session.id)")
-        .swipeActions(edge: .leading, allowsFullSwipe: false) {
-            pinButton(for: session)
-        }
-        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-            archiveButton(for: session)
-        }
-        // A per-row menu keeps the action tied to this row without
-        // changing List selection.
-        .contextMenu {
-            pinButton(for: session)
-            archiveButton(for: session)
-            renameButton(for: session)
-            copyDeepLinkButton(for: session)
-            MoveToFolderMenu(
-                session: session,
-                folders: folders,
-                currentFolderID: currentFolderID,
-                onMove: onMoveToFolder
-            )
+        SessionRow(session: session)
+            .accessibilityLabel(session.displayTitle)
+            .accessibilityValue(sessionRowDetail(session))
+            .accessibilityIdentifier("session-row-\(session.id)")
+            // The row surface belongs to List, but VoiceOver still needs the
+            // same default activation that the old row Button provided.
+            .accessibilityAction {
+                onOpen(session)
+            }
+            .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                pinButton
+            }
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                archiveButton
+            }
+            .contextMenu {
+                contextMenu
+            }
+    }
+
+    private var contextChats: [ChatSession] {
+        let targets = SidebarSelectionPolicy.contextTargets(
+            clicked: .chat(session.id),
+            selected: selection
+        )
+        var seen = Set<String>()
+        return visibleOrder.compactMap { item in
+            guard case let .chat(id) = item,
+                  targets.contains(item),
+                  seen.insert(id).inserted
+            else { return nil }
+            return sessionsByID[id]
         }
     }
 
+    private var moveChats: [ChatSession] {
+        contextChats.filter { !scheduledIDs.contains($0.id) }
+    }
+
     @ViewBuilder
-    private func pinButton(for session: ChatSession) -> some View {
+    private var contextMenu: some View {
+        let chats = contextChats
+        let chatNoun = chats.count == 1 ? "Chat" : "Chats"
+        let linkNoun = chats.count == 1 ? "Link" : "Links"
+        let action = SidebarSelectionPolicy.convergingPinAction(
+            for: chats.map(\.pinned)
+        )
+        if let action {
+            Button(
+                action == .pin ? "Pin \(chats.count) \(chatNoun)" : "Unpin \(chats.count) \(chatNoun)",
+                systemImage: action == .pin ? "pin" : "pin.slash"
+            ) {
+                onPin(chats, action == .pin)
+            }
+        }
+        Button("Archive \(chats.count) \(chatNoun)", systemImage: "archivebox") {
+            onArchive(chats)
+        }
+        Button("Copy \(chats.count) Deep \(linkNoun)", systemImage: "link") {
+            onCopyDeepLinks(chats)
+        }
+        Button("Delete Selected Chats Permanently", systemImage: "trash.fill", role: .destructive) {
+            onPurge(chats.map(\.id), [], .chatsOnly)
+        }
+        .disabled(!purgeAvailable)
+        .help(purgeAvailable ? "Permanently delete selected chats" : purgeUnavailableReason)
+        let folderIDs = Set(chats.compactMap { membership[$0.id] })
+        if !folderIDs.isEmpty {
+            Button("Delete Folders and Chats Permanently", systemImage: "folder.badge.minus", role: .destructive) {
+                onPurge(chats.map(\.id), Array(folderIDs), .foldersAndChats)
+            }
+            .disabled(!purgeAvailable)
+            .help(purgeAvailable ? "Permanently delete selected folders and chats" : purgeUnavailableReason)
+        }
+        if !moveChats.isEmpty {
+            moveMenu(moveChats)
+        }
+        Divider()
+        Button("Rename", systemImage: "pencil") {
+            if chats.count == 1, let chat = chats.first { onRename(chat) }
+        }
+        .disabled(chats.count != 1)
+    }
+    @ViewBuilder
+    private func moveMenu(_ chats: [ChatSession]) -> some View {
+        let noun = chats.count == 1 ? "Chat" : "Chats"
+        Menu("Move \(chats.count) \(noun) to Folder", systemImage: "folder") {
+            if folders.isEmpty {
+                Button("No Folders Yet") {}.disabled(true)
+            } else {
+                ForEach(folders) { folder in
+                    Button(folder.name) {
+                        onMove(chats, folder.id)
+                    }
+                    .disabled(chats.allSatisfy { membership[$0.id] == folder.id })
+                }
+            }
+            if chats.contains(where: { membership[$0.id] != nil }) {
+                Divider()
+                Button("Remove from Folder", systemImage: "folder.badge.minus") {
+                    onMove(chats, nil)
+                }
+            }
+        }
+    }
+
+    private var pinButton: some View {
         Button(
             session.pinned ? "Unpin" : "Pin",
             systemImage: session.pinned ? "pin.slash" : "pin"
         ) {
-            onPin(session)
+            onPin([session], !session.pinned)
         }
         .tint(.accentColor)
     }
 
-    @ViewBuilder
-    private func archiveButton(for session: ChatSession) -> some View {
+    private var archiveButton: some View {
         Button("Archive", systemImage: "archivebox") {
-            onArchive(session)
+            onArchive([session])
         }
         .tint(.accentColor)
-    }
-
-    @ViewBuilder
-    private func copyDeepLinkButton(for session: ChatSession) -> some View {
-        Button("Copy deep link", systemImage: "link") {
-            onCopyDeepLink(session)
-        }
-    }
-
-    @ViewBuilder
-    private func renameButton(for session: ChatSession) -> some View {
-        Button("Rename", systemImage: "pencil") {
-            onRename(session)
-        }
     }
 }
 

@@ -26,6 +26,33 @@ public enum HistoryCacheFileKind: Equatable, Sendable {
     case legacyCollision
     case orphan
 }
+public struct SessionLocalCleanupResult: Equatable, Sendable {
+    public enum Outcome: Equatable, Sendable {
+        case removed
+        case failed(String)
+        case notRequired
+
+        public var succeeded: Bool {
+            switch self {
+            case .removed, .notRequired: return true
+            case .failed: return false
+            }
+        }
+    }
+
+    public let sessionID: String
+    public let cache: Outcome
+    public let index: Outcome
+
+    public init(sessionID: String, cache: Outcome, index: Outcome) {
+        self.sessionID = sessionID
+        self.cache = cache
+        self.index = index
+    }
+
+    public var succeeded: Bool { cache.succeeded && index.succeeded }
+}
+
 
 /// Core transcript persistence seam. Plain HistoryCache is the no-search
 /// implementation; SearchIndexReconciliation decorates the same boundary.
@@ -39,7 +66,7 @@ public protocol TranscriptPersisting: Sendable {
         for id: String,
         expectedEpoch: UInt64?
     ) async throws -> CacheStoreResult
-    func remove(sessionID: String) async throws -> Bool
+    func remove(sessionID: String) async throws -> SessionLocalCleanupResult
     func clear() async throws -> Bool
     /// Destructively reconciles disk and index state against `validIDs`.
     ///
@@ -411,7 +438,7 @@ public actor HistoryCache: TranscriptPersisting {
     }
 
     @discardableResult
-    public func remove(sessionID: String) -> Bool {
+    public func remove(sessionID: String) -> SessionLocalCleanupResult {
         memory[sessionID] = nil
         let targets = [url(for: sessionID), legacyURL(for: sessionID)]
             .compactMap { $0 }
@@ -427,7 +454,11 @@ public actor HistoryCache: TranscriptPersisting {
                 success = false
             }
         }
-        return success
+        return SessionLocalCleanupResult(
+            sessionID: sessionID,
+            cache: success ? .removed : .failed("The local transcript cache could not be removed."),
+            index: .notRequired
+        )
     }
 
     public func transcript(for id: String) -> CachedTranscript? {

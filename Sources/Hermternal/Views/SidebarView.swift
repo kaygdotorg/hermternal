@@ -2,8 +2,9 @@ import SwiftUI
 import AppKit
 import HermternalCore
 
-/// Captures the native event that owns a selection change.
-/// Programmatic model selection has no matching event and never opens again.
+/// SwiftUI's `List(selection:)` reports only the resulting Set. The local
+/// monitor captures the initiating event synchronously, so a modified click
+/// cannot be mistaken for an ordinary singleton selection later.
 @MainActor
 private enum SidebarSelectionEventAdapter {
     private struct Event {
@@ -21,14 +22,16 @@ private enum SidebarSelectionEventAdapter {
         ) { event in
             switch event.type {
             case .leftMouseDown:
+                let modifiers = event.modifierFlags.intersection([.command, .shift, .control])
+                let isControlClick = modifiers.contains(.control)
                 pending = Event(
-                    isContextClick: false,
-                    isModified: event.modifierFlags.intersection([.command, .shift]).isEmpty == false
+                    isContextClick: isControlClick,
+                    isModified: !modifiers.isEmpty
                 )
             case .rightMouseDown:
                 pending = Event(isContextClick: true, isModified: true)
             case .keyDown:
-                pending = Event(isContextClick: false, isModified: false)
+                pending = nil
             default:
                 break
             }
@@ -42,10 +45,6 @@ private enum SidebarSelectionEventAdapter {
         return (pending.isContextClick, pending.isModified)
     }
 
-    static func isUserNavigationPending() -> Bool {
-        guard let pending else { return false }
-        return !pending.isContextClick && !pending.isModified
-    }
 
     static func stop() {
         if let monitor {
@@ -56,6 +55,10 @@ private enum SidebarSelectionEventAdapter {
     }
 }
 
+enum SidebarContentMode: String, Hashable {
+    case chats
+    case archived
+}
 struct SidebarView: View {
     @Bindable var model: AppModel
     let accountName: String
@@ -63,12 +66,21 @@ struct SidebarView: View {
     let accountID: String?
     @State private var pendingOpenTask: Task<Void, Never>?
     @State private var pointerActivatedID: String?
+    @State private var sidebarSelection: Set<SidebarSelectionID> = []
+    @State private var programmaticSelectionID: String?
+    @State private var programmaticArchivedSelectionID: String?
+    @State private var contentMode: SidebarContentMode = .chats
+    @State private var archivedSelection: Set<String> = []
     @State private var renameSession: ChatSession?
     @State private var renameTitle = ""
     @State private var isCreatingFolder = false
     @State private var renameFolderTarget: SidebarFolderTarget?
-    @State private var deleteFolderTarget: SidebarFolderTarget?
+    @State private var deleteFolderTarget: SidebarFolderDeletionTarget?
+    @State private var purgePreparationTask: Task<Void, Never>?
+    @State private var purgeRequestGeneration = 0
     /// Shared by the create and the rename alert. Only one of the two can be
+    @State private var purgeTarget: SidebarPurgeTarget?
+    @State private var purgeConfirmation = ""
     /// on screen, so a second field would only be a second thing to reset.
     @State private var folderNameField = ""
     /// Height of the floating pinned layer. The chat list's dissolve is
@@ -112,36 +124,102 @@ struct SidebarView: View {
         // rendering moves out of the List. Reading the section shares its
         // rows array rather than copying any row.
         let scheduleRows = sections.first { $0.kind == .schedules }?.rows ?? []
+        let scheduledIDs = Set(scheduleRows.map(\.sessionID))
 
+        let visibleOrder = sections.flatMap { section in
+            section.rows.map { SidebarSelectionID.chat($0.sessionID) }
+        }
+        let folderVisibleOrder = sections.compactMap { section in
+            if case let .folder(id, _) = section.kind {
+                return SidebarSelectionID.folder(id)
+            }
+            return nil
+        }
+        let sessionsByID = Dictionary(
+            sections.flatMap { $0.rows }.map { ($0.sessionID, $0.session) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let foldersByID = Dictionary(
+            model.folders.map { ($0.id, SidebarFolderTarget(id: $0.id, name: $0.name)) },
+            uniquingKeysWith: { first, _ in first }
+        )
         return columnChrome(
-            ZStack(alignment: .bottom) {
-                chatList(sections)
-                floatingLayer(scheduleRows)
-            }
-        )
-    }
-
-    /// The chat list, and the edge treatment that lets its rows travel
-    /// under fixed chrome without colliding with it.
-    private var selectionBinding: Binding<String?> {
-        Binding(
-            get: { model.selectedSessionID },
-            set: { id in
-                guard !model.hasProgrammaticSelection(id),
-                      SidebarSelectionEventAdapter.isUserNavigationPending()
-                else {
-                    model.selectedSessionID = id
-                    return
+            Group {
+                if contentMode == .chats {
+                    ZStack(alignment: .bottom) {
+                        chatList(
+                            sections,
+                            visibleOrder: visibleOrder,
+                            folderVisibleOrder: folderVisibleOrder,
+                            sessionsByID: sessionsByID,
+                            foldersByID: foldersByID,
+                            scheduledIDs: scheduledIDs
+                        )
+                        floatingLayer(scheduleRows, scheduledIDs: scheduledIDs)
+                    }
+                } else {
+                    archivedList
                 }
-                model.userNavigationDidBegin()
-                model.selectedSessionID = id
             }
         )
     }
+    private var archivedList: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            List(selection: $archivedSelection) {
+                ArchivedSidebarContent(
+                    sessions: model.archivedSessions,
+                    selection: $archivedSelection,
+                    isLoading: model.archivedSessionsLoading,
+                    errorMessage: model.archivedSessionsError,
+                    onOpen: { session in
+                        openArchivedImmediately(session)
+                    },
+                    onRefresh: {
+                        Task { await model.loadArchivedSessions() }
+                    },
+                    onRestore: { sessions in
+                        Task { await model.restoreArchived(sessions) }
+                    },
+                    onCopyDeepLinks: { sessions in
+                        model.copyDeepLinks(for: sessions)
+                    },
+                    canPurge: model.canPurgeSessions,
+                    purgeUnavailableReason: model.sessionPurgeUnavailableReason,
+                    onPurge: { ids in
+                        requestPurge(chatIDs: ids, folderIDs: [], mode: .chatsOnly)
+                    }
+            )
+            }
+            .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
+            Divider()
+            SidebarAccountRow(
+                gateway: accountName,
+                account: accountDetail,
+                accountID: accountID
+            )
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+        }
+    }
 
-    private func chatList(_ sections: [SidebarSection]) -> some View {
-        List(selection: selectionBinding) {
-            sessionSections(sections)
+    private func chatList(
+        _ sections: [SidebarSection],
+        visibleOrder: [SidebarSelectionID],
+        folderVisibleOrder: [SidebarSelectionID],
+        sessionsByID: [String: ChatSession],
+        foldersByID: [String: SidebarFolderTarget],
+        scheduledIDs: Set<String>
+    ) -> some View {
+        List(selection: $sidebarSelection) {
+            sessionSections(
+                sections,
+                visibleOrder: visibleOrder,
+                folderVisibleOrder: folderVisibleOrder,
+                sessionsByID: sessionsByID,
+                foldersByID: foldersByID,
+                scheduledIDs: scheduledIDs
+            )
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
@@ -176,49 +254,50 @@ struct SidebarView: View {
     /// Split out on its own so the thirteen-argument call is an expression
     /// the solver checks by itself. Its concrete return type costs it
     /// nothing and saves it inferring one.
-    private func sessionSections(_ sections: [SidebarSection]) -> SidebarSections {
+    private func sessionSections(
+        _ sections: [SidebarSection],
+        visibleOrder: [SidebarSelectionID],
+        folderVisibleOrder: [SidebarSelectionID],
+        sessionsByID: [String: ChatSession],
+        foldersByID: [String: SidebarFolderTarget],
+        scheduledIDs: Set<String>
+    ) -> SidebarSections {
         SidebarSections(
             sections: sections,
             folders: model.folders,
             membership: model.membership,
-            onOpen: { session in
-                openImmediately(session)
+            selection: sidebarSelection,
+            visibleOrder: visibleOrder,
+            folderVisibleOrder: folderVisibleOrder,
+            sessionsByID: sessionsByID,
+            foldersByID: foldersByID,
+            scheduledIDs: scheduledIDs,
+            onOpen: { session in openImmediately(session) },
+            onPin: { sessions, pinned in
+                Task { await model.setPinned(sessions, pinned: pinned) }
             },
-            onPin: { session in
-                Task {
-                    await model.setPinned(session, pinned: !session.pinned)
-                }
+            onArchive: { sessions in
+                Task { await model.setArchived(sessions, archived: true) }
             },
-            onArchive: { session in
-                Task {
-                    await model.setArchived(session, archived: true)
-                }
+            onRename: { session in beginRename(session) },
+            onCopyDeepLinks: { sessions in model.copyDeepLinks(for: sessions) },
+            onMove: { sessions, folderID in
+                Task { await model.assign(sessions, toFolder: folderID) }
             },
-            onRename: { session in
-                beginRename(session)
+            onRenameFolder: { target in beginFolderRename(target) },
+            onDeleteFolder: { targets in
+                let affected = Set(model.membership.compactMap { sessionID, folderID in
+                    targets.contains { $0.id == folderID } ? sessionID : nil
+                }).count
+                deleteFolderTarget = SidebarFolderDeletionTarget(
+                    folders: targets,
+                    affectedChatCount: affected
+                )
             },
-            onCopyDeepLink: { session in
-                model.copyDeepLink(for: session)
-            },
-            onMove: { session, folderID in
-                Task {
-                    if let folderID {
-                        await model.assign(session, toFolder: folderID)
-                    } else {
-                        await model.unassign(session)
-                    }
-                }
-            },
-            onRenameFolder: { target in
-                beginFolderRename(target)
-            },
-            onDeleteFolder: { target in
-                deleteFolderTarget = target
-            },
-            // The same door as the toolbar menu, on the Folders header
-            // where Craft puts it.
             onNewFolder: beginFolderCreate,
-            // The complete new order, every folder, never a slice.
+            onPurge: requestPurge,
+            purgeAvailable: model.canPurgeSessions,
+            purgeUnavailableReason: model.sessionPurgeUnavailableReason,
             onReorderFolders: { ids in
                 Task { await model.reorderFolders(ids: ids) }
             }
@@ -229,10 +308,13 @@ struct SidebarView: View {
     /// and its rows pass beneath, dissolving into the mask above. An empty
     /// layer would hold a strip of the chat list hostage to say nothing,
     /// and a user cannot create a schedule from here, so absence hides it.
-    private func floatingLayer(_ scheduleRows: [SidebarRow]) -> some View {
+    private func floatingLayer(
+        _ scheduleRows: [SidebarRow],
+        scheduledIDs: Set<String>
+    ) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             if !scheduleRows.isEmpty {
-                schedulesPane(scheduleRows)
+                schedulesPane(scheduleRows, scheduledIDs: scheduledIDs)
             }
             Divider()
             // `accountName` and `accountDetail` are the older names at the
@@ -256,39 +338,35 @@ struct SidebarView: View {
         }
     }
 
-    private func schedulesPane(_ scheduleRows: [SidebarRow]) -> SidebarSchedulesPane {
-        SidebarSchedulesPane(
+    private func schedulesPane(
+        _ scheduleRows: [SidebarRow],
+        scheduledIDs: Set<String>
+    ) -> SidebarSchedulesPane {
+        let scheduleSessions = Dictionary(
+            scheduleRows.map { ($0.sessionID, $0.session) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return SidebarSchedulesPane(
             rows: scheduleRows,
             folders: model.folders,
             membership: model.membership,
-            selection: selectionBinding,
-            onOpen: { session in
-                openImmediately(session)
+            sessionsByID: scheduleSessions,
+            scheduledIDs: scheduledIDs,
+            selection: $sidebarSelection,
+            onOpen: { session in openImmediately(session) },
+            onPin: { sessions, pinned in
+                Task { await model.setPinned(sessions, pinned: pinned) }
             },
-            onPin: { session in
-                Task {
-                    await model.setPinned(session, pinned: !session.pinned)
-                }
+            onArchive: { sessions in
+                Task { await model.setArchived(sessions, archived: true) }
             },
-            onArchive: { session in
-                Task {
-                    await model.setArchived(session, archived: true)
-                }
-            },
-            onRename: { session in
-                beginRename(session)
-            },
-            onCopyDeepLink: { session in
-                model.copyDeepLink(for: session)
-            },
-            onMove: { session, folderID in
-                Task {
-                    if let folderID {
-                        await model.assign(session, toFolder: folderID)
-                    } else {
-                        await model.unassign(session)
-                    }
-                }
+            onRename: { session in beginRename(session) },
+            onCopyDeepLinks: { sessions in model.copyDeepLinks(for: sessions) },
+            onPurge: requestPurge,
+            purgeAvailable: model.canPurgeSessions,
+            purgeUnavailableReason: model.sessionPurgeUnavailableReason,
+            onMove: { sessions, folderID in
+                Task { await model.assign(sessions, toFolder: folderID) }
             }
         )
     }
@@ -298,18 +376,34 @@ struct SidebarView: View {
     /// Alerts attach anywhere in the column, so gathering them here costs
     /// no behaviour and keeps `body` readable.
     private func columnChrome(_ content: some View) -> some View {
-        content
+        let folderCount = deleteFolderTarget?.folders.count ?? 0
+        let folderDeleteTitle = "Delete \(folderCount) Folders?"
+        let chrome = content
             // Declared on the sidebar column, because everything in the
             // menu is a property of the chat list rather than of the open
             // chat.
             .toolbar {
                 ToolbarItem {
                     Menu {
-                        SidebarOrganizeMenu(
-                            sortMode: sortModeBinding,
-                            groupByDate: groupByDateBinding,
-                            onNewFolder: beginFolderCreate
+                        SidebarModeMenu(
+                            mode: $contentMode,
+                            onChatsSelected: {
+                                if model.viewingArchivedSessionID != nil {
+                                    model.leaveArchivedView()
+                                }
+                            },
+                            onArchivedSelected: {
+                                Task { await model.loadArchivedSessions() }
+                            }
                         )
+                        if contentMode == .chats {
+                            Divider()
+                            SidebarOrganizeMenu(
+                                sortMode: sortModeBinding,
+                                groupByDate: groupByDateBinding,
+                                onNewFolder: beginFolderCreate
+                            )
+                        }
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
@@ -361,55 +455,221 @@ struct SidebarView: View {
                 Text("Enter a new name for the folder.")
             }
             .confirmationDialog(
-                "Delete Folder?",
+                folderDeleteTitle,
                 isPresented: folderDeletePresented,
                 titleVisibility: .visible,
                 presenting: deleteFolderTarget
             ) { target in
-                Button("Delete Folder", role: .destructive) {
+                Button("Delete Folders", role: .destructive) {
                     deleteFolderTarget = nil
-                    Task {
-                        await model.deleteFolder(id: target.id)
-                    }
+                    Task { await model.deleteFolders(ids: target.folders.map(\.id)) }
                 }
                 Button("Cancel", role: .cancel) {
                     deleteFolderTarget = nil
                 }
             } message: { target in
-                // The kept chats are the whole question a user has here, so
-                // the answer is stated and not left to be assumed.
-                Text("“\(target.name)” is removed. The chats inside it are kept and return to the list.")
+                Text(
+                    "\(target.folders.count) folder(s) will be removed. "
+                        + "\(target.affectedChatCount) chat(s) will be kept and return to the list."
+                )
             }
+            .alert(
+                "Permanently Delete?",
+                isPresented: purgePresented,
+                presenting: purgeTarget
+            ) { target in
+                TextField("Type delete to confirm", text: $purgeConfirmation)
+                    .onSubmit {
+                        guard SessionPurgeConfirmation.isExact(purgeConfirmation) else { return }
+                        completePurge(target)
+                    }
+                Button("Delete Permanently", role: .destructive) {
+                    completePurge(target)
+                }
+                .disabled(!SessionPurgeConfirmation.isExact(purgeConfirmation))
+                Button("Cancel", role: .cancel) {
+                    cancelPurge()
+                }
+            } message: { target in
+                let countSummary: String = switch target.plan.mode {
+                case .chatsOnly:
+                    "\(target.plan.chatCount) chat(s) will be permanently deleted. "
+                case .foldersOnly, .foldersAndChats:
+                    "\(target.plan.folderCount) folder(s) and "
+                        + "\(target.plan.chatCount) chat(s) will be permanently deleted. "
+                }
+                Text(
+                    countSummary
+                        + "Branches may be retained; scheduled jobs remain. "
+                        + "Backups or external memory may retain data. No undo."
+                )
+            }
+        return sidebarLifecycle(chrome)
+    }
+
+    private func sidebarLifecycle(_ content: some View) -> some View {
+        content
             .onChange(of: model.selectedSessionID) { _, newValue in
+                synchronizeModelSelection(forceChats: newValue != nil)
+            }
+            .onChange(of: sidebarSelection) { _, selection in
                 let event = SidebarSelectionEventAdapter.consume()
-                if model.consumeProgrammaticSelection(newValue) {
+                guard selection.count == 1,
+                      let item = selection.first,
+                      case let .chat(id) = item,
+                      model.sessions.contains(where: { $0.id == id })
+                else {
+                    pendingOpenTask?.cancel()
+                    pendingOpenTask = nil
                     pointerActivatedID = nil
+                    programmaticSelectionID = nil
                     return
                 }
-                if pointerActivatedID == newValue {
+                if programmaticSelectionID == id {
+                    programmaticSelectionID = nil
                     pointerActivatedID = nil
                     return
                 }
                 guard !event.isContextClick, !event.isModified else {
-                    pointerActivatedID = nil
                     pendingOpenTask?.cancel()
                     pendingOpenTask = nil
+                    pointerActivatedID = nil
                     return
                 }
-                pointerActivatedID = nil
                 model.userNavigationDidBegin()
-                scheduleOpen(for: newValue)
+                scheduleOpen(for: id)
+            }
+            .onChange(of: archivedSelection) { _, selection in
+                let event = SidebarSelectionEventAdapter.consume()
+                guard contentMode == .archived,
+                      selection.count == 1,
+                      let id = selection.first,
+                      let session = model.archivedSessions.first(where: { $0.id == id })
+                else {
+                    pendingOpenTask?.cancel()
+                    pendingOpenTask = nil
+                    pointerActivatedID = nil
+                    programmaticArchivedSelectionID = nil
+                    return
+                }
+                if programmaticArchivedSelectionID == id {
+                    programmaticArchivedSelectionID = nil
+                    return
+                }
+                guard !event.isContextClick, !event.isModified else {
+                    pendingOpenTask?.cancel()
+                    pendingOpenTask = nil
+                    pointerActivatedID = nil
+                    return
+                }
+                model.userNavigationDidBegin()
+                openArchivedImmediately(session)
+            }
+            .onChange(of: model.viewingArchivedSessionID) { _, _ in
+                synchronizeModelSelection(forceChats: true)
+            }
+            .onChange(of: contentMode) { _, mode in
+                if mode == .archived {
+                    sidebarSelection.removeAll()
+                    programmaticSelectionID = nil
+                } else {
+                    archivedSelection.removeAll()
+                    programmaticArchivedSelectionID = nil
+                    synchronizeModelSelection()
+                }
+            }
+            .onChange(of: model.archivedSessions) { _, sessions in
+                archivedSelection.formIntersection(Set(sessions.map(\.id)))
+                synchronizeArchivedRouteSelection()
+            }
+            .onChange(of: model.sessions) { _, sessions in
+                pruneSelection(validChatIDs: Set(sessions.map(\.id)))
+            }
+            .onChange(of: model.folders) { _, folders in
+                pruneSelection(validFolderIDs: Set(folders.map(\.id)))
             }
             .onAppear {
                 SidebarSelectionEventAdapter.start()
+                synchronizeModelSelection()
             }
             .onDisappear {
                 SidebarSelectionEventAdapter.stop()
                 pendingOpenTask?.cancel()
                 pendingOpenTask = nil
+                purgePreparationTask?.cancel()
+                purgePreparationTask = nil
+                purgeRequestGeneration &+= 1
             }
     }
 
+    /// Model navigation is authoritative. A transcript route can temporarily
+    /// carry an id that is not in the live list (archived and New Chat both do
+    /// this), so selection must be cleared rather than left as an inert tag.
+    private func synchronizeModelSelection(forceChats: Bool = false) {
+        if let archivedID = model.viewingArchivedSessionID {
+            contentMode = .archived
+            sidebarSelection.removeAll()
+            programmaticSelectionID = nil
+            pointerActivatedID = nil
+            let selection = model.archivedSessions.contains(where: { $0.id == archivedID })
+                ? [archivedID]
+                : []
+            if archivedSelection != Set(selection) {
+                programmaticArchivedSelectionID = selection.first
+                archivedSelection = Set(selection)
+            }
+            return
+        }
+
+        if forceChats {
+            contentMode = .chats
+            archivedSelection.removeAll()
+            programmaticArchivedSelectionID = nil
+        }
+        if contentMode == .archived {
+            archivedSelection.formIntersection(Set(model.archivedSessions.map(\.id)))
+        }
+
+        guard let liveID = model.selectedSessionID,
+              model.sessions.contains(where: { $0.id == liveID })
+        else {
+            // A manually selected Archived mode has no live row to highlight
+            // while its archived list is loading.
+            sidebarSelection.removeAll()
+            programmaticSelectionID = nil
+            pointerActivatedID = nil
+            return
+        }
+
+        guard contentMode == .chats else {
+            sidebarSelection.removeAll()
+            programmaticSelectionID = nil
+            pointerActivatedID = nil
+            return
+        }
+
+        let selection: Set<SidebarSelectionID> = [.chat(liveID)]
+        guard sidebarSelection != selection else { return }
+        programmaticSelectionID = liveID
+        sidebarSelection = selection
+        pointerActivatedID = nil
+    }
+
+    /// Archived rows can arrive after the read-only route. Restore only that
+    /// route's row here; live-chat selection remains untouched for ordinary
+    /// archive list refreshes.
+    private func synchronizeArchivedRouteSelection() {
+        guard let archivedID = model.viewingArchivedSessionID else { return }
+        contentMode = .archived
+        sidebarSelection.removeAll()
+        programmaticSelectionID = nil
+        guard model.archivedSessions.contains(where: { $0.id == archivedID }) else {
+            return
+        }
+        guard archivedSelection != Set([archivedID]) else { return }
+        programmaticArchivedSelectionID = archivedID
+        archivedSelection = [archivedID]
+    }
     /// One continuous gradient with two ramps. The first ramp fades the
     /// rows that move under the glass titlebar. The second ramp fades the
     /// rows that move under the floating layer. Two masks would make two
@@ -501,6 +761,15 @@ struct SidebarView: View {
             }
         )
     }
+    private var purgePresented: Binding<Bool> {
+        Binding(
+            get: { purgeTarget != nil },
+            set: { presented in
+                if !presented { cancelPurge() }
+            }
+        )
+    }
+
 
     private func beginRename(_ session: ChatSession) {
         renameTitle = session.displayTitle
@@ -515,6 +784,18 @@ struct SidebarView: View {
         Task {
             await model.rename(session, to: title)
         }
+    }
+    private func pruneSelection(
+        validChatIDs: Set<String>? = nil,
+        validFolderIDs: Set<String>? = nil
+    ) {
+        let chats = validChatIDs ?? Set(model.sessions.map(\.id))
+        let folders = validFolderIDs ?? Set(model.folders.map(\.id))
+        sidebarSelection = SidebarSelectionPolicy.prunedSelection(
+            sidebarSelection,
+            validChatIDs: chats,
+            validFolderIDs: folders
+        )
     }
 
     private func cancelRename() {
@@ -535,6 +816,49 @@ struct SidebarView: View {
         Task {
             await model.createFolder(named: name)
         }
+    }
+
+    private func requestPurge(
+        chatIDs: [String],
+        folderIDs: [String],
+        mode: SessionPurgeActionMode
+    ) {
+        guard model.canPurgeSessions else { return }
+        purgePreparationTask?.cancel()
+        purgeRequestGeneration &+= 1
+        let generation = purgeRequestGeneration
+        purgeTarget = nil
+        purgeConfirmation = ""
+        purgePreparationTask = Task {
+            guard !Task.isCancelled,
+                  let plan = await model.preparePurge(
+                      selectedChatIDs: chatIDs,
+                      selectedFolderIDs: folderIDs,
+                      mode: mode
+                  ),
+                  !Task.isCancelled,
+                  generation == purgeRequestGeneration,
+                  !plan.isEmpty
+            else { return }
+            purgeTarget = SidebarPurgeTarget(plan: plan)
+            purgePreparationTask = nil
+        }
+    }
+
+    private func completePurge(_ target: SidebarPurgeTarget) {
+        guard SessionPurgeConfirmation.isExact(purgeConfirmation) else { return }
+        purgeTarget = nil
+        purgeConfirmation = ""
+        purgePreparationTask?.cancel()
+        purgePreparationTask = nil
+        Task {
+            await model.purge(plan: target.plan)
+        }
+    }
+
+    private func cancelPurge() {
+        purgeTarget = nil
+        purgeConfirmation = ""
     }
 
     private func beginFolderRename(_ target: SidebarFolderTarget) {
@@ -558,8 +882,8 @@ struct SidebarView: View {
         folderNameField = ""
     }
 
-    /// Mouse activation should paint cached detail immediately. Mark the id
-    /// so the selection change does not schedule a duplicate delayed open.
+    /// Explicit activation (including VoiceOver) opens immediately. Mark the
+    /// id so the model's selection observer does not schedule a second open.
     private func openImmediately(_ session: ChatSession) {
         model.userNavigationDidBegin()
         pointerActivatedID = session.id
@@ -571,6 +895,21 @@ struct SidebarView: View {
         pendingOpenTask = Task {
             guard !Task.isCancelled else { return }
             await model.open(session)
+            if !Task.isCancelled, pointerActivatedID == session.id {
+                pointerActivatedID = nil
+            }
+        }
+    }
+
+    /// Explicit archived activation shares cancellation with native singleton
+    /// selection, while the list remains the owner of its row surface.
+    private func openArchivedImmediately(_ session: ChatSession) {
+        guard model.viewingArchivedSessionID != session.id else { return }
+        pendingOpenTask?.cancel()
+        pendingOpenTask = nil
+        pendingOpenTask = Task {
+            guard !Task.isCancelled else { return }
+            await model.openArchived(session)
         }
     }
 
@@ -583,6 +922,7 @@ struct SidebarView: View {
               let session = model.sessions.first(where: { $0.id == id })
         else { return }
 
+        pointerActivatedID = id
         pendingOpenTask = Task {
             do {
                 try await Task.sleep(for: .milliseconds(45))
@@ -591,10 +931,57 @@ struct SidebarView: View {
             }
             guard !Task.isCancelled else { return }
             await model.open(session)
+            if !Task.isCancelled, pointerActivatedID == id {
+                pointerActivatedID = nil
+            }
+        }
+    }
+}
+private struct SidebarPurgeTarget: Identifiable {
+    let plan: SessionPurgePlan
+
+    var id: String {
+        "\(plan.mode.rawValue):\(plan.chatIDs.joined(separator: ",")):"
+            + "\(plan.folderIDs.joined(separator: ","))"
+    }
+}
+
+private struct SidebarModeMenu: View {
+    @Binding var mode: SidebarContentMode
+    let onChatsSelected: () -> Void
+    let onArchivedSelected: () -> Void
+
+    var body: some View {
+        Button {
+            onChatsSelected()
+            mode = .chats
+        } label: {
+            modeLabel("Chats", selected: mode == .chats)
+        }
+        Button {
+            mode = .archived
+            onArchivedSelected()
+        } label: {
+            modeLabel("Archived Chats", selected: mode == .archived)
+        }
+    }
+
+    private func modeLabel(_ title: String, selected: Bool) -> some View {
+        Label {
+            Text(title)
+        } icon: {
+            Image(systemName: "checkmark")
+                .opacity(selected ? 1 : 0)
         }
     }
 }
 
+private struct SidebarFolderDeletionTarget: Identifiable {
+    let folders: [SidebarFolderTarget]
+    let affectedChatCount: Int
+
+    var id: String { folders.map(\.id).joined(separator: ",") }
+}
 /// The chat list's two dissolves: one under the glass titlebar at the top,
 /// one under the floating layer at the bottom.
 ///

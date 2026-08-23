@@ -97,7 +97,9 @@ func restPagingEnforcesPageBound() async throws {
         switch error {
         case .messagePageLimitExceeded:
             break
-        case .badStatus, .sessionPageLimitExceeded, .noMutableFields, .sessionNotFound:
+        case .badStatus, .sessionPageLimitExceeded, .noMutableFields, .sessionNotFound,
+             .purgeEmptyIDs, .purgeBatchTooLarge, .purgeInvalidConfirmation,
+             .purgeUnsupportedEndpoint, .purgeHTTPError, .purgeMalformedResponse:
             Issue.record("unexpected REST error: \(error)")
         }
     } catch {

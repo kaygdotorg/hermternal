@@ -1,5 +1,31 @@
 import HermternalCore
 import Testing
+@Test("replacing a descriptor updates an existing observer's read")
+func registryReplacementUpdatesExistingObserver() throws {
+    let registry = try CapabilityRegistry(capabilities: [
+        CapabilityDescriptor(
+            id: "session-purge",
+            name: "Complete Session Deletion",
+            purpose: "Permanently remove application session state.",
+            state: .omitted,
+            implementationSource: .builtIn
+        )
+    ])
+    // Settings holds this same reference for the lifetime of its window.
+    let openSettingsRegistry = registry
+
+    #expect(openSettingsRegistry.state(for: "session-purge") == .omitted)
+    try registry.replace(CapabilityDescriptor(
+        id: "session-purge",
+        name: "Complete Session Deletion",
+        purpose: "Permanently remove application session state.",
+        state: .available,
+        implementationSource: .builtIn
+    ))
+
+    #expect(openSettingsRegistry.state(for: "session-purge") == .available)
+    #expect(openSettingsRegistry.capabilities.count == 1)
+}
 
 @Test("registry resolves available and unknown capabilities as omitted")
 func registryResolvesRuntimeState() throws {
@@ -78,7 +104,7 @@ func registryUsesStableOrdering() throws {
 
 @Test("Core modules cannot be registered as optional capabilities")
 func coreModulesAreRejected() throws {
-    var registry = CapabilityRegistry()
+    let registry = CapabilityRegistry()
     let coreModule = CapabilityDescriptor(
         id: "history-cache",
         name: "History Cache",
@@ -102,7 +128,7 @@ func coreModulesAreRejected() throws {
 
 @Test("batch registration does not partially apply after rejection")
 func batchRegistrationIsAtomic() throws {
-    var registry = CapabilityRegistry()
+    let registry = CapabilityRegistry()
     let search = CapabilityDescriptor(
         id: "search",
         name: "Search",

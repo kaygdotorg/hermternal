@@ -67,20 +67,25 @@ enum SidebarMetrics {
 struct SidebarSections: View {
     let sections: [SidebarSection]
     let folders: [Folder]
-    /// Session id to folder id. One dictionary lookup per row, no scan.
     let membership: [String: String]
+    let selection: Set<SidebarSelectionID>
+    let visibleOrder: [SidebarSelectionID]
+    let folderVisibleOrder: [SidebarSelectionID]
+    let sessionsByID: [String: ChatSession]
+    let foldersByID: [String: SidebarFolderTarget]
+    let scheduledIDs: Set<String>
     let onOpen: (ChatSession) -> Void
-    let onPin: (ChatSession) -> Void
-    let onArchive: (ChatSession) -> Void
+    let onPin: ([ChatSession], Bool) -> Void
+    let onArchive: ([ChatSession]) -> Void
     let onRename: (ChatSession) -> Void
-    let onCopyDeepLink: (ChatSession) -> Void
-    /// A `nil` folder id removes the chat from its folder.
-    let onMove: (ChatSession, String?) -> Void
+    let onCopyDeepLinks: ([ChatSession]) -> Void
+    let onMove: ([ChatSession], String?) -> Void
     let onRenameFolder: (SidebarFolderTarget) -> Void
-    let onDeleteFolder: (SidebarFolderTarget) -> Void
+    let onDeleteFolder: ([SidebarFolderTarget]) -> Void
     let onNewFolder: () -> Void
-    /// The complete new folder order, every id and never a slice, because
-    /// the store rejects a partial list.
+    let onPurge: ([String], [String], SessionPurgeActionMode) -> Void
+    let purgeAvailable: Bool
+    let purgeUnavailableReason: String
     let onReorderFolders: ([String]) -> Void
 
     /// Collapse is view state, not user data. It is deliberately not
@@ -130,10 +135,16 @@ struct SidebarSections: View {
                     SidebarFolderRow(
                         target: run.target,
                         isExpanded: folderExpansion(for: run.target.id),
+                        selection: selection,
+                        visibleOrder: folderVisibleOrder,
+                        foldersByID: foldersByID,
                         onRename: onRenameFolder,
+                        onPurge: onPurge,
+                        purgeAvailable: purgeAvailable,
+                        purgeUnavailableReason: purgeUnavailableReason,
                         onDelete: onDeleteFolder,
                         onDropSessions: file,
-                        onDropFolder: reorderFolder
+                        onDropFolders: reorderFolders
                     )
                     if isFolderExpanded(run.target.id) {
                         // A List spreads a modifier on a `ForEach` over the
@@ -223,26 +234,44 @@ struct SidebarSections: View {
     /// The session rows of one section, typed as `DynamicViewContent` so a
     /// caller can attach a drop handler to the `ForEach` rather than to a row.
     private func sessionRows(for section: SidebarSection) -> some DynamicViewContent {
-        ForEach(section.rows) { row in
+        var dragIDsBySessionID = [String: [String]]()
+        if section.kind != .schedules {
+            for item in visibleOrder {
+                guard case let .chat(id) = item else { continue }
+                dragIDsBySessionID[id] = SidebarSelectionPolicy.applicableDragTargets(
+                    dragged: .chat(id),
+                    selected: selection,
+                    visibleOrder: visibleOrder
+                )
+                .compactMap { item in
+                    guard case let .chat(id) = item, !scheduledIDs.contains(id) else { return nil }
+                    return id
+                }
+            }
+        }
+        return ForEach(section.rows) { row in
+            let draggedIDs = dragIDsBySessionID[row.sessionID] ?? []
             SessionRowItem(
                 session: row.session,
                 folders: folders,
-                currentFolderID: membership[row.sessionID],
-                onMoveToFolder: onMove,
+                membership: membership,
+                sessionsByID: sessionsByID,
+                selection: selection,
+                visibleOrder: visibleOrder,
+                scheduledIDs: scheduledIDs,
                 onOpen: onOpen,
                 onPin: onPin,
                 onArchive: onArchive,
                 onRename: onRename,
-                onCopyDeepLink: onCopyDeepLink
+                onCopyDeepLinks: onCopyDeepLinks,
+                onPurge: onPurge,
+                purgeAvailable: purgeAvailable,
+                purgeUnavailableReason: purgeUnavailableReason,
+                onMove: onMove
             )
-            .tag(row.sessionID)
-            // The durable id is the whole payload. The drag preview comes
-            // from the row itself, so nothing is drawn for it.
-            .onDrag { SidebarDragPayload.provider(sessionID: row.sessionID) }
-            // A folder row is not selectable, and a chat is. They are
-            // siblings now rather than a group and its subtree, so this
-            // states the chat's own rule and inherits nothing.
+            .tag(SidebarSelectionID.chat(row.sessionID))
             .selectionDisabled(false)
+            .onDrag { SidebarDragPayload.provider(sessionIDs: draggedIDs) }
         }
     }
 
@@ -261,16 +290,17 @@ struct SidebarSections: View {
     private func file(_ ids: [String], into folderID: String) {
         guard !ids.isEmpty else { return }
         var wanted = Set(ids)
+        var moved = [ChatSession]()
         for section in sections {
             for row in section.rows {
-                guard wanted.remove(row.sessionID) != nil else { continue }
-                // A chat dropped on the folder it already lives in is not a
-                // change, and must not become a write.
-                guard membership[row.sessionID] != folderID else { continue }
-                onMove(row.session, folderID)
+                guard wanted.remove(row.sessionID) != nil,
+                      membership[row.sessionID] != folderID
+                else { continue }
+                moved.append(row.session)
             }
-            if wanted.isEmpty { return }
+            if wanted.isEmpty { break }
         }
+        onMove(moved, folderID)
     }
 
     /// Takes chats out of their folder, from the ids a bucket's drop carried.
@@ -278,7 +308,7 @@ struct SidebarSections: View {
         Task {
             unfile(await sidebarDraggedIDs(
                 providers,
-                parse: SidebarDragPayload.sessionID
+                parse: SidebarDragPayload.sessionIDs
             ))
         }
     }
@@ -287,18 +317,19 @@ struct SidebarSections: View {
     /// hands back is ignored on purpose: sidebar order comes from the sort
     /// mode, so the only thing a drop into a date bucket can mean is that the
     /// chat leaves its folder. Only folder sections are searched, so dragging
-    /// an unfiled chat about does nothing.
     private func unfile(_ ids: [String]) {
         guard !ids.isEmpty else { return }
         var wanted = Set(ids)
+        var moved = [ChatSession]()
         for section in sections {
             guard case .folder = section.kind else { continue }
             for row in section.rows {
                 guard wanted.remove(row.sessionID) != nil else { continue }
-                onMove(row.session, nil)
+                moved.append(row.session)
             }
-            if wanted.isEmpty { return }
+            if wanted.isEmpty { break }
         }
+        onMove(moved, nil)
     }
 
     /// Gives a dragged folder the place of the folder it was dropped on, and
@@ -306,20 +337,16 @@ struct SidebarSections: View {
     ///
     /// The order is read back out of `sections`, which is the order actually
     /// on screen. That happens on a drop, never on a body pass.
-    private func reorderFolder(_ draggedID: String, onto targetID: String) {
-        guard draggedID != targetID else { return }
-        var ids = [String]()
-        ids.reserveCapacity(sections.count)
-        for section in sections {
-            if case .folder(let id, _) = section.kind {
-                ids.append(id)
-            }
+    private func reorderFolders(_ draggedIDs: [String], onto targetID: String) {
+        var ids = folderVisibleOrder.compactMap { item in
+            if case let .folder(id) = item { return id }
+            return nil
         }
-        guard let from = ids.firstIndex(of: draggedID),
-              let to = ids.firstIndex(of: targetID)
-        else { return }
-        ids.remove(at: from)
-        ids.insert(draggedID, at: to)
+        let dragged = draggedIDs.filter { ids.contains($0) }
+        guard !dragged.isEmpty, !dragged.contains(targetID) else { return }
+        ids.removeAll { dragged.contains($0) }
+        guard let targetIndex = ids.firstIndex(of: targetID) else { return }
+        ids.insert(contentsOf: dragged, at: targetIndex)
         onReorderFolders(ids)
     }
 

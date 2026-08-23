@@ -28,7 +28,8 @@ struct HermternalApp: App {
             // production server setting or credential stores.
             let model = AppModel(transcriptSource: SidebarFixtures.transcriptSource)
             model.serverText = SidebarFixtures.gatewayURL.absoluteString
-            model.sessions = SidebarFixtures.sessions
+            model.sessions = SidebarFixtures.sessions.filter { !$0.archived }
+            model.archivedSessions = SidebarFixtures.sessions.filter(\.archived)
             model.selectedSessionID = SidebarFixtures.transcriptSessionID
             model.messages = SidebarFixtures.transcriptMessages
             model.phase = .ready
@@ -41,7 +42,7 @@ struct HermternalApp: App {
         self.fixtureMode = fixtureMode
         _model = State(initialValue: model)
 
-        var registry = CapabilityRegistry()
+        let registry = CapabilityRegistry()
         let searchState: CapabilityState = if model.searchQuerying != nil {
             .available
         } else {
@@ -64,7 +65,42 @@ struct HermternalApp: App {
                     + "search; Modules page will remain empty: \(error)"
             )
         }
+        do {
+            try registry.register(CapabilityDescriptor(
+                id: CapabilityID("session-purge"),
+                name: "Complete Session Deletion",
+                purpose: "Permanently remove application session state through the gateway REST API.",
+                state: model.canPurgeSessions ? .available : .omitted,
+                implementationSource: .builtIn
+            ))
+        } catch {
+            Log.error("Built-in session purge capability registration failed: \(error)")
+        }
         _registry = State(initialValue: registry)
+    }
+
+    private var sessionPurgeCapabilityState: CapabilityState {
+        if model.canPurgeSessions {
+            return .available
+        }
+        if case .ready = model.phase {
+            return .unavailable(reason: model.sessionPurgeUnavailableReason)
+        }
+        return .omitted
+    }
+
+    private func refreshSessionPurgeCapability() {
+        do {
+            try registry.replace(CapabilityDescriptor(
+                id: CapabilityID("session-purge"),
+                name: "Complete Session Deletion",
+                purpose: "Permanently remove application session state through the gateway REST API.",
+                state: sessionPurgeCapabilityState,
+                implementationSource: .builtIn
+            ))
+        } catch {
+            Log.error("Built-in session purge capability update failed: \(error)")
+        }
     }
 
     var body: some Scene {
@@ -94,6 +130,15 @@ struct HermternalApp: App {
             .task {
                 guard !fixtureMode else { return }
                 await model.restoreOrPromptSignIn()
+            }
+            .onChange(of: model.phase) { _, _ in
+                refreshSessionPurgeCapability()
+            }
+            .onChange(of: model.sessionPurgeCapability) { _, _ in
+                refreshSessionPurgeCapability()
+            }
+            .onChange(of: model.sessionPurgeUnavailableReason) { _, _ in
+                refreshSessionPurgeCapability()
             }
         }
         .windowToolbarStyle(.unified)

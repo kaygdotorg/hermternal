@@ -131,6 +131,16 @@ extension Folder: Codable {
     }
 }
 
+public struct SessionOrganizationFolderDeletionResult: Equatable, Sendable {
+    public let deletedFolderIDs: [String]
+    public let affectedSessionIDs: [String]
+
+    public init(deletedFolderIDs: [String], affectedSessionIDs: [String]) {
+        self.deletedFolderIDs = deletedFolderIDs
+        self.affectedSessionIDs = affectedSessionIDs
+    }
+}
+
 public enum SessionOrganizationError: Error, Equatable, Sendable {
     case unsupportedSchemaVersion(Int)
     case malformedConfiguration(String)
@@ -138,4 +148,5 @@ public enum SessionOrganizationError: Error, Equatable, Sendable {
     case fileWriteFailed(String)
     case folderNotFound(String)
     case invalidFolderOrder
+    case invalidFolderDeletion(String)
 }

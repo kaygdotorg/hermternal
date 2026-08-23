@@ -88,13 +88,25 @@ public actor SearchIndexReconciliation: TranscriptPersisting {
         }
     }
 
-    /// Removes one cache entry's search rows. Call this at the same Core
-    /// deletion boundary that removes the cache file.
-    public func remove(sessionID: String) async -> Bool {
-        let removed = await cache.remove(sessionID: sessionID)
-        do { try await index.remove(sessionID: sessionID) }
-        catch { recordIndexFailure(error, operation: "remove") }
-        return removed
+    /// Removes one cache entry and its search rows as one typed operation.
+    /// Each store reports its own outcome, so callers can distinguish a
+    /// durable cache failure from an index failure.
+    public func remove(sessionID: String) async -> SessionLocalCleanupResult {
+        let cacheResult = await cache.remove(sessionID: sessionID)
+
+        let indexOutcome: SessionLocalCleanupResult.Outcome
+        do {
+            try await index.remove(sessionID: sessionID)
+            indexOutcome = .removed
+        } catch {
+            recordIndexFailure(error, operation: "remove")
+            indexOutcome = .failed(error.localizedDescription)
+        }
+        return SessionLocalCleanupResult(
+            sessionID: sessionID,
+            cache: cacheResult.cache,
+            index: indexOutcome
+        )
     }
 
     /// Clears both stores. The index is cleared only when HistoryCache's epoch

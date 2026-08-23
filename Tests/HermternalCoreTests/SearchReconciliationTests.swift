@@ -13,8 +13,9 @@ func reconciliationStoresAndRemoves() async throws {
         ChatMessage(id: .provisional(UUID()), role: .assistant, text: "live only"),
         ChatMessage(id: .server(ServerMessageID(rawValue: 7)), role: .user, text: "durable needle")
     ], snapshot: snapshot, title: "Chat", for: "s")
-    #expect(try await index.indexedMessageCount(sessionID: "s") == 1)
-    _ = await coordinator.remove(sessionID: "s")
+    let removal = await coordinator.remove(sessionID: "s")
+    #expect(removal.cache.succeeded)
+    #expect(removal.index.succeeded)
     #expect(try await index.indexedMessageCount(sessionID: "s") == 0)
     try await index.disable()
     try? FileManager.default.removeItem(at: root)
@@ -48,6 +49,9 @@ func indexFailureLeavesCacheAuthoritative() async throws {
     let result = await coordinator.store([ChatMessage(id: .server(ServerMessageID(rawValue: 1)), role: .user, text: "durable")], snapshot: snapshot, title: "Chat", for: "s")
     #expect(result.addedEntry)
     #expect(await cache.messages(for: "s")?.first?.text == "durable")
+    let removal = await coordinator.remove(sessionID: "s")
+    #expect(removal.cache.succeeded)
+    #expect(!removal.index.succeeded)
     #expect(await coordinator.isDegraded())
     try? FileManager.default.removeItem(at: root)
 }

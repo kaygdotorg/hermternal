@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 
 /// Stable identity for an optional product capability.
 public struct CapabilityID: RawRepresentable, Hashable, Codable, Sendable, ExpressibleByStringLiteral {
@@ -91,6 +92,7 @@ public struct CapabilityDescriptor: Identifiable, Equatable, Codable, Sendable {
 public enum CapabilityRegistrationError: Error, Equatable, Sendable {
     case coreModule(CapabilityID)
     case duplicate(CapabilityID)
+    case missing(CapabilityID)
 }
 
 /// An injected, deterministic collection of optional capability descriptors.
@@ -98,14 +100,25 @@ public enum CapabilityRegistrationError: Error, Equatable, Sendable {
 /// Registry order is canonicalized by stable identifier rather than by the
 /// order in which the composition root discovers adapters. This keeps the
 /// Settings page and policy tests deterministic across launch environments.
-public struct CapabilityRegistry: Equatable, Sendable {
+///
+/// The registry is reference-owned by the composition root so observers such
+/// as an already-open Settings window see descriptor replacements immediately.
+@Observable
+public final class CapabilityRegistry: Equatable, @unchecked Sendable {
     private var entries: [CapabilityDescriptor] = []
 
     public init() {}
 
-    public init(capabilities: [CapabilityDescriptor]) throws {
+    public convenience init(capabilities: [CapabilityDescriptor]) throws {
         self.init()
         try register(contentsOf: capabilities)
+    }
+
+    public static func == (
+        lhs: CapabilityRegistry,
+        rhs: CapabilityRegistry
+    ) -> Bool {
+        lhs.capabilities == rhs.capabilities
     }
 
     public var capabilities: [CapabilityDescriptor] {
@@ -130,7 +143,7 @@ public struct CapabilityRegistry: Equatable, Sendable {
     }
 
     @discardableResult
-    public mutating func register(_ capability: CapabilityDescriptor) throws -> Bool {
+    public func register(_ capability: CapabilityDescriptor) throws -> Bool {
         guard capability.origin == .optionalCapability else {
             throw CapabilityRegistrationError.coreModule(capability.id)
         }
@@ -141,7 +154,7 @@ public struct CapabilityRegistry: Equatable, Sendable {
         return true
     }
 
-    public mutating func register(contentsOf capabilities: [CapabilityDescriptor]) throws {
+    public func register(contentsOf capabilities: [CapabilityDescriptor]) throws {
         var registeredIDs = Set(entries.map(\.id))
         for capability in capabilities {
             guard capability.origin == .optionalCapability else {
@@ -152,5 +165,19 @@ public struct CapabilityRegistry: Equatable, Sendable {
             }
         }
         entries.append(contentsOf: capabilities)
+    }
+
+    /// Replaces the descriptor with the same stable ID while preserving the
+    /// registry's composition-root ownership and observer identity.
+    @discardableResult
+    public func replace(_ capability: CapabilityDescriptor) throws -> Bool {
+        guard capability.origin == .optionalCapability else {
+            throw CapabilityRegistrationError.coreModule(capability.id)
+        }
+        guard let index = entries.firstIndex(where: { $0.id == capability.id }) else {
+            throw CapabilityRegistrationError.missing(capability.id)
+        }
+        entries[index] = capability
+        return true
     }
 }
