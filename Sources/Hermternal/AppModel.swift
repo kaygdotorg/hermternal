@@ -84,6 +84,9 @@ final class AppModel {
     private var auth: AuthClient?
     private var gateway: GatewayClient?
     private var rest: RestClient?
+    /// True only after a complete REST paging pass has loaded the sessions.
+    /// Reconciliation must never use a partial page as the authoritative set.
+    private var sessionsLoadedCompletely = false
     /// Injectable seam for exercising cache-first opening without a live app
     /// connection; production builds construct the gateway/rest adapter.
     private let injectedTranscriptSource: (any TranscriptSource)?
@@ -310,19 +313,48 @@ final class AppModel {
     // MARK: - Sessions
 
     func loadSessions() async {
-        guard let gateway else { return }
+        guard let rest else { return }
+        sessionsLoadedCompletely = false
         do {
-            let result = try await gateway.call("session.list")
-            let rows = result["sessions"]?.arrayValue ?? []
-            sessions = rows.map(ChatSession.init(from:)).filter { !$0.id.isEmpty }
+            let rows = try await rest.allSessions()
+            sessions = rows.compactMap { row in
+                let session = ChatSession(from: row)
+                return session.id.isEmpty ? nil : session
+            }
+            sessions.sort(by: Self.sessionComesBefore)
+            sessionsLoadedCompletely = true
             cacheTotalCount = sessions.count
-            Log.info("session.list returned \(sessions.count) sessions")
+            Log.info("REST session list returned \(sessions.count) sessions")
             await refreshCacheStatistics()
             prefetchTranscripts()
         } catch {
-            Log.error("session.list failed: \(error)")
+            Log.error("REST session list failed: \(error)")
             postError("Could not load sessions", detail: error.localizedDescription)
         }
+    }
+
+    private static func sessionComesBefore(_ lhs: ChatSession, _ rhs: ChatSession) -> Bool {
+        switch (lhs.lastActive, rhs.lastActive) {
+        case let (left?, right?) where left != right:
+            return left > right
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        default:
+            break
+        }
+        switch (lhs.startedAt, rhs.startedAt) {
+        case let (left?, right?) where left != right:
+            return left > right
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        default:
+            break
+        }
+        return lhs.id < rhs.id
     }
 
     func setCacheEnabled(_ enabled: Bool) {
@@ -400,6 +432,13 @@ final class AppModel {
             cacheCachedCount = 0
             cacheBytes = 0
             isCacheWarming = false
+            return
+        }
+        guard sessionsLoadedCompletely else {
+            // A partial REST page would make reconcile delete older chats from
+            // the cache and search index. Skipping costs disk space; deleting
+            // user data cannot be undone.
+            Log.info("cache: skipped reconciliation because session list is incomplete")
             return
         }
         guard let statistics = try? await cache.reconcile(validIDs: sessions.map(\.id)) else {

@@ -28,6 +28,9 @@ public actor RestClient {
     /// malformed or adversarial session at 50,000 rows instead of allowing an
     /// endless loop when pagination never reports a short page.
     public static let maximumMessagePages = 100
+    /// One hundred pages bound a malformed session list at 10,000 rows and
+    /// prevents an endless loop when pinned rows repeat forever.
+    public static let maximumSessionPages = 100
 
     public init(server: URL, auth: AuthClient, urlSession: URLSession = .shared) {
         self.server = server
@@ -181,6 +184,47 @@ public actor RestClient {
         }
     }
 
+    /// Returns the complete durable session list, de-duplicated by id.
+    ///
+    /// Pinned rows repeat on every REST page, so `total` and a short page are
+    /// not completion signals. A page that adds no new id is the only reliable
+    /// stopping condition. The offset always advances by the requested page
+    /// size, not by the number of newly added rows.
+    public func allSessions(
+        order: String = "recent",
+        archived: String = "exclude",
+        profile: String? = nil
+    ) async throws -> [JSONValue] {
+        let pageLimit = 100
+        var offset = 0
+        var rows: [JSONValue] = []
+        var ids = Set<String>()
+        rows.reserveCapacity(pageLimit)
+
+        for _ in 0..<Self.maximumSessionPages {
+            try Task.checkCancellation()
+            let page = try await sessionList(
+                limit: pageLimit,
+                offset: offset,
+                order: order,
+                archived: archived,
+                profile: profile
+            )
+            var added = 0
+            for row in page.sessions {
+                guard let id = row["id"]?.stringValue, ids.insert(id).inserted else {
+                    continue
+                }
+                rows.append(row)
+                added += 1
+            }
+            guard added > 0 else { return rows }
+            offset += pageLimit
+        }
+
+        throw RestError.sessionPageLimitExceeded
+    }
+
     /// Updates a durable session by id without needing a live session or resume.
     ///
     /// This endpoint takes the DURABLE session id, needs no live session and no
@@ -326,6 +370,7 @@ public actor RestClient {
 public enum RestError: LocalizedError, Sendable {
     case badStatus(Int, String)
     case messagePageLimitExceeded
+    case sessionPageLimitExceeded
     case noMutableFields
     case sessionNotFound
 
@@ -335,6 +380,8 @@ public enum RestError: LocalizedError, Sendable {
             "Request failed (HTTP \(status)): \(body)"
         case .messagePageLimitExceeded:
             "The transcript exceeded the maximum number of REST pages."
+        case .sessionPageLimitExceeded:
+            "The session list exceeded the maximum number of REST pages."
         case .noMutableFields:
             "At least one mutable session field must be supplied."
         case .sessionNotFound:

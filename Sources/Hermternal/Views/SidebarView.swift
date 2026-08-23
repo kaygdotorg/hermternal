@@ -120,8 +120,8 @@ private struct SessionRow: View {
                 .font(.body)
                 .help(title)
             HStack(spacing: 5) {
-                if let startedAt = session.startedAt {
-                    Text(startedAt, format: .relative(presentation: .named))
+                if let timestamp = session.lastActive ?? session.startedAt {
+                    Text(timestamp, format: .relative(presentation: .named))
                 }
                 if session.messageCount > 0 {
                     Text("·")
