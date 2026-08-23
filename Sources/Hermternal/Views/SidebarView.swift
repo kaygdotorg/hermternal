@@ -34,6 +34,17 @@ struct SidebarView: View {
                                 }
                             )
                             .tag(session.id)
+                            // Labels and identifiers are declared here, on the
+                            // view the List treats as the row. Verified on
+                            // macOS 26.6.2: the resulting AXRow still reports no
+                            // label and no children, so a sidebar row is opaque
+                            // to accessibility. Tracked by issue #13; the
+                            // declarations stay because they are correct and
+                            // cost nothing, and `children: .ignore` was removed
+                            // because it would strip the row's own text.
+                            .accessibilityLabel(session.displayTitle)
+                            .accessibilityValue(messageCountLabel(session.messageCount))
+                            .accessibilityIdentifier("session-row-\(session.id)")
                     }
                 }
             }
@@ -98,18 +109,17 @@ struct SidebarView: View {
     }
 }
 
+/// Spoken message count for a row. Empty reads as no value.
+private func messageCountLabel(_ count: Int) -> String {
+    switch count {
+    case ..<1: ""
+    case 1: "1 message"
+    default: "\(count) messages"
+    }
+}
+
 private struct SessionRow: View {
     let session: ChatSession
-
-    /// An empty value reads as no value, so this avoids a conditional branch that
-    /// would give the row two identities and churn it when the count crosses zero.
-    private var accessibilityCount: String {
-        switch session.messageCount {
-        case ..<1: ""
-        case 1: "1 message"
-        default: "\(session.messageCount) messages"
-        }
-    }
 
     var body: some View {
         // `displayTitle` is stored on the session, so reading it costs nothing.
@@ -132,9 +142,5 @@ private struct SessionRow: View {
             .foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(title)
-        .accessibilityValue(accessibilityCount)
-        .accessibilityIdentifier("session-row-\(session.id)")
     }
 }
