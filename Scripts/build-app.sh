@@ -83,28 +83,43 @@ else
 	   ! ERR="$(codesign "${SIGN_ARGS[@]}" "${CODESIGN_KEYCHAIN_ARGS[@]}" \
 		--sign "$IDENTITY" "$APP" 2>&1)"; then
 		printf '%s\n' "$ERR" >&2
-		# errSecInternalComponent here is almost always the private key's ACL
-		# refusing a non-interactive caller, not a broken certificate.
+		# errSecInternalComponent identifies private-key access failure; the recovery
+		# differs for the temporary portable keychain and the installed login keychain.
 		if [[ "$ERR" == *errSecInternalComponent* ]]; then
-			cat >&2 <<-'HINT'
+			if [[ -n "$CODESIGN_KEYCHAIN" ]]; then
+				cat >&2 <<-'HINT'
 
-			codesign could not use the private key. This is the usual result of
-			signing from a shell with no window server -- an ssh session -- since
-			the key's ACL wants a confirmation dialog it cannot draw.
+				codesign could not use the private key from the temporary portable
+				keychain. This usually means the imported key lacks the codesign
+				partition grant or the ephemeral keychain was not first in the
+				search list. It is a portable-keychain failure, not a login ACL
+				failure.
 
-			This recovery step requires a human at the Mac's physical keyboard.
-			It CANNOT be automated or scripted. An automated caller must stop and
-			report this failure; do not open or drive Terminal.app.
+				A person at the Mac must repair the portable .p12/password setup
+				and rerun the release. This cannot be automated by an agent.
+				Do not open or drive Terminal.app.
+				HINT
+			else
+				cat >&2 <<-'HINT'
 
-			A human at the Mac can either run this from Terminal.app, or grant
-			codesign non-interactive access to the key once:
+				codesign could not use the private key. This is the usual result of
+				signing from a shell with no window server -- an SSH session -- since
+				the login key's ACL wants a confirmation dialog it cannot draw.
 
-			  security unlock-keychain ~/Library/Keychains/login.keychain-db
-			  security set-key-partition-list \
-			      -S apple-tool:,apple:,codesign: -s \
-			      -k "<your login password>" \
-			      ~/Library/Keychains/login.keychain-db
-			HINT
+				This recovery step requires a human at the Mac's physical keyboard.
+				It cannot be automated or scripted. An automated caller must stop
+				and report this failure; do not open or drive Terminal.app.
+
+				A human at the Mac can either run this from Terminal.app, or grant
+				codesign non-interactive access to the key once:
+
+				  security unlock-keychain ~/Library/Keychains/login.keychain-db
+				  security set-key-partition-list \
+				      -S apple-tool:,apple:,codesign: -s \
+				      -k "<your login password>" \
+				      ~/Library/Keychains/login.keychain-db
+				HINT
+			fi
 		fi
 		exit 1
 	fi

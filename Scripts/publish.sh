@@ -100,8 +100,31 @@ else
 	NOTES_BODY=""
 fi
 
-# Keep the API read unauthenticated. The response is split from the status so
-# a network error and a normal 404 cannot be confused.
+resolve_fj() {
+	local candidate resolved
+	local -a candidates=()
+	if [[ -n "${FJ_BIN:-}" ]]; then
+		candidates+=("$FJ_BIN")
+	fi
+	candidates+=("$HOME/.nix-profile/bin/fj")
+	resolved="$(command -v fj 2>/dev/null || true)"
+	[[ -z "$resolved" ]] || candidates+=("$resolved")
+	for candidate in "${candidates[@]}"; do
+		if [[ "$candidate" != */* ]]; then
+			candidate="$(command -v "$candidate" 2>/dev/null || true)"
+		fi
+		[[ -x "$candidate" ]] || continue
+		if "$candidate" release asset --help >/dev/null 2>&1; then
+			FJ="$candidate"
+			return 0
+		fi
+	done
+	fail 'Forgejo CLI fj is missing or incompatible; install the canonical Nix forgejo-cli or set FJ_BIN to a compatible binary'
+}
+resolve_fj
+
+# The API read remains unauthenticated. The response is split from the status
+# so a network error and a normal 404 cannot be confused.
 API_URL="$FORGEJO_HOST/api/v1/repos/$FORGEJO_REPO/releases/tags/$TAG"
 API_RESPONSE="$(curl --fail-with-body --silent --show-error --write-out $'\n%{http_code}' "$API_URL" 2>&1)" || {
 	status_line="${API_RESPONSE##*$'\n'}"
@@ -144,7 +167,7 @@ else
 		git push origin "refs/tags/$TAG" || fail "could not push tag $TAG to origin"
 	fi
 	printf 'Creating Forgejo release %s\n' "$TAG"
-	RELEASE_ARGS=(fj -H "$FORGEJO_HOST" release create --repo "$FORGEJO_REPO" "$TAG" --tag "$TAG")
+	RELEASE_ARGS=("$FJ" -H "$FORGEJO_HOST" release create --repo "$FORGEJO_REPO" "$TAG" --tag "$TAG")
 	[[ -z "$NOTES_FILE" ]] || RELEASE_ARGS+=(--body "$NOTES_BODY")
 	"${RELEASE_ARGS[@]}" || fail 'could not create the Forgejo release'
 fi
@@ -159,23 +182,23 @@ if (( REPLACE_ASSET )); then
 		TEMP_ASSET_NAME="$ASSET_NAME.pending-$CHECKSUM"
 		TEMP_ZIP="$ROOT/dist/$TEMP_ASSET_NAME"
 		cp "$ZIP" "$TEMP_ZIP" || fail "could not stage the replacement $ASSET_NAME"
-		fj -H "$FORGEJO_HOST" release asset create --repo "$FORGEJO_REPO" \
+		"$FJ" -H "$FORGEJO_HOST" release asset create --repo "$FORGEJO_REPO" \
 			"$RELEASE_NAME" "$TEMP_ZIP" || fail "could not upload the replacement $ASSET_NAME"
-		fj -H "$FORGEJO_HOST" release asset delete --repo "$FORGEJO_REPO" \
+		"$FJ" -H "$FORGEJO_HOST" release asset delete --repo "$FORGEJO_REPO" \
 			"$RELEASE_NAME" "$ASSET_NAME" || fail "could not delete the old $ASSET_NAME asset"
-		fj -H "$FORGEJO_HOST" release asset create --repo "$FORGEJO_REPO" \
+		"$FJ" -H "$FORGEJO_HOST" release asset create --repo "$FORGEJO_REPO" \
 			"$RELEASE_NAME" "$ZIP" || fail "could not publish the replacement $ASSET_NAME"
-		fj -H "$FORGEJO_HOST" release asset delete --repo "$FORGEJO_REPO" \
+		"$FJ" -H "$FORGEJO_HOST" release asset delete --repo "$FORGEJO_REPO" \
 			"$RELEASE_NAME" "$TEMP_ASSET_NAME" || fail "could not remove the temporary replacement asset"
 		rm -f "$TEMP_ZIP"
 	else
 		printf 'Attaching %s to release %s\n' "$ASSET_NAME" "$RELEASE_NAME"
-		fj -H "$FORGEJO_HOST" release asset create --repo "$FORGEJO_REPO" \
+		"$FJ" -H "$FORGEJO_HOST" release asset create --repo "$FORGEJO_REPO" \
 			"$RELEASE_NAME" "$ZIP" || fail "could not upload $ASSET_NAME"
 	fi
 else
 	printf 'Attaching %s to release %s\n' "$ASSET_NAME" "$RELEASE_NAME"
-	fj -H "$FORGEJO_HOST" release asset create --repo "$FORGEJO_REPO" \
+	"$FJ" -H "$FORGEJO_HOST" release asset create --repo "$FORGEJO_REPO" \
 		"$RELEASE_NAME" "$ZIP" || fail "could not upload $ASSET_NAME"
 fi
 RELEASE_URL="$FORGEJO_HOST/$FORGEJO_REPO/releases/tag/$TAG"

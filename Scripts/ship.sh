@@ -7,6 +7,12 @@ cd "$ROOT"
 FORGEJO_HOST="${FORGEJO_HOST:-https://git.kayg.org}"
 FORGEJO_HOST="${FORGEJO_HOST%/}"
 FORGEJO_REPO="kayg/hermternal-apple"
+# The Forgejo SSH key is dedicated to this host. Preserve an explicit caller
+# override, otherwise select it for every Git operation in this release.
+if [[ -z "${GIT_SSH_COMMAND:-}" && -f "$HOME/.ssh/git.kayg.org" ]]; then
+	GIT_SSH_COMMAND="ssh -i $HOME/.ssh/git.kayg.org -o IdentitiesOnly=yes"
+	export GIT_SSH_COMMAND
+fi
 REPLACE_ASSET=0
 DRY_RUN=0
 
@@ -103,7 +109,7 @@ fi
 
 # Actual releases run only from the stable main branch.
 RELEASE_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
-[[ "$RELEASE_BRANCH" == "main" ]] || fail "actual releases must run from branch main (current: ${RELEASE_BRANCH:-detached})" 'Complete the dev audit and promote the audited commit to main before rerunning Scripts/ship.sh.'
+[[ "$RELEASE_BRANCH" == "main" ]] || fail "actual releases require the audited, promoted main branch after the performance and honesty gates (current: ${RELEASE_BRANCH:-detached})" 'Complete the dev audit and promote the audited commit to main before rerunning Scripts/ship.sh.'
 mkdir -p "$DIST" 2>/dev/null || fail 'could not create dist' 'A person at the Mac must make the checkout writable, then rerun Scripts/ship.sh.'
 mkdir -p "$STATE" 2>/dev/null || fail 'could not create release state' 'A person at the Mac must make dist writable, then rerun Scripts/ship.sh.'
 if [[ -f "$META" ]] && { ! grep -qF "head=$HEAD" "$META" || ! grep -qF "version=$VERSION" "$META"; }; then

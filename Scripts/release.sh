@@ -39,14 +39,14 @@ RESUME_ID="${RELEASE_RESUME_ID:-}"
 while (($# > 0)); do
 	case "$1" in
 		--stage)
-			(($# >= 2)) || { printf 'error: --stage requires a value\n' >&2; printf 'NEXT: A person at the Mac must rerun Scripts/ship.sh with a valid stage.\n' >&2; exit 1; }
+			(($# >= 2)) || { printf 'error: --stage requires a value\n' >&2; if [[ "${SHIP_CHILD:-0}" != 1 ]]; then printf 'NEXT: A person at the Mac must rerun Scripts/ship.sh with a valid stage.\n' >&2; fi; exit 1; }
 			STAGE="$2"
 			shift 2
 			;;
 		--stage=*) STAGE="${1#*=}"; shift ;;
 		--dry-run) DRY_RUN=1; shift ;;
 		--resume-id)
-			(($# >= 2)) || { printf 'error: --resume-id requires a value\n' >&2; printf 'NEXT: A person at the Mac must rerun Scripts/ship.sh with a valid resume id.\n' >&2; exit 1; }
+			(($# >= 2)) || { printf 'error: --resume-id requires a value\n' >&2; if [[ "${SHIP_CHILD:-0}" != 1 ]]; then printf 'NEXT: A person at the Mac must rerun Scripts/ship.sh with a valid resume id.\n' >&2; fi; exit 1; }
 			RESUME_ID="$2"
 			shift 2
 			;;
@@ -55,13 +55,13 @@ while (($# > 0)); do
 			printf 'Usage: %s [--stage build|notarize|staple|package|verify-local] [--dry-run]\n' "${BASH_SOURCE[0]}"
 			exit 0
 			;;
-		*) printf 'error: unknown argument: %s\n' "$1" >&2; printf 'NEXT: A person at the Mac must rerun Scripts/ship.sh with a valid option.\n' >&2; exit 1 ;;
+		*) printf 'error: unknown argument: %s\n' "$1" >&2; if [[ "${SHIP_CHILD:-0}" != 1 ]]; then printf 'NEXT: A person at the Mac must rerun Scripts/ship.sh with a valid option.\n' >&2; fi; exit 1 ;;
 	esac
 done
 
 case "$STAGE" in
 	all|build|notarize|staple|package|verify-local) ;;
-	*) printf 'error: unknown release stage: %s\n' "$STAGE" >&2; printf 'NEXT: A person at the Mac must rerun Scripts/ship.sh with a valid stage.\n' >&2; exit 1 ;;
+	*) printf 'error: unknown release stage: %s\n' "$STAGE" >&2; if [[ "${SHIP_CHILD:-0}" != 1 ]]; then printf 'NEXT: A person at the Mac must rerun Scripts/ship.sh with a valid stage.\n' >&2; fi; exit 1 ;;
 esac
 
 fail() {
@@ -146,11 +146,11 @@ restore_keychain() {
 	local restored
 	[[ -z "$EPHEMERAL_KEYCHAIN" ]] && return 0
 	security list-keychains -s "${ORIGINAL_KEYCHAINS[@]}" >/dev/null 2>&1 || {
-		printf 'error: could not restore the keychain search list\n' >&2
+		printf 'error: could not restore the keychain search list; a person at the Mac must inspect the original plain security list-keychains output before another release run\n' >&2
 		return 1
 	}
 	restored="$(security list-keychains 2>/dev/null)" || {
-		printf 'error: could not read the restored keychain search list\n' >&2
+		printf 'error: could not read the restored plain keychain search list; stop before another release run\n' >&2
 		return 1
 	}
 	if [[ "$restored" != "$ORIGINAL_KEYCHAIN_BYTES" ]]; then
@@ -221,8 +221,11 @@ setup_signing_keychain() {
 	)"
 	selector_count="${selector_info%%$'\t'*}"
 	selector="${selector_info#*$'\t'}"
+	if [[ "$selector_count" == 0 ]]; then
+		fail 'portable signing identity was not found in the ephemeral keychain; check the certificate name and .p12'
+	fi
 	if [[ "$selector_count" != 1 || ! "$selector" =~ ^[[:xdigit:]]{40}$ ]]; then
-		fail 'portable signing identity is unavailable or ambiguous'
+		fail 'portable signing identity name is ambiguous in the ephemeral keychain; provide one matching Developer ID certificate'
 	fi
 	CODESIGN_SELECTOR="$selector"
 }
