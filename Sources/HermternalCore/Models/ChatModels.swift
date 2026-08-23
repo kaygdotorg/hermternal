@@ -19,6 +19,30 @@ public struct ChatSession: Identifiable, Hashable, Sendable {
     /// The row label. Cheap to read, because it is computed at decode time.
     public let displayTitle: String
 
+    private init(
+        id: String,
+        title: String,
+        preview: String,
+        startedAt: Date?,
+        lastActive: Date?,
+        pinned: Bool,
+        source: String,
+        profile: String?,
+        messageCount: Int,
+        displayTitle: String
+    ) {
+        self.id = id
+        self.title = title
+        self.preview = preview
+        self.startedAt = startedAt
+        self.lastActive = lastActive
+        self.pinned = pinned
+        self.source = source
+        self.profile = profile
+        self.messageCount = messageCount
+        self.displayTitle = displayTitle
+    }
+
     public init(from value: JSONValue) {
         id = value["id"]?.stringValue ?? ""
         let title = value["title"]?.stringValue ?? ""
@@ -32,6 +56,22 @@ public struct ChatSession: Identifiable, Hashable, Sendable {
         source = value["source"]?.stringValue ?? ""
         profile = value["profile"]?.stringValue
         displayTitle = Self.deriveDisplayTitle(title: title, preview: preview)
+    }
+
+    /// Returns a copy with only the server pin state changed.
+    public func withPinned(_ pinned: Bool) -> ChatSession {
+        ChatSession(
+            id: id,
+            title: title,
+            preview: preview,
+            startedAt: startedAt,
+            lastActive: lastActive,
+            pinned: pinned,
+            source: source,
+            profile: profile,
+            messageCount: messageCount,
+            displayTitle: displayTitle
+        )
     }
 
     /// Picks the row label, preferring the server title over the preview.

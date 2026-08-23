@@ -85,6 +85,53 @@ func chatSessionDefaultsAbsentDashboardProperties() {
     #expect(session.source.isEmpty)
 }
 
+@Test("withPinned preserves every ChatSession field")
+func chatSessionWithPinnedPreservesFields() {
+    let session = ChatSession(from: .object([
+        "id": .string("session-pinned"),
+        "title": .string("A saved chat"),
+        "preview": .string("A preview"),
+        "started_at": .integer(1_700_000_000),
+        "last_active": .integer(1_700_000_600),
+        "pinned": .bool(false),
+        "source": .string("api_server"),
+        "profile": .string("work"),
+        "message_count": .integer(7)
+    ]))
+
+    let pinned = session.withPinned(true)
+
+    #expect(!session.pinned)
+    #expect(pinned.pinned)
+    #expect(pinned.id == session.id)
+    #expect(pinned.title == session.title)
+    #expect(pinned.preview == session.preview)
+    #expect(pinned.startedAt == session.startedAt)
+    #expect(pinned.lastActive == session.lastActive)
+    #expect(pinned.source == session.source)
+    #expect(pinned.profile == session.profile)
+    #expect(pinned.messageCount == session.messageCount)
+    #expect(pinned.displayTitle == session.displayTitle)
+}
+
+@Test("withPinned can round-trip the pin state")
+func chatSessionWithPinnedRoundTrips() {
+    let session = chatSession(title: "A chat", preview: "A preview")
+
+    let roundTripped = session.withPinned(true).withPinned(false)
+
+    #expect(roundTripped == session)
+    #expect(roundTripped.displayTitle == session.displayTitle)
+}
+
+@Test("withPinned preserves the New Chat fallback title")
+func chatSessionWithPinnedPreservesFallbackDisplayTitle() {
+    let session = chatSession(title: "", preview: "### Generate a title")
+
+    #expect(session.withPinned(true).displayTitle == "New Chat")
+    #expect(session.withPinned(false).displayTitle == "New Chat")
+}
+
 private func chatSession(title: String, preview: String) -> ChatSession {
     ChatSession(from: .object([
         "title": .string(title),

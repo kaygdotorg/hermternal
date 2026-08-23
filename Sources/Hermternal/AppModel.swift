@@ -337,6 +337,44 @@ final class AppModel {
             postError("Could not load sessions", detail: error.localizedDescription)
         }
     }
+    /// Changes the server pin state without waiting for the network to move the row.
+    func setPinned(_ session: ChatSession, pinned: Bool) async {
+        guard let index = sessions.firstIndex(where: { $0.id == session.id }) else { return }
+        let previous = sessions[index]
+        sessions[index] = previous.withPinned(pinned)
+        sessions.sort(by: Self.sessionComesBefore)
+
+        guard let rest else {
+            if let index = sessions.firstIndex(where: { $0.id == session.id }),
+               sessions[index].pinned == pinned {
+                sessions[index] = previous
+                sessions.sort(by: Self.sessionComesBefore)
+            }
+            postError("Could not update pin", detail: "The server connection is unavailable.")
+            return
+        }
+
+        do {
+            _ = try await rest.patchSession(
+                durableID: session.id,
+                pinned: pinned,
+                profile: session.profile
+            )
+        } catch {
+            if let restError = error as? RestError, case .sessionNotFound = restError {
+                sessions.removeAll { $0.id == session.id }
+                postError("Chat no longer exists", detail: error.localizedDescription)
+                return
+            }
+            if let index = sessions.firstIndex(where: { $0.id == session.id }),
+               sessions[index].pinned == pinned {
+                sessions[index] = previous
+                sessions.sort(by: Self.sessionComesBefore)
+            }
+            postError("Could not update pin", detail: error.localizedDescription)
+        }
+    }
+
 
     /// Sources whose sessions are machine work rather than chats.
     ///

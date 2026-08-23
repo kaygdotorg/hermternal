@@ -36,6 +36,14 @@ struct SidebarView: View {
                         .accessibilityLabel(session.displayTitle)
                         .accessibilityValue(messageCountLabel(session.messageCount))
                         .accessibilityIdentifier("session-row-\(session.id)")
+                        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                            pinButton(for: session)
+                        }
+                        // A per-row menu keeps the action tied to this row without
+                        // changing List selection.
+                        .contextMenu {
+                            pinButton(for: session)
+                        }
                     }
                 }
             }
@@ -62,6 +70,19 @@ struct SidebarView: View {
             pendingOpenTask?.cancel()
             pendingOpenTask = nil
         }
+    }
+
+    @ViewBuilder
+    private func pinButton(for session: ChatSession) -> some View {
+        Button(
+            session.pinned ? "Unpin" : "Pin",
+            systemImage: session.pinned ? "pin.slash" : "pin"
+        ) {
+            Task {
+                await model.setPinned(session, pinned: !session.pinned)
+            }
+        }
+        .tint(.accentColor)
     }
 
     /// Mouse activation should paint cached detail immediately. Mark the id
