@@ -77,11 +77,16 @@ esac
 # codesign fails with "User interaction is not allowed" -- after the build.
 # Check up front instead.
 IDENTITIES="$(security find-identity -v -p codesigning 2>&1)" ||
-	die "cannot inspect signing identities; run this from Terminal.app on the Mac."
+	die "cannot inspect signing identities. A human at the Mac's physical \
+keyboard must run this from Terminal.app or an interactive ssh -t session; \
+this CANNOT be automated or scripted. An automated caller must stop and \
+report this failure."
 grep -qF "$CODESIGN_IDENTITY" <<<"$IDENTITIES" ||
 	die "codesign cannot reach '$CODESIGN_IDENTITY'. The login keychain is \
-locked or unreadable. Run this from Terminal.app on the Mac, not over ssh; \
-or unlock first with: security unlock-keychain"
+locked or unreadable. A human at the Mac's physical keyboard must use \
+Terminal.app or an interactive ssh -t session, not a non-interactive SSH \
+call, then unlock first with: security unlock-keychain. This CANNOT be \
+automated or scripted; an automated caller must stop and report this failure."
 xcrun notarytool history "${NOTARY_ARGS[@]}" >/dev/null 2>&1 ||
 	die "no usable notarytool credentials. Store profile '$NOTARY_PROFILE' with \
 Scripts/setup-signing.sh, or set ASC_KEY_PATH/ASC_KEY_ID/ASC_ISSUER_ID in .env."
@@ -132,6 +137,8 @@ step "Building final zip"
 # Re-zip after stapling: the earlier archive predates the ticket.
 rm -f "$ZIP"
 /usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"
+step "Verifying final archive"
+bash Scripts/verify-notarization.sh "$ZIP"
 
 step "Done"
 shasum -a 256 "$ZIP"

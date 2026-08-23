@@ -39,8 +39,15 @@ if [[ -z "$IDENTITY" ]]; then
 	)"
 fi
 if [[ -z "$IDENTITY" ]]; then
+	if [[ "${ALLOW_ADHOC:-0}" != 1 ]]; then
+		cat >&2 <<-'HINT'
+		error: no codesigning identity found; refusing to create an ad-hoc build.
+		Local ad-hoc builds require the explicit ALLOW_ADHOC=1 opt-in.
+		HINT
+		exit 1
+	fi
 	IDENTITY="-"
-	echo "note: no codesigning identity found; signing ad-hoc" >&2
+	echo "warning: ALLOW_ADHOC=1; signing an ad-hoc build (not publishable)" >&2
 fi
 
 # Hardened runtime and a trusted timestamp are both prerequisites for
@@ -66,8 +73,12 @@ else
 			signing from a shell with no window server -- an ssh session -- since
 			the key's ACL wants a confirmation dialog it cannot draw.
 
-			Either run this from Terminal.app on the Mac, or grant codesign
-			non-interactive access to the key once:
+			This recovery step requires a human at the Mac's physical keyboard.
+			It CANNOT be automated or scripted. An automated caller must stop and
+			report this failure; do not open or drive Terminal.app.
+
+			A human at the Mac can either run this from Terminal.app, or grant
+			codesign non-interactive access to the key once:
 
 			  security unlock-keychain ~/Library/Keychains/login.keychain-db
 			  security set-key-partition-list \

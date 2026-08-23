@@ -76,21 +76,9 @@ VERSION="$(
 ZIP="$ROOT/dist/Hermternal-$VERSION.zip"
 [[ -f "$ZIP" ]] ||
 	die "release artifact is missing: dist/Hermternal-$VERSION.zip; run Scripts/release.sh first"
-# Validate the app extracted from the exact archive before any tag or upload.
-# The stapled ticket lives inside the app bundle, not beside the archive.
-VERIFY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hermternal-publish.XXXXXX")"
-trap 'rm -rf "$VERIFY_DIR"' EXIT
-VERIFY_APP="$VERIFY_DIR/Hermternal.app"
-/usr/bin/ditto -x -k "$ZIP" "$VERIFY_DIR" ||
-	die 'could not extract release artifact for notarization checks'
-[[ -d "$VERIFY_APP" ]] ||
-	die 'release artifact does not contain Hermternal.app'
-
 printf '\nVerifying notarization and Gatekeeper acceptance\n'
-xcrun stapler validate "$VERIFY_APP" ||
-	die 'release artifact has no valid stapled notarization ticket'
-spctl -a -t exec "$VERIFY_APP" ||
-	die 'release artifact fails Gatekeeper assessment'
+bash "$ROOT/Scripts/verify-notarization.sh" "$ZIP" ||
+	die 'release artifact failed notarization verification'
 
 HEAD="$(git rev-parse HEAD)"
 BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"

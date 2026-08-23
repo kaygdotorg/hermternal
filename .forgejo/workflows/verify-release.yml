@@ -1,0 +1,40 @@
+name: Verify release notarization
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  verify-notarization:
+    # Forgejo must have a macOS runner registered under this label. stapler and
+    # spctl are macOS-only; a Linux runner cannot verify Apple's ticket.
+    runs-on: macos-latest
+    steps:
+      - name: Check out verifier
+        uses: actions/checkout@v4
+
+      - name: Verify every zip asset
+        env:
+          RELEASE_ASSETS: ${{ toJSON(github.event.release.assets) }}
+          FORGEJO_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=0
+          while IFS=$'\t' read -r name url; do
+            [[ "$name" == *.zip ]] || continue
+            count=$((count + 1))
+            echo "Downloading and verifying $name"
+            curl --fail --location --silent --show-error \
+              --header "Authorization: token $FORGEJO_TOKEN" \
+              --output "$name" "$url"
+            bash Scripts/verify-notarization.sh "$name"
+          done < <(
+            jq -r '.[] | [.name, .browser_download_url] | @tsv' \
+              <<<"$RELEASE_ASSETS"
+          )
+
+          ((count > 0)) || {
+            echo "error: release has no .zip assets to verify" >&2
+            exit 1
+          }

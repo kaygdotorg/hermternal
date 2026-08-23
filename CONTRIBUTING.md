@@ -36,3 +36,9 @@ question.
 
 See `AGENTS.md` for the conventions this repository is developed under,
 including the required tooling and commit style.
+
+## Release invariant
+
+An artifact reaches a release only after `Scripts/verify-notarization.sh`
+passes. Never upload an artifact directly through Forgejo; publish it through
+the verified release process.

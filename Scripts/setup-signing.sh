@@ -194,7 +194,9 @@ banner "Hermternal — code signing and notarization setup"
 # Terminal.app on the Mac both do.
 if [[ ! -t 0 ]]; then
   warn "No terminal attached, so nothing you paste can be read."
-  say "Run this from Terminal.app on the Mac, or over 'ssh -t'."
+  say "A human at the physical keyboard must run this with a TTY: use \
+Terminal.app on the Mac or an interactive 'ssh -t' session. This step CANNOT \
+be automated or scripted; an automated caller must stop and report."
   exit 1
 fi
 
@@ -204,7 +206,9 @@ fi
 if security show-keychain-info ~/Library/Keychains/login.keychain-db 2>&1 |
    grep -q "User interaction is not allowed"; then
   warn "The login keychain is locked and cannot be unlocked from here."
-  say "Unlock it on the Mac (log in, or open Keychain Access) and re-run."
+  say "A human at the Mac's physical keyboard must unlock it (log in, or open \
+Keychain Access) and re-run. This CANNOT be automated or scripted; an \
+automated caller must stop and report."
   exit 1
 fi
 
