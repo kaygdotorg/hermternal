@@ -10,11 +10,11 @@ set -euo pipefail
 # Mach-O bytes (stat -f %z). Timings/CPU/RSS remain report-only on loaded hosts.
 # The binary gate is deliberately generous at 64 MiB.
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-rsync -a --exclude .git --exclude .build --exclude build --exclude dist "$ROOT/" "$SCRATCH/"
+BINARY_CEILING_BYTES=$((64 * 1024 * 1024))
 mkdir -p "$HOME/tmp"
-rm -rf "$SCRATCH"
+SCRATCH=$(mktemp -d "$HOME/tmp/hermternal-performance.XXXXXX")
 trap 'rm -rf "$SCRATCH"' EXIT
-rsync -a --exclude .git "$ROOT/" "$SCRATCH/"
+rsync -a --exclude .git --exclude .build --exclude build --exclude dist "$ROOT/" "$SCRATCH/"
 
 log=$(mktemp "${TMPDIR:-/tmp}/hermternal-performance.XXXXXX")
 trap 'rm -f "$log"; rm -rf "$SCRATCH"' EXIT
