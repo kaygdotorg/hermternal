@@ -8,6 +8,8 @@ struct ChatView: View {
     @State private var isFindPresented = false
     @State private var findQuery = ""
     @State private var activeFindIndex = 0
+    @State private var scrollPosition: MessageIdentity?
+    @State private var messageTargetActive = false
 
     var body: some View {
         transcript
@@ -51,6 +53,8 @@ struct ChatView: View {
         }
         .onChange(of: model.selectedSessionID) {
             closeFind()
+            scrollPosition = nil
+            messageTargetActive = false
         }
     }
 
@@ -64,6 +68,50 @@ struct ChatView: View {
     private var activeFindMatch: TranscriptMatch? {
         guard findMatches.indices.contains(activeFindIndex) else { return nil }
         return findMatches[activeFindIndex]
+    }
+
+    private var initialMessageTarget: MessageIdentity? {
+        if messageTargetActive {
+            // A nil write-back means the user has scrolled away. Do not fall
+            // through to the routed identity and pull them back.
+            return scrollPosition
+        }
+        guard let location = model.pendingMessageLocation,
+              model.selectedSessionID == location.sessionID
+        else { return nil }
+        // Keep the requested identity bound before the transcript arrives.
+        // With scrollTargetLayout below, SwiftUI applies this position during
+        // the first layout that contains the target row; no proxy scroll is
+        // needed after the transcript has painted.
+        return .server(location.messageID)
+    }
+
+    private var hasPositionedMessageTarget: Bool {
+        messageTargetActive
+    }
+
+    private var messageScrollPosition: Binding<MessageIdentity?> {
+        Binding(
+            get: { initialMessageTarget },
+            set: { newPosition in
+                guard messageTargetActive else { return }
+                scrollPosition = newPosition
+            }
+        )
+    }
+
+    @MainActor
+    private func capturePendingMessageTarget() -> Bool {
+        guard let location = model.pendingMessageLocation,
+              model.selectedSessionID == location.sessionID,
+              model.messages.contains(where: {
+                  $0.id == .server(location.messageID)
+              })
+        else { return false }
+
+        messageTargetActive = true
+        scrollPosition = .server(location.messageID)
+        return true
     }
 
     private func openFind() {
@@ -118,10 +166,16 @@ struct ChatView: View {
                         .frame(height: 1)
                         .id(Self.bottomAnchor)
                 }
+                .scrollTargetLayout()
                 .padding(.horizontal, 22)
                 .padding(.vertical, 20)
                 .frame(maxWidth: 680, alignment: .leading)
                 .frame(maxWidth: .infinity)
+            }
+            .defaultScrollAnchor(.bottom)
+            .scrollPosition(id: messageScrollPosition, anchor: .center)
+            .transaction { transaction in
+                transaction.animation = nil
             }
             .overlay(alignment: .top) { Self.topFade }
             .overlay(alignment: .top) {
@@ -139,7 +193,12 @@ struct ChatView: View {
                 }
             }
             .onChange(of: model.pendingMessageLocation) {
-                _ = consumePendingMessageTarget(using: proxy)
+                if model.pendingMessageLocation == nil {
+                    scrollPosition = nil
+                    messageTargetActive = false
+                } else {
+                    _ = capturePendingMessageTarget()
+                }
             }
             .onChange(of: isFindPresented) {
                 activateFindMatch(using: proxy)
@@ -151,7 +210,8 @@ struct ChatView: View {
                 activateFindMatch(using: proxy)
             }
             .onChange(of: model.messages.last?.text) {
-                guard !consumePendingMessageTarget(using: proxy) else { return }
+                guard model.pendingMessageLocation == nil else { return }
+                guard !hasPositionedMessageTarget else { return }
                 guard !isFindPresented else { return }
                 guard pendingScrollTask == nil else { return }
                 pendingScrollTask = Task { @MainActor in
@@ -168,7 +228,10 @@ struct ChatView: View {
             .onChange(of: model.messages.count) { oldCount, newCount in
                 pendingScrollTask?.cancel()
                 pendingScrollTask = nil
-                guard !consumePendingMessageTarget(using: proxy) else { return }
+                // A routed target is captured once. Its binding write-back,
+                // including a user scroll away, remains authoritative.
+                guard !hasPositionedMessageTarget else { return }
+                guard !capturePendingMessageTarget() else { return }
                 guard !isFindPresented else { return }
 
                 if newCount == oldCount + 1 {
@@ -180,36 +243,13 @@ struct ChatView: View {
                 }
             }
             .onAppear {
-                _ = consumePendingMessageTarget(using: proxy)
+                _ = capturePendingMessageTarget()
             }
             .onDisappear {
                 pendingScrollTask?.cancel()
                 pendingScrollTask = nil
             }
         }
-    }
-    /// Consume a routed target only once its durable row is in the transcript.
-    /// The animated scroll is intentional: non-animated scrolling can fail
-    /// silently for variable-height LazyVStack rows.
-    @MainActor
-    private func consumePendingMessageTarget(using proxy: ScrollViewProxy) -> Bool {
-        guard let location = model.pendingMessageLocation,
-              model.selectedSessionID == location.sessionID,
-              model.messages.contains(where: {
-                  $0.id == .server(location.messageID)
-              })
-        else { return false }
-
-        pendingScrollTask?.cancel()
-        pendingScrollTask = nil
-        model.pendingMessageLocation = nil
-        withAnimation(.easeInOut(duration: 0.28)) {
-            proxy.scrollTo(
-                MessageIdentity.server(location.messageID),
-                anchor: .center
-            )
-        }
-        return true
     }
 
     /// Hiding the toolbar backing is what makes the titlebar glass, but it

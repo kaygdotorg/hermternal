@@ -99,7 +99,7 @@ struct ChatWindow: View {
                         querying: querying,
                         activate: { location in
                             Task {
-                                await model.openThenScroll(to: location)
+                                await model.open(at: location)
                                 model.isSearchPresented = false
                             }
                         },

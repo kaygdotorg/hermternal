@@ -7,6 +7,9 @@ import HermternalCore
 /// Ordinary launches do not enter this path.
 enum SidebarFixtures {
     static let isEnabled = ProcessInfo.processInfo.environment["HERMTERNAL_FIXTURES"] == "1"
+    /// Fixture authority is deliberately non-production so labels and copied
+    /// links never claim the real gateway.
+    static let gatewayURL = URL(string: "https://fixtures.hermternal.invalid")!
 
     /// The complete fixture set is built once per process.
     static let sessions: [ChatSession] = {
@@ -20,6 +23,14 @@ enum SidebarFixtures {
                 lastActive: now.addingTimeInterval(-300),
                 pinned: true,
                 messageCount: 8
+            ),
+            session(
+                id: "fixture-transcript",
+                title: "Long transcript positioning",
+                preview: "Fixture message 1199 is the newest message.",
+                startedAt: now.addingTimeInterval(-600),
+                lastActive: now.addingTimeInterval(-60),
+                messageCount: 200
             ),
             session(
                 id: "fixture-cron-daily",
@@ -47,6 +58,24 @@ enum SidebarFixtures {
                 lastActive: now.addingTimeInterval(-18 * 86_400),
                 source: "cron",
                 messageCount: 3
+            ),
+            session(
+                id: "fixture-cron-nightly",
+                title: "Nightly test report",
+                preview: "The nightly scheduled test report is ready.",
+                startedAt: now.addingTimeInterval(-10_800),
+                lastActive: now.addingTimeInterval(-9_000),
+                source: "cron",
+                messageCount: 4
+            ),
+            session(
+                id: "fixture-cron-release",
+                title: "Release readiness digest",
+                preview: "The scheduled release readiness digest is ready.",
+                startedAt: now.addingTimeInterval(-4 * 86_400),
+                lastActive: now.addingTimeInterval(-4 * 86_400),
+                source: "cron",
+                messageCount: 5
             ),
             session(
                 id: "fixture-today",
@@ -132,9 +161,66 @@ enum SidebarFixtures {
         ]
     }()
 
+    static let transcriptSessionID = "fixture-transcript"
+
+    static let transcriptMessages: [ChatMessage] = (0..<200).map { offset in
+        let rawID = Int64(1_000 + offset)
+        let role: Role = offset.isMultiple(of: 2) ? .user : .assistant
+        return ChatMessage(
+            id: .server(ServerMessageID(rawValue: rawID)),
+            role: role,
+            text: "Fixture transcript message \(rawID): numbered content for positioning.",
+            timestamp: Date(timeIntervalSince1970: TimeInterval(rawID))
+        )
+    }
+
+    static let transcriptSource: any TranscriptSource = FixtureTranscriptSource(
+        sessionID: transcriptSessionID,
+        messages: transcriptMessages
+    )
+
+    private struct FixtureTranscriptSource: TranscriptSource, Sendable {
+        let sessionID: String
+        let rows: [JSONValue]
+
+        init(sessionID: String, messages: [ChatMessage]) {
+            self.sessionID = sessionID
+            self.rows = messages.map { message in
+                let rawID: Int64
+                if case .server(let serverID) = message.id {
+                    rawID = serverID.rawValue
+                } else {
+                    rawID = 0
+                }
+                return .object([
+                    "id": .integer(rawID),
+                    "role": .string(message.role.rawValue),
+                    "text": .string(message.text),
+                    "timestamp": .number(message.timestamp?.timeIntervalSince1970 ?? 0)
+                ])
+            }
+        }
+
+        func fetchAuthoritative(sessionID: String) async throws -> AuthoritativeTranscript {
+            guard sessionID == self.sessionID else {
+                return AuthoritativeTranscript(rows: [], serverTotal: 0)
+            }
+            return AuthoritativeTranscript(rows: rows, serverTotal: rows.count)
+        }
+
+        func resume(sessionID: String) async throws -> ResumedTranscript {
+            ResumedTranscript(
+                liveSessionID: sessionID == self.sessionID ? "fixture-live-session" : nil,
+                rows: [],
+                messageCount: sessionID == self.sessionID ? rows.count : 0
+            )
+        }
+    }
+
     @MainActor
     static func previewModel() -> AppModel {
         let model = AppModel()
+        model.serverText = gatewayURL.absoluteString
         model.sessions = sessions
         model.phase = .ready
         return model

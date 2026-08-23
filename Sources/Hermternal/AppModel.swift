@@ -17,7 +17,6 @@ final class AppModel {
 
     var phase: Phase = .signedOut
     var sessions: [ChatSession] = []
-    /// Sidebar organization uses in-memory defaults until config persistence is wired.
     var sortMode: SortMode = .lastActivity
     var groupByDate = true
     var folders: [Folder] = []
@@ -25,9 +24,9 @@ final class AppModel {
     var messages: [ChatMessage] = []
     /// Durable id of the sidebar selection.
     var selectedSessionID: String?
-    /// A routed message target waiting for ChatView to consume after the
-    /// transcript has been rendered. The view clears this one-shot value.
-    var pendingMessageLocation: MessageLocation?
+    /// A routed message target that ChatView reads during the transcript's
+    /// initial layout. It is single-use and owned by its open generation.
+    var pendingMessageLocation: MessageLocation? { pendingMessageRoute?.location }
 
     var isAwaitingReply = false
     var composerText = ""
@@ -89,6 +88,9 @@ final class AppModel {
     private var auth: AuthClient?
     private var gateway: GatewayClient?
     private var rest: RestClient?
+    private let organizationStore: SessionOrganizationStore
+    private var organizationSnapshot: SessionOrganization?
+    private var organizationLoaded = false
     /// True only after a complete REST paging pass has loaded the sessions.
     /// Reconciliation must never use a partial page as the authoritative set.
     private var sessionsLoadedCompletely = false
@@ -104,13 +106,17 @@ final class AppModel {
     private var cacheControlTask: Task<Void, Never>?
     private var cacheControlGeneration = 0
     private var prefetchGeneration = 0
-    /// Core-owned generation guard used by opening and terminal reconciliation.
+    /// Core-owned generation guard used to invalidate superseded opens.
+    private struct PendingMessageRoute: Equatable {
+        let location: MessageLocation
+        let generation: Int
+    }
+    private var pendingMessageRoute: PendingMessageRoute?
     private let openGenerations = OpenGenerationController()
     private var streamingReducer = StreamingEventReducer()
 
     private static let serverKey = "serverURL"
     private static let defaultServer = "https://hermes-dashboard.kayg.org"
-    private static let archiveToastID = ToastID("archive")
 
     private static var storedServer: String {
         UserDefaults.standard.string(forKey: serverKey) ?? defaultServer
@@ -127,10 +133,12 @@ final class AppModel {
     init(
         cache: HistoryCache = HistoryCache(),
         transcriptSource: (any TranscriptSource)? = nil,
-        toastPresenter: ToastPresenter = ToastPresenter()
+        toastPresenter: ToastPresenter = ToastPresenter(),
+        organizationStore: SessionOrganizationStore = SessionOrganizationStore()
     ) {
         self.injectedTranscriptSource = transcriptSource
         self.toastPresenter = toastPresenter
+        self.organizationStore = organizationStore
 
         guard let historyDirectory = HistoryCache.defaultDirectory() else {
             self.cache = cache
@@ -160,6 +168,7 @@ final class AppModel {
     /// Reconnect silently when a stored session is already present, so a
     /// relaunch lands straight in the chat.
     func restoreOrPromptSignIn() async {
+        await loadOrganizationIfNeeded()
         // Cache disablement is a privacy/storage promise and must not depend
         // on auth or network success. Recover an interrupted purge before
         // attempting either.
@@ -189,7 +198,44 @@ final class AppModel {
         await connect()
     }
 
+    private func loadOrganizationIfNeeded() async {
+        guard !organizationLoaded else {
+            applyOrganizationForCurrentGateway()
+            return
+        }
+        do {
+            let organization = try await organizationStore.load()
+            organizationLoaded = true
+            applyOrganization(organization)
+        } catch {
+            postError("Could not load sidebar organization", detail: error.localizedDescription)
+        }
+    }
+
+    /// The only seam that publishes organization state. The snapshot and all
+    /// visible fields change together, so reconnects cannot restore launch
+    /// state over a successful mutation.
+    private func applyOrganization(_ organization: SessionOrganization) {
+        organizationSnapshot = organization
+        sortMode = organization.sort.mode
+        groupByDate = organization.grouping.byDate
+        folders = organization.folders
+        membership = configuredGatewayHost
+            .flatMap { organization.gateways[$0]?.folderMembership }
+            ?? [:]
+    }
+
+    private func applyOrganizationForCurrentGateway() {
+        guard let organization = organizationSnapshot else { return }
+        applyOrganization(organization)
+    }
+
+    private func refreshOrganizationAfterMutation() async throws {
+        applyOrganization(try await organizationStore.load())
+    }
+
     func signIn() async {
+        await loadOrganizationIfNeeded()
         guard let url = serverURL else {
             phase = .failed(AuthError.badServerURL.localizedDescription)
             return
@@ -214,6 +260,7 @@ final class AppModel {
 
     func signOut() async {
         _ = openGenerations.begin()
+        pendingMessageRoute = nil
         eventTask?.cancel()
         eventTask = nil
         prefetchTask?.cancel()
@@ -285,6 +332,7 @@ final class AppModel {
     // MARK: - Connection
 
     private func connect() async {
+        await loadOrganizationIfNeeded()
         guard let auth, let url = serverURL else { return }
         phase = .connecting
         do {
@@ -343,6 +391,106 @@ final class AppModel {
             postError("Could not load sessions", detail: error.localizedDescription)
         }
     }
+    // MARK: - Sidebar organization
+
+    func copyDeepLink(for session: ChatSession) {
+        guard let host = configuredGatewayHost,
+              let link = MessageDeepLink(gatewayHost: host, sessionID: session.id)
+        else {
+            postError("Could not copy deep link", detail: "The gateway address is unavailable.")
+            return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(link.url.absoluteString, forType: .string)
+    }
+
+    func createFolder(named name: String) async {
+        do {
+            _ = try await organizationStore.createFolder(name: name)
+            try await refreshOrganizationAfterMutation()
+        } catch {
+            postError("Could not create folder", detail: error.localizedDescription)
+        }
+    }
+
+    func renameFolder(id: String, to name: String) async {
+        do {
+            try await organizationStore.renameFolder(id: id, name: name)
+            try await refreshOrganizationAfterMutation()
+        } catch {
+            postError("Could not rename folder", detail: error.localizedDescription)
+        }
+    }
+
+    func deleteFolder(id: String) async {
+        do {
+            _ = try await organizationStore.deleteFolder(id: id)
+            try await refreshOrganizationAfterMutation()
+        } catch {
+            postError("Could not delete folder", detail: error.localizedDescription)
+        }
+    }
+    func reorderFolders(ids: [String]) async {
+        do {
+            try await organizationStore.reorderFolders(ids: ids)
+            try await refreshOrganizationAfterMutation()
+        } catch {
+            postError("Could not reorder folders", detail: error.localizedDescription)
+        }
+    }
+
+
+    func assign(_ session: ChatSession, toFolder folderID: String) async {
+        guard let host = configuredGatewayHost else {
+            postError("Could not move chat", detail: "The gateway address is unavailable.")
+            return
+        }
+        do {
+            try await organizationStore.assignChat(
+                sessionID: session.id,
+                toFolderID: folderID,
+                gatewayHost: host
+            )
+            try await refreshOrganizationAfterMutation()
+        } catch {
+            postError("Could not move chat", detail: error.localizedDescription)
+        }
+    }
+
+    func unassign(_ session: ChatSession) async {
+        guard let host = configuredGatewayHost else {
+            postError("Could not remove chat from folder", detail: "The gateway address is unavailable.")
+            return
+        }
+        do {
+            try await organizationStore.clearChatAssignment(
+                sessionID: session.id,
+                gatewayHost: host
+            )
+            try await refreshOrganizationAfterMutation()
+        } catch {
+            postError("Could not remove chat from folder", detail: error.localizedDescription)
+        }
+    }
+
+    func setSortMode(_ mode: SortMode) async {
+        do {
+            try await organizationStore.setSortMode(mode)
+            try await refreshOrganizationAfterMutation()
+        } catch {
+            postError("Could not save sidebar sorting", detail: error.localizedDescription)
+        }
+    }
+
+    func setGroupByDate(_ enabled: Bool) async {
+        do {
+            try await organizationStore.setGrouping(byDate: enabled)
+            try await refreshOrganizationAfterMutation()
+        } catch {
+            postError("Could not save sidebar grouping", detail: error.localizedDescription)
+        }
+    }
+
     /// Changes the server pin state without waiting for the network to move the row.
     func setPinned(_ session: ChatSession, pinned: Bool) async {
         guard let index = sessions.firstIndex(where: { $0.id == session.id }) else { return }
@@ -467,7 +615,7 @@ final class AppModel {
             guard archived else { return }
             toastPresenter.post(
                 ToastMessage(
-                    id: Self.archiveToastID,
+                    id: ToastID("archive-\(session.id)-\(UUID().uuidString)"),
                     title: "Chat archived",
                     severity: .success,
                     action: ToastAction(label: "Undo"),
@@ -698,9 +846,9 @@ final class AppModel {
         }
         cacheBytes = max(0, cacheBytes + result.byteDelta)
     }
-
     func newChat() async {
         _ = openGenerations.begin()
+        pendingMessageRoute = nil
         guard let gateway else { return }
         do {
             let result = try await gateway.call("session.create")
@@ -744,12 +892,17 @@ final class AppModel {
     }
     @discardableResult
     func open(_ session: ChatSession) async -> Bool {
+        let generation = openGenerations.begin()
+        pendingMessageRoute = nil
+        return await open(session, generation: generation)
+    }
+
+    private func open(_ session: ChatSession, generation: Int) async -> Bool {
         guard let source = transcriptSource(for: session) else {
             postError("Could not open chat \(session.id)", detail: "The gateway is unavailable.")
             return false
         }
 
-        let generation = openGenerations.begin()
         selectedSessionID = session.id
 
         let opener = TranscriptOpener(
@@ -785,11 +938,21 @@ final class AppModel {
         }
         return true
     }
-    /// Opens the target chat and hands a durable target to ChatView only
-    /// after all transcript phases have finished. ChatView consumes and
-    /// clears the target once its row is ready, then performs the animated
-    /// scroll.
-    func openThenScroll(to location: MessageLocation) async {
+    /// Opens the target chat at its newest message.
+    func openChat(sessionID: String) async {
+        let generation = openGenerations.begin()
+        pendingMessageRoute = nil
+        guard let session = sessions.first(where: { $0.id == sessionID }) else {
+            postError("Could not open chat", detail: "The chat no longer exists.")
+            return
+        }
+        _ = await open(session, generation: generation)
+    }
+
+    /// Opens a chat with a message target available during its first layout.
+    func open(at location: MessageLocation) async {
+        let generation = openGenerations.begin()
+        pendingMessageRoute = nil
         guard !location.sessionID.isEmpty,
               let session = sessions.first(where: { $0.id == location.sessionID })
         else {
@@ -797,16 +960,24 @@ final class AppModel {
             return
         }
 
-        pendingMessageLocation = nil
-        guard await open(session) else { return }
+        pendingMessageRoute = PendingMessageRoute(location: location, generation: generation)
+        let opened = await open(session, generation: generation)
+        guard pendingMessageRoute?.generation == generation else { return }
+        guard opened else {
+            pendingMessageRoute = nil
+            return
+        }
 
-        guard selectedSessionID == location.sessionID else { return }
+        guard selectedSessionID == location.sessionID else {
+            pendingMessageRoute = nil
+            return
+        }
         let targetIdentity = MessageIdentity.server(location.messageID)
         guard messages.contains(where: { $0.id == targetIdentity }) else {
+            pendingMessageRoute = nil
             postError("Could not open that message", detail: "It is no longer available.")
             return
         }
-        pendingMessageLocation = location
     }
     // MARK: - Prompting
 

@@ -22,9 +22,16 @@ struct HermternalApp: App {
     init() {
         let fixtureMode = SidebarFixtures.isEnabled
         self.fixtureMode = fixtureMode
-        let model = AppModel()
+        let model = fixtureMode
+            ? AppModel(transcriptSource: SidebarFixtures.transcriptSource)
+            : AppModel()
         if fixtureMode {
+            // Keep fixture authority in memory only. Never write it to the
+            // production server setting or credential stores.
+            model.serverText = SidebarFixtures.gatewayURL.absoluteString
             model.sessions = SidebarFixtures.sessions
+            model.selectedSessionID = SidebarFixtures.transcriptSessionID
+            model.messages = SidebarFixtures.transcriptMessages
             model.phase = .ready
         }
         _model = State(initialValue: model)
@@ -77,7 +84,14 @@ struct HermternalApp: App {
                     )
                     return
                 }
-                Task { await model.openThenScroll(to: link.location) }
+                Task {
+                    switch link.destination {
+                    case .chat(let sessionID):
+                        await model.openChat(sessionID: sessionID)
+                    case .message(let location):
+                        await model.open(at: location)
+                    }
+                }
             }
             .task {
                 guard !fixtureMode else { return }
