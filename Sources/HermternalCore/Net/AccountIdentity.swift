@@ -39,10 +39,13 @@ public struct AccountIdentity: Codable, Equatable, Sendable {
     }
 }
 
-/// The account label and optional secondary detail rendered by composition.
+/// The identity at the foot of the sidebar: the gateway, and the account.
 ///
-/// `accountID` remains available for an accessibility label or tooltip when
-/// the visible title is the intentionally truncated account identifier.
+/// `title` is the gateway. A person needs the gateway to tell two windows
+/// apart when each window uses a different backend. `detail` is the
+/// human-readable account name, if the gateway supplies one. `accountID` is
+/// available for a tooltip and for an accessibility label. `accountID` never
+/// takes a visible line, because an opaque identifier is not a name.
 public struct AccountIdentityPresentation: Equatable, Sendable {
     public let title: String
     public let detail: String?
@@ -57,64 +60,61 @@ public struct AccountIdentityPresentation: Equatable, Sendable {
 
 /// Pure account-label resolution shared by platform compositions.
 public enum AccountIdentityResolver {
-    /// Resolves the account label in priority order:
-    /// display name, email, truncated account ID, provider display name,
-    /// gateway host, then the configured URL.
+    /// Resolves the sidebar identity. The gateway is first. A human-readable
+    /// account name is second.
     ///
-    /// Empty or whitespace-only values are treated as absent. The account ID
-    /// is deliberately presented as an account label, never as a person's
-    /// name. Hermes's web widget truncates IDs after 14 characters; matching
-    /// that rule keeps both surfaces recognizable while `accountID` retains
-    /// the complete value for a tooltip.
+    /// Empty values and whitespace-only values are absent. The gateway label
+    /// contains a host and an explicit port only. It never contains a scheme,
+    /// a path, a query, or credentials. If the configuration gives no host,
+    /// the label is the account name, then the provider name. The label is
+    /// never the complete URL.
     public static func resolve(
         identity: AccountIdentity?,
         provider: AuthProvider?,
         gateway: URL
     ) -> AccountIdentityPresentation {
-        let displayName = nonEmpty(identity?.displayName)
-        let email = nonEmpty(identity?.email)
         let userID = nonEmpty(identity?.userID)
-        let organizationID = nonEmpty(identity?.orgID)
-        let providerName = nonEmpty(provider?.displayName)
-        let host = nonEmpty(gateway.host)
-        let configuredURL = nonEmpty(gateway.absoluteString) ?? gateway.absoluteString
+        // The order in which a person recognizes an account. The account ID
+        // is not in this chain, because an identifier is not a name.
+        let accountName = nonEmpty(identity?.displayName)
+            ?? nonEmpty(identity?.email)
+            ?? nonEmpty(identity?.orgID)
 
-        if let displayName {
+        if let gatewayName = gatewayLabel(for: gateway) {
             return AccountIdentityPresentation(
-                title: displayName,
-                detail: email ?? organizationID,
+                title: gatewayName,
+                detail: accountName,
                 accountID: userID
             )
         }
-        if let email {
-            return AccountIdentityPresentation(
-                title: email,
-                detail: organizationID,
-                accountID: userID
-            )
+        if let accountName {
+            return AccountIdentityPresentation(title: accountName, accountID: userID)
         }
-        if let userID {
-            return AccountIdentityPresentation(
-                title: truncateAccountID(userID),
-                detail: organizationID,
-                accountID: userID
-            )
-        }
-        if let providerName {
-            return AccountIdentityPresentation(title: providerName, detail: organizationID)
-        }
-        if let host {
-            return AccountIdentityPresentation(title: host, detail: configuredURL == host ? nil : configuredURL)
-        }
-        return AccountIdentityPresentation(title: configuredURL)
+        return AccountIdentityPresentation(
+            title: nonEmpty(provider?.displayName) ?? Self.unnamedGateway,
+            accountID: userID
+        )
     }
 
-    /// Hermes's web widget returns the first 14 characters and a horizontal
-    /// ellipsis for longer IDs.
-    public static func truncateAccountID(_ userID: String) -> String {
-        guard userID.count > 14 else { return userID }
-        return String(userID.prefix(14)) + "…"
+    /// The gateway host, and the port if the URL gives one.
+    ///
+    /// The result is absent if the URL has no authority component. Such a URL
+    /// is a misconfiguration. Its path can also contain a token, and this
+    /// function must not show a token.
+    public static func gatewayLabel(for gateway: URL) -> String? {
+        guard let host = nonEmpty(gateway.host(percentEncoded: false)) else {
+            return nil
+        }
+        // Foundation removes the brackets from an IPv6 literal. Without the
+        // brackets, a reader cannot tell the address from the port.
+        let authority = host.contains(":") ? "[\(host)]" : host
+        guard let port = gateway.port else { return authority }
+        return "\(authority):\(port)"
     }
+
+    /// Used only if the configuration gives no host and the account has no
+    /// name. Every other value would show a URL or an opaque identifier.
+    public static let unnamedGateway = "No gateway"
 
     private static func nonEmpty(_ value: String?) -> String? {
         guard let value else { return nil }

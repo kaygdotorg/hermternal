@@ -80,8 +80,8 @@ func accountIdentityFetchUsesBearerToken() async throws {
     #expect(identity.userID == "sub-123")
 }
 
-@Test("identity display resolution uses each source in priority order")
-func accountIdentityFallbackChain() {
+@Test("the gateway is the primary label and the human name the secondary")
+func gatewayLeadsAndAccountNameFollows() {
     let gateway = URL(string: "https://gateway.example/instance")!
     let provider = AuthProvider(name: "self-hosted", displayName: "Self-Hosted OIDC", supportsPassword: false)
 
@@ -89,52 +89,105 @@ func accountIdentityFallbackChain() {
         identity: AccountIdentity(userID: "sub-123", email: "ada@example.com", displayName: "Ada", orgID: "org-7"),
         provider: provider,
         gateway: gateway
-    ) == AccountIdentityPresentation(title: "Ada", detail: "ada@example.com", accountID: "sub-123"))
+    ) == AccountIdentityPresentation(title: "gateway.example", detail: "Ada", accountID: "sub-123"))
     #expect(AccountIdentityResolver.resolve(
         identity: AccountIdentity(userID: "sub-123", email: "ada@example.com", orgID: "org-7"),
         provider: provider,
         gateway: gateway
-    ) == AccountIdentityPresentation(title: "ada@example.com", detail: "org-7", accountID: "sub-123"))
-    #expect(AccountIdentityResolver.resolve(
-        identity: AccountIdentity(userID: "sub-123456789012345", orgID: "org-7"),
-        provider: provider,
-        gateway: gateway
-    ) == AccountIdentityPresentation(title: "sub-1234567890…", detail: "org-7", accountID: "sub-123456789012345"))
+    ) == AccountIdentityPresentation(title: "gateway.example", detail: "ada@example.com", accountID: "sub-123"))
     #expect(AccountIdentityResolver.resolve(
         identity: AccountIdentity(),
         provider: provider,
         gateway: gateway
-    ) == AccountIdentityPresentation(title: "Self-Hosted OIDC"))
+    ) == AccountIdentityPresentation(title: "gateway.example"))
     #expect(AccountIdentityResolver.resolve(
         identity: nil,
         provider: nil,
         gateway: gateway
-    ) == AccountIdentityPresentation(title: "gateway.example", detail: "https://gateway.example/instance"))
+    ) == AccountIdentityPresentation(title: "gateway.example"))
 }
 
-@Test("blank human fields select the account ID, never an empty label")
-func blankHumanFieldsUseAccountID() {
-    let identity = AccountIdentity(userID: "account-identifier-123", email: "", displayName: " ")
-    let presentation = AccountIdentityResolver.resolve(
-        identity: identity,
-        provider: AuthProvider(name: "self-hosted", displayName: "Self-Hosted OIDC", supportsPassword: false),
+@Test("an opaque account identifier never occupies a visible line")
+func accountIdentifierStaysOutOfSight() {
+    let provider = AuthProvider(name: "self-hosted", displayName: "Self-Hosted OIDC", supportsPassword: false)
+    // The self-hosted gateway returns a subject only. This case put an
+    // identifier in the sidebar before.
+    let anonymous = AccountIdentityResolver.resolve(
+        identity: AccountIdentity(userID: "sub-123456789012345", orgID: "org-7"),
+        provider: provider,
+        gateway: URL(string: "https://gateway.example/instance")!
+    )
+    #expect(anonymous == AccountIdentityPresentation(
+        title: "gateway.example",
+        detail: "org-7",
+        accountID: "sub-123456789012345"
+    ))
+
+    // Blank fields are absent, not an empty label. The subject must stay out
+    // of both visible lines.
+    let blank = AccountIdentityResolver.resolve(
+        identity: AccountIdentity(userID: "account-identifier-123", email: "", displayName: " "),
+        provider: provider,
         gateway: URL(string: "https://gateway.example")!
     )
-    // 14 characters plus U+2026, matching the Hermes web widget exactly.
-    #expect(presentation.title == "account-identi…")
-    #expect(presentation.accountID == "account-identifier-123")
+    #expect(blank.title == "gateway.example")
+    #expect(blank.detail == nil)
+    // Retained for the tooltip and the accessibility label only.
+    #expect(blank.accountID == "account-identifier-123")
 }
 
-@Test("account ID truncation matches the web widget boundary")
-func accountIDTruncationBoundary() {
-    #expect(AccountIdentityResolver.truncateAccountID("12345678901234") == "12345678901234")
-    #expect(AccountIdentityResolver.truncateAccountID("123456789012345") == "12345678901234…")
+@Test("a gateway label carries an explicit port and nothing else")
+func gatewayLabelKeepsHostAndPort() {
+    #expect(AccountIdentityResolver.gatewayLabel(
+        for: URL(string: "https://hermes-dashboard.kayg.org/api")!
+    ) == "hermes-dashboard.kayg.org")
+    #expect(AccountIdentityResolver.gatewayLabel(
+        for: URL(string: "https://gateway.example:8443/api/")!
+    ) == "gateway.example:8443")
+    #expect(AccountIdentityResolver.gatewayLabel(
+        for: URL(string: "http://localhost:8787")!
+    ) == "localhost:8787")
+    // Foundation removes the brackets from an IPv6 literal. Without the
+    // brackets, a reader cannot tell the address from the port.
+    #expect(AccountIdentityResolver.gatewayLabel(
+        for: URL(string: "http://[::1]:8787/api")!
+    ) == "[::1]:8787")
 }
 
-@Test("a configured URL is the final fallback when no host is known")
-func configuredURLFallback() {
-    let gateway = URL(string: "gateway.example/config")!
-    #expect(AccountIdentityResolver.resolve(identity: nil, provider: nil, gateway: gateway).title == "gateway.example/config")
+@Test("no scheme, path, credential, query, or trailing slash reaches the pill")
+func gatewayLabelWithholdsSecrets() throws {
+    let loaded = URL(string: "https://ada:s3cr3t@gateway.example/api/v1/?token=abcdef#frag")!
+    let label = try #require(AccountIdentityResolver.gatewayLabel(for: loaded))
+
+    #expect(label == "gateway.example")
+    for secret in ["https", "://", "ada", "s3cr3t", "@", "/", "api", "token", "abcdef", "frag"] {
+        #expect(!label.contains(secret), "\(label) leaked \(secret)")
+    }
+}
+
+@Test("a configuration naming no host falls back without showing the URL")
+func hostlessConfigurationFallsBackToNames() {
+    // A relative URL has no authority component. Its path can contain a
+    // token, so the label must not use the path.
+    let hostless = URL(string: "gateway.example/config?token=abcdef")!
+    #expect(AccountIdentityResolver.gatewayLabel(for: hostless) == nil)
+
+    let provider = AuthProvider(name: "self-hosted", displayName: "Self-Hosted OIDC", supportsPassword: false)
+    #expect(AccountIdentityResolver.resolve(
+        identity: AccountIdentity(userID: "sub-123", displayName: "Ada"),
+        provider: provider,
+        gateway: hostless
+    ) == AccountIdentityPresentation(title: "Ada", accountID: "sub-123"))
+    #expect(AccountIdentityResolver.resolve(
+        identity: AccountIdentity(userID: "sub-123"),
+        provider: provider,
+        gateway: hostless
+    ) == AccountIdentityPresentation(title: "Self-Hosted OIDC", accountID: "sub-123"))
+    #expect(AccountIdentityResolver.resolve(
+        identity: nil,
+        provider: nil,
+        gateway: hostless
+    ) == AccountIdentityPresentation(title: AccountIdentityResolver.unnamedGateway))
 }
 
 @Test("web socket tickets preserve optional TTL")
