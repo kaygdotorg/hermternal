@@ -288,3 +288,246 @@ public struct ToastQueue: Sendable, Equatable {
         }
     }
 }
+
+// MARK: - Swipe dismissal
+
+/// What a released toast drag asks for.
+public enum ToastSwipeOutcome: Hashable, Sendable {
+    case dismiss
+    case restore
+}
+
+/// One released toast drag, in points and monotonic wall-clock time.
+///
+/// `travel` and `projectedTravel` point toward the exit edge: a positive value
+/// moves the card away, a negative value moves it back into the stack. The
+/// view layer applies the sign, so this type never learns which edge it is.
+public struct ToastSwipe: Hashable, Sendable {
+    /// Distance the pointer covered, measured toward the exit edge.
+    public var travel: Double
+
+    /// Where the platform projects the drag to stop, measured the same way.
+    public var projectedTravel: Double
+
+    /// Time from the first drag update to the release.
+    public var elapsed: Duration
+
+    public init(travel: Double, projectedTravel: Double = 0, elapsed: Duration = .zero) {
+        self.travel = travel
+        self.projectedTravel = projectedTravel
+        self.elapsed = elapsed
+    }
+
+    /// Mean speed over the whole drag, in points per millisecond.
+    ///
+    /// The threshold this feeds is an average, not the speed at release. A
+    /// deliberate 300 pt drag over 3 s must restore, and its instantaneous
+    /// speed is above the threshold for the whole drag. `max(_:1)` keeps a
+    /// zero-length drag from dividing by zero.
+    public var averageSpeed: Double {
+        travel / max(elapsed.toastMilliseconds, 1)
+    }
+}
+
+/// The numbers that decide a toast dismissal.
+public struct ToastSwipeThresholds: Hashable, Sendable {
+    /// Travel that dismisses on distance alone.
+    public var distance: Double
+
+    /// Projected travel that dismisses, so a flick needs no distance.
+    public var projectedDistance: Double
+
+    /// Mean speed that dismisses, in points per millisecond.
+    public var averageSpeed: Double
+
+    /// Travel below which speed cannot dismiss. A 2 pt twitch in 4 ms has a
+    /// mean speed of 0.5 pt/ms, so speed alone needs a jitter guard.
+    public var minimumTravelForSpeed: Double
+
+    /// The value the card approaches when the drag goes the wrong way.
+    public var resistanceLimit: Double
+
+    public init(
+        distance: Double = 40,
+        projectedDistance: Double = 40,
+        averageSpeed: Double = 0.11,
+        minimumTravelForSpeed: Double = 12,
+        resistanceLimit: Double = 36
+    ) {
+        self.distance = distance
+        self.projectedDistance = projectedDistance
+        self.averageSpeed = averageSpeed
+        self.minimumTravelForSpeed = minimumTravelForSpeed
+        self.resistanceLimit = resistanceLimit
+    }
+
+    public static let `default` = ToastSwipeThresholds()
+
+    /// Damped translation for a drag that moves away from the exit edge.
+    ///
+    /// Monotonic and asymptotic at `resistanceLimit`, so the card never stops
+    /// dead against an invisible wall. Travel toward the exit passes 1:1,
+    /// because direct manipulation must track the pointer exactly.
+    ///
+    /// A positive `translation` moves away from the exit edge.
+    public func resisted(_ translation: Double) -> Double {
+        guard translation > 0 else { return translation }
+        return resistanceLimit * (1 - 1 / (translation / resistanceLimit + 1))
+    }
+}
+
+/// The dismissal decision for a released toast drag.
+///
+/// Pure, so the one part of the toast surface that needs no pixel is tested
+/// without one. Order matters: distance first, then the platform's own
+/// momentum projection, then mean speed behind the jitter guard.
+public func toastSwipeOutcome(
+    _ swipe: ToastSwipe,
+    thresholds: ToastSwipeThresholds = .default
+) -> ToastSwipeOutcome {
+    guard swipe.travel > 0 else { return .restore }
+    if swipe.travel >= thresholds.distance { return .dismiss }
+    if swipe.projectedTravel >= thresholds.projectedDistance { return .dismiss }
+    if swipe.travel >= thresholds.minimumTravelForSpeed,
+       swipe.averageSpeed > thresholds.averageSpeed {
+        return .dismiss
+    }
+    return .restore
+}
+
+private extension Duration {
+    /// This duration in milliseconds.
+    ///
+    /// `Duration` exposes no millisecond accessor, and `components` avoids the
+    /// overflow that scaling attoseconds in one integer would risk.
+    var toastMilliseconds: Double {
+        let parts = components
+        return Double(parts.seconds) * 1_000
+            + Double(parts.attoseconds) / 1_000_000_000_000_000
+    }
+}
+
+// MARK: - Stack geometry
+
+/// The stack arithmetic for the toast surface, in points.
+///
+/// It lives here, and not in the view, for two reasons: it is testable without
+/// a window, and it is the single home for every number the stack uses. It
+/// uses `Double` rather than `CGFloat` so this module keeps importing
+/// `Foundation` alone; the view converts at the boundary.
+public enum ToastStackGeometry {
+    /// The visible sliver between two stacked cards. It equals the card corner
+    /// radius, so the sliver equals the corner it reveals.
+    public static let gap: Double = 14
+
+    /// How much smaller each card behind the front card is drawn.
+    public static let scaleStep: Double = 0.05
+
+    /// The opacity step that replaces `scaleStep` under reduced motion, where
+    /// depth must not be carried by a size change.
+    public static let reducedOpacityStep: Double = 0.08
+
+    /// Cards drawn at once. `ToastPolicy.visibleLimit` bounds the queue; this
+    /// bounds the view as well, so a later policy change cannot make the view
+    /// draw an unbounded stack.
+    public static let renderedLimit = 3
+
+    /// The height of a card that is not measured yet: the 44 pt minimum height
+    /// plus 2 x 11 pt of vertical padding.
+    public static let estimatedCardHeight: Double = 66
+
+    /// Clearance a flung card needs beyond the stack so that its shadow
+    /// (radius 14, offset y 8) also leaves the surface.
+    public static let flingHeadroom: Double = 24
+
+    /// Card width, and the total horizontal inset that keeps it off the
+    /// window edges. The toast is deliberately narrower than the search
+    /// panel: the two surfaces share only their vertical origin.
+    public static let maximumWidth: Double = 360
+    public static let horizontalInset: Double = 32
+
+    /// The scale an arriving card grows from. Far from zero, because nothing
+    /// appears from nothing.
+    public static let enterScale: Double = 0.94
+
+    /// Where an arriving card starts, and where a leaving card ends.
+    public static let enterOffset: Double = -12
+    public static let exitOffset: Double = -10
+
+    /// Opacity a card loses at the dismissal distance under reduced motion,
+    /// where the drag reports progress by colour instead of position.
+    public static let dragFeedbackFade: Double = 0.4
+
+    public static func width(in containerWidth: Double) -> Double {
+        min(maximumWidth, max(0, containerWidth - horizontalInset))
+    }
+
+    /// Offset of a card in the collapsed stack: one gap for each card in
+    /// front of it, which leaves exactly one sliver of each card visible.
+    public static func collapsedOffset(depth: Int) -> Double {
+        Double(depth) * gap
+    }
+
+    /// Offset of a card in the expanded stack: every preceding card's height
+    /// plus a gap after each. It never includes the card's own height, which
+    /// would drift the whole stack down by one card.
+    public static func expandedOffset(depth: Int, heights: [Double]) -> Double {
+        guard depth > 0 else { return 0 }
+        let preceding = heights.prefix(depth)
+        return preceding.reduce(0, +) + Double(preceding.count) * gap
+    }
+
+    public static func depthScale(depth: Int, reduceMotion: Bool) -> Double {
+        reduceMotion ? 1 : 1 - Double(depth) * scaleStep
+    }
+
+    /// Opacity that carries depth when scale cannot.
+    ///
+    /// With motion allowed, scale and shadow carry depth and every card is
+    /// fully opaque: fading a translucent surface would double-dip. Under
+    /// reduced motion, opacity is the only depth cue left.
+    public static func depthOpacity(depth: Int, reduceMotion: Bool) -> Double {
+        reduceMotion ? 1 - Double(depth) * reducedOpacityStep : 1
+    }
+
+    /// Height of the collapsed stack: the front card plus one gap for each
+    /// card behind it, because the cards behind adopt the front height.
+    public static func stackedHeight(of heights: [Double]) -> Double {
+        guard let front = heights.first else { return 0 }
+        return front + Double(heights.count - 1) * gap
+    }
+
+    /// Height of the expanded stack: every card plus the gaps between them.
+    public static func expandedHeight(of heights: [Double]) -> Double {
+        guard !heights.isEmpty else { return 0 }
+        return heights.reduce(0, +) + Double(heights.count - 1) * gap
+    }
+
+    public static func regionHeight(of heights: [Double], expanded: Bool) -> Double {
+        expanded ? expandedHeight(of: heights) : stackedHeight(of: heights)
+    }
+
+    /// Opacity that reports drag progress without moving the card, for
+    /// reduced motion. A colour change, which reduced motion keeps.
+    public static func dragFeedbackOpacity(
+        travel: Double,
+        thresholds: ToastSwipeThresholds = .default
+    ) -> Double {
+        1 - dragFeedbackFade * min(1, max(0, travel) / thresholds.distance)
+    }
+
+    /// The measured heights that are still in use.
+    ///
+    /// The view measures one height per card and keys it by toast id. Those
+    /// ids are fresh UUIDs, so a store that is never pruned grows for the
+    /// whole process lifetime. Returns the input untouched when there is
+    /// nothing to drop, so a live measurement never rewrites the store.
+    public static func pruned<Value>(
+        _ heights: [ToastID: Value],
+        keeping ids: some Sequence<ToastID>
+    ) -> [ToastID: Value] {
+        let live = Set(ids)
+        guard heights.contains(where: { !live.contains($0.key) }) else { return heights }
+        return heights.filter { live.contains($0.key) }
+    }
+}
