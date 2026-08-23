@@ -224,6 +224,14 @@ func gatewayMembershipIsScoped() async throws {
         ]
     ))
 
+    try await store.assignChat(sessionID: "new-session", toFolderID: "work", gatewayHost: "gateway-a")
+    try await store.clearChatAssignment(sessionID: "a-session", gatewayHost: "gateway-a")
+    let reloaded = try await SessionOrganizationStore(directory: directory).load()
+
+    #expect(reloaded.gateways["gateway-a"]?.folderMembership == ["new-session": "work"])
+    #expect(reloaded.gateways["gateway-b"]?.folderMembership == ["b-session": "work"])
+}
+
 @Test("Duplicate folder names receive distinct stable IDs")
 func duplicateFolderNamesHaveDistinctIDs() async throws {
     let directory = try makeOrganizationTestDirectory()
@@ -237,14 +245,6 @@ func duplicateFolderNamesHaveDistinctIDs() async throws {
     #expect(first.id != second.id)
     #expect(first.name == second.name)
     #expect(reloaded.folders.map(\.id) == [first.id, second.id])
-}
-
-    try await store.assignChat(sessionID: "new-session", toFolderID: "work", gatewayHost: "gateway-a")
-    try await store.clearChatAssignment(sessionID: "a-session", gatewayHost: "gateway-a")
-    let reloaded = try await SessionOrganizationStore(directory: directory).load()
-
-    #expect(reloaded.gateways["gateway-a"]?.folderMembership == ["new-session": "work"])
-    #expect(reloaded.gateways["gateway-b"]?.folderMembership == ["b-session": "work"])
 }
 
 @Test("Reassigning a chat replaces its folder")
@@ -286,6 +286,18 @@ func noChangeFolderMutationSkipsWrite() async throws {
     #expect(writesAfterInitialSave == 1)
     #expect(writesAfterAssignment == 2)
     #expect(fileSystem.atomicWriteCount == writesAfterAssignment)
+}
+
+@Test("No-change mutation on a missing file performs no write")
+func noChangeMutationOnMissingFileSkipsWrite() async throws {
+    let directory = try makeOrganizationTestDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let fileSystem = CountingOrganizationFileSystem()
+    let store = SessionOrganizationStore(directory: directory, fileSystem: fileSystem)
+
+    try await store.setGrouping(byDate: true)
+
+    #expect(fileSystem.atomicWriteCount == 0)
 }
 
 @Test("Reordering requires the complete folder permutation")

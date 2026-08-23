@@ -1,11 +1,13 @@
 #!/bin/bash
 # Build, sign, notarize, staple, and package Hermternal as a zip for distribution.
 #
-# Run Scripts/setup-signing.sh first: this script needs a Developer ID
-# Application identity in the keychain. Notarization uses ASC_KEY_PATH,
-# ASC_KEY_ID, and ASC_ISSUER_ID from .env when present, or falls back to
-# the stored notarytool profile. Run codesign in the Mac's own login session;
-# the private-key ACL cannot prompt over ssh.
+# Run Scripts/setup-signing.sh first for the normal interactive setup. For
+# non-interactive SSH, set CODESIGN_P12_PATH and
+# CODESIGN_P12_PASSWORD_FILE, or place one .p12 and password.txt under
+# ~/.config/appstoreconnect. The release creates a temporary keychain from
+# those files and removes it before exiting.
+# Notarization uses ASC_KEY_PATH, ASC_KEY_ID, and ASC_ISSUER_ID from .env
+# when present, or falls back to the stored notarytool profile.
 #
 # Notarization uploads the app to Apple and blocks until they answer, so this
 # takes minutes, not seconds. Stapling writes the resulting ticket into the
@@ -72,21 +74,119 @@ case "$CODESIGN_IDENTITY" in
 Apple rejects anything else for notarized distribution. Got: $CODESIGN_IDENTITY" ;;
 esac
 
-# The private key lives in the login keychain, which only the Mac's own login
-# session can unlock. Over ssh the Security framework cannot prompt and
-# codesign fails with "User interaction is not allowed" -- after the build.
-# Check up front instead.
-IDENTITIES="$(security find-identity -v -p codesigning 2>&1)" ||
-	die "cannot inspect signing identities. A human at the Mac's physical \
-keyboard must run this from Terminal.app or an interactive ssh -t session; \
-this CANNOT be automated or scripted. An automated caller must stop and \
-report this failure."
-grep -qF "$CODESIGN_IDENTITY" <<<"$IDENTITIES" ||
-	die "codesign cannot reach '$CODESIGN_IDENTITY'. The login keychain is \
-locked or unreadable. A human at the Mac's physical keyboard must use \
-Terminal.app or an interactive ssh -t session, not a non-interactive SSH \
-call, then unlock first with: security unlock-keychain. This CANNOT be \
-automated or scripted; an automated caller must stop and report this failure."
+# If a portable signing identity is available, import it into a fresh
+# keychain. This avoids depending on the login keychain's GUI security
+# session while retaining the existing login-keychain path as a fallback.
+CREDENTIAL_DIR="$HOME/.config/appstoreconnect"
+SIGNING_P12_PATH="${CODESIGN_P12_PATH:-}"
+SIGNING_PASSWORD_FILE="${CODESIGN_P12_PASSWORD_FILE:-}"
+if [[ "$SIGNING_P12_PATH" == "~/"* ]]; then
+	SIGNING_P12_PATH="$HOME/${SIGNING_P12_PATH#~/}"
+fi
+if [[ "$SIGNING_PASSWORD_FILE" == "~/"* ]]; then
+	SIGNING_PASSWORD_FILE="$HOME/${SIGNING_PASSWORD_FILE#~/}"
+fi
+if [[ -z "$SIGNING_P12_PATH" && -d "$CREDENTIAL_DIR" ]]; then
+	p12_count=0
+	for candidate in "$CREDENTIAL_DIR"/*.p12; do
+		[[ -f "$candidate" ]] || continue
+		p12_count=$((p12_count + 1))
+		SIGNING_P12_PATH="$candidate"
+	done
+	(( p12_count == 1 )) || SIGNING_P12_PATH=""
+fi
+if [[ -z "$SIGNING_PASSWORD_FILE" &&
+	-f "$CREDENTIAL_DIR/password.txt" ]]; then
+	SIGNING_PASSWORD_FILE="$CREDENTIAL_DIR/password.txt"
+fi
+
+EPHEMERAL_KEYCHAIN=""
+KEYCHAIN_DIR=""
+declare -a ORIGINAL_KEYCHAINS=()
+cleanup_signing_keychain() {
+	local status=$?
+	trap - EXIT INT TERM
+	if [[ -n "$EPHEMERAL_KEYCHAIN" ]]; then
+		if (( ${#ORIGINAL_KEYCHAINS[@]} > 0 )); then
+			security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}" \
+				>/dev/null 2>&1 || printf \
+				'warning: could not restore the keychain search list\n' >&2
+		fi
+		security delete-keychain "$EPHEMERAL_KEYCHAIN" >/dev/null 2>&1 || true
+		if [[ -n "$KEYCHAIN_DIR" && -d "$KEYCHAIN_DIR" ]]; then
+			rm -rf "$KEYCHAIN_DIR"
+		fi
+	fi
+	exit "$status"
+}
+trap cleanup_signing_keychain EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+USE_EPHEMERAL_KEYCHAIN=0
+if [[ -f "$SIGNING_P12_PATH" && -f "$SIGNING_PASSWORD_FILE" ]]; then
+	USE_EPHEMERAL_KEYCHAIN=1
+	KEYCHAIN_LIST="$(security list-keychains -d user 2>&1)" ||
+		die "cannot capture the keychain search list"
+	while IFS= read -r keychain; do
+		keychain="${keychain#"${keychain%%[!$' \t\r\n']*}"}"
+		keychain="${keychain#\"}"
+		keychain="${keychain%\"}"
+		[[ -n "$keychain" ]] && ORIGINAL_KEYCHAINS+=("$keychain")
+	done <<<"$KEYCHAIN_LIST"
+	[[ ${#ORIGINAL_KEYCHAINS[@]} -gt 0 ]] ||
+		die "cannot determine the keychain search list"
+
+	[[ -d "$CREDENTIAL_DIR" ]] ||
+		die "signing credential directory is missing: $CREDENTIAL_DIR"
+	KEYCHAIN_DIR="$(mktemp -d "$CREDENTIAL_DIR/.hermternal-signing.XXXXXX")" ||
+		die "could not create a temporary signing directory"
+	KEYCHAIN_PASSWORD="$(uuidgen)$(uuidgen)" ||
+		die "could not generate a temporary keychain password"
+	EPHEMERAL_KEYCHAIN="$KEYCHAIN_DIR/signing-$RANDOM-$RANDOM.keychain-db"
+	if ! security create-keychain -p "$KEYCHAIN_PASSWORD" \
+		"$EPHEMERAL_KEYCHAIN" >/dev/null 2>&1; then
+		die "could not create the temporary signing keychain"
+	fi
+	if ! chmod 600 "$EPHEMERAL_KEYCHAIN"; then
+		die "could not restrict the temporary signing keychain"
+	fi
+	if ! security unlock-keychain -p "$KEYCHAIN_PASSWORD" \
+		"$EPHEMERAL_KEYCHAIN" >/dev/null 2>&1; then
+		die "could not unlock the temporary signing keychain"
+	fi
+	if ! security import "$SIGNING_P12_PATH" -k "$EPHEMERAL_KEYCHAIN" \
+		-f pkcs12 -T /usr/bin/codesign <"$SIGNING_PASSWORD_FILE" \
+		>/dev/null 2>&1; then
+		die "could not import the portable signing identity"
+	fi
+	if ! security set-key-partition-list \
+		-S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" \
+		"$EPHEMERAL_KEYCHAIN" >/dev/null 2>&1; then
+		die "could not grant codesign access to the temporary keychain"
+	fi
+	unset KEYCHAIN_PASSWORD
+	if ! security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}" \
+		"$EPHEMERAL_KEYCHAIN" >/dev/null 2>&1; then
+		die "could not add the temporary signing keychain to the search list"
+	fi
+fi
+
+if (( USE_EPHEMERAL_KEYCHAIN )); then
+	IDENTITIES="$(security find-identity -v -p codesigning 2>&1)" ||
+		die "cannot inspect identities in the temporary signing keychain"
+	grep -qF "$CODESIGN_IDENTITY" <<<"$IDENTITIES" ||
+		die "portable signing identity '$CODESIGN_IDENTITY' is unavailable"
+else
+	# The fallback is for local interactive builds using an installed
+	# identity. The login keychain may be locked in a non-interactive shell.
+	IDENTITIES="$(security find-identity -v -p codesigning 2>&1)" ||
+		die "cannot inspect signing identities from the login keychain"
+	grep -qF "$CODESIGN_IDENTITY" <<<"$IDENTITIES" ||
+		die "codesign cannot reach '$CODESIGN_IDENTITY'. Unlock the login \
+keychain in an interactive session, or provide CODESIGN_P12_PATH and \
+CODESIGN_P12_PASSWORD_FILE for non-interactive signing."
+fi
 xcrun notarytool history "${NOTARY_ARGS[@]}" >/dev/null 2>&1 ||
 	die "no usable notarytool credentials. Store profile '$NOTARY_PROFILE' with \
 Scripts/setup-signing.sh, or set ASC_KEY_PATH/ASC_KEY_ID/ASC_ISSUER_ID in .env."
