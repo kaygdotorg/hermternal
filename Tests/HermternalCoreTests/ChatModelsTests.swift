@@ -192,6 +192,61 @@ func chatSessionWithPinnedPreservesFallbackDisplayTitle() {
     #expect(session.withPinned(false).displayTitle == "New Chat")
 }
 
+@Test("withTitle sets the title and recomputes the display title")
+func chatSessionWithTitleRecomputesDisplayTitle() {
+    let session = chatSession(title: "", preview: "Old preview")
+    let renamed = session.withTitle("Renamed chat")
+
+    #expect(renamed.title == "Renamed chat")
+    #expect(renamed.displayTitle == "Renamed chat")
+    #expect(session.displayTitle == "Old preview")
+}
+
+@Test("withTitle replaces a New Chat fallback")
+func chatSessionWithTitleReplacesNewChatFallback() {
+    let session = chatSession(title: "", preview: "### Task: something")
+
+    #expect(session.displayTitle == "New Chat")
+    #expect(session.withTitle("Renamed chat").displayTitle == "Renamed chat")
+}
+
+@Test("An explicit heading title is honored verbatim")
+func chatSessionWithTitleHonorsHeadingText() {
+    let session = chatSession(title: "", preview: "A preview")
+    let renamed = session.withTitle("### Task: something")
+
+    #expect(renamed.title == "### Task: something")
+    #expect(renamed.displayTitle == "### Task: something")
+}
+
+@Test("withTitle preserves every other ChatSession field")
+func chatSessionWithTitlePreservesEveryOtherField() {
+    let session = ChatSession(from: .object([
+        "id": .string("session-renamed"),
+        "title": .string("Old title"),
+        "preview": .string("A preview"),
+        "started_at": .integer(1_700_000_000),
+        "last_active": .integer(1_700_000_600),
+        "pinned": .bool(true),
+        "archived": .bool(true),
+        "source": .string("api_server"),
+        "profile": .string("work"),
+        "message_count": .integer(7)
+    ]))
+    let renamed = session.withTitle("New title")
+
+    #expect(renamed.id == session.id)
+    #expect(renamed.title == "New title")
+    #expect(renamed.preview == session.preview)
+    #expect(renamed.startedAt == session.startedAt)
+    #expect(renamed.lastActive == session.lastActive)
+    #expect(renamed.pinned == session.pinned)
+    #expect(renamed.archived == session.archived)
+    #expect(renamed.source == session.source)
+    #expect(renamed.profile == session.profile)
+    #expect(renamed.messageCount == session.messageCount)
+}
+
 private func chatSession(title: String, preview: String) -> ChatSession {
     ChatSession(from: .object([
         "title": .string(title),

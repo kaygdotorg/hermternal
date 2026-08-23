@@ -376,6 +376,49 @@ final class AppModel {
         }
     }
 
+    /// Changes the server title while keeping the sidebar responsive.
+    func rename(_ session: ChatSession, to newTitle: String) async {
+        let trimmedTitle = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty else {
+            postError("Could not rename chat", detail: "The title cannot be empty.")
+            return
+        }
+        guard let index = sessions.firstIndex(where: { $0.id == session.id }) else { return }
+        let previous = sessions[index]
+        sessions[index] = previous.withTitle(trimmedTitle)
+        sessions.sort(by: Self.sessionComesBefore)
+
+        guard let rest else {
+            if let index = sessions.firstIndex(where: { $0.id == session.id }),
+               sessions[index].title == trimmedTitle {
+                sessions[index] = previous
+                sessions.sort(by: Self.sessionComesBefore)
+            }
+            postError("Could not rename chat", detail: "The server connection is unavailable.")
+            return
+        }
+
+        do {
+            _ = try await rest.patchSession(
+                durableID: session.id,
+                title: trimmedTitle,
+                profile: session.profile
+            )
+        } catch {
+            if let restError = error as? RestError, case .sessionNotFound = restError {
+                sessions.removeAll { $0.id == session.id }
+                postError("Chat no longer exists", detail: error.localizedDescription)
+                return
+            }
+            if let index = sessions.firstIndex(where: { $0.id == session.id }),
+               sessions[index].title == trimmedTitle {
+                sessions[index] = previous
+                sessions.sort(by: Self.sessionComesBefore)
+            }
+            postError("Could not rename chat", detail: error.localizedDescription)
+        }
+    }
+
     /// Changes the server archive state while keeping the sidebar responsive.
     func setArchived(_ session: ChatSession, archived: Bool) async {
         let previous: ChatSession

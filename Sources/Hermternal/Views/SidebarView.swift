@@ -8,6 +8,8 @@ struct SidebarView: View {
     let accountID: String?
     @State private var pendingOpenTask: Task<Void, Never>?
     @State private var pointerActivatedID: String?
+    @State private var renameSession: ChatSession?
+    @State private var renameTitle = ""
 
     init(
         model: AppModel,
@@ -26,33 +28,47 @@ struct SidebarView: View {
             List(selection: $model.selectedSessionID) {
                 Section("Chats") {
                     ForEach(model.sessions) { session in
-                        Button {
-                            openImmediately(session)
-                        } label: {
-                            SessionRow(session: session)
-                        }
-                        .buttonStyle(.plain)
+                        SessionRowItem(
+                            session: session,
+                            onOpen: { session in
+                                openImmediately(session)
+                            },
+                            onPin: { session in
+                                Task {
+                                    await model.setPinned(session, pinned: !session.pinned)
+                                }
+                            },
+                            onArchive: { session in
+                                Task {
+                                    await model.setArchived(session, archived: true)
+                                }
+                            },
+                            onRename: { session in
+                                beginRename(session)
+                            }
+                        )
                         .tag(session.id)
-                        .accessibilityLabel(session.displayTitle)
-                        .accessibilityValue(messageCountLabel(session.messageCount))
-                        .accessibilityIdentifier("session-row-\(session.id)")
-                        .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                            pinButton(for: session)
-                        }
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                            archiveButton(for: session)
-                        }
-                        // A per-row menu keeps the action tied to this row without
-                        // changing List selection.
-                        .contextMenu {
-                            pinButton(for: session)
-                            archiveButton(for: session)
-                        }
                     }
                 }
             }
             .listStyle(.sidebar)
             .scrollContentBackground(.hidden)
+            .alert(
+                "Rename Chat",
+                isPresented: renamePresented,
+                presenting: renameSession
+            ) { _ in
+                TextField("Title", text: $renameTitle)
+                    .onSubmit { commitRename() }
+                Button("Rename") {
+                    commitRename()
+                }
+                Button("Cancel", role: .cancel) {
+                    cancelRename()
+                }
+            } message: { _ in
+                Text("Enter a new title.")
+            }
 
             SidebarBottomEdge {
                 SidebarAccountRow(
@@ -76,27 +92,35 @@ struct SidebarView: View {
         }
     }
 
-    @ViewBuilder
-    private func pinButton(for session: ChatSession) -> some View {
-        Button(
-            session.pinned ? "Unpin" : "Pin",
-            systemImage: session.pinned ? "pin.slash" : "pin"
-        ) {
-            Task {
-                await model.setPinned(session, pinned: !session.pinned)
+    private var renamePresented: Binding<Bool> {
+        Binding(
+            get: { renameSession != nil },
+            set: { isPresented in
+                if !isPresented {
+                    cancelRename()
+                }
             }
-        }
-        .tint(.accentColor)
+        )
     }
 
-    @ViewBuilder
-    private func archiveButton(for session: ChatSession) -> some View {
-        Button("Archive", systemImage: "archivebox") {
-            Task {
-                await model.setArchived(session, archived: true)
-            }
+    private func beginRename(_ session: ChatSession) {
+        renameTitle = session.displayTitle
+        renameSession = session
+    }
+
+    private func commitRename() {
+        guard let session = renameSession else { return }
+        let title = renameTitle
+        renameSession = nil
+        renameTitle = ""
+        Task {
+            await model.rename(session, to: title)
         }
-        .tint(.accentColor)
+    }
+
+    private func cancelRename() {
+        renameSession = nil
+        renameTitle = ""
     }
 
     /// Mouse activation should paint cached detail immediately. Mark the id
@@ -141,6 +165,65 @@ private func messageCountLabel(_ count: Int) -> String {
     case ..<1: ""
     case 1: "1 message"
     default: "\(count) messages"
+    }
+}
+
+private struct SessionRowItem: View {
+    let session: ChatSession
+    let onOpen: (ChatSession) -> Void
+    let onPin: (ChatSession) -> Void
+    let onArchive: (ChatSession) -> Void
+    let onRename: (ChatSession) -> Void
+
+    var body: some View {
+        Button {
+            onOpen(session)
+        } label: {
+            SessionRow(session: session)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(session.displayTitle)
+        .accessibilityValue(messageCountLabel(session.messageCount))
+        .accessibilityIdentifier("session-row-\(session.id)")
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            pinButton(for: session)
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            archiveButton(for: session)
+        }
+        // A per-row menu keeps the action tied to this row without
+        // changing List selection.
+        .contextMenu {
+            pinButton(for: session)
+            archiveButton(for: session)
+            renameButton(for: session)
+        }
+    }
+
+    @ViewBuilder
+    private func pinButton(for session: ChatSession) -> some View {
+        Button(
+            session.pinned ? "Unpin" : "Pin",
+            systemImage: session.pinned ? "pin.slash" : "pin"
+        ) {
+            onPin(session)
+        }
+        .tint(.accentColor)
+    }
+
+    @ViewBuilder
+    private func archiveButton(for session: ChatSession) -> some View {
+        Button("Archive", systemImage: "archivebox") {
+            onArchive(session)
+        }
+        .tint(.accentColor)
+    }
+
+    @ViewBuilder
+    private func renameButton(for session: ChatSession) -> some View {
+        Button("Rename", systemImage: "pencil") {
+            onRename(session)
+        }
     }
 }
 

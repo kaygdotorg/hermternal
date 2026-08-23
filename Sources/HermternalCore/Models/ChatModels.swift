@@ -95,6 +95,22 @@ public struct ChatSession: Identifiable, Hashable, Sendable {
             displayTitle: displayTitle
         )
     }
+    /// Returns a copy with the server title changed.
+    public func withTitle(_ title: String) -> ChatSession {
+        ChatSession(
+            id: id,
+            title: title,
+            preview: preview,
+            startedAt: startedAt,
+            lastActive: lastActive,
+            pinned: pinned,
+            archived: archived,
+            source: source,
+            profile: profile,
+            messageCount: messageCount,
+            displayTitle: Self.deriveDisplayTitle(title: title, preview: preview)
+        )
+    }
 
     /// Picks the row label, preferring the server title over the preview.
     ///
@@ -102,7 +118,7 @@ public struct ChatSession: Identifiable, Hashable, Sendable {
     /// that as a title is misleading. A preview is rejected when it is blank,
     /// spans lines, or opens with a Markdown heading marker. A value that is
     /// only marker characters is rejected too, because it carries no title text.
-    private static func deriveDisplayTitle(title: String, preview: String) -> String {
+    static func deriveDisplayTitle(title: String, preview: String) -> String {
         // `contains(where:)` short-circuits and allocates nothing, unlike
         // trimming a copy only to test whether it is empty.
         if title.contains(where: { !$0.isWhitespace }) { return title }
