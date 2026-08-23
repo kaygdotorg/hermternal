@@ -83,13 +83,20 @@ private extension NSItemProvider {
     }
 }
 
-/// One folder as a List row: a native `DisclosureGroup` whose label is the
-/// folder and whose content is the chats filed inside it.
+/// One folder as a flat List row: a disclosure caret, then the folder.
 ///
 /// A row rather than a `Section`, because a drop attaches to a view and a
 /// `Section` cannot receive one. Dragging a chat onto a folder is the gesture
 /// a sidebar is for, so the folder has to be something that can be dropped
 /// on.
+///
+/// The chats of the folder are NOT children of this view. The Folders section
+/// places them after this row as siblings, each with one small leading inset.
+/// A `DisclosureGroup` nested them instead, and a nested row makes the whole
+/// List an outline: every other row in the sidebar, including Pinned and the
+/// date buckets, then carries an indentation column it never asked for, and
+/// sits right of the same rows in the schedules pane. No public API reduces
+/// that column.
 ///
 /// The drop is `onDrop` and the drag is `onDrag`, not `dropDestination` and
 /// `draggable`. That is measured, not preferred: in a live build the modern
@@ -106,9 +113,10 @@ private extension NSItemProvider {
 /// which is the honest limit of what these APIs can express here, and it
 /// beats a reorder gesture that silently does nothing.
 ///
-/// The disclosure triangle, its indentation and the row's own highlight all
-/// belong to the platform. Nothing here is drawn by hand.
-struct SidebarFolderRow<Content: View>: View {
+/// The caret is the one thing this row draws, and it is the same glyph, scale
+/// and rotation the section headers use, so the sidebar keeps one disclosure
+/// vocabulary. The row's highlight still belongs to the platform.
+struct SidebarFolderRow: View {
     let target: SidebarFolderTarget
     @Binding var isExpanded: Bool
     let onRename: (SidebarFolderTarget) -> Void
@@ -117,20 +125,18 @@ struct SidebarFolderRow<Content: View>: View {
     let onDropSessions: ([String], String) -> Void
     /// A folder dragged onto this one: the dragged id, then this row's id.
     let onDropFolder: (String, String) -> Void
-    @ViewBuilder var content: () -> Content
 
     /// Held here, so a drag over one folder redraws that folder alone.
     @State private var isTargeted = false
 
     var body: some View {
-        DisclosureGroup(isExpanded: $isExpanded) {
-            content()
-        } label: {
+        HStack(spacing: 0) {
+            disclosure
             label
         }
         // A folder is not a chat, so it must not become the List selection
-        // and clear the open conversation. Chats inside it re-enable
-        // selection for themselves.
+        // and clear the open conversation. The chats of the folder are
+        // sibling rows now and state their own rule.
         .selectionDisabled()
         .contextMenu {
             FolderCommands(
@@ -141,8 +147,34 @@ struct SidebarFolderRow<Content: View>: View {
         }
     }
 
-    /// The drop lands on the label, not on the whole group, so a chat already
-    /// inside the folder is not sitting on top of its own target.
+    /// The folder's caret, always visible.
+    ///
+    /// A section header may keep its caret for hover, because the header
+    /// title is part of the same button. A folder title is the drop target,
+    /// so the caret is the only control that opens the folder and it has to
+    /// be there before the pointer is.
+    private var disclosure: some View {
+        Button {
+            isExpanded.toggle()
+        } label: {
+            Image(systemName: "chevron.right")
+                .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                .imageScale(.small)
+                .foregroundStyle(.secondary)
+                .frame(width: SidebarMetrics.folderIndent, alignment: .leading)
+                // The gutter is narrow, so the target takes the height of the
+                // row and not the height of the glyph.
+                .frame(maxHeight: .infinity)
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(
+            isExpanded ? "Collapse \(target.name)" : "Expand \(target.name)"
+        )
+    }
+
+    /// The drop lands on the label and not on the caret's gutter, so the
+    /// control that opens the folder is never also its drop target.
     private var label: some View {
         Label {
             Text(target.name)

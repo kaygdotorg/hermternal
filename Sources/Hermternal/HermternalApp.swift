@@ -89,14 +89,7 @@ struct HermternalApp: App {
                     )
                     return
                 }
-                Task {
-                    switch link.destination {
-                    case .chat(let sessionID):
-                        await model.openChat(sessionID: sessionID)
-                    case .message(let location):
-                        await model.open(at: location)
-                    }
-                }
+                model.route(link.destination)
             }
             .task {
                 guard !fixtureMode else { return }

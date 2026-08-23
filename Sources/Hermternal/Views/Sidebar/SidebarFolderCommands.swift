@@ -50,8 +50,8 @@ struct MoveToFolderMenu: View {
 ///
 /// Shared by the folder row's context menu, so every route to these two
 /// commands states them the same way. Folding a folder away is not here: a
-/// folder is a row now and carries the platform's own disclosure triangle,
-/// which is always visible and needs no menu item to stand in for it.
+/// folder is a row now and carries its own disclosure caret, which is always
+/// visible and needs no menu item to stand in for it.
 struct FolderCommands: View {
     let target: SidebarFolderTarget
     let onRename: (SidebarFolderTarget) -> Void

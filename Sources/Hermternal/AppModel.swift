@@ -112,6 +112,8 @@ final class AppModel {
         let generation: Int
     }
     private var pendingMessageRoute: PendingMessageRoute?
+    private var pendingExternalRoute = PendingRouteCoordinator()
+    private var programmaticSelectionID: String?
     private let openGenerations = OpenGenerationController()
     private var streamingReducer = StreamingEventReducer()
 
@@ -264,6 +266,7 @@ final class AppModel {
     }
 
     func signOut() async {
+        pendingExternalRoute.clearPending()
         _ = openGenerations.begin()
         pendingMessageRoute = nil
         eventTask?.cancel()
@@ -387,6 +390,7 @@ final class AppModel {
             }
             sessions.sort(by: Self.sessionComesBefore)
             sessionsLoadedCompletely = true
+            drainPendingExternalRouteIfReady()
             cacheTotalCount = sessions.count
             Log.info("REST session list returned \(sessions.count) sessions")
             await refreshCacheStatistics()
@@ -856,6 +860,7 @@ final class AppModel {
         cacheBytes = max(0, cacheBytes + result.byteDelta)
     }
     func newChat() async {
+        pendingExternalRoute.clearPending()
         _ = openGenerations.begin()
         pendingMessageRoute = nil
         guard let gateway else { return }
@@ -897,10 +902,107 @@ final class AppModel {
         guard let gateway, let rest else { return nil }
         var totals: [String: Int] = [:]
         if let sessionID, let serverTotal { totals[sessionID] = serverTotal }
+
         return GatewayTranscriptSource(gateway: gateway, rest: rest, serverTotals: totals)
+    }
+    /// Routes a validated external destination after session authority exists.
+    /// A route received during restore replaces any older queued destination.
+    func route(_ destination: MessageDeepLink.Destination) {
+        let generation = openGenerations.begin()
+        pendingMessageRoute = nil
+        let decision = pendingExternalRoute.route(
+            destination,
+            phase: pendingRoutePhase,
+            sessionsLoadedCompletely: sessionsLoadedCompletely
+        )
+        guard case let .open(destination, routeGeneration) = decision else { return }
+        dispatchExternalRoute(
+            destination,
+            routeGeneration: routeGeneration,
+            generation: generation
+        )
+    }
+
+    /// Invalidates a queued external route when the user starts navigation.
+    /// This runs before the delayed transcript open can begin.
+    func userNavigationDidBegin() {
+        pendingExternalRoute.clearPending()
+        _ = openGenerations.begin()
+        pendingMessageRoute = nil
+        programmaticSelectionID = nil
+    }
+    func consumeProgrammaticSelection(_ id: String?) -> Bool {
+        guard let id, programmaticSelectionID == id else { return false }
+        programmaticSelectionID = nil
+        return true
+    }
+    func hasProgrammaticSelection(_ id: String?) -> Bool {
+        guard let id else { return false }
+        return programmaticSelectionID == id
+    }
+
+
+
+    private var pendingRoutePhase: PendingRouteCoordinator.Phase {
+        switch phase {
+        case .signedOut: .signedOut
+        case .connecting: .connecting
+        case .ready: .ready
+        case .failed: .failed
+        }
+    }
+
+    private func drainPendingExternalRouteIfReady() {
+        guard phase == .ready,
+              let decision = pendingExternalRoute.sessionsLoadedCompletely(phase: pendingRoutePhase),
+              case let .open(destination, routeGeneration) = decision
+        else { return }
+        let generation = openGenerations.begin()
+        dispatchExternalRoute(
+            destination,
+            routeGeneration: routeGeneration,
+            generation: generation
+        )
+    }
+
+    private func dispatchExternalRoute(
+        _ destination: MessageDeepLink.Destination,
+        routeGeneration: Int,
+        generation: Int
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.pendingExternalRoute.isCurrent(routeGeneration),
+                  self.openGenerations.isCurrent(generation)
+            else { return }
+            await self.openExternalDestination(
+                destination,
+                routeGeneration: routeGeneration,
+                generation: generation
+            )
+        }
+    }
+
+    private func openExternalDestination(
+        _ destination: MessageDeepLink.Destination,
+        routeGeneration: Int,
+        generation: Int
+    ) async {
+        guard pendingExternalRoute.isCurrent(routeGeneration),
+              openGenerations.isCurrent(generation)
+        else { return }
+        switch destination {
+        case .chat(let sessionID):
+            programmaticSelectionID = sessionID
+            await openChat(sessionID: sessionID, generation: generation)
+        case .message(let location):
+            programmaticSelectionID = location.sessionID
+            await open(at: location, generation: generation)
+        }
     }
     @discardableResult
     func open(_ session: ChatSession) async -> Bool {
+        pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
         pendingMessageRoute = nil
         return await open(session, generation: generation)
@@ -949,7 +1051,12 @@ final class AppModel {
     }
     /// Opens the target chat at its newest message.
     func openChat(sessionID: String) async {
+        pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
+        await openChat(sessionID: sessionID, generation: generation)
+    }
+
+    private func openChat(sessionID: String, generation: Int) async {
         pendingMessageRoute = nil
         guard let session = sessions.first(where: { $0.id == sessionID }) else {
             postError("Could not open chat", detail: "The chat no longer exists.")
@@ -960,7 +1067,12 @@ final class AppModel {
 
     /// Opens a chat with a message target available during its first layout.
     func open(at location: MessageLocation) async {
+        pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
+        await open(at: location, generation: generation)
+    }
+
+    private func open(at location: MessageLocation, generation: Int) async {
         pendingMessageRoute = nil
         guard !location.sessionID.isEmpty,
               let session = sessions.first(where: { $0.id == location.sessionID })

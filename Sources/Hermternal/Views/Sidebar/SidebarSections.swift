@@ -42,6 +42,24 @@ enum SidebarMetrics {
     static let headerControlSlot: CGFloat = 14
     /// Gap between a header's items, and between the control and the title.
     static let headerControlGap: CGFloat = 4
+    /// The folder disclosure gutter, and the leading inset on the chats
+    /// inside a folder. One constant does both, so a chat's icon column
+    /// lands exactly under the icon column of the folder that holds it,
+    /// with the folder's caret alone in the gutter to their left.
+    ///
+    /// This is a tenth of what the sidebar used to indent by, and it is
+    /// local. A `DisclosureGroup` or a `Section(isExpanded:)` makes the
+    /// whole List an outline, and an outline reserves an indentation column
+    /// on EVERY row: Pinned and the date buckets were pushed right by a
+    /// folder feature they have nothing to do with, and sat right of the
+    /// same rows in the schedules pane. No public API reduces that column.
+    /// So the sidebar List holds no outline primitive at all, and the one
+    /// place that wants an indent asks for it by name.
+    static let folderIndent: CGFloat = 10
+    /// One motion for every disclosure in the sidebar. It runs inside the
+    /// expansion bindings, so the header button, the header menu command and
+    /// a folder's own caret all animate the same way.
+    static let disclosureAnimation = Animation.easeOut(duration: 0.12)
     /// Schedules show three entries at once and scroll for the rest.
     static let visibleScheduleRows: CGFloat = 3
 }
@@ -94,26 +112,43 @@ struct SidebarSections: View {
     /// A `Section` can neither receive a drop nor be reordered, and a row can
     /// do both. That, and not decoration, is why the shape changed. The
     /// trailing control sits on the header, which is Craft's shape too.
+    ///
+    /// The chats of a folder are siblings of their folder row, not children
+    /// of a `DisclosureGroup`. Nesting them turned the List into an outline
+    /// and indented every unrelated row with it. Flat rows plus
+    /// `folderIndent` group the chats under their folder, leave every other
+    /// row on the plain sidebar baseline, and keep each chat its own list
+    /// row for selection, drag and swipe.
     @ViewBuilder
     private func foldersSection(_ runs: [SidebarFolderRun]) -> some View {
-        Section(isExpanded: $isFoldersExpanded) {
-            ForEach(runs) { run in
-                SidebarFolderRow(
-                    target: run.target,
-                    isExpanded: folderExpansion(for: run.target.id),
-                    onRename: onRenameFolder,
-                    onDelete: onDeleteFolder,
-                    onDropSessions: file,
-                    onDropFolder: reorderFolder
-                ) {
-                    rows(for: run.section)
+        Section {
+            // Expansion gates the content instead of `Section(isExpanded:)`,
+            // which draws a second disclosure control on the trailing side
+            // and turns the List into an outline.
+            if isFoldersExpanded {
+                ForEach(runs) { run in
+                    SidebarFolderRow(
+                        target: run.target,
+                        isExpanded: folderExpansion(for: run.target.id),
+                        onRename: onRenameFolder,
+                        onDelete: onDeleteFolder,
+                        onDropSessions: file,
+                        onDropFolder: reorderFolder
+                    )
+                    if isFolderExpanded(run.target.id) {
+                        // A List spreads a modifier on a `ForEach` over the
+                        // rows it makes, so this is one inset per chat and
+                        // not a wrapper view around the run.
+                        rows(for: run.section)
+                            .padding(.leading, SidebarMetrics.folderIndent)
+                    }
                 }
             }
         } header: {
-            SidebarSectionHeader(title: "Folders", isExpanded: $isFoldersExpanded) {
+            SidebarSectionHeader(title: "Folders", isExpanded: foldersExpansion) {
                 Menu {
                     FoldersSectionCommands(
-                        isExpanded: $isFoldersExpanded,
+                        isExpanded: foldersExpansion,
                         onNewFolder: onNewFolder
                     )
                 } label: {
@@ -143,8 +178,10 @@ struct SidebarSections: View {
                     .padding(.top, SidebarMetrics.sectionGap)
             }
         case .bucket:
-            Section(isExpanded: sectionExpansion(for: section.kind)) {
-                unfilingRows(for: section)
+            Section {
+                if isSectionExpanded(section.kind) {
+                    unfilingRows(for: section)
+                }
             } header: {
                 SidebarSectionHeader(
                     title: sectionTitle(for: section.kind),
@@ -152,8 +189,10 @@ struct SidebarSections: View {
                 )
             }
         default:
-            Section(isExpanded: sectionExpansion(for: section.kind)) {
-                rows(for: section)
+            Section {
+                if isSectionExpanded(section.kind) {
+                    rows(for: section)
+                }
             } header: {
                 SidebarSectionHeader(
                     title: sectionTitle(for: section.kind),
@@ -200,9 +239,9 @@ struct SidebarSections: View {
             // The durable id is the whole payload. The drag preview comes
             // from the row itself, so nothing is drawn for it.
             .onDrag { SidebarDragPayload.provider(sessionID: row.sessionID) }
-            // A folder row turns selection off for its own subtree, so a
-            // chat inside a folder says plainly that it stays selectable.
-            // Outside a folder this changes nothing.
+            // A folder row is not selectable, and a chat is. They are
+            // siblings now rather than a group and its subtree, so this
+            // states the chat's own rule and inherits nothing.
             .selectionDisabled(false)
         }
     }
@@ -302,23 +341,48 @@ struct SidebarSections: View {
         Binding(
             get: { !collapsedFolderIDs.contains(folderID) },
             set: { isExpanded in
-                if isExpanded {
-                    collapsedFolderIDs.remove(folderID)
-                } else {
-                    collapsedFolderIDs.insert(folderID)
+                withAnimation(SidebarMetrics.disclosureAnimation) {
+                    if isExpanded {
+                        collapsedFolderIDs.remove(folderID)
+                    } else {
+                        collapsedFolderIDs.insert(folderID)
+                    }
                 }
             }
         )
+    }
+
+    private func isFolderExpanded(_ folderID: String) -> Bool {
+        !collapsedFolderIDs.contains(folderID)
     }
 
     private func sectionExpansion(for kind: SidebarSectionKind) -> Binding<Bool> {
         Binding(
             get: { !collapsedSections.contains(kind) },
             set: { isExpanded in
-                if isExpanded {
-                    collapsedSections.remove(kind)
-                } else {
-                    collapsedSections.insert(kind)
+                withAnimation(SidebarMetrics.disclosureAnimation) {
+                    if isExpanded {
+                        collapsedSections.remove(kind)
+                    } else {
+                        collapsedSections.insert(kind)
+                    }
+                }
+            }
+        )
+    }
+
+    private func isSectionExpanded(_ kind: SidebarSectionKind) -> Bool {
+        !collapsedSections.contains(kind)
+    }
+
+    /// The Folders header and its menu write through the same animated
+    /// binding, so a collapse looks identical from either control.
+    private var foldersExpansion: Binding<Bool> {
+        Binding(
+            get: { isFoldersExpanded },
+            set: { isExpanded in
+                withAnimation(SidebarMetrics.disclosureAnimation) {
+                    isFoldersExpanded = isExpanded
                 }
             }
         )
@@ -406,6 +470,11 @@ private struct SidebarSectionRuns {
 /// button, so clicking anywhere on it works, and the Folders header carries
 /// the same command in its menu. A hover-only control is invisible to anyone
 /// using a keyboard and to anyone who never hovers.
+///
+/// This caret is the only disclosure control a section has. A section uses a
+/// plain `Section` and gates its own content, because `Section(isExpanded:)`
+/// draws a second control on the trailing side and makes the whole List an
+/// outline, which indents every row in it.
 private struct SidebarSectionHeader<Trailing: View>: View {
     let title: String
     @Binding var isExpanded: Bool
@@ -459,6 +528,9 @@ private struct SidebarSectionHeader<Trailing: View>: View {
         .sidebarSectionHeader()
         .padding(.trailing, SidebarMetrics.headerTrailingInset)
         .onHover { isHovered = $0 }
+        // A header is not a row, and must never join a Select All or hold
+        // the selection that a row should have.
+        .selectionDisabled()
     }
 }
 

@@ -128,8 +128,23 @@ private struct SessionRow: View {
             Text(title)
                 .lineLimit(1)
         } icon: {
+            // The glyph takes the row's own foreground and adds no style of
+            // its own: primary on an unselected row, the selection's content
+            // colour on the accent plate, the inactive label colour when the
+            // window is not key. `.secondary` was a step below all three, and
+            // a 13pt stroked symbol carries so little ink that the step is the
+            // first thing the translucent sidebar swallows. Measured at true
+            // 2x, `.secondary` held 4.5:1 against a settled backdrop where the
+            // title held 9:1, and lost more than that once the window frost
+            // let the desktop through. The glyph stays subordinate because it
+            // is a thin outline beside dense text, not because it is dimmer.
+            //
+            // The rendering mode is explicit because the table holds
+            // multi-layer symbols. Left to context, those can resolve
+            // hierarchically and draw their own lower layers at a further
+            // reduced level, which costs the mark most of its ink.
             Image(systemName: sessionSourceGlyphs[session.source] ?? sessionFallbackGlyph)
-                .foregroundStyle(.secondary)
+                .symbolRenderingMode(.monochrome)
         }
         .font(.body)
         .help(title)

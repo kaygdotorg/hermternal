@@ -327,32 +327,71 @@ struct ChatView: View {
 }
 
 private struct EmptyState: View {
+    /// The effective scheme, so an explicit app appearance and the system
+    /// setting both resolve to the matching drawing.
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
-        VStack(spacing: 8) {
-            hermesMark
-            Text("Ask Hermes anything")
-                .font(.title3.weight(.medium))
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity)
+        // The composer already reads "Message Hermes…", so a heading here
+        // would only repeat it. The mark carries the state alone: no copy,
+        // no surface, no motion.
+        mark
+            .frame(maxWidth: .infinity)
     }
 
     @ViewBuilder
-    private var hermesMark: some View {
-        if let path = Bundle.main.path(forResource: "HermesIcon", ofType: "png"),
-           let image = NSImage(contentsOfFile: path) {
+    private var mark: some View {
+        if let image = HermternalMark.image(for: colorScheme) {
             Image(nsImage: image)
+                // A 256px drawing at 64pt is a downscale, and the line art
+                // aliases without the better sampler.
+                .interpolation(.high)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .frame(width: 44, height: 44)
-                .accessibilityLabel("Hermes")
+                .frame(width: Self.markSize, height: Self.markSize)
+                .accessibilityLabel("Hermternal")
         } else {
-            Text("Hermes")
-                .font(.headline.weight(.semibold))
-                .foregroundStyle(.tertiary)
-                .frame(width: 44, height: 44)
-                .accessibilityLabel("Hermes")
+            // The drawing is missing whenever the process runs without its
+            // bundle resources, which is what `swift run` does. That is a
+            // packaging fault and `HermternalMark` reports it, but the state
+            // still has to read as something, so it falls back to the
+            // platform's terminal glyph rather than leaving the pane blank.
+            Image(systemName: "terminal")
+                .font(.system(size: Self.markSize, weight: .light))
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Hermternal")
         }
+    }
+
+    /// 44pt suited a mark paired with a heading. Alone, the drawing has to
+    /// read on its own: at 44pt the face and the sparkles collapse into a
+    /// smudge, at 64pt they hold.
+    private static let markSize: CGFloat = 64
+}
+
+/// The light and dark drawings of the app mark, decoded at most once each.
+///
+/// `NSImage(contentsOf:)` reads and decodes the file, so loading inside a
+/// `body` would repeat that work on every evaluation. Main-actor isolation
+/// is what makes a `static let` of a non-Sendable `NSImage` legal under
+/// strict concurrency; view bodies are the only caller.
+@MainActor
+private enum HermternalMark {
+    static func image(for colorScheme: ColorScheme) -> NSImage? {
+        colorScheme == .dark ? dark : light
+    }
+
+    private static let light = load("HermternalMarkLight")
+    private static let dark = load("HermternalMarkDark")
+
+    private static func load(_ name: String) -> NSImage? {
+        guard let url = Bundle.main.url(forResource: name, withExtension: "png"),
+              let image = NSImage(contentsOf: url)
+        else {
+            Log.error("Missing bundle resource \(name).png")
+            return nil
+        }
+        return image
     }
 }
 

@@ -1,5 +1,60 @@
 import SwiftUI
+import AppKit
 import HermternalCore
+
+/// Captures the native event that owns a selection change.
+/// Programmatic model selection has no matching event and never opens again.
+@MainActor
+private enum SidebarSelectionEventAdapter {
+    private struct Event {
+        let isContextClick: Bool
+        let isModified: Bool
+    }
+
+    private static var monitor: Any?
+    private static var pending: Event?
+
+    static func start() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .keyDown]
+        ) { event in
+            switch event.type {
+            case .leftMouseDown:
+                pending = Event(
+                    isContextClick: false,
+                    isModified: event.modifierFlags.intersection([.command, .shift]).isEmpty == false
+                )
+            case .rightMouseDown:
+                pending = Event(isContextClick: true, isModified: true)
+            case .keyDown:
+                pending = Event(isContextClick: false, isModified: false)
+            default:
+                break
+            }
+            return event
+        }
+    }
+
+    static func consume() -> (isContextClick: Bool, isModified: Bool) {
+        defer { pending = nil }
+        guard let pending else { return (false, false) }
+        return (pending.isContextClick, pending.isModified)
+    }
+
+    static func isUserNavigationPending() -> Bool {
+        guard let pending else { return false }
+        return !pending.isContextClick && !pending.isModified
+    }
+
+    static func stop() {
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+            self.monitor = nil
+        }
+        pending = nil
+    }
+}
 
 struct SidebarView: View {
     @Bindable var model: AppModel
@@ -68,8 +123,24 @@ struct SidebarView: View {
 
     /// The chat list, and the edge treatment that lets its rows travel
     /// under fixed chrome without colliding with it.
+    private var selectionBinding: Binding<String?> {
+        Binding(
+            get: { model.selectedSessionID },
+            set: { id in
+                guard !model.hasProgrammaticSelection(id),
+                      SidebarSelectionEventAdapter.isUserNavigationPending()
+                else {
+                    model.selectedSessionID = id
+                    return
+                }
+                model.userNavigationDidBegin()
+                model.selectedSessionID = id
+            }
+        )
+    }
+
     private func chatList(_ sections: [SidebarSection]) -> some View {
-        List(selection: $model.selectedSessionID) {
+        List(selection: selectionBinding) {
             sessionSections(sections)
         }
         .listStyle(.sidebar)
@@ -92,7 +163,7 @@ struct SidebarView: View {
         // primitive that applies.
         .safeAreaInset(edge: .bottom, spacing: 0) {
             Color.clear
-                .frame(height: pinnedLayerHeight + SidebarDissolve.bottomReach)
+                .frame(height: pinnedLayerHeight + SidebarDissolve.reach)
         }
         // Rows travel under fixed chrome at both edges, so the CONTENT
         // dissolves before it reaches either boundary. A `Material` behind
@@ -190,7 +261,7 @@ struct SidebarView: View {
             rows: scheduleRows,
             folders: model.folders,
             membership: model.membership,
-            selection: $model.selectedSessionID,
+            selection: selectionBinding,
             onOpen: { session in
                 openImmediately(session)
             },
@@ -310,35 +381,67 @@ struct SidebarView: View {
                 Text("“\(target.name)” is removed. The chats inside it are kept and return to the list.")
             }
             .onChange(of: model.selectedSessionID) { _, newValue in
+                let event = SidebarSelectionEventAdapter.consume()
+                if model.consumeProgrammaticSelection(newValue) {
+                    pointerActivatedID = nil
+                    return
+                }
                 if pointerActivatedID == newValue {
                     pointerActivatedID = nil
                     return
                 }
+                guard !event.isContextClick, !event.isModified else {
+                    pointerActivatedID = nil
+                    pendingOpenTask?.cancel()
+                    pendingOpenTask = nil
+                    return
+                }
                 pointerActivatedID = nil
+                model.userNavigationDidBegin()
                 scheduleOpen(for: newValue)
             }
+            .onAppear {
+                SidebarSelectionEventAdapter.start()
+            }
             .onDisappear {
+                SidebarSelectionEventAdapter.stop()
                 pendingOpenTask?.cancel()
                 pendingOpenTask = nil
             }
     }
 
-    /// One continuous gradient with two ramps: a short softening where the
-    /// list's first rows pass under the glass titlebar, and a longer one
-    /// where its last rows pass under the floating layer. Two masks would
-    /// be two compositing groups fighting over the same rows, so both
-    /// ramps live in one gradient.
+    /// One continuous gradient with two ramps. The first ramp fades the
+    /// rows that move under the glass titlebar. The second ramp fades the
+    /// rows that move under the floating layer. Two masks would make two
+    /// compositing groups over the same rows, so one gradient holds both
+    /// ramps.
     ///
-    /// Both are measured in points from the edge they belong to and only
-    /// then turned into fractions, so each keeps its real length whatever
-    /// the window's height.
+    /// The code measures both ramps in points from the edge that they
+    /// belong to, then converts the points to fractions. Each ramp keeps
+    /// its length at any window height.
+    ///
+    /// The list frame extends 44pt up, under the titlebar. SwiftUI lays out
+    /// mask content inside the safe area. A gradient that uses only the
+    /// size of this proxy therefore starts at the bottom edge of the
+    /// titlebar. The overlap band then gets no gradient, the rows cross it
+    /// at full opacity, and the complete ramp falls on the resting section
+    /// header. The offset below draws the gradient through the inset, over
+    /// the rows.
+    ///
+    /// The mask extends up, and the list does not. `ignoresSafeArea` here,
+    /// or a top inset on the list, changes the position of the first
+    /// section header. An offset changes only the paint, so the column
+    /// keeps its layout.
     private var chatListDissolve: some View {
         GeometryReader { geometry in
-            let height = max(geometry.size.height, 1)
+            let insets = geometry.safeAreaInsets
+            let height = max(geometry.size.height + insets.top + insets.bottom, 1)
             SidebarDissolve.ramp(
                 boundary: max(height - pinnedLayerHeight, 0),
                 height: height
             )
+            .frame(height: height)
+            .offset(y: -insets.top)
             // Rule 4 of the progressive edge: a mask that hit-tests would
             // swallow the scrolling, clicks and focus it sits over.
             .allowsHitTesting(false)
@@ -458,6 +561,7 @@ struct SidebarView: View {
     /// Mouse activation should paint cached detail immediately. Mark the id
     /// so the selection change does not schedule a duplicate delayed open.
     private func openImmediately(_ session: ChatSession) {
+        model.userNavigationDidBegin()
         pointerActivatedID = session.id
         pendingOpenTask?.cancel()
         pendingOpenTask = nil
@@ -491,8 +595,8 @@ struct SidebarView: View {
     }
 }
 
-/// The chat list's two dissolves: a short one under the glass titlebar at
-/// the top, and a longer one under the floating layer at the bottom.
+/// The chat list's two dissolves: one under the glass titlebar at the top,
+/// one under the floating layer at the bottom.
 ///
 /// Both ramps borrow their SHAPE from what the app already ships, and
 /// neither borrows its distance. `SearchPanel` runs clear through 30pt,
@@ -504,37 +608,44 @@ struct SidebarView: View {
 /// so 96pt would be three whole rows fading at once: a hazy band, which is
 /// the thing rule 3 of the progressive-edge skill exists to prevent.
 ///
-/// So the proportions are kept and the distances come from this column.
-/// `bottomReach` is 48pt, one and a half rows: the dissolve starts a row
-/// and a half above the layer and is complete 15pt short of it, so only
-/// the row actually passing underneath is fading.
+/// So the code keeps the proportions and takes the distances from this
+/// column. `reach` is 48pt, which is one and a half rows. A row is fully
+/// opaque at 48pt from the chrome. A row is fully transparent at `gone`,
+/// which is 15pt from the chrome. Only the row that passes under the
+/// chrome fades.
 ///
-/// `topReach` is 6pt, and it is small because the geometry leaves no room
-/// for more. Measured on the Mac at true 2x: the chat list's frame begins
-/// at the titlebar's BOTTOM edge, 52pt down, and the first section
-/// header's ink rests 2pt below that, at 54pt. The list does not pass
-/// under the titlebar, so there is no overlap band to dissolve in, and any
-/// ramp longer than the header's own ink dims that header where it rests.
-/// 6pt is the longest feather that leaves the header's body fully opaque
-/// and softens only its ascenders, while still taking the hard edge off a
-/// row on its way out. A real top dissolve would need the list's frame to
-/// extend under the titlebar, which is a change to the column's base
-/// geometry rather than to this mask.
+/// Both edges use the same four distances, in mirror, because both edges
+/// are the same event: a row arrives at fixed chrome. Measurement on the
+/// Mac at true 2x shows that the top edge has the space for it. The list
+/// frame starts 8pt down the window. It extends 44pt up, under the
+/// titlebar. The bottom edge of the titlebar is 52pt down the window. The
+/// first section header rests at 54pt.
+///
+/// The top ramp is therefore transparent for its first 15pt, which end at
+/// 23pt down the window, and it keeps ink away from the window buttons.
+/// The ramp fades the rows across the overlap band, where the glass
+/// titlebar draws no background of its own. The ramp is fully opaque at
+/// 48pt, which is 56pt down the window. That point is 2pt inside the
+/// ascenders of the resting header, and above the body of its text.
+///
+/// The 6pt ramp that this replaced came from an incorrect measurement.
+/// That measurement put the top of the list frame at the bottom edge of
+/// the titlebar. The ramp had no overlap band to work in, so it faded the
+/// resting header instead.
 ///
 /// One type owns these numbers because two things depend on them: the mask
 /// that draws the ramps, and the list's bottom content margin that keeps
 /// the last row out of the bottom one. Split across two literals they
 /// would drift, and the drift is invisible until a row is unreadable.
 private enum SidebarDissolve {
-    /// Distances up from the floating layer's top edge.
-    static let bottomReach: CGFloat = 48
+    /// Distances from the chrome edge each ramp belongs to: up from the
+    /// floating layer's top edge at the bottom, down from the list's own
+    /// frame edge at the top.
+    static let reach: CGFloat = 48
     static let strong: CGFloat = 36
     static let soft: CGFloat = 24
-    /// Fully gone, short of the boundary, so no ink ever touches it.
+    /// Fully gone, short of the edge, so no ink ever touches it.
     static let gone: CGFloat = 15
-
-    /// Distance down from the list's own top edge.
-    static let topReach: CGFloat = 6
 
     /// One continuous gradient. Stacked opacity bands would step and seam,
     /// and a second mask would be a second compositing group.
@@ -542,10 +653,12 @@ private enum SidebarDissolve {
     /// `boundary` is the distance from the mask's top edge down to the
     /// floating layer, and `height` is the mask's own height.
     static func ramp(boundary: CGFloat, height: CGFloat) -> LinearGradient {
-        // Clamped to the end of the top ramp, so in a sidebar too short to
-        // hold both the two can meet but never cross and invert.
+        // The code limits every bottom stop to the end of the top ramp. In
+        // a sidebar that is too short for both ramps, the two ramps then
+        // meet, but they never cross and invert. The unlimited values
+        // increase in order, so the limited values stay in order.
         func up(_ above: CGFloat) -> CGFloat {
-            max(boundary - above, topReach) / height
+            min(max(boundary - above, reach), height) / height
         }
         func down(_ below: CGFloat) -> CGFloat {
             min(below, height) / height
@@ -553,11 +666,11 @@ private enum SidebarDissolve {
         return LinearGradient(
             stops: [
                 .init(color: .clear, location: 0),
-                .init(color: .black.opacity(0.25), location: down(topReach * 0.30)),
-                .init(color: .black.opacity(0.65), location: down(topReach * 0.55)),
-                .init(color: .black.opacity(0.88), location: down(topReach * 0.76)),
-                .init(color: .black, location: down(topReach)),
-                .init(color: .black, location: up(bottomReach)),
+                .init(color: .clear, location: down(gone)),
+                .init(color: .black.opacity(0.12), location: down(soft)),
+                .init(color: .black.opacity(0.55), location: down(strong)),
+                .init(color: .black, location: down(reach)),
+                .init(color: .black, location: up(reach)),
                 .init(color: .black.opacity(0.55), location: up(strong)),
                 .init(color: .black.opacity(0.12), location: up(soft)),
                 .init(color: .clear, location: up(gone)),

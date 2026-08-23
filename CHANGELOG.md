@@ -5,6 +5,37 @@ All notable changes to Hermternal are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow Semantic Versioning.
 
+## [v0.0.4] — 2026-08-23
+
+This release gives the application a native app icon and tightens sidebar and
+deep-link behavior.
+
+### Added
+
+- An appearance-aware native app icon, compiled from an Icon Composer package
+  into the bundle's asset catalog, so macOS draws the light or dark artwork
+  itself.
+- The new-chat state is an icon-only mark with no heading or subtitle, and it
+  falls back to a system glyph when the bundle resource is absent.
+
+### Changed
+
+- The sidebar shows one left caret and no native right caret, aligns rows with
+  Schedules using a 10pt folder-child offset, and mirrors its top and bottom
+  fades at 48pt.
+- A folder child chat menu no longer inherits the folder menu, and the focused
+  source glyph keeps sufficient contrast.
+- A valid cold-launch deep link waits for the app to become ready and the
+  session list to complete before it opens.
+- The release keeps the existing deterministic performance contracts and
+  release verification flow.
+
+### Known limitations
+
+- Attachments, voice input, model controls, and reasoning controls are not
+  implemented.
+- Automatic updates are not implemented yet.
+
 ## [v0.0.3] — 2026-08-23
 
 This feature release improves sidebar organization and makes release execution

@@ -18,8 +18,62 @@ APP="$ROOT/build/Hermternal.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN/Hermternal" "$APP/Contents/MacOS/Hermternal"
-cp "$ROOT/Resources/HermesIcon.png" "$APP/Contents/Resources/HermesIcon.png"
+# The new-chat mark, one drawing per appearance; ChatView loads them by name.
+cp "$ROOT/Resources/HermternalMarkLight.png" \
+	"$APP/Contents/Resources/HermternalMarkLight.png"
+cp "$ROOT/Resources/HermternalMarkDark.png" \
+	"$APP/Contents/Resources/HermternalMarkDark.png"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
+
+# The app icon is an Icon Composer package: two stacked 1024px drawings whose
+# per-appearance visibility is specialized, so macOS picks the light or the dark
+# artwork itself and keeps ownership of the squircle, the material, the specular
+# highlight and the shadow -- none of which is baked into the sources. Only
+# `actool` can lower that package into the Assets.car the system reads; a static
+# .icns has no appearance axis, so there is no fallback worth shipping. A failure
+# here is fatal rather than silently producing a bundle with a generic icon.
+ICON_BUILD="$ROOT/build/icon"
+rm -rf "$ICON_BUILD"
+mkdir -p "$ICON_BUILD"
+# Match the deployment floor the bundle itself advertises instead of repeating it.
+MIN_MACOS="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' \
+	"$ROOT/Resources/Info.plist" 2>/dev/null)" ||
+	{ echo "error: Resources/Info.plist has no LSMinimumSystemVersion" >&2; exit 1; }
+if ! ICON_LOG="$(xcrun actool "$ROOT/Resources/AppIcon.icon" \
+	--compile "$ICON_BUILD" \
+	--app-icon AppIcon \
+	--output-partial-info-plist "$ICON_BUILD/partial.plist" \
+	--platform macosx \
+	--minimum-deployment-target "$MIN_MACOS" \
+	--target-device mac \
+	--errors --warnings --notices \
+	--output-format human-readable-text 2>&1)"; then
+	printf '%s\n' "$ICON_LOG" >&2
+	echo "error: actool failed to compile Resources/AppIcon.icon" >&2
+	exit 1
+fi
+printf '%s\n' "$ICON_LOG"
+if [[ ! -f "$ICON_BUILD/Assets.car" ]]; then
+	printf '%s\n' "$ICON_LOG" >&2
+	echo "error: actool reported success but produced no Assets.car" >&2
+	exit 1
+fi
+cp "$ICON_BUILD/Assets.car" "$APP/Contents/Resources/Assets.car"
+
+# actool names the compiled icon in a partial plist; read the name from there
+# rather than hardcoding it, so the bundle can never advertise an icon the
+# catalog does not contain. The partial plist's CFBundleIconFile is dropped on
+# purpose: it names the legacy light-only AppIcon.icns that actool also writes
+# into the staging directory. That file stays there -- the bundle ships only
+# Assets.car, and a dangling CFBundleIconFile outranks nothing but confuses
+# icon services.
+ICON_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' \
+	"$ICON_BUILD/partial.plist" 2>/dev/null)" ||
+	{ echo "error: actool's partial plist has no CFBundleIconName" >&2; exit 1; }
+[[ "$ICON_NAME" == AppIcon ]] ||
+	{ echo "error: actool compiled icon '$ICON_NAME', expected AppIcon" >&2; exit 1; }
+/usr/libexec/PlistBuddy -c "Add :CFBundleIconName string $ICON_NAME" \
+	"$APP/Contents/Info.plist" >/dev/null
 
 # Prefer a real codesigning identity when one is installed. A real identity
 # gives the bundle a designated requirement based on the certificate, which is

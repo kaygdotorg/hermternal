@@ -14,13 +14,13 @@ Hermternal is a client for an existing Hermes gateway. It does not run a gateway
 
 ## Install
 
-1. Open the [v0.0.3 release](https://git.kayg.org/kayg/hermternal-apple/releases/tag/v0.0.3).
-2. Download `Hermternal-0.0.3.zip`.
+1. Open the [v0.0.4 release](https://git.kayg.org/kayg/hermternal-apple/releases/tag/v0.0.4).
+2. Download `Hermternal-0.0.4.zip`.
 3. Extract the archive.
 4. Move `Hermternal.app` to the `Applications` folder.
 5. Open Hermternal and enter your Hermes gateway URL. Sign-in opens your browser.
 
-The v0.0.3 archive is notarized. macOS Gatekeeper can verify the application before it starts.
+The v0.0.4 archive is notarized. macOS Gatekeeper can verify the application before it starts.
 
 ## Build from source
 
@@ -42,7 +42,7 @@ For a release configuration, run:
 CONFIG=release bash Scripts/build-app.sh
 ```
 
-## Current features in v0.0.3
+## Current features in v0.0.4
 
 - [x] Native SwiftUI and AppKit macOS application.
 - [x] Browser-based native sign-in with PKCE and a local callback.
@@ -60,6 +60,10 @@ CONFIG=release bash Scripts/build-app.sh
 - [x] Sidebar row actions pin, archive, and rename chats.
 - [x] The sidebar shows the selected gateway identity in a gateway pill.
 - [x] The performance contract runner is available for release audits.
+- [x] The application bundle carries an appearance-aware native macOS app icon.
+- [x] The new-chat state is an icon-only mark, with no placeholder copy.
+- [x] The sidebar shows one left caret, aligns rows with Schedules, and mirrors its top and bottom fades.
+- [x] A cold-launch deep link waits for the application to become ready and the chat list to finish loading before it opens.
 
 ## Planned work
 
@@ -96,10 +100,11 @@ These items are tracked in Forgejo. The issue descriptions are the source of tru
 - [ ] [Notarized release credentials and key ACL setup](https://git.kayg.org/kayg/hermternal-apple/issues/25).
 - [ ] [Complete history retrieval beyond 500 messages](https://git.kayg.org/kayg/hermternal-apple/issues/28).
 
-## Known limitations in v0.0.3
+## Known limitations in v0.0.4
 
 - The native split view uses a hairline divider with a tonal step.
-- The application bundle has no configured macOS application icon.
+- Attachments, voice input, model controls, and reasoning controls are not implemented.
+- Automatic updates are not implemented.
 
 ## Architecture
 
