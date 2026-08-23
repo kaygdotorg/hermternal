@@ -12,6 +12,7 @@ public struct ChatSession: Identifiable, Hashable, Sendable {
     public let startedAt: Date?
     public let lastActive: Date?
     public let pinned: Bool
+    public let archived: Bool
     public let source: String
     public let profile: String?
     public let messageCount: Int
@@ -26,6 +27,7 @@ public struct ChatSession: Identifiable, Hashable, Sendable {
         startedAt: Date?,
         lastActive: Date?,
         pinned: Bool,
+        archived: Bool,
         source: String,
         profile: String?,
         messageCount: Int,
@@ -37,6 +39,7 @@ public struct ChatSession: Identifiable, Hashable, Sendable {
         self.startedAt = startedAt
         self.lastActive = lastActive
         self.pinned = pinned
+        self.archived = archived
         self.source = source
         self.profile = profile
         self.messageCount = messageCount
@@ -53,6 +56,7 @@ public struct ChatSession: Identifiable, Hashable, Sendable {
         startedAt = DateParser.date(from: value["started_at"])
         lastActive = DateParser.date(from: value["last_active"])
         pinned = value["pinned"]?.boolValue ?? false
+        archived = value["archived"]?.boolValue ?? false
         source = value["source"]?.stringValue ?? ""
         profile = value["profile"]?.stringValue
         displayTitle = Self.deriveDisplayTitle(title: title, preview: preview)
@@ -67,6 +71,24 @@ public struct ChatSession: Identifiable, Hashable, Sendable {
             startedAt: startedAt,
             lastActive: lastActive,
             pinned: pinned,
+            archived: archived,
+            source: source,
+            profile: profile,
+            messageCount: messageCount,
+            displayTitle: displayTitle
+        )
+    }
+
+    /// Returns a copy with only the server archive state changed.
+    public func withArchived(_ archived: Bool) -> ChatSession {
+        ChatSession(
+            id: id,
+            title: title,
+            preview: preview,
+            startedAt: startedAt,
+            lastActive: lastActive,
+            pinned: pinned,
+            archived: archived,
             source: source,
             profile: profile,
             messageCount: messageCount,
@@ -102,6 +124,7 @@ public struct ChatSession: Identifiable, Hashable, Sendable {
     public static func == (lhs: ChatSession, rhs: ChatSession) -> Bool {
         lhs.id == rhs.id
             && lhs.pinned == rhs.pinned
+            && lhs.archived == rhs.archived
             && lhs.messageCount == rhs.messageCount
             && lhs.lastActive == rhs.lastActive
             && lhs.startedAt == rhs.startedAt

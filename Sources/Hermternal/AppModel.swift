@@ -105,6 +105,7 @@ final class AppModel {
 
     private static let serverKey = "serverURL"
     private static let defaultServer = "https://hermes-dashboard.kayg.org"
+    private static let archiveToastID = ToastID("archive")
 
     private static var storedServer: String {
         UserDefaults.standard.string(forKey: serverKey) ?? defaultServer
@@ -372,6 +373,83 @@ final class AppModel {
                 sessions.sort(by: Self.sessionComesBefore)
             }
             postError("Could not update pin", detail: error.localizedDescription)
+        }
+    }
+
+    /// Changes the server archive state while keeping the sidebar responsive.
+    func setArchived(_ session: ChatSession, archived: Bool) async {
+        let previous: ChatSession
+        if archived {
+            guard let index = sessions.firstIndex(where: { $0.id == session.id }) else { return }
+            previous = sessions.remove(at: index)
+        } else {
+            let restored = session.withArchived(false)
+            if let index = sessions.firstIndex(where: { $0.id == session.id }) {
+                previous = sessions[index]
+                sessions[index] = restored
+            } else {
+                previous = restored
+                sessions.append(restored)
+            }
+            sessions.sort(by: Self.sessionComesBefore)
+        }
+
+        guard let rest else {
+            if archived {
+                if !sessions.contains(where: { $0.id == previous.id }) {
+                    sessions.append(previous)
+                }
+                sessions.sort(by: Self.sessionComesBefore)
+            } else {
+                sessions.removeAll { $0.id == session.id }
+            }
+            postError(
+                archived ? "Could not archive chat" : "Could not restore chat",
+                detail: "The server connection is unavailable."
+            )
+            return
+        }
+
+        do {
+            _ = try await rest.patchSession(
+                durableID: session.id,
+                archived: archived,
+                profile: session.profile
+            )
+            guard archived else { return }
+            toastPresenter.post(
+                ToastMessage(
+                    id: Self.archiveToastID,
+                    title: "Chat archived",
+                    severity: .success,
+                    action: ToastAction(label: "Undo"),
+                    isPersistent: true
+                ),
+                action: { [weak self] in
+                    guard let self else { return }
+                    Task { @MainActor in
+                        await self.setArchived(session, archived: false)
+                    }
+                }
+            )
+        } catch {
+            if let restError = error as? RestError, case .sessionNotFound = restError {
+                sessions.removeAll { $0.id == session.id }
+                postError("Chat no longer exists", detail: error.localizedDescription)
+                return
+            }
+            if archived {
+                if !sessions.contains(where: { $0.id == previous.id }) {
+                    sessions.append(previous)
+                }
+                sessions.sort(by: Self.sessionComesBefore)
+            } else {
+                sessions.removeAll { $0.id == session.id }
+            }
+            postError(
+                archived ? "Could not archive chat" : "Could not restore chat",
+                detail: error.localizedDescription
+            )
         }
     }
 

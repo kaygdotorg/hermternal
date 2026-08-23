@@ -68,11 +68,13 @@ func chatSessionParsesDashboardProperties() {
         "id": .string("session-1"),
         "last_active": .integer(1_700_000_000),
         "pinned": .bool(true),
+        "archived": .bool(true),
         "source": .string("api_server")
     ]))
 
     #expect(session.lastActive == Date(timeIntervalSince1970: 1_700_000_000))
     #expect(session.pinned)
+    #expect(session.archived)
     #expect(session.source == "api_server")
 }
 
@@ -82,6 +84,7 @@ func chatSessionDefaultsAbsentDashboardProperties() {
 
     #expect(session.lastActive == nil)
     #expect(!session.pinned)
+    #expect(!session.archived)
     #expect(session.source.isEmpty)
 }
 
@@ -94,6 +97,7 @@ func chatSessionWithPinnedPreservesFields() {
         "started_at": .integer(1_700_000_000),
         "last_active": .integer(1_700_000_600),
         "pinned": .bool(false),
+        "archived": .bool(true),
         "source": .string("api_server"),
         "profile": .string("work"),
         "message_count": .integer(7)
@@ -103,6 +107,8 @@ func chatSessionWithPinnedPreservesFields() {
 
     #expect(!session.pinned)
     #expect(pinned.pinned)
+    #expect(session.archived)
+    #expect(pinned.archived)
     #expect(pinned.id == session.id)
     #expect(pinned.title == session.title)
     #expect(pinned.preview == session.preview)
@@ -122,6 +128,60 @@ func chatSessionWithPinnedRoundTrips() {
 
     #expect(roundTripped == session)
     #expect(roundTripped.displayTitle == session.displayTitle)
+}
+
+@Test("withArchived preserves every ChatSession field")
+func chatSessionWithArchivedPreservesFields() {
+    let session = ChatSession(from: .object([
+        "id": .string("session-archived"),
+        "title": .string("A saved chat"),
+        "preview": .string("A preview"),
+        "started_at": .integer(1_700_000_000),
+        "last_active": .integer(1_700_000_600),
+        "pinned": .bool(true),
+        "archived": .bool(false),
+        "source": .string("api_server"),
+        "profile": .string("work"),
+        "message_count": .integer(7)
+    ]))
+
+    let archived = session.withArchived(true)
+
+    #expect(!session.archived)
+    #expect(archived.archived)
+    #expect(archived.pinned == session.pinned)
+    #expect(archived.id == session.id)
+    #expect(archived.title == session.title)
+    #expect(archived.preview == session.preview)
+    #expect(archived.startedAt == session.startedAt)
+    #expect(archived.lastActive == session.lastActive)
+    #expect(archived.source == session.source)
+    #expect(archived.profile == session.profile)
+    #expect(archived.messageCount == session.messageCount)
+    #expect(archived.displayTitle == session.displayTitle)
+}
+
+@Test("withArchived can round-trip the archive state")
+func chatSessionWithArchivedRoundTrips() {
+    let session = chatSession(title: "A chat", preview: "A preview")
+
+    let roundTripped = session.withArchived(true).withArchived(false)
+
+    #expect(roundTripped == session)
+}
+
+@Test("withPinned and withArchived compose in either order")
+func chatSessionCopiesCompose() {
+    let session = chatSession(title: "A chat", preview: "A preview")
+
+    let pinnedThenArchived = session.withPinned(true).withArchived(true)
+    let archivedThenPinned = session.withArchived(true).withPinned(true)
+
+    #expect(pinnedThenArchived.pinned)
+    #expect(pinnedThenArchived.archived)
+    #expect(archivedThenPinned.pinned)
+    #expect(archivedThenPinned.archived)
+    #expect(pinnedThenArchived == archivedThenPinned)
 }
 
 @Test("withPinned preserves the New Chat fallback title")

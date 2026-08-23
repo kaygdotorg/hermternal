@@ -39,10 +39,14 @@ struct SidebarView: View {
                         .swipeActions(edge: .leading, allowsFullSwipe: false) {
                             pinButton(for: session)
                         }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            archiveButton(for: session)
+                        }
                         // A per-row menu keeps the action tied to this row without
                         // changing List selection.
                         .contextMenu {
                             pinButton(for: session)
+                            archiveButton(for: session)
                         }
                     }
                 }
@@ -80,6 +84,16 @@ struct SidebarView: View {
         ) {
             Task {
                 await model.setPinned(session, pinned: !session.pinned)
+            }
+        }
+        .tint(.accentColor)
+    }
+
+    @ViewBuilder
+    private func archiveButton(for session: ChatSession) -> some View {
+        Button("Archive", systemImage: "archivebox") {
+            Task {
+                await model.setArchived(session, archived: true)
             }
         }
         .tint(.accentColor)
