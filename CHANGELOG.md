@@ -5,6 +5,30 @@ All notable changes to Hermternal are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow Semantic Versioning.
 
+## [v0.0.3] — 2026-08-23
+
+This feature release improves sidebar organization and makes release execution
+more reliable.
+
+### Added
+
+- Organize chats into folders, reorder them by drag, and keep scheduled runs in
+their own sidebar section.
+- Show the selected gateway identity in a compact gateway pill.
+- Open chats and target messages from deep links.
+
+### Changed
+
+- Pin, archive, and rename chats from the sidebar.
+- Release scripts can resume safely, verify signed and notarized artifacts, and
+publish only the verified artifact.
+- SSH signing uses an ephemeral keychain.
+- The performance release check gates deterministic cache, search, markdown,
+  disk-footprint, and release-binary contracts. Wall time, CPU, and RSS are
+  measured report-only values. Parser invocation, projection rebuild, actual
+  SQLite row visits, and allocation reuse are not gated because no counter
+  seam exists; they are future measurement gaps.
+
 ## [v0.0.2] — 2026-08-22
 
 This feature release makes the app usable for signed-in sessions: the previous
@@ -12,14 +36,15 @@ release could not reliably load chats or messages, while this release adds
 working search, credential refresh, and a rebuilt Settings window.
 
 ### Added
-
 - Search across indexed conversation history, including result navigation into
-a chat and find-in-conversation.
+  a chat and find-in-conversation.
 - Gateway settings and account identity in the app's native Settings window.
-- Keychain-backed credential storage with the existing file-backed path retained
-as a fallback where Keychain access is unavailable.
-- Visible-time toast notifications and an honest indexing indicator that reports
-real progress instead of showing a permanent spinner.
+- Production credentials are stored in an owner-only file under
+  `Application Support/Hermternal/credentials`. The Keychain adapter exists as
+  an injectable capability, but production composition uses the file-backed
+  store.
+- Visible-time toast notifications and an indexing status that distinguishes
+  queued backlog from active work.
 
 ### Changed
 

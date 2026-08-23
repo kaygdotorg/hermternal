@@ -14,13 +14,13 @@ Hermternal is a client for an existing Hermes gateway. It does not run a gateway
 
 ## Install
 
-1. Open the [v0.0.1 release](https://git.kayg.org/kayg/hermternal-apple/releases/tag/v0.0.1).
-2. Download `Hermternal-0.0.1.zip`.
+1. Open the [v0.0.3 release](https://git.kayg.org/kayg/hermternal-apple/releases/tag/v0.0.3).
+2. Download `Hermternal-0.0.3.zip`.
 3. Extract the archive.
 4. Move `Hermternal.app` to the `Applications` folder.
 5. Open Hermternal and enter your Hermes gateway URL. Sign-in opens your browser.
 
-The v0.0.1 archive is notarized. macOS Gatekeeper can verify the application before it starts.
+The v0.0.3 archive is notarized. macOS Gatekeeper can verify the application before it starts.
 
 ## Build from source
 
@@ -42,7 +42,7 @@ For a release configuration, run:
 CONFIG=release bash Scripts/build-app.sh
 ```
 
-## Current features in v0.0.1
+## Current features in v0.0.3
 
 - [x] Native SwiftUI and AppKit macOS application.
 - [x] Browser-based native sign-in with PKCE and a local callback.
@@ -55,6 +55,11 @@ CONFIG=release bash Scripts/build-app.sh
 - [x] Adjustable window frost setting and native Appearance and Cache settings tabs.
 - [x] Persistent server selection and stored sign-in credentials for the selected gateway.
 - [x] Reduce Transparency produces an opaque, legible system fallback across existing glass and material surfaces.
+- [x] Chat and message deep links open a chat and target a message.
+- [x] Sidebar folders organize chats, drag reorder changes their order, and scheduled runs have their own section.
+- [x] Sidebar row actions pin, archive, and rename chats.
+- [x] The sidebar shows the selected gateway identity in a gateway pill.
+- [x] The performance contract runner is available for release audits.
 
 ## Planned work
 
@@ -62,7 +67,7 @@ These items are tracked in Forgejo. The issue descriptions are the source of tru
 
 ### Search and navigation
 
-- [ ] [Chat and message deep links](https://git.kayg.org/kayg/hermternal-apple/issues/4).
+- [x] [Chat and message deep links](https://git.kayg.org/kayg/hermternal-apple/issues/4).
 - [ ] [Local chat search with Command-K](https://git.kayg.org/kayg/hermternal-apple/issues/8).
 - [ ] [Core Spotlight indexing](https://git.kayg.org/kayg/hermternal-apple/issues/11).
 - [ ] [Command-Shift-K action mode](https://git.kayg.org/kayg/hermternal-apple/issues/22).
@@ -87,16 +92,14 @@ These items are tracked in Forgejo. The issue descriptions are the source of tru
 ### Infrastructure
 
 - [ ] [Password sign-in test gateway and client support](https://git.kayg.org/kayg/hermternal-apple/issues/1).
-- [ ] [Deterministic performance and hitch harness](https://git.kayg.org/kayg/hermternal-apple/issues/14).
+- [x] [Deterministic performance and hitch harness](https://git.kayg.org/kayg/hermternal-apple/issues/14).
 - [ ] [Notarized release credentials and key ACL setup](https://git.kayg.org/kayg/hermternal-apple/issues/25).
 - [ ] [Complete history retrieval beyond 500 messages](https://git.kayg.org/kayg/hermternal-apple/issues/28).
 
-## Known limitations in v0.0.1
+## Known limitations in v0.0.3
 
-- The REST history endpoint returns at most 500 messages for a session and has no pagination. Older messages can be absent from the local transcript cache.
 - The native split view uses a hairline divider with a tonal step.
 - The application bundle has no configured macOS application icon.
-- v0.0.1 has no chat search and no deep-link support.
 
 ## Architecture
 

@@ -100,6 +100,10 @@ if (( DRY_RUN )); then
 	done
 	exit 0
 fi
+
+# Actual releases run only from the stable main branch.
+RELEASE_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
+[[ "$RELEASE_BRANCH" == "main" ]] || fail "actual releases must run from branch main (current: ${RELEASE_BRANCH:-detached})" 'Complete the dev audit and promote the audited commit to main before rerunning Scripts/ship.sh.'
 mkdir -p "$DIST" 2>/dev/null || fail 'could not create dist' 'A person at the Mac must make the checkout writable, then rerun Scripts/ship.sh.'
 mkdir -p "$STATE" 2>/dev/null || fail 'could not create release state' 'A person at the Mac must make dist writable, then rerun Scripts/ship.sh.'
 if [[ -f "$META" ]] && { ! grep -qF "head=$HEAD" "$META" || ! grep -qF "version=$VERSION" "$META"; }; then
