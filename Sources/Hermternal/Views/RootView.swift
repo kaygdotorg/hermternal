@@ -1,5 +1,4 @@
 import SwiftUI
-import AppKit
 
 struct RootView: View {
     @Bindable var model: AppModel
@@ -17,9 +16,12 @@ struct RootView: View {
                 FailureView(message: message, model: model)
             }
         }
-        .background {
-            ToolbarChromeVisibility(isHidden: model.isSearchPresented)
-        }
+        // The search panel is the front surface of the window. No toolbar item
+        // must show above it. The `automatic` placement removes the toolbar
+        // items only. The `.windowToolbar` placement removes the whole window
+        // toolbar, and it also removes the title and the traffic light
+        // controls. This window keeps those controls.
+        .toolbarVisibility(model.isSearchPresented ? .hidden : .automatic)
         .overlay {
             ToastLayer()
                 .environment(model.toastPresenter)
@@ -87,14 +89,25 @@ struct ChatWindow: View {
                 accountID: model.accountPresentation.accountID
             )
                 .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 340)
+                // `NavigationSplitView` supplies the sidebar toggle item. A
+                // hidden toolbar visibility removes custom items only, so it
+                // does not remove this item. Apple documents
+                // `toolbar(removing:)` on the sidebar column for this purpose.
+                // The parameter is optional, so one state controls both
+                // modifiers.
+                .toolbar(
+                    removing: model.isSearchPresented ? .sidebarToggle : nil
+                )
         } detail: {
             ChatView(
                 model: model,
                 isReadOnly: model.isViewingArchivedTranscript
             )
         }
-        // Keep the native titlebar and traffic lights; ChatView conditionally
-        // renders its controls so the toolbar group has no empty capsule.
+        // The window keeps the native titlebar and the traffic light controls.
+        // `ChatView` and `SidebarView` declare the toolbar items
+        // unconditionally. Only the visibility modifiers above respond to the
+        // search panel, so the panel does not cause a toolbar rebuild.
         .overlay {
             ZStack {
                 if model.isSearchPresented, let querying = model.searchQuerying {
@@ -125,134 +138,6 @@ struct ChatWindow: View {
         }
         .task {
             model.toastPresenter.setSuppressed(model.isSearchPresented)
-        }
-    }
-}
-
-
-private struct ToolbarChromeVisibility: NSViewRepresentable {
-    let isHidden: Bool
-
-    func makeNSView(context: Context) -> ToolbarChromeHost {
-        ToolbarChromeHost()
-    }
-
-    func updateNSView(_ nsView: ToolbarChromeHost, context: Context) {
-        nsView.setHidden(isHidden)
-    }
-}
-
-@MainActor
-private final class ToolbarChromeHost: NSView {
-    private var desiredHidden = false
-    private var savedIdentifiers: [NSToolbarItem.Identifier] = []
-    private var savedTitlebarButtons: [(NSView, Bool)] = []
-
-    func setHidden(_ hidden: Bool) {
-        desiredHidden = hidden
-
-        if hidden {
-            // Hide chrome as soon as the panel appears, but keep restoration
-            // behind the panel's opacity transition so it cannot flash over
-            // the still-fading card and shadow on dismissal.
-            applyVisibility()
-        } else {
-            // The search overlay owns the fade-out. Let the dim remain until
-            // that transition has completed; restoring here would expose a
-            // bright window behind the card for a frame.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-                guard let self, !self.desiredHidden else { return }
-                self.applyVisibility()
-            }
-        }
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        applyVisibility()
-    }
-
-    private func applyVisibility() {
-        if desiredHidden {
-            hideTitlebarButtons()
-        } else {
-            restoreTitlebarButtons()
-        }
-
-        guard let toolbar = window?.toolbar else { return }
-        if desiredHidden {
-            guard savedIdentifiers.isEmpty else { return }
-            savedIdentifiers = toolbar.items.map(\.itemIdentifier)
-            guard !toolbar.items.isEmpty else { return }
-            for index in stride(from: toolbar.items.count - 1, through: 0, by: -1) {
-                toolbar.removeItem(at: index)
-            }
-        } else {
-            guard !savedIdentifiers.isEmpty else { return }
-            let identifiers = savedIdentifiers
-            savedIdentifiers.removeAll()
-            for (index, identifier) in identifiers.enumerated() {
-                guard !toolbar.items.contains(where: {
-                    $0.itemIdentifier == identifier
-                }) else { continue }
-                toolbar.insertItem(
-                    withItemIdentifier: identifier,
-                    at: min(index, toolbar.items.count)
-                )
-            }
-        }
-    }
-
-    private func hideTitlebarButtons() {
-        guard savedTitlebarButtons.isEmpty, let window else { return }
-        let standardButtons = [
-            window.standardWindowButton(.closeButton),
-            window.standardWindowButton(.miniaturizeButton),
-            window.standardWindowButton(.zoomButton)
-        ].compactMap { $0 }
-        guard let root = window.contentView?.superview else { return }
-        collectTitlebarViews(
-            in: root,
-            insideTitlebar: false,
-            insideStandardButton: false,
-            excluding: standardButtons
-        )
-    }
-
-    private func collectTitlebarViews(
-        in view: NSView,
-        insideTitlebar: Bool,
-        insideStandardButton: Bool,
-        excluding standardButtons: [NSButton]
-    ) {
-        let className = NSStringFromClass(type(of: view))
-        let isTitlebar = insideTitlebar
-            || className.localizedCaseInsensitiveContains("toolbar")
-            || className.localizedCaseInsensitiveContains("titlebar")
-        let isStandardButton = view is NSButton
-            && standardButtons.contains(where: { $0 === view })
-        let isInsideStandardButton = insideStandardButton || isStandardButton
-
-        if isTitlebar, !isInsideStandardButton, view !== window,
-           view.subviews.isEmpty {
-            savedTitlebarButtons.append((view, view.isHidden))
-            view.isHidden = true
-        }
-        for child in view.subviews {
-            collectTitlebarViews(
-                in: child,
-                insideTitlebar: isTitlebar,
-                insideStandardButton: isInsideStandardButton,
-                excluding: standardButtons
-            )
-        }
-    }
-
-    private func restoreTitlebarButtons() {
-        let saved = savedTitlebarButtons
-        savedTitlebarButtons.removeAll()
-        for (button, wasHidden) in saved {
-            button.isHidden = wasHidden
         }
     }
 }

@@ -20,7 +20,4 @@ enum AppShapeScale {
 
     /// Dense content blocks, such as a code block inside a transcript.
     static let compact: CGFloat = 8
-
-    /// Capsule geometry for app-owned controls and identity pills.
-    static let control = Capsule()
 }

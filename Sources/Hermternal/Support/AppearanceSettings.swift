@@ -32,42 +32,61 @@ enum AppearanceMode: String, CaseIterable, Identifiable {
 final class AppearanceSettings {
     var mode: AppearanceMode {
         didSet {
+            guard oldValue != mode else { return }
             defaults.set(mode.rawValue, forKey: Keys.mode)
             applyAppKitAppearance()
         }
     }
 
-    /// Crossfades the window between its most transparent state at 0 and a
-    /// frosted material at 1. Live value while dragging; persisted when
-    /// editing ends so a pointer drag does not write UserDefaults once per
-    /// sample.
-    var windowFrost: Double
+    /// How solid the chat window's background is, 0...1. Continuous, and it
+    /// owns show-through on its own: the treatment behind it is never scaled
+    /// by this value. Live value while dragging; persisted when editing ends
+    /// so a pointer drag does not write UserDefaults once per sample.
+    var backgroundOpacity: Double
 
-    /// The dial directly controls the stronger material's opacity; a thin
-    /// system material remains underneath at every position for continuous
-    /// blur without a global tint or darkness floor.
-    var windowFrostMaterialOpacity: Double {
-        windowFrost
+    /// Swaps the window's frosted blur for Liquid Glass. A mode, not a point
+    /// on the opacity dial, and the two are mutually exclusive. Persisted on
+    /// change rather than on edit end, because a tick is not dragged.
+    var usesLiquidGlass: Bool {
+        didSet {
+            defaults.set(usesLiquidGlass, forKey: Keys.usesLiquidGlass)
+        }
+    }
+
+    /// Solid enough to read against any desktop, translucent enough that the
+    /// blur behind it is plainly the point.
+    private static let defaultBackgroundOpacity = 0.85
+
+    /// Opacity only means anything inside 0...1, and the value can arrive from
+    /// a `UserDefaults` payload written by another build.
+    private static func clamped(_ value: Double) -> Double {
+        value.isFinite ? min(max(value, 0), 1) : defaultBackgroundOpacity
     }
 
     private let defaults: UserDefaults
 
     private enum Keys {
         static let mode = "appearance.mode"
-        static let windowFrost = "appearance.windowFrost"
+        static let backgroundOpacity = "appearance.backgroundOpacity"
+        static let usesLiquidGlass = "appearance.usesLiquidGlass"
     }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         mode = AppearanceMode(rawValue: defaults.string(forKey: Keys.mode) ?? "")
             ?? .system
-        windowFrost = defaults.object(forKey: Keys.windowFrost) as? Double ?? 0.20
+        backgroundOpacity = Self.clamped(
+            defaults.object(forKey: Keys.backgroundOpacity) as? Double
+                ?? Self.defaultBackgroundOpacity
+        )
+        // `didSet` does not fire for this, so loading costs no write back.
+        usesLiquidGlass = defaults.bool(forKey: Keys.usesLiquidGlass)
         applyAppKitAppearance()
     }
 
     /// SwiftUI's `preferredColorScheme` only updates SwiftUI's environment.
     /// AppKit materials, toolbars, and window chrome resolve from `NSAppearance`,
-    /// so update every window synchronously before SwiftUI renders the new mode.
+    /// so update the application synchronously before SwiftUI renders the new mode.
     private func applyAppKitAppearance() {
         let appKitAppearance: NSAppearance? = switch mode {
         case .system:
@@ -78,26 +97,30 @@ final class AppearanceSettings {
             NSAppearance(named: .darkAqua)
         }
 
+        // Apple documents that NSApplication.appearance is inherited by the
+        // app's windows and views:
+        // https://developer.apple.com/documentation/appkit/nsapplication/appearance
+        // Assigning windows one at a time made adoption depend on each
+        // window's next update cycle, so Settings changed first while Chat
+        // waited for focus to repaint.
+        // Use `.shared` rather than `NSApp`: initialization can run before
+        // NSApp's implicitly unwrapped global has an application instance.
         NSApplication.shared.appearance = appKitAppearance
-        for window in NSApplication.shared.windows {
-            window.appearance = appKitAppearance
-            // AppKit-backed materials can otherwise retain their previous
-            // sampled appearance until the next invalidation.
-            window.contentView?.needsDisplay = true
-        }
     }
 
-    func previewWindowFrost(_ value: Double) {
-        windowFrost = min(max(value, 0), 1)
+    /// Live value while the thumb is moving: the window follows it exactly.
+    func previewBackgroundOpacity(_ value: Double) {
+        backgroundOpacity = Self.clamped(value)
     }
 
-    func persistWindowFrost() {
-        defaults.set(windowFrost, forKey: Keys.windowFrost)
+    func persistBackgroundOpacity() {
+        defaults.set(backgroundOpacity, forKey: Keys.backgroundOpacity)
     }
 
     func resetToDefaults() {
         mode = .system
-        windowFrost = 0.20
-        persistWindowFrost()
+        backgroundOpacity = Self.defaultBackgroundOpacity
+        persistBackgroundOpacity()
+        usesLiquidGlass = false
     }
 }

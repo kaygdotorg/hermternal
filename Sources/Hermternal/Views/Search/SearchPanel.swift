@@ -9,6 +9,7 @@ import HermternalCore
 struct SearchPanel: View {
     @State private var model: SearchPanelModel
     @FocusState private var fieldFocused: Bool
+    @Namespace private var searchFocusScope
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorSchemeContrast) private var contrast
     @State private var hasAppeared = false
@@ -53,14 +54,14 @@ struct SearchPanel: View {
                     .fill(.clear)
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
-                    .onTapGesture(perform: dismiss)
+                    .onTapGesture(perform: dismissPanel)
                     .accessibilityHidden(true)
                 SearchPanelSurface(
                     model: model,
                     fieldFocused: $fieldFocused,
                     maximumHeight: maximumHeight,
                     activate: activate,
-                    dismiss: dismiss
+                    dismiss: dismissPanel
                 )
                 .frame(width: panelWidth)
                 .padding(.top, geometry.size.height / 3)
@@ -70,13 +71,30 @@ struct SearchPanel: View {
             }
             .animation(panelAnimation, value: hasAppeared)
             .onAppear {
-                // Focus is established before the visual ramp so ⌘K is
-                // immediately ready for typing, including Reduce Motion.
-                fieldFocused = true
                 hasAppeared = true
             }
-            .onExitCommand(perform: dismiss)
+            .onDisappear {
+                // Relinquish the panel's scoped focus before its hierarchy is
+                // removed so SwiftUI can restore the focus that opened it.
+                fieldFocused = false
+            }
+            .task {
+                // The sidebar List has a default focus target. Deferring one
+                // focus transaction lets this newly-created scope win even
+                // when Command-K arrives while the List or composer is live.
+                await Task.yield()
+                guard !Task.isCancelled else { return }
+                fieldFocused = true
+            }
+            .onExitCommand(perform: dismissPanel)
+            .focusScope(searchFocusScope)
+            .defaultFocus($fieldFocused, true)
         }
+    }
+
+    private func dismissPanel() {
+        fieldFocused = false
+        dismiss()
     }
 
     private var panelAnimation: Animation {

@@ -124,10 +124,10 @@ struct SettingsDetailView: View {
 private struct AppearanceSettingsView: View {
     @Bindable var appearance: AppearanceSettings
 
-    private var frostBinding: Binding<Double> {
+    private var opacityBinding: Binding<Double> {
         Binding(
-            get: { appearance.windowFrost },
-            set: { appearance.previewWindowFrost($0) }
+            get: { appearance.backgroundOpacity },
+            set: { appearance.previewBackgroundOpacity($0) }
         )
     }
 
@@ -146,27 +146,42 @@ private struct AppearanceSettingsView: View {
                 LabeledContent {
                     HStack {
                         Slider(
-                            value: frostBinding,
+                            value: opacityBinding,
                             in: 0...1,
                             onEditingChanged: { editing in
                                 if !editing {
-                                    appearance.persistWindowFrost()
+                                    appearance.persistBackgroundOpacity()
                                 }
                             }
                         )
+                        // The dial is a plain 0...1 opacity, so VoiceOver's
+                        // own percentage is the truth and needs no override.
                         Text(
-                            appearance.windowFrost.formatted(
-                                .percent.precision(.fractionLength(0))
-                            )
+                            appearance.backgroundOpacity,
+                            format: .percent.precision(.fractionLength(0))
                         )
+                        // Monospaced digits so the readout cannot shimmy
+                        // while the thumb is moving.
                         .monospacedDigit()
-                        .frame(width: 42, alignment: .trailing)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 48, alignment: .trailing)
                     }
                 } label: {
-                    Text("Frost")
+                    Text("Background Opacity")
                     Text(
-                        "Applies to the chat window only. At 0% the desktop shows through "
-                            + "the window; at 100% the window is a frosted material."
+                        "How solid the chat window is. Lower lets more of the "
+                            + "desktop show through the blur; 100% hides it "
+                            + "entirely."
+                    )
+                }
+
+                Toggle(isOn: $appearance.usesLiquidGlass) {
+                    Text("Refract the desktop instead of blurring it")
+                    Text(
+                        "Replaces the frosted blur behind the chat window with "
+                            + "Liquid Glass. Glass adjusts the luminosity of "
+                            + "whatever sits behind the window, so text can "
+                            + "read softer at low opacity."
                     )
                 }
             } header: {

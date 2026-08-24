@@ -105,7 +105,7 @@ struct HermternalApp: App {
 
     var body: some Scene {
         Window("", id: "main") {
-            GlassFrame(appearance: appearance) {
+            WindowFrame(appearance: appearance) {
                 RootView(model: model)
             }
             .preferredColorScheme(appearance.mode.colorScheme)
@@ -183,35 +183,38 @@ private struct FindCommand: View {
     }
 }
 
-/// One Liquid Glass layer spanning the whole window, titlebar included.
+/// The window's background, escaping the titlebar so the chrome is not a solid
+/// strip.
 ///
-/// Both halves are load-bearing: the glass layer respects the titlebar safe
-/// area, so without `ignoresSafeArea` the titlebar stays a solid strip; and
-/// the toolbar draws its own opaque backing over the glass, so without
-/// hiding that backing the titlebar covers the material either way.
-private struct GlassFrame<Content: View>: View {
-    @Bindable var appearance: AppearanceSettings
+/// Both halves are load-bearing: the background must escape the titlebar safe
+/// area, or the titlebar stays a solid strip; and the toolbar draws its own
+/// opaque backing over it, so without hiding that backing the titlebar masks
+/// the treatment either way.
+///
+/// The default treatment is a frosted blur, not Liquid Glass. The Materials HIG
+/// is explicit — "Don't use Liquid Glass in the content layer… Instead, use
+/// standard materials for elements in the content layer, such as app
+/// backgrounds" — and a window-sized `glassEffect(.regular)` used to sit here.
+/// `Glass.regular` "adjusts the luminosity of background content" to protect
+/// legibility, which is right for a floating control and can wash a whole
+/// window of text. Glass is now the tick in Settings rather than the default,
+/// and the always-on Liquid Glass stays where Apple puts it: the composer
+/// capsule, the send button, and the search field.
+private struct WindowFrame<Content: View>: View {
+    let appearance: AppearanceSettings
     @ViewBuilder let content: Content
 
     var body: some View {
         content
-            // The glass must escape the titlebar safe area, but the content
-            // must not: a ZStack sibling that ignores it collapses the safe
-            // area for the whole stack, so the transcript stops knowing a
+            // The background must escape the titlebar safe area, but the
+            // content must not: a ZStack sibling that ignores it collapses the
+            // safe area for the whole stack, so the transcript stops knowing a
             // titlebar is above it and loses its scroll edge effect.
             .background {
-                ZStack {
-                    Color.clear
-                        .glassEffect(.regular, in: .rect(cornerRadius: 0))
-                    // Frost rides over the glass on purpose: at 0 the glass
-                    // refracts untouched, at 1 the window reads as a frosted
-                    // material. No base blur here — the glass is the blur, and
-                    // a material over it would stop it refracting.
-                    FrostedWindowBackground(
-                        materialOpacity: appearance.windowFrostMaterialOpacity,
-                        includesBaseBlur: false
-                    )
-                }
+                WindowBackdrop(
+                    opacity: appearance.backgroundOpacity,
+                    usesLiquidGlass: appearance.usesLiquidGlass
+                )
                 .ignoresSafeArea()
             }
             .containerBackground(.clear, for: .window)
