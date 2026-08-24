@@ -155,7 +155,10 @@ struct MarkdownMessage: View {
 
     var body: some View {
         if isStreaming {
-            let _ = TextWorkTrace.recordRow(text: text)
+            let _ = TextWorkTrace.recordRow(
+                text: text,
+                owner: .swiftUITranscriptRow
+            )
             Text(text)
                 .font(.body)
                 .foregroundStyle(.primary)
@@ -177,12 +180,23 @@ struct MarkdownBlocks: View {
     var matches: MessageFindMatches?
 
     var body: some View {
-        let _ = TextWorkTrace.recordRow(text: text)
+        let _ = TextWorkTrace.recordRow(
+            text: text,
+            owner: .swiftUITranscriptRow
+        )
         // `parse` and `sourceSpans` are both cached in Core and keyed by the
         // message text, so this is a lookup rather than a parse, and the
         // segment ids are stable across invalidations for `ForEach` reuse.
-        let segments = MarkdownSegment.parse(text)
-        let spans = matches == nil ? [] : MarkdownSegment.sourceSpans(for: text)
+        let segments = MarkdownSegment.parse(
+            text,
+            owner: .swiftUITranscriptRow
+        )
+        let spans = matches == nil
+            ? []
+            : MarkdownSegment.sourceSpans(
+                for: text,
+                owner: .findHighlighting
+            )
 
         VStack(alignment: .leading, spacing: 0) {
             ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
@@ -299,7 +313,7 @@ struct MarkdownBlocks: View {
             return content
         }
 
-        let conversionToken = TextWorkTrace.begin()
+        let conversionToken = TextWorkTrace.begin(owner: .findHighlighting)
         let rendered = String(content.characters)
         TextWorkTrace.finish(
             conversionToken,
@@ -308,7 +322,7 @@ struct MarkdownBlocks: View {
         )
         let ranges = projected(span.source, onto: rendered)
         guard !ranges.isEmpty else { return content }
-        let constructionToken = TextWorkTrace.begin()
+        let constructionToken = TextWorkTrace.begin(owner: .findHighlighting)
         let highlighted = FindTextHighlighting.mark(content, ranges: ranges)
         TextWorkTrace.finish(
             constructionToken,
@@ -346,7 +360,7 @@ private enum TranscriptCodeHighlightCache {
             return cached
         }
 
-        let token = TextWorkTrace.begin()
+        let token = TextWorkTrace.begin(owner: .findHighlighting)
         let marked = FindTextHighlighting.mark(
             AttributedString(source),
             ranges: ranges

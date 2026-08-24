@@ -2,6 +2,40 @@ import SwiftUI
 import HermternalCore
 import AppKit
 
+private enum TranscriptBlockWindowCache {
+    private struct Key: Hashable {
+        let messageID: MessageIdentity
+        let contentHash: UInt64
+    }
+
+    private static let storage = ByteBoundedCache<Key, [TranscriptBlock]>(
+        byteBudget: MarkdownSegment.parseCacheByteBudget
+    )
+
+    static func blocks(for message: ChatMessage) -> [TranscriptBlock] {
+        let key = Key(messageID: message.id, contentHash: contentHash(of: message.text))
+        if let cached = storage.value(for: key) {
+            return cached
+        }
+        let blocks = TranscriptBlockSegmenter.blocks(for: message)
+        let textCost = message.text.utf8.count
+        let blockCost = blocks.count.multipliedReportingOverflow(
+            by: MemoryLayout<TranscriptBlock>.stride
+        ).partialValue
+        let cost = max(1, textCost.addingReportingOverflow(blockCost).partialValue)
+        storage.insert(blocks, for: key, byteCost: cost)
+        return blocks
+    }
+
+    private static func contentHash(of text: String) -> UInt64 {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in text.utf8 {
+            hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211
+        }
+        return hash
+    }
+}
+
 struct ChatView: View {
     @Bindable var model: AppModel
     let isReadOnly: Bool
@@ -469,7 +503,7 @@ struct ChatView: View {
         let windowedMatches = windowedProjection.matches
         let activeWindowMatchIndex = windowedProjection.activeIndex
         let windowedBlocks = windowedMessages.flatMap {
-            TranscriptBlockSegmenter.blocks(for: $0)
+            TranscriptBlockWindowCache.blocks(for: $0)
         }
         // Capture the publication generation, not the latest streaming
         // generation. A stream can begin while the first rows are painting.

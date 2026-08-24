@@ -1,4 +1,25 @@
 import Foundation
+
+/// Closed attribution vocabulary shared by the process-local measurement probes.
+public enum TraceOwner: String, CaseIterable, Hashable, Sendable {
+    case blockPreparation = "block-preparation"
+    case blockRowConfiguration = "block-row-configuration"
+    case swiftUITranscriptRow = "swiftui-transcript-row"
+    case findHighlighting = "find-highlighting"
+    case searchPanel = "search-panel"
+    case sidebarRow = "sidebar-row"
+    case backgroundPrefetch = "background-prefetch"
+    case unattributed = "unattributed"
+}
+
+/// Executor recorded for a real sample. `none` is used only by synthetic
+/// zero-valued category lines retained for parser compatibility.
+public enum TraceExecutor: String, CaseIterable, Hashable, Sendable {
+    case main
+    case offMain = "off-main"
+    case none
+}
+
 /// Opt-in contention measurements for interactive transcript work.
 ///
 /// The probe records lock and actor-entry wait only. It does not record work
@@ -11,29 +32,65 @@ public enum ContentionTrace {
         public let maxNanoseconds: UInt64
         public let backgroundAtBeginTotal: UInt64
         public let backgroundAtBeginMax: Int
+        public let owner: TraceOwner
+        public let executor: TraceExecutor
+        public let generation: UInt64
+        fileprivate let resource: String
 
         public init(
             count: Int,
             totalNanoseconds: UInt64,
             maxNanoseconds: UInt64,
             backgroundAtBeginTotal: UInt64,
-            backgroundAtBeginMax: Int
+            backgroundAtBeginMax: Int,
+            owner: TraceOwner = .unattributed,
+            executor: TraceExecutor = .none,
+            generation: UInt64 = 0,
+            resource: String = "unknown"
         ) {
             self.count = count
             self.totalNanoseconds = totalNanoseconds
             self.maxNanoseconds = maxNanoseconds
             self.backgroundAtBeginTotal = backgroundAtBeginTotal
             self.backgroundAtBeginMax = backgroundAtBeginMax
+            self.owner = owner
+            self.executor = executor
+            self.generation = generation
+            self.resource = resource
         }
     }
 
     public struct Snapshot: Sendable, Equatable {
         public let resources: [String: Aggregate]
         public let backgroundWorkInFlight: Int
-
-        public init(resources: [String: Aggregate], backgroundWorkInFlight: Int) {
-            self.resources = resources
+        fileprivate let generation: UInt64
+        public init(
+            resources: [String: Aggregate],
+            backgroundWorkInFlight: Int,
+            generation: UInt64 = 0
+        ) {
+            self.resources = Dictionary(
+                uniqueKeysWithValues: resources.map { key, aggregate in
+                    (
+                        key,
+                        Aggregate(
+                            count: aggregate.count,
+                            totalNanoseconds: aggregate.totalNanoseconds,
+                            maxNanoseconds: aggregate.maxNanoseconds,
+                            backgroundAtBeginTotal: aggregate.backgroundAtBeginTotal,
+                            backgroundAtBeginMax: aggregate.backgroundAtBeginMax,
+                            owner: aggregate.owner,
+                            executor: aggregate.executor,
+                            generation: aggregate.generation,
+                            resource: aggregate.resource == "unknown"
+                                ? key
+                                : aggregate.resource
+                        )
+                    )
+                }
+            )
             self.backgroundWorkInFlight = backgroundWorkInFlight
+            self.generation = generation
         }
     }
 
@@ -42,8 +99,17 @@ public enum ContentionTrace {
         let beganAt: UInt64
         let backgroundAtBegin: Int
         let generation: UInt64
+        let owner: TraceOwner
+        let executor: TraceExecutor
         var waitTotal: UInt64 = 0
         var waitMax: UInt64 = 0
+    }
+
+    private struct AggregateKey: Hashable {
+        let resource: String
+        let owner: TraceOwner
+        let executor: TraceExecutor
+        let generation: UInt64
     }
 
     @inline(__always)
@@ -51,11 +117,10 @@ public enum ContentionTrace {
         MeasurementGate.isEnabled(.resourceContention)
     }
 
-
     private final class State: @unchecked Sendable {
         let lock = NSLock()
         var backgroundWorkInFlight = 0
-        var aggregates: [String: Aggregate] = [:]
+        var aggregates: [AggregateKey: Aggregate] = [:]
         var generation: UInt64 = 0
     }
 
@@ -81,9 +146,21 @@ public enum ContentionTrace {
             return Snapshot(resources: [:], backgroundWorkInFlight: 0)
         }
         state.lock.lock()
+        let generation = state.generation
+        let aggregates = state.aggregates
         let snapshot = Snapshot(
-            resources: state.aggregates,
-            backgroundWorkInFlight: state.backgroundWorkInFlight
+            resources: Dictionary(
+                uniqueKeysWithValues: aggregates.enumerated().map { index, pair in
+                    let (key, aggregate) = pair
+                    return (
+                        "\(key.resource)\u{1F}\(key.owner.rawValue)\u{1F}"
+                            + "\(key.executor.rawValue)\u{1F}\(key.generation)\u{1F}\(index)",
+                        aggregate
+                    )
+                }
+            ),
+            backgroundWorkInFlight: state.backgroundWorkInFlight,
+            generation: generation
         )
         state.aggregates.removeAll(keepingCapacity: true)
         state.generation &+= 1
@@ -111,6 +188,7 @@ public enum ContentionTrace {
 
     private static func begin(
         resource: String,
+        owner: TraceOwner,
         requireMainThread: Bool
     ) -> Request? {
         guard isEnabled() else { return nil }
@@ -123,16 +201,24 @@ public enum ContentionTrace {
             resource: resource,
             beganAt: DispatchTime.now().uptimeNanoseconds,
             backgroundAtBegin: backgroundAtBegin,
-            generation: generation
+            generation: generation,
+            owner: owner,
+            executor: Thread.isMainThread ? .main : .offMain
         )
     }
 
-    static func beginInteractive(resource: String) -> Request? {
-        begin(resource: resource, requireMainThread: false)
+    static func beginInteractive(
+        resource: String,
+        owner: TraceOwner = .unattributed
+    ) -> Request? {
+        begin(resource: resource, owner: owner, requireMainThread: false)
     }
 
-    static func beginMainInteractive(resource: String) -> Request? {
-        begin(resource: resource, requireMainThread: true)
+    static func beginMainInteractive(
+        resource: String,
+        owner: TraceOwner = .unattributed
+    ) -> Request? {
+        begin(resource: resource, owner: owner, requireMainThread: true)
     }
 
     static func recordLockWait(
@@ -162,8 +248,14 @@ public enum ContentionTrace {
             request = nil
             return
         }
-        let current = state.aggregates[value.resource]
-        state.aggregates[value.resource] = Aggregate(
+        let key = AggregateKey(
+            resource: value.resource,
+            owner: value.owner,
+            executor: value.executor,
+            generation: value.generation
+        )
+        let current = state.aggregates[key]
+        state.aggregates[key] = Aggregate(
             count: (current?.count ?? 0) + 1,
             totalNanoseconds: (current?.totalNanoseconds ?? 0) &+ value.waitTotal,
             maxNanoseconds: max(current?.maxNanoseconds ?? 0, value.waitMax),
@@ -172,7 +264,11 @@ public enum ContentionTrace {
             backgroundAtBeginMax: max(
                 current?.backgroundAtBeginMax ?? 0,
                 value.backgroundAtBegin
-            )
+            ),
+            owner: value.owner,
+            executor: value.executor,
+            generation: value.generation,
+            resource: value.resource
         )
         state.lock.unlock()
         request = nil
@@ -187,23 +283,32 @@ public enum ContentionTrace {
                 + " resource=none"
                 + " count=0 wait_total_ns=0 wait_max_ns=0"
                 + " bg_at_begin_total=0 bg_at_begin_max=0"
-                + " bg_inflight=\(snapshot.backgroundWorkInFlight)\n"
+                + " bg_inflight=\(snapshot.backgroundWorkInFlight)"
+                + " owner=\(TraceOwner.unattributed.rawValue)"
+                + " executor=\(TraceExecutor.none.rawValue)"
+                + " generation=\(snapshot.generation)\n"
             FileHandle.standardError.write(Data(line.utf8))
             return
         }
-        for resource in snapshot.resources.keys.sorted() {
-            guard let aggregate = snapshot.resources[resource] else { continue }
+        let aggregates = snapshot.resources.values.sorted {
+            ($0.resource, $0.owner.rawValue, $0.executor.rawValue, $0.generation)
+                < ($1.resource, $1.owner.rawValue, $1.executor.rawValue, $1.generation)
+        }
+        for aggregate in aggregates {
             let line = "[DEBUG-contention-7F3A] ns="
                 + "\(DispatchTime.now().uptimeNanoseconds)"
                 + " event=contention.aggregate"
                 + " phase=\(phase)"
-                + " resource=\(resource)"
+                + " resource=\(aggregate.resource)"
                 + " count=\(aggregate.count)"
                 + " wait_total_ns=\(aggregate.totalNanoseconds)"
                 + " wait_max_ns=\(aggregate.maxNanoseconds)"
                 + " bg_at_begin_total=\(aggregate.backgroundAtBeginTotal)"
                 + " bg_at_begin_max=\(aggregate.backgroundAtBeginMax)"
-                + " bg_inflight=\(snapshot.backgroundWorkInFlight)\n"
+                + " bg_inflight=\(snapshot.backgroundWorkInFlight)"
+                + " owner=\(aggregate.owner.rawValue)"
+                + " executor=\(aggregate.executor.rawValue)"
+                + " generation=\(aggregate.generation)\n"
             FileHandle.standardError.write(Data(line.utf8))
         }
     }
@@ -224,19 +329,31 @@ public enum TextWorkTrace {
     public struct Token: Sendable {
         fileprivate let startedAt: UInt64
         fileprivate let generation: UInt64
+        fileprivate let owner: TraceOwner
+        fileprivate let executor: TraceExecutor
     }
 
     private struct Aggregate {
         var count = 0
         var characters = 0
         var totalNanoseconds: UInt64 = 0
+        var largestRowCharacters = 0
+        let owner: TraceOwner
+        let executor: TraceExecutor
+        let generation: UInt64
+    }
+
+    private struct AggregateKey: Hashable {
+        let category: Category
+        let owner: TraceOwner
+        let executor: TraceExecutor
+        let generation: UInt64
     }
 
     private final class State: @unchecked Sendable {
         let lock = NSLock()
         var generation: UInt64 = 0
-        var aggregates: [Category: Aggregate] = [:]
-        var largestRowCharacters = 0
+        var aggregates: [AggregateKey: Aggregate] = [:]
     }
 
     @inline(__always)
@@ -250,18 +367,21 @@ public enum TextWorkTrace {
         state.lock.lock()
         state.generation &+= 1
         state.aggregates.removeAll(keepingCapacity: true)
-        state.largestRowCharacters = 0
         state.lock.unlock()
     }
 
-    public static func begin() -> Token? {
+    public static func begin(
+        owner: TraceOwner = .unattributed
+    ) -> Token? {
         guard isEnabled() else { return nil }
         state.lock.lock()
         let generation = state.generation
         state.lock.unlock()
         return Token(
             startedAt: DispatchTime.now().uptimeNanoseconds,
-            generation: generation
+            generation: generation,
+            owner: owner,
+            executor: Thread.isMainThread ? .main : .offMain
         )
     }
 
@@ -285,11 +405,21 @@ public enum TextWorkTrace {
             state.lock.unlock()
             return
         }
-        var aggregate = state.aggregates[category] ?? Aggregate()
+        let key = AggregateKey(
+            category: category,
+            owner: token.owner,
+            executor: token.executor,
+            generation: token.generation
+        )
+        var aggregate = state.aggregates[key] ?? Aggregate(
+            owner: token.owner,
+            executor: token.executor,
+            generation: token.generation
+        )
         aggregate.count &+= 1
         aggregate.characters &+= max(0, characters)
         aggregate.totalNanoseconds &+= elapsed
-        state.aggregates[category] = aggregate
+        state.aggregates[key] = aggregate
         state.lock.unlock()
     }
 
@@ -306,12 +436,28 @@ public enum TextWorkTrace {
         )
     }
 
-
-    public static func recordRow(text: String) {
+    public static func recordRow(
+        text: String,
+        owner: TraceOwner = .unattributed
+    ) {
         guard isEnabled() else { return }
         let characters = text.utf16.count
         state.lock.lock()
-        state.largestRowCharacters = max(state.largestRowCharacters, characters)
+        let generation = state.generation
+        let executor: TraceExecutor = Thread.isMainThread ? .main : .offMain
+        let key = AggregateKey(
+            category: .appLayout,
+            owner: owner,
+            executor: executor,
+            generation: generation
+        )
+        var aggregate = state.aggregates[key] ?? Aggregate(
+            owner: owner,
+            executor: executor,
+            generation: generation
+        )
+        aggregate.largestRowCharacters = max(aggregate.largestRowCharacters, characters)
+        state.aggregates[key] = aggregate
         state.lock.unlock()
     }
 
@@ -319,31 +465,52 @@ public enum TextWorkTrace {
         guard isEnabled() else { return }
         state.lock.lock()
         let aggregates = state.aggregates
-        let largestRowCharacters = state.largestRowCharacters
+        let generation = state.generation
         state.aggregates.removeAll(keepingCapacity: true)
-        state.largestRowCharacters = 0
         state.generation &+= 1
         state.lock.unlock()
 
         for category in Category.allCases {
-            let aggregate = aggregates[category] ?? Aggregate()
-            let line = "[DEBUG-contention-7F3A] ns="
-                + "\(DispatchTime.now().uptimeNanoseconds)"
-                + " event=text.aggregate"
-                + " phase=\(phase)"
-                + " category=\(category.rawValue)"
-                + " count=\(aggregate.count)"
-                + " chars_total=\(aggregate.characters)"
-                + " total_ns=\(aggregate.totalNanoseconds)"
-                + " largest_row_chars=\(largestRowCharacters)\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            let matching = aggregates
+                .filter { $0.key.category == category }
+                .map(\.value)
+                .sorted {
+                    ($0.owner.rawValue, $0.executor.rawValue, $0.generation)
+                        < ($1.owner.rawValue, $1.executor.rawValue, $1.generation)
+                }
+            let values = matching.isEmpty
+                ? [
+                    Aggregate(
+                        owner: .unattributed,
+                        executor: .none,
+                        generation: generation
+                    )
+                ]
+                : matching
+            for aggregate in values {
+                let line = "[DEBUG-contention-7F3A] ns="
+                    + "\(DispatchTime.now().uptimeNanoseconds)"
+                    + " event=text.aggregate"
+                    + " phase=\(phase)"
+                    + " category=\(category.rawValue)"
+                    + " count=\(aggregate.count)"
+                    + " chars_total=\(aggregate.characters)"
+                    + " total_ns=\(aggregate.totalNanoseconds)"
+                    + " largest_row_chars=\(aggregate.largestRowCharacters)"
+                    + " owner=\(aggregate.owner.rawValue)"
+                    + " executor=\(aggregate.executor.rawValue)"
+                    + " generation=\(aggregate.generation)\n"
+                FileHandle.standardError.write(Data(line.utf8))
+            }
         }
     }
 }
 
-
-fileprivate func tracedStringConversion(_ value: Substring) -> String {
-    let token = TextWorkTrace.begin()
+fileprivate func tracedStringConversion(
+    _ value: Substring,
+    owner: TraceOwner = .unattributed
+) -> String {
+    let token = TextWorkTrace.begin(owner: owner)
     let result = String(value)
     TextWorkTrace.finish(
         token,
@@ -353,8 +520,11 @@ fileprivate func tracedStringConversion(_ value: Substring) -> String {
     return result
 }
 
-fileprivate func tracedStringConversion(_ value: Character) -> String {
-    let token = TextWorkTrace.begin()
+fileprivate func tracedStringConversion(
+    _ value: Character,
+    owner: TraceOwner = .unattributed
+) -> String {
+    let token = TextWorkTrace.begin(owner: owner)
     let result = String(value)
     TextWorkTrace.finish(
         token,
@@ -363,6 +533,7 @@ fileprivate func tracedStringConversion(_ value: Character) -> String {
     )
     return result
 }
+
 
 /// A message body split into inline-rendered blocks and fenced-code runs.
 ///
@@ -400,14 +571,20 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
     }
 
     /// Parses and caches the message's block and inline structure.
-    public static func parse(_ text: String) -> [MarkdownSegment] {
-        MarkdownParseCache.shared.value(for: text).segments
+    public static func parse(
+        _ text: String,
+        owner: TraceOwner = .unattributed
+    ) -> [MarkdownSegment] {
+        MarkdownParseCache.shared.value(for: text, owner: owner).segments
     }
 
     /// A descriptive alias for callers that want to make the cached seam
     /// explicit.
-    public static func segments(for text: String) -> [MarkdownSegment] {
-        parse(text)
+    public static func segments(
+        for text: String,
+        owner: TraceOwner = .unattributed
+    ) -> [MarkdownSegment] {
+        parse(text, owner: owner)
     }
 
     /// UTF-16 source spans aligned with `parse(_:)`'s returned segments.
@@ -415,17 +592,22 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
     ///
     /// Spans are intentionally recomputed for this request and are not
     /// retained with the decoded attributed payload.
-    public static func sourceSpans(for text: String) -> [
+    public static func sourceSpans(
+        for text: String,
+        owner: TraceOwner = .unattributed
+    ) -> [
         (source: Range<Int>, language: Range<Int>?)
     ] {
-        MarkdownParseCache.shared.sourceSpans(for: text)
+        MarkdownParseCache.shared.sourceSpans(for: text, owner: owner)
     }
 
     fileprivate static func parseUncached(
         _ text: String,
         includeSegments: Bool = true,
-        includeSourceSpans: Bool = false
+        includeSourceSpans: Bool = false,
+        owner: TraceOwner = .unattributed
     ) -> MarkdownParseResult {
+
         var segments: [MarkdownSegment] = []
         var sourceSpans: [(source: Range<Int>, language: Range<Int>?)] = []
         var proseBuffer: [Substring] = []
@@ -447,7 +629,7 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
                 proseEnd = nil
                 return
             }
-            let joinToken = includeSegments ? TextWorkTrace.begin() : nil
+            let joinToken = includeSegments ? TextWorkTrace.begin(owner: owner) : nil
             let joined = includeSegments ? proseBuffer.joined(separator: "\n") : ""
             TextWorkTrace.finish(
                 joinToken,
@@ -459,7 +641,7 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
             proseEnd = nil
             if includeSegments && !joined.isEmpty {
                 let id = stableID(kind: "prose", position: position, content: joined)
-                segments.append(.prose(id: id, attributed(from: joined)))
+                segments.append(.prose(id: id, attributed(from: joined, owner: owner)))
             }
             if includeSourceSpans {
                 sourceSpans.append((start..<max(start, end), nil))
@@ -468,7 +650,7 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
         }
 
         func flushCode(at end: Int) {
-            let joinToken = includeSegments ? TextWorkTrace.begin() : nil
+            let joinToken = includeSegments ? TextWorkTrace.begin(owner: owner) : nil
             let body = includeSegments ? codeBuffer.joined(separator: "\n") : ""
             TextWorkTrace.finish(
                 joinToken,
@@ -502,8 +684,10 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
                     inFence = false
                 } else {
                     flushProse(at: lineStart)
-                    language = tracedStringConversion(line.dropFirst(3))
-                        .trimmingCharacters(in: .whitespaces)
+                    language = tracedStringConversion(
+                        line.dropFirst(3),
+                        owner: owner
+                    ).trimmingCharacters(in: .whitespaces)
                     languageRange = (lineStart + 3)..<lineEnd
                     codeStart = min(lineEnd + 1, textLength)
                     inFence = true
@@ -524,7 +708,7 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
                 continue
             }
 
-            if let heading = heading(in: line) {
+            if let heading = heading(in: line, owner: owner) {
                 flushProse(at: lineStart)
                 if includeSegments {
                     let id = stableID(
@@ -535,7 +719,7 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
                     segments.append(.heading(
                         id: id,
                         level: heading.level,
-                        attributed(from: heading.content)
+                        attributed(from: heading.content, owner: owner)
                     ))
                 }
                 if includeSourceSpans {
@@ -546,7 +730,7 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
                 continue
             }
 
-            if let bullet = bullet(in: line) {
+            if let bullet = bullet(in: line, owner: owner) {
                 flushProse(at: lineStart)
                 if includeSegments {
                     let id = stableID(
@@ -558,7 +742,7 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
                         id: id,
                         marker: bullet.marker,
                         depth: bullet.depth,
-                        attributed(from: bullet.content)
+                        attributed(from: bullet.content, owner: owner)
                     ))
                 }
                 if includeSourceSpans {
@@ -569,7 +753,7 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
                 continue
             }
 
-            if let numbered = numbered(in: line) {
+            if let numbered = numbered(in: line, owner: owner) {
                 flushProse(at: lineStart)
                 if includeSegments {
                     let id = stableID(
@@ -582,7 +766,7 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
                         marker: numbered.marker,
                         number: numbered.number,
                         depth: numbered.depth,
-                        attributed(from: numbered.content)
+                        attributed(from: numbered.content, owner: owner)
                     ))
                 }
                 if includeSourceSpans {
@@ -607,7 +791,10 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
         return MarkdownParseResult(segments: segments, sourceSpans: sourceSpans)
     }
 
-    private static func heading(in line: Substring) -> (level: Int, content: String)? {
+    private static func heading(
+        in line: Substring,
+        owner: TraceOwner
+    ) -> (level: Int, content: String)? {
         let indentation = line.prefix { $0 == " " || $0 == "\t" }
         guard indentation.count <= 3 else { return nil }
         let remainder = line.dropFirst(indentation.count)
@@ -618,10 +805,12 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
             return nil
         }
         let content = afterHashes.drop { $0 == " " || $0 == "\t" }
-        return (hashes.count, tracedStringConversion(content))
+        return (hashes.count, tracedStringConversion(content, owner: owner))
     }
-
-    private static func bullet(in line: Substring) -> (marker: String, depth: Int, content: String)? {
+    private static func bullet(
+        in line: Substring,
+        owner: TraceOwner
+    ) -> (marker: String, depth: Int, content: String)? {
         let indentation = line.prefix { $0 == " " || $0 == "\t" }
         let remainder = line.dropFirst(indentation.count)
         guard let marker = remainder.first, "-*+".contains(marker) else { return nil }
@@ -629,13 +818,16 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
         guard afterMarker.first == " " || afterMarker.first == "\t" else { return nil }
         let content = afterMarker.drop { $0 == " " || $0 == "\t" }
         return (
-            tracedStringConversion(marker),
+            tracedStringConversion(marker, owner: owner),
             indentationDepth(indentation),
-            tracedStringConversion(content)
+            tracedStringConversion(content, owner: owner)
         )
     }
 
-    private static func numbered(in line: Substring) -> (
+    private static func numbered(
+        in line: Substring,
+        owner: TraceOwner
+    ) -> (
         marker: String,
         number: Int,
         depth: Int,
@@ -654,10 +846,11 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
         guard let number = Int(digits) else { return nil }
         let content = afterDelimiter.drop { $0 == " " || $0 == "\t" }
         return (
-            tracedStringConversion(digits) + tracedStringConversion(delimiter),
+            tracedStringConversion(digits, owner: owner)
+                + tracedStringConversion(delimiter, owner: owner),
             number,
             indentationDepth(indentation),
-            tracedStringConversion(content)
+            tracedStringConversion(content, owner: owner)
         )
     }
 
@@ -681,8 +874,11 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
         return Int(truncatingIfNeeded: hash)
     }
 
-    private static func attributed(from markdown: String) -> AttributedString {
-        let token = TextWorkTrace.begin()
+    private static func attributed(
+        from markdown: String,
+        owner: TraceOwner
+    ) -> AttributedString {
+        let token = TextWorkTrace.begin(owner: owner)
         let options = AttributedString.MarkdownParsingOptions(
             interpretedSyntax: .inlineOnlyPreservingWhitespace,
             failurePolicy: .returnPartiallyParsedIfPossible
@@ -833,15 +1029,31 @@ private final class MarkdownParseCache: @unchecked Sendable {
         storage.retainedByteCount
     }
 
-    func value(for key: String) -> MarkdownParseResult {
-        lookupOrParse(key, includeSourceSpans: false, measureWait: true)
+    func value(
+        for key: String,
+        owner: TraceOwner
+    ) -> MarkdownParseResult {
+        lookupOrParse(
+            key,
+            includeSourceSpans: false,
+            measureWait: true,
+            owner: owner
+        )
     }
 
-    func sourceSpans(for key: String) -> [
+    func sourceSpans(
+        for key: String,
+        owner: TraceOwner
+    ) -> [
         (source: Range<Int>, language: Range<Int>?)
     ] {
-        let token = TextWorkTrace.begin()
-        let result = lookupOrParse(key, includeSourceSpans: true, measureWait: false)
+        let token = TextWorkTrace.begin(owner: owner)
+        let result = lookupOrParse(
+            key,
+            includeSourceSpans: true,
+            measureWait: false,
+            owner: owner
+        )
         TextWorkTrace.finish(
             token,
             category: .markdownParseSpans,
@@ -853,11 +1065,17 @@ private final class MarkdownParseCache: @unchecked Sendable {
     private func lookupOrParse(
         _ key: String,
         includeSourceSpans: Bool,
-        measureWait: Bool
+        measureWait: Bool,
+        owner: TraceOwner
     ) -> MarkdownParseResult {
-        let textToken = includeSourceSpans ? nil : TextWorkTrace.begin()
+        let textToken = includeSourceSpans
+            ? nil
+            : TextWorkTrace.begin(owner: owner)
         var contentionRequest = measureWait
-            ? ContentionTrace.beginMainInteractive(resource: "markdown-parse")
+            ? ContentionTrace.beginMainInteractive(
+                resource: "markdown-parse",
+                owner: owner
+            )
             : nil
         var lockStartedAt: UInt64 = contentionRequest == nil
             ? 0
@@ -879,7 +1097,8 @@ private final class MarkdownParseCache: @unchecked Sendable {
                     sourceSpans: MarkdownSegment.parseUncached(
                         key,
                         includeSegments: false,
-                        includeSourceSpans: true
+                        includeSourceSpans: true,
+                        owner: owner
                     ).sourceSpans
                 )
             }
@@ -891,9 +1110,14 @@ private final class MarkdownParseCache: @unchecked Sendable {
         let parsed = MarkdownSegment.parseUncached(
             key,
             includeSegments: true,
-            includeSourceSpans: includeSourceSpans
+            includeSourceSpans: includeSourceSpans,
+            owner: owner
         )
-        let cost = estimateByteCost(for: key, segments: parsed.segments)
+        let cost = estimateByteCost(
+            for: key,
+            segments: parsed.segments,
+            owner: owner
+        )
 
         lockStartedAt = contentionRequest == nil
             ? 0
@@ -928,7 +1152,8 @@ private final class MarkdownParseCache: @unchecked Sendable {
 
     private func estimateByteCost(
         for key: String,
-        segments: [MarkdownSegment]
+        segments: [MarkdownSegment],
+        owner: TraceOwner
     ) -> Int {
         var estimate = key.utf8.count.multipliedReportingOverflow(by: 2).partialValue
         estimate += 128
@@ -939,7 +1164,7 @@ private final class MarkdownParseCache: @unchecked Sendable {
                  .heading(_, _, let attributed),
                  .bullet(_, _, _, let attributed),
                  .numbered(_, _, _, _, let attributed):
-                let token = TextWorkTrace.begin()
+                let token = TextWorkTrace.begin(owner: owner)
                 let rendered = String(attributed.characters)
                 TextWorkTrace.finish(
                     token,

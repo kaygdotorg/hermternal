@@ -86,8 +86,14 @@ public enum TranscriptBlockSegmenter {
 
     /// Segments text with a caller-supplied stable message identity.
     public static func blocks(for messageID: String, text: String) -> [TranscriptBlock] {
-        let parsed = MarkdownSegment.segments(for: text)
-        let spans = MarkdownSegment.sourceSpans(for: text)
+        let parsed = MarkdownSegment.segments(
+            for: text,
+            owner: .blockPreparation
+        )
+        let spans = MarkdownSegment.sourceSpans(
+            for: text,
+            owner: .blockPreparation
+        )
         guard parsed.count == spans.count else {
             // The parser contract promises aligned arrays. Returning no rows
             // is safer than assigning a wrong range to a visible block if a

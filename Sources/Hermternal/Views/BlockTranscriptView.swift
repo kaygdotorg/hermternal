@@ -468,7 +468,10 @@ private enum BlockText {
             return code(source, style: style, stripsFence: true)
         }
 
-        guard let segment = MarkdownSegment.parse(source).first else {
+        guard let segment = MarkdownSegment.parse(
+            source,
+            owner: .blockRowConfiguration
+        ).first else {
             return paragraph(
                 AttributedString(source),
                 font: style.bodyFont,
@@ -554,6 +557,17 @@ private enum BlockText {
             AttributedString(source),
             font: style.bodyFont,
             color: role == .user ? style.userBubbleForeground : style.label,
+            lineSpacing: MessageTypography.bodyLineSpacing,
+            alignment: .natural,
+            style: style
+        )
+    }
+
+    static func thinking(style: BlockRenderStyle) -> BlockPreparedText {
+        paragraph(
+            AttributedString("•••"),
+            font: style.bodyFont,
+            color: style.secondaryLabel,
             lineSpacing: MessageTypography.bodyLineSpacing,
             alignment: .natural,
             style: style
@@ -968,6 +982,7 @@ struct BlockTranscriptView: NSViewRepresentable {
             self.findQuery = input.findQuery
             self.findMatches = input.findMatches
             self.activeFindIndex = input.activeFindIndex
+            self.pendingMessageID = input.pendingMessageID
             self.hasMoreOlderMessages = input.window.hasMoreOlderMessages
             self.onRequestOlder = input.onRequestOlder
             self.onCopyCode = input.onCopyCode
@@ -976,9 +991,10 @@ struct BlockTranscriptView: NSViewRepresentable {
                 (messageID(for: $0), $0.text)
             })
 
-            let incomingBlocks = input.blocks.isEmpty
-                ? input.messages.flatMap { TranscriptBlockSegmenter.blocks(for: $0) }
-                : input.blocks
+            let incomingBlocks = normalizedBlocks(
+                input.blocks,
+                messages: input.messages
+            )
             let nextBlocks = reconciledBlocks(
                 oldBlocks: oldBlocks,
                 oldMessages: oldMessages,
@@ -1124,6 +1140,32 @@ struct BlockTranscriptView: NSViewRepresentable {
             }
         }
 
+        private func normalizedBlocks(
+            _ blocks: [TranscriptBlock],
+            messages: [ChatMessage]
+        ) -> [TranscriptBlock] {
+            let blocksByMessageID = Dictionary(grouping: blocks, by: \.messageID)
+            var result: [TranscriptBlock] = []
+            result.reserveCapacity(blocks.count + messages.count)
+            for message in messages {
+                let id = messageID(for: message)
+                if message.role == .assistant, message.isStreaming {
+                    result.append(
+                        TranscriptBlock(
+                            messageID: id,
+                            blockIndex: 0,
+                            kind: .paragraph,
+                            sourceRange: 0..<message.text.utf16.count,
+                            contentHash: contentHash(of: message.text)
+                        )
+                    )
+                } else {
+                    result.append(contentsOf: blocksByMessageID[id] ?? [])
+                }
+            }
+            return result
+        }
+
         private func reconciledBlocks(
             oldBlocks: [TranscriptBlock],
             oldMessages: [ChatMessage],
@@ -1135,6 +1177,8 @@ struct BlockTranscriptView: NSViewRepresentable {
                   oldMessage.id == newMessage.id,
                   oldMessage.text != newMessage.text,
                   newMessage.text.utf16.starts(with: oldMessage.text.utf16),
+                  !oldMessage.isStreaming,
+                  !newMessage.isStreaming,
                   !oldBlocks.isEmpty
             else { return newBlocks }
             // Only the final logical block is re-segmented. The caller's blocks
@@ -1319,15 +1363,43 @@ struct BlockTranscriptView: NSViewRepresentable {
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.generation == current, let tableView else { return }
                 tableView.layoutSubtreeIfNeeded()
-                if let pending = pendingMessageID,
-                   let index = rows.firstIndex(where: { $0.message.id == pending }) {
+                if let pending = pendingMessageID {
+                    guard let index = rows.firstIndex(where: { $0.message.id == pending }) else { return }
                     tableView.scrollRowToVisible(index)
-                } else if routeChanged || isStreaming, !isReadOnly, !rows.isEmpty {
+                    return
+                }
+                if let activeIndex = activeFindIndex,
+                   findMatches.indices.contains(activeIndex) {
+                    let match = findMatches[activeIndex]
+                    guard let index = rows.firstIndex(where: {
+                        $0.messageIndex == match.messageIndex
+                    }) else { return }
+                    scrollRowToCenter(index, in: tableView)
+                    return
+                }
+                if routeChanged || isStreaming, !isReadOnly, !rows.isEmpty {
                     let clip = tableView.enclosingScrollView?.contentView
                     clip?.scroll(to: NSPoint(x: 0, y: max(0, tableView.bounds.height - (clip?.bounds.height ?? 0))))
                     if let clip { tableView.enclosingScrollView?.reflectScrolledClipView(clip) }
                 }
             }
+        }
+
+        private func scrollRowToCenter(_ row: Int, in tableView: NSTableView) {
+            guard let clip = tableView.enclosingScrollView?.contentView,
+                  row >= 0,
+                  row < tableView.numberOfRows
+            else { return }
+            let rowRect = tableView.rect(ofRow: row)
+            guard !rowRect.isNull, !rowRect.isEmpty else { return }
+            let visibleHeight = clip.bounds.height
+            let maximumOrigin = max(0, tableView.bounds.height - visibleHeight)
+            let centeredOrigin = rowRect.midY - visibleHeight / 2
+            clip.scroll(to: NSPoint(
+                x: clip.bounds.origin.x,
+                y: min(max(0, centeredOrigin), maximumOrigin)
+            ))
+            tableView.enclosingScrollView?.reflectScrolledClipView(clip)
         }
 
         private func updateAccessibility(in container: BlockTranscriptContainerView) {
@@ -1354,6 +1426,14 @@ struct BlockTranscriptView: NSViewRepresentable {
             case .server(let id): return String(id.rawValue)
             case .provisional(let id): return id.uuidString
             }
+        }
+
+        private func contentHash(of text: String) -> UInt64 {
+            var hash: UInt64 = 14_695_981_039_346_656_037
+            for byte in text.utf8 {
+                hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211
+            }
+            return hash
         }
     }
 }
@@ -1511,13 +1591,18 @@ private final class BlockTranscriptRowView: NSTableCellView {
         textView.position = position
         textView.selectionHandler = self
 
-        let isCode = block.kind == .code
-        let content = prepared?.content ?? BlockText.fallback(
-            sourceText,
-            kind: block.kind,
-            role: message.role,
-            style: style
-        )
+        let isThinking = message.role == .assistant
+            && message.isStreaming
+            && message.text.isEmpty
+        let isCode = block.kind == .code && !isThinking
+        let content = isThinking
+            ? BlockText.thinking(style: style)
+            : (prepared?.content ?? BlockText.fallback(
+                sourceText,
+                kind: block.kind,
+                role: message.role,
+                style: style
+            ))
         copiedCode = content.copyText ?? ""
         textView.textContainerInset = NSSize(
             width: isCode
@@ -1541,18 +1626,22 @@ private final class BlockTranscriptRowView: NSTableCellView {
         assistantMark.isHidden = message.role != .assistant || !isFirstInMessage
         if !assistantMark.isHidden {
             assistantMark.image = BlockAssistantMark.image(isDark: style.isDark)
-            // Only the symbol fallback is a template image; the drawings carry
-            // their own appearance, exactly as `AssistantMark` selects them.
-            assistantMark.contentTintColor = style.assistantMark.nsColor
         }
-
         languageLabel.isHidden = !isCode
         headerDivider.isHidden = !isCode
         copyButton.isHidden = !isCode
         if isCode {
-            languageLabel.stringValue = TranscriptCodeBlock.label(for: block.language ?? "")
+            let label = TranscriptCodeBlock.label(for: block.language ?? "")
+            languageLabel.stringValue = label
             languageLabel.font = style.codeLabelFont
             languageLabel.textColor = style.secondaryLabel.nsColor
+            applyLanguageFindMarks(
+                findRanges,
+                blockRange: block.sourceRange,
+                sourceText: sourceText,
+                label: label,
+                style: style
+            )
             headerDivider.layer?.backgroundColor = style.codeDivider.cgColor
             copyPointSize = CGFloat(style.codeLabelSize)
             copyButton.contentTintColor = style.secondaryLabel.nsColor
@@ -1587,14 +1676,12 @@ private final class BlockTranscriptRowView: NSTableCellView {
             trailing.constant = -max(20, bounds.width - leading.constant - outer)
         }
     }
-
     /// The row's background, border, and corner treatment.
     ///
     /// `MessageRow` tints a user bubble, `TranscriptCodeBlock` draws a bordered
     /// card, and `FindHighlightedMessage` tints and outlines the active
-    /// message. A row that already carries a translucent fill takes only the
-    /// find outline, because two translucent fills would paint twice what
-    /// SwiftUI paints once.
+    /// message. Active-find styling takes precedence over the role surface on
+    /// every block row so the rows read as one continuous highlighted message.
     private func applySurface(
         role: Role,
         isCode: Bool,
@@ -1605,15 +1692,18 @@ private final class BlockTranscriptRowView: NSTableCellView {
     ) {
         let background: BlockInk?
         let radius: CGFloat
-        if isCode {
+        if isFindActive {
+            background = style.findActiveRow
+            radius = AppShapeScale.row
+        } else if isCode {
             background = style.codeBackground
             radius = AppShapeScale.compact
         } else if role == .user {
             background = style.userBubble
             radius = AppShapeScale.toast
         } else {
-            background = isFindActive ? style.findActiveRow : nil
-            radius = isFindActive ? AppShapeScale.row : 0
+            background = nil
+            radius = 0
         }
         var corners: CACornerMask = []
         if isFirstInMessage { corners.formUnion([.layerMinXMinYCorner, .layerMaxXMinYCorner]) }
@@ -1624,6 +1714,7 @@ private final class BlockTranscriptRowView: NSTableCellView {
         if isFindActive {
             surface.layer?.borderWidth = BlockRenderStyle.findBorderWidth
             surface.layer?.borderColor = style.findActiveBorder.cgColor
+
         } else if isCode {
             surface.layer?.borderWidth = BlockRenderStyle.codeBorderWidth
             surface.layer?.borderColor = style.codeBorder.cgColor
@@ -1631,6 +1722,75 @@ private final class BlockTranscriptRowView: NSTableCellView {
             surface.layer?.borderWidth = 0
             surface.layer?.borderColor = NSColor.clear.cgColor
         }
+    }
+    private func applyLanguageFindMarks(
+        _ findRanges: [Range<Int>],
+        blockRange: Range<Int>,
+        sourceText: String,
+        label: String,
+        style: BlockRenderStyle
+    ) {
+        guard !findRanges.isEmpty else { return }
+        let units = Array(sourceText.utf16)
+        guard units.count >= 3,
+              units[0] == 96, units[1] == 96, units[2] == 96
+        else { return }
+        let lineEnd = units.firstIndex(of: 10) ?? units.count
+        var start = 3
+        while start < lineEnd, units[start] == 32 || units[start] == 9 {
+            start += 1
+        }
+        var end = lineEnd
+        while end > start, units[end - 1] == 32 || units[end - 1] == 9 {
+            end -= 1
+        }
+        guard start < end else { return }
+        let languageRange = start..<end
+        let languageSource = String(decoding: units[languageRange], as: UTF16.self)
+        let localRanges = findRanges.compactMap { range -> Range<Int>? in
+            let lower = max(range.lowerBound, blockRange.lowerBound + languageRange.lowerBound)
+            let upper = min(range.upperBound, blockRange.lowerBound + languageRange.upperBound)
+            guard lower < upper else { return nil }
+            let localLower = lower - blockRange.lowerBound - start
+            let localUpper = upper - blockRange.lowerBound - start
+            return localLower..<localUpper
+        }
+        let projected = FindTextHighlighting.project(
+            localRanges,
+            from: languageSource,
+            to: label
+        )
+        guard !projected.isEmpty else { return }
+        let marked = NSMutableAttributedString(
+            string: label,
+            attributes: [
+                .font: style.codeLabelFont,
+                .foregroundColor: style.secondaryLabel.nsColor
+            ]
+        )
+        for (offset, range) in projected.enumerated() {
+            guard range.lowerBound >= 0,
+                  range.upperBound <= marked.length
+            else { continue }
+            let nsRange = NSRange(
+                location: range.lowerBound,
+                length: range.upperBound - range.lowerBound
+            )
+            marked.addAttribute(
+                .foregroundColor,
+                value: (offset == 0 ? style.findActiveMatch : style.findMatch).nsColor,
+                range: nsRange
+            )
+            marked.addAttribute(
+                .font,
+                value: NSFontManager.shared.convert(
+                    style.codeLabelFont,
+                    toHaveTrait: .boldFontMask
+                ),
+                range: nsRange
+            )
+        }
+        languageLabel.attributedStringValue = marked
     }
 
     /// Marks find hits the way `MarkdownBlocks` does: the first match inside a

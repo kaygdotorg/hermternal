@@ -3,10 +3,11 @@ import Foundation
 import HermternalCore
 import Observation
 /// Launch: `HERMTERNAL_SWITCH_TRACE=1 /home/kayg/Developer/hermternal-apple/build/Hermternal.app/Contents/MacOS/Hermternal > /tmp/herm-switch-trace.log 2>&1`
-/// Summarize coverage and latency: `awk '{ ns=event=token=gen=""; for (i=1;i<=NF;i++) { split($i,p,"="); if (p[1]=="ns") ns=p[2]; else if (p[1]=="event") event=p[2]; else if (p[1]=="token") token=p[2]; else if (p[1]=="gen") gen=p[2] } key=token "/" gen; if (event=="selection.publish") { publications++; pub[key]=ns } else if (event=="transcript.visible" && (key in pub)) { paints++; print "LATENCY ms=" (ns-pub[key])/1000000; delete pub[key] } else if (event=="transcript.superseded" && (key in pub)) { superseded++; delete pub[key] } } END { terminal=paints+superseded; coverage=publications ? 100*terminal/publications : 100; printf "COVERAGE publications=%d paints=%d superseded=%d terminal=%d coverage=%.1f%%\\n", publications, paints, superseded, terminal, coverage }' /tmp/herm-switch-trace.log | tee /tmp/herm-switch-coverage.log; awk '$1=="LATENCY" { split($2,p,"="); print p[2] }' /tmp/herm-switch-coverage.log | sort -n | awk '{ v[NR]=$1 } END { if (NR) printf "LATENCY count=%d median=%.1fms p90=%.1fms max=%.1fms\\n", NR, v[int((NR+1)/2)], v[int((90*NR+99)/100)], v[NR] }'`
+/// Summarize coverage and latency: `awk '{ ns=event=token=gen=""; for (i=1;i<=NF;i++) { split($i,p,"="); if (p[1]=="ns") ns=p[2]; else if (p[1]=="event") event=p[2]; else if (p[1]=="token") token=p[2]; else if (p[1]=="gen") gen=p[2] } key=token "/" gen; if (event=="selection.publish") { publications++; pub[key]=ns } else if (event=="transcript.visible" && (key in pub)) { paints++; print "LATENCY ms=" (ns-pub[key])/1000000; delete pub[key] } else if (event=="transcript.superseded" && (key in pub)) { superseded++; delete pub[key] } else if (event=="transcript.stalePaint") { stale++ } } END { terminal=paints+superseded; coverage=publications ? 100*terminal/publications : 100; printf "COVERAGE publications=%d paints=%d superseded=%d stalePaints=%d terminal=%d coverage=%.1f%%\\n", publications, paints, superseded, stale, terminal, coverage }' /tmp/herm-switch-trace.log | tee /tmp/herm-switch-coverage.log; awk '$1=="LATENCY" { split($2,p,"="); print p[2] }' /tmp/herm-switch-coverage.log | sort -n | awk '{ v[NR]=$1 } END { if (NR) printf "LATENCY count=%d median=%.1fms p90=%.1fms max=%.1fms\\n", NR, v[int((NR+1)/2)], v[int((90*NR+99)/100)], v[NR] }'`
 /// Each `selection.publish` has exactly one terminal event: either
 /// `transcript.visible` after a real paint or `transcript.superseded` when a
-/// newer publication wins before that paint.
+/// newer publication wins before that paint. Stale paint candidates are
+/// reported as `transcript.stalePaint` and do not terminate the publication.
 /// Temporary, opt-in trace sink for session switching and sidebar selection.
 @MainActor
 enum HermternalSwitchTrace {
@@ -17,6 +18,7 @@ enum HermternalSwitchTrace {
     /// these counters before contributing to a new sample series.
     private static var selectionCount = 0
     private static var publicationCount = 0
+    private static var stalePaintCount = 0
     private static var hasRecordedMetricSample = false
     /// The one publication that has not reached a terminal paint outcome.
     /// A newer publication closes this record as superseded before replacing
@@ -33,6 +35,7 @@ enum HermternalSwitchTrace {
         pendingTranscriptPublication = nil
         selectionCount = 0
         publicationCount = 0
+        stalePaintCount = 0
         hasRecordedMetricSample = false
         HermternalSelectionOccupancyTrace.configure(gate: gate)
     }
@@ -100,6 +103,22 @@ enum HermternalSwitchTrace {
               pending.id == id,
               pending.generation == generation
         else {
+            return false
+        }
+        guard visibleAtNanoseconds > pending.publishedAtNanoseconds else {
+            stalePaintCount &+= 1
+            let signedDeltaNanoseconds =
+                Int64(visibleAtNanoseconds) - Int64(pending.publishedAtNanoseconds)
+            session(
+                "transcript.stalePaint",
+                id: id,
+                generation: generation,
+                messages: messages,
+                renderedRows: renderedRows,
+                detail: "deltaNs=\(signedDeltaNanoseconds), count=\(stalePaintCount)",
+                module: .visiblePaint,
+                timestampNanoseconds: visibleAtNanoseconds
+            )
             return false
         }
         pendingTranscriptPublication = nil
@@ -207,6 +226,7 @@ enum HermternalSwitchTrace {
         else { return }
         selectionCount = 0
         publicationCount = 0
+        stalePaintCount = 0
         hasRecordedMetricSample = false
     }
 
@@ -417,9 +437,6 @@ final class AppModel {
     /// starts. Its handle clears producer-owned transcript state synchronously.
     private var activeOpenTask: Task<Void, Never>?
     private var activeOpenHandle: TranscriptOpenHandle?
-    /// Each sidebar request owns one ticket. A newer request invalidates an
-    /// older ticket before it can build or publish a transcript projection.
-    private var selectionCoalescer = SelectionCoalescer<String>()
     private var externalRouteTask: Task<Void, Never>?
     private let openGenerations = OpenGenerationController()
     private var streamingReducer = StreamingEventReducer()
@@ -2058,16 +2075,14 @@ final class AppModel {
         activeOpenTask = nil
     }
 
-    /// Selection bookkeeping is synchronous so the sidebar highlight can
-    /// commit before transcript observation starts. Projection publication is
-    /// deferred to the next main-actor turn; reconciliation remains
-    /// generation-guarded.
+    /// Selection bookkeeping and the warm projection publish synchronously so
+    /// the sidebar highlight and transcript advance in the same interaction
+    /// turn. Only the authoritative opener runs in a cancellable task.
     @discardableResult
     func requestOpen(_ session: ChatSession) -> Task<Void, Never> {
         cancelActiveOpen()
         pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
-        let ticket = selectionCoalescer.submit(session.id)
         let handle = TranscriptOpenHandle()
         activeOpenHandle = handle
         pendingMessageRoute = nil
@@ -2085,76 +2100,61 @@ final class AppModel {
             event: "selectedSessionID.mutation",
             generation: generation
         )
+
+        // Publication is deliberately synchronous. The warm-store lookup is
+        // cheap; doing it before the first suspension means key-repeat task
+        // cancellation cannot suppress a settled selection.
+        let warm = cacheEnabled
+            ? warmStore.projection(
+                for: session.id,
+                minimumServerTotal: session.messageCount
+            )
+            : nil
+        if let warm {
+            streamingReducer.reset(messages: warm.messages)
+            messages = warm.messages
+            isAwaitingReply = streamingReducer.isAwaitingReply
+            HermternalSwitchTrace.session(
+                "selection.publish",
+                id: session.id,
+                generation: generation,
+                messages: warm.messages.count,
+                detail: "warm.publish"
+            )
+            ContentionTrace.snapshotAndReset(phase: "first-publish")
+            HermternalSwitchTrace.session(
+                "warm.publish",
+                id: session.id,
+                generation: generation,
+                messages: warm.messages.count
+            )
+        } else {
+            // A cold miss must not leave the prior chat painted while the
+            // cancellable opener obtains its first authoritative phase.
+            streamingReducer.reset()
+            messages = []
+            isAwaitingReply = streamingReducer.isAwaitingReply
+            HermternalSwitchTrace.session(
+                "selection.publish",
+                id: session.id,
+                generation: generation,
+                messages: 0,
+                detail: "cold.publish"
+            )
+            ContentionTrace.snapshotAndReset(phase: "first-publish")
+            HermternalSwitchTrace.session(
+                "cold.publish",
+                id: session.id,
+                generation: generation,
+                messages: 0
+            )
+        }
+
+        // Only expensive work remains in this task. A newer selection cancels
+        // opener tasks and handles, cache reads, REST fetches, and block
+        // preparation through the generation and TranscriptOpenHandle guards.
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            // Force projection onto the turn after the synchronous selection
-            // bookkeeping, rather than allowing the task to run inline with
-            // the click's actor turn.
-            await Task.yield()
-            guard self.openGenerations.isCurrent(generation),
-                  self.selectionCoalescer.isCurrent(ticket),
-                  !Task.isCancelled
-            else {
-                return
-            }
-
-            // Keep all transcript work here so the selection highlight can
-            // commit on its own frame.
-            let warm = self.cacheEnabled
-                ? self.warmStore.projection(
-                    for: session.id,
-                    minimumServerTotal: session.messageCount
-                )
-                : nil
-            guard self.openGenerations.isCurrent(generation),
-                  self.selectionCoalescer.consume(ticket),
-                  !Task.isCancelled
-            else {
-                return
-            }
-            if let warm {
-                self.streamingReducer.reset(messages: warm.messages)
-                self.messages = warm.messages
-                self.isAwaitingReply = self.streamingReducer.isAwaitingReply
-                HermternalSwitchTrace.session(
-                    "selection.publish",
-                    id: session.id,
-                    generation: generation,
-                    messages: warm.messages.count,
-                    detail: "warm.publish"
-                )
-                ContentionTrace.snapshotAndReset(phase: "first-publish")
-                HermternalSwitchTrace.session(
-                    "warm.publish",
-                    id: session.id,
-                    generation: generation,
-                    messages: warm.messages.count
-                )
-            } else {
-                // A cold miss must not leave the prior chat painted while
-                // the opener obtains its first authoritative phase.
-                self.streamingReducer.reset()
-                self.messages = []
-                self.isAwaitingReply = self.streamingReducer.isAwaitingReply
-                HermternalSwitchTrace.session(
-                    "selection.publish",
-                    id: session.id,
-                    generation: generation,
-                    messages: 0,
-                    detail: "cold.publish"
-                )
-                ContentionTrace.snapshotAndReset(phase: "first-publish")
-                HermternalSwitchTrace.session(
-                    "cold.publish",
-                    id: session.id,
-                    generation: generation,
-                    messages: 0
-                )
-            }
-
-            // Keep cache reads and network setup off the publication turn.
-            // Yielding also gives a newer held-arrow selection a chance to
-            // invalidate this generation before reconciliation starts.
             await Task.yield()
             guard self.openGenerations.isCurrent(generation), !Task.isCancelled else { return }
             _ = await self.open(

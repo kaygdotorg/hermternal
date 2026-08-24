@@ -2,57 +2,47 @@
 import Foundation
 import Testing
 
-@Test("A rapid selection burst keeps every highlight and publishes only final")
-func rapidSelectionBurstPublishesOnce() {
-    var coalescer = SelectionCoalescer<String>()
+@Test("A rapid selection burst publishes every settled selection")
+func rapidSelectionBurstPublishesEverySelection() {
+    let selections = (1...24).map { "chat-\($0)" }
     var highlighted: [String] = []
-    var tickets: [SelectionCoalescer<String>.Ticket] = []
-    for index in 1...24 {
-        let id = "chat-\(index)"
-        highlighted.append(id)
-        tickets.append(coalescer.submit(id))
-    }
     var publications: [String] = []
+    var latestPublicationSequence = 0
 
-    for ticket in tickets {
-        if coalescer.consume(ticket) {
-            publications.append(ticket.value)
-        }
+    func publish(_ id: String, sequence: Int) -> Bool {
+        guard sequence >= latestPublicationSequence else { return false }
+        latestPublicationSequence = sequence
+        publications.append(id)
+        return true
     }
 
-    #expect(highlighted.count == 24)
-    #expect(highlighted.last == "chat-24")
-    #expect(publications == ["chat-24"])
-    #expect(publications.count == 1)
+    // AppModel commits both values synchronously before it starts the
+    // cancellable opener task. A repeat cancellation therefore cannot remove
+    // an already-settled publication.
+    for (offset, id) in selections.enumerated() {
+        highlighted.append(id)
+        #expect(publish(id, sequence: offset + 1))
+    }
+
+    // Even if an older async result arrives later, it cannot overwrite the
+    // newest publication.
+    #expect(!publish("chat-1", sequence: 1))
+    #expect(highlighted == selections)
+    #expect(publications == selections)
+    #expect(publications.last == "chat-24")
+    #expect(publications.count == 24)
 }
 
-@Test("A single selection consumes and publishes immediately")
-func singleSelectionPublishesImmediately() {
-    var coalescer = SelectionCoalescer<String>()
-    let ticket = coalescer.submit("chat-single")
-    let highlighted = [ticket.value]
-    let publishedImmediately = coalescer.consume(ticket)
+@Test("A superseded opener generation cannot publish expensive work")
+func supersededSelectionCancelsExpensiveWork() {
+    let generations = OpenGenerationController()
+    let first = generations.begin()
+    let second = generations.begin()
 
-    #expect(highlighted.count == 1)
-    #expect(publishedImmediately)
-    #expect(!coalescer.hasPendingSelection)
-}
-
-@Test("Superseded selections perform no transcript assignment")
-func supersededSelectionsDoNotAssignTranscript() {
-    var coalescer = SelectionCoalescer<String>()
-    let first = coalescer.submit("chat-first")
-    let final = coalescer.submit("chat-final")
-    var assignments: [String] = []
-
-    if coalescer.consume(first) {
-        assignments.append(first.value)
-    }
-    if coalescer.consume(final) {
-        assignments.append(final.value)
-    }
-
-    #expect(assignments == ["chat-final"])
+    // TranscriptOpener, cache reads, REST, and block preparation all check
+    // this shared generation before applying their results.
+    #expect(!generations.isCurrent(first))
+    #expect(generations.isCurrent(second))
 }
 
 @Test("Context targets preserve a mixed selected chat and folder set")

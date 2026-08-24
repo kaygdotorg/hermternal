@@ -543,7 +543,10 @@ final class AppKitTranscriptRowView: NSTableCellView {
         // segments inside assistant MarkdownMessage rows. In particular, a
         // user row remains plain text even if its payload contains backticks.
         let codeSegments = message.role == .assistant
-            ? MarkdownSegment.parse(message.text).compactMap { segment -> String? in
+            ? MarkdownSegment.parse(
+                message.text,
+                owner: .blockRowConfiguration
+            ).compactMap { segment -> String? in
                 if case .code(_, _, let body) = segment { return body }
                 return nil
             }
@@ -809,7 +812,10 @@ private enum AppKitTranscriptText {
             }
             return result
         }
-        let segments = MarkdownSegment.parse(message.text)
+        let segments = MarkdownSegment.parse(
+            message.text,
+            owner: .blockRowConfiguration
+        )
         var previous: MarkdownSegment?
         for segment in segments {
             if result.length > 0 { result.append(NSAttributedString(string: "\n")) }

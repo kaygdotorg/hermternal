@@ -62,7 +62,10 @@ private func presegmentInitialWindow(_ messages: [ChatMessage]) -> Int? {
     for message in messages[start...] {
         guard !Task.isCancelled else { return nil }
         guard message.role == .assistant, !message.isStreaming else { continue }
-        _ = MarkdownSegment.parse(message.text)
+        _ = MarkdownSegment.parse(
+            message.text,
+            owner: .backgroundPrefetch
+        )
         segmentedRows += 1
     }
     return segmentedRows
