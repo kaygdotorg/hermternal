@@ -141,10 +141,8 @@ struct SidebarFolderRow: View {
     @Binding var isExpanded: Bool
     let selection: Set<SidebarSelectionID>
     let visibleOrder: [SidebarSelectionID]
-    let sessionVisibleOrder: [SidebarSelectionID]
     let foldersByID: [String: SidebarFolderTarget]
-    let sessionsByID: [String: ChatSession]
-    let membership: [String: String]
+    let expandedChats: [ChatSession]
     let onRename: (SidebarFolderTarget) -> Void
     /// Selects this folder without opening a transcript.
     let onSelect: (String) -> Void
@@ -256,27 +254,11 @@ struct SidebarFolderRow: View {
         }
     }
 
-    private var contentChats: [ChatSession] {
-        let contextSelection = SidebarSelectionPolicy.contextTargets(
-            clicked: .folder(target.id),
-            selected: selection
-        )
-        let authoritativeSessions = sessionVisibleOrder.compactMap { item -> ChatSession? in
-            guard case let .chat(id) = item else { return nil }
-            return sessionsByID[id]
-        }
-        let expandedIDs = SidebarSelectionPolicy.expandedChatIDs(
-            selection: contextSelection,
-            authoritativeSessions: authoritativeSessions,
-            folderMembership: membership
-        )
-        return expandedIDs.compactMap { sessionsByID[$0] }
-    }
 
     @ViewBuilder
     private var folderContextMenu: some View {
         let targets = folderTargets
-        let chats = contentChats
+        let chats = expandedChats
         let chatNoun = chats.count == 1 ? "Chat" : "Chats"
         let folderPhrase = targets.count == 1
             ? "Folder"

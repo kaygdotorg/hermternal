@@ -18,9 +18,9 @@ struct SidebarSchedulesPane: View {
     let rows: [SidebarRow]
     let folders: [Folder]
     let membership: [String: String]
-    let visibleOrder: [SidebarSelectionID]
-    let sessionsByID: [String: ChatSession]
     let scheduledIDs: Set<String>
+    let expandedChats: [ChatSession]
+    let expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
     @Binding var selection: Set<SidebarSelectionID>
     let onOpen: (ChatSession) -> Void
     let onPin: ([ChatSession], Bool) -> Void
@@ -57,9 +57,10 @@ struct SidebarSchedulesPane: View {
                         session: row.session,
                         folders: folders,
                         membership: membership,
-                        sessionsByID: sessionsByID,
+                        contextChats: selection.contains(.chat(row.sessionID))
+                            ? expandedChats
+                            : expandedChatsByItem[.chat(row.sessionID)] ?? [],
                         selection: selection,
-                        visibleOrder: visibleOrder,
                         scheduledIDs: scheduledIDs,
                         onOpen: onOpen,
                         onPin: onPin,

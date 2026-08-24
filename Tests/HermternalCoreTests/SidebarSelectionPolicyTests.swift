@@ -1,5 +1,5 @@
+@testable import HermternalCore
 import Foundation
-import HermternalCore
 import Testing
 
 @Test("A rapid selection burst keeps every highlight and publishes only final")
@@ -80,7 +80,8 @@ func folderSelectionExpandsContents() {
     #expect(
         SidebarSelectionPolicy.expandedChatIDs(
             selection: selection,
-            authoritativeSessions: sessions,
+            orderedSessionIDs: sessions.map(\.id),
+            scheduledSessionIDs: ["cron"],
             folderMembership: [
                 "first": "work",
                 "second": "work",
@@ -88,6 +89,28 @@ func folderSelectionExpandsContents() {
                 "outside": "other"
             ]
         ) == ["second", "first"]
+    )
+}
+
+@Test("An explicitly selected scheduled chat bypasses folder exclusion")
+func explicitlySelectedScheduledChatExpands() {
+    let membership = ["scheduled": "work"]
+
+    #expect(
+        SidebarSelectionPolicy.expandedChatIDs(
+            selection: [.folder("work")],
+            orderedSessionIDs: ["scheduled"],
+            scheduledSessionIDs: ["scheduled"],
+            folderMembership: membership
+        ).isEmpty
+    )
+    #expect(
+        SidebarSelectionPolicy.expandedChatIDs(
+            selection: [.folder("work"), .chat("scheduled")],
+            orderedSessionIDs: ["scheduled"],
+            scheduledSessionIDs: ["scheduled"],
+            folderMembership: membership
+        ) == ["scheduled"]
     )
 }
 
@@ -104,7 +127,8 @@ func mixedSelectionExpandsAndDeduplicates() {
     #expect(
         SidebarSelectionPolicy.expandedChatIDs(
             selection: selection,
-            authoritativeSessions: sessions,
+            orderedSessionIDs: sessions.map(\.id),
+            scheduledSessionIDs: [],
             folderMembership: [
                 "folder-chat": "work",
                 "explicit": "work",
@@ -113,6 +137,57 @@ func mixedSelectionExpandsAndDeduplicates() {
         ) == ["folder-chat", "explicit", "duplicate"]
     )
 }
+
+@Test("Expansion scans a large heterogeneous corpus within a deterministic bound")
+func expansionWorkIsBoundedForLargeCorpus() {
+    let sessions = (0..<4_096).map { index in
+        selectionSession(
+            id: "session-\(index)",
+            source: index.isMultiple(of: 211) ? "cron" : ""
+        )
+    }
+    let orderedSessionIDs = sessions.map(\.id)
+    let folderMembership = Dictionary(
+        uniqueKeysWithValues: sessions.enumerated().map { index, session in
+            (session.id, "folder-\(index % 8)")
+        }
+    )
+    let scheduledSessionIDs = Set(
+        sessions.filter { $0.source == "cron" }.map(\.id)
+    )
+    let selection: Set<SidebarSelectionID> = [
+        .chat("session-37"),
+        .chat("session-211"),
+        .folder("folder-2"),
+        .folder("folder-5")
+    ]
+
+    let expansion = SidebarSelectionPolicy.expandedChatIDsWithWork(
+        selection: selection,
+        orderedSessionIDs: orderedSessionIDs,
+        scheduledSessionIDs: scheduledSessionIDs,
+        folderMembership: folderMembership
+    )
+    let expected = orderedSessionIDs.reduce(into: [String]()) { result, id in
+        guard !id.isEmpty,
+              !result.contains(id),
+              selection.contains(.chat(id))
+                || (folderMembership[id].map { selection.contains(.folder($0)) } ?? false)
+                    && !scheduledSessionIDs.contains(id)
+        else { return }
+        result.append(id)
+    }
+
+    #expect(expansion.chatIDs == expected)
+    #expect(expansion.work.selectionItemsVisited == selection.count)
+    #expect(expansion.work.membershipEntriesVisited == folderMembership.count)
+    #expect(expansion.work.orderedSessionIDsVisited == orderedSessionIDs.count)
+    #expect(
+        expansion.work.total
+            == selection.count + folderMembership.count + orderedSessionIDs.count
+    )
+}
+
 
 @Test("An unselected clicked row remains the only context target")
 func unselectedClickScopesToOneTarget() {
@@ -125,10 +200,8 @@ func unselectedClickScopesToOneTarget() {
     #expect(
         SidebarSelectionPolicy.expandedChatIDs(
             selection: context,
-            authoritativeSessions: [
-                selectionSession(id: "folder-chat"),
-                selectionSession(id: "already-selected")
-            ],
+            orderedSessionIDs: ["folder-chat", "already-selected"],
+            scheduledSessionIDs: [],
             folderMembership: [
                 "folder-chat": "work",
                 "already-selected": "other"

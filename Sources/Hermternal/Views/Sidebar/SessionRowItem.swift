@@ -44,9 +44,8 @@ struct SessionRowItem: View {
     let session: ChatSession
     let folders: [Folder]
     let membership: [String: String]
-    let sessionsByID: [String: ChatSession]
+    let contextChats: [ChatSession]
     let selection: Set<SidebarSelectionID>
-    let visibleOrder: [SidebarSelectionID]
     let scheduledIDs: Set<String>
     let onOpen: (ChatSession) -> Void
     let onPin: ([ChatSession], Bool) -> Void
@@ -109,22 +108,6 @@ struct SessionRowItem: View {
             }
     }
 
-    private var contextChats: [ChatSession] {
-        let contextSelection = SidebarSelectionPolicy.contextTargets(
-            clicked: .chat(session.id),
-            selected: selection
-        )
-        let authoritativeSessions = visibleOrder.compactMap { item -> ChatSession? in
-            guard case let .chat(id) = item else { return nil }
-            return sessionsByID[id]
-        }
-        let expandedIDs = SidebarSelectionPolicy.expandedChatIDs(
-            selection: contextSelection,
-            authoritativeSessions: authoritativeSessions,
-            folderMembership: membership
-        )
-        return expandedIDs.compactMap { sessionsByID[$0] }
-    }
 
     private var moveChats: [ChatSession] {
         contextChats.filter { !scheduledIDs.contains($0.id) }

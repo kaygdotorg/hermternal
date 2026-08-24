@@ -264,6 +264,7 @@ struct SidebarView: View {
             sessions: model.sessions,
             folders: model.folders,
             membership: model.membership,
+            selection: sidebarSelection,
             sortMode: model.sortMode,
             groupByDate: model.groupByDate,
             calendar: calendar,
@@ -275,8 +276,9 @@ struct SidebarView: View {
         let scheduledIDs = derived.scheduledIDs
         let visibleOrder = derived.visibleOrder
         let folderVisibleOrder = derived.folderVisibleOrder
-        let sessionsByID = derived.sessionsByID
         let foldersByID = derived.foldersByID
+        let expandedChats = derived.expandedChats
+        let expandedChatsByItem = derived.expandedChatsByItem
         let content = columnChrome(
             Group {
                 if contentMode == .chats {
@@ -285,15 +287,16 @@ struct SidebarView: View {
                             sections,
                             visibleOrder: visibleOrder,
                             folderVisibleOrder: folderVisibleOrder,
-                            sessionsByID: sessionsByID,
                             foldersByID: foldersByID,
-                            scheduledIDs: scheduledIDs
+                            scheduledIDs: scheduledIDs,
+                            expandedChats: expandedChats,
+                            expandedChatsByItem: expandedChatsByItem
                         )
                         floatingLayer(
                             scheduleRows,
-                            visibleOrder: visibleOrder,
-                            sessionsByID: sessionsByID,
-                            scheduledIDs: scheduledIDs
+                            scheduledIDs: scheduledIDs,
+                            expandedChats: expandedChats,
+                            expandedChatsByItem: expandedChatsByItem
                         )
                     }
                 } else {
@@ -354,18 +357,20 @@ struct SidebarView: View {
         _ sections: [SidebarSection],
         visibleOrder: [SidebarSelectionID],
         folderVisibleOrder: [SidebarSelectionID],
-        sessionsByID: [String: ChatSession],
         foldersByID: [String: SidebarFolderTarget],
-        scheduledIDs: Set<String>
+        scheduledIDs: Set<String>,
+        expandedChats: [ChatSession],
+        expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
     ) -> some View {
         List(selection: $sidebarSelection) {
             sessionSections(
                 sections,
                 visibleOrder: visibleOrder,
                 folderVisibleOrder: folderVisibleOrder,
-                sessionsByID: sessionsByID,
                 foldersByID: foldersByID,
-                scheduledIDs: scheduledIDs
+                scheduledIDs: scheduledIDs,
+                expandedChats: expandedChats,
+                expandedChatsByItem: expandedChatsByItem
             )
         }
         .listStyle(.sidebar)
@@ -417,9 +422,10 @@ struct SidebarView: View {
         _ sections: [SidebarSection],
         visibleOrder: [SidebarSelectionID],
         folderVisibleOrder: [SidebarSelectionID],
-        sessionsByID: [String: ChatSession],
         foldersByID: [String: SidebarFolderTarget],
-        scheduledIDs: Set<String>
+        scheduledIDs: Set<String>,
+        expandedChats: [ChatSession],
+        expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
     ) -> SidebarSections {
         SidebarSections(
             sections: sections,
@@ -428,9 +434,10 @@ struct SidebarView: View {
             selection: sidebarSelection,
             visibleOrder: visibleOrder,
             folderVisibleOrder: folderVisibleOrder,
-            sessionsByID: sessionsByID,
             foldersByID: foldersByID,
             scheduledIDs: scheduledIDs,
+            expandedChats: expandedChats,
+            expandedChatsByItem: expandedChatsByItem,
             onOpen: { session in openImmediately(session) },
             onPin: { sessions, pinned in
                 Task { await model.setPinned(sessions, pinned: pinned) }
@@ -482,17 +489,17 @@ struct SidebarView: View {
     /// and a user cannot create a schedule from here, so absence hides it.
     private func floatingLayer(
         _ scheduleRows: [SidebarRow],
-        visibleOrder: [SidebarSelectionID],
-        sessionsByID: [String: ChatSession],
-        scheduledIDs: Set<String>
+        scheduledIDs: Set<String>,
+        expandedChats: [ChatSession],
+        expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
     ) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             if !scheduleRows.isEmpty {
                 schedulesPane(
                     scheduleRows,
-                    visibleOrder: visibleOrder,
-                    sessionsByID: sessionsByID,
-                    scheduledIDs: scheduledIDs
+                    scheduledIDs: scheduledIDs,
+                    expandedChats: expandedChats,
+                    expandedChatsByItem: expandedChatsByItem
                 )
             }
             Divider()
@@ -519,17 +526,17 @@ struct SidebarView: View {
 
     private func schedulesPane(
         _ scheduleRows: [SidebarRow],
-        visibleOrder: [SidebarSelectionID],
-        sessionsByID: [String: ChatSession],
-        scheduledIDs: Set<String>
+        scheduledIDs: Set<String>,
+        expandedChats: [ChatSession],
+        expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
     ) -> SidebarSchedulesPane {
         return SidebarSchedulesPane(
             rows: scheduleRows,
             folders: model.folders,
             membership: model.membership,
-            visibleOrder: visibleOrder,
-            sessionsByID: sessionsByID,
             scheduledIDs: scheduledIDs,
+            expandedChats: expandedChats,
+            expandedChatsByItem: expandedChatsByItem,
             selection: $sidebarSelection,
             onOpen: { session in openImmediately(session) },
             onPin: { sessions, pinned in
@@ -1215,9 +1222,10 @@ struct SidebarView: View {
 
 }
 
-/// The body-level values derived from sidebar ordering inputs. Selection is
-/// deliberately not represented here; rows consume it independently.
+/// The body-level values derived from sidebar ordering and selection inputs.
 private struct SidebarDerivedData {
+    let selection: Set<SidebarSelectionID>
+    let orderedSessionIDs: [String]
     let sections: [SidebarSection]
     let scheduleRows: [SidebarRow]
     let scheduledIDs: Set<String>
@@ -1225,11 +1233,13 @@ private struct SidebarDerivedData {
     let folderVisibleOrder: [SidebarSelectionID]
     let sessionsByID: [String: ChatSession]
     let foldersByID: [String: SidebarFolderTarget]
+    let expandedChats: [ChatSession]
+    let expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
 }
 
-/// Keeps the ordering projection and its dependent identity maps resident
-/// across SwiftUI body passes. The memo's input excludes selection, so a
-/// selection-only update performs no ordering or map construction.
+/// Keeps ordering and selection expansion projections resident across SwiftUI
+/// body passes. Ordering inputs rebuild the per-item context projections;
+/// selection changes rebuild only the one aggregate expansion.
 private final class SidebarDerivationCache {
     private var orderingMemo = SidebarOrderingMemo()
     private var derived: SidebarDerivedData?
@@ -1239,6 +1249,7 @@ private final class SidebarDerivationCache {
         sessions: [ChatSession],
         folders: [Folder],
         membership: [String: String],
+        selection: Set<SidebarSelectionID>,
         sortMode: SortMode,
         groupByDate: Bool,
         calendar: Calendar,
@@ -1255,30 +1266,77 @@ private final class SidebarDerivationCache {
                 now: now
             )
         )
-        guard derivedRebuildCount != orderingMemo.rebuildCount || derived == nil else {
-            return derived!
+        let orderingChanged = derivedRebuildCount != orderingMemo.rebuildCount || derived == nil
+        if !orderingChanged, let cached = derived, cached.selection == selection {
+            return cached
         }
 
-        let scheduleRows = projection.sections.first { $0.kind == .schedules }?.rows ?? []
-        let sessionsByID = Dictionary(
-            projection.sections.flatMap { $0.rows }.map { ($0.sessionID, $0.session) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        let foldersByID = Dictionary(
-            folders.map { ($0.id, SidebarFolderTarget(id: $0.id, name: $0.name)) },
-            uniquingKeysWith: { first, _ in first }
+        let base: SidebarDerivedData
+        if orderingChanged {
+            let scheduleRows = projection.sections.first { $0.kind == .schedules }?.rows ?? []
+            let sessionsByID = Dictionary(
+                projection.sections.flatMap { $0.rows }.map { ($0.sessionID, $0.session) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            let foldersByID = Dictionary(
+                folders.map { ($0.id, SidebarFolderTarget(id: $0.id, name: $0.name)) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            let scheduledIDs = Set(scheduleRows.map(\.sessionID))
+            let orderedSessionIDs = projection.visibleOrder.compactMap { item -> String? in
+                guard case let .chat(id) = item else { return nil }
+                return id
+            }
+            let contextItems = projection.visibleOrder + projection.folderVisibleOrder
+            let expandedChatsByItem = Dictionary(
+                uniqueKeysWithValues: contextItems.map { item in
+                    let ids = SidebarSelectionPolicy.expandedChatIDs(
+                        selection: [item],
+                        orderedSessionIDs: orderedSessionIDs,
+                        scheduledSessionIDs: scheduledIDs,
+                        folderMembership: membership
+                    )
+                    return (item, ids.compactMap { sessionsByID[$0] })
+                }
+            )
+            base = SidebarDerivedData(
+                selection: [],
+                orderedSessionIDs: orderedSessionIDs,
+                sections: projection.sections,
+                scheduleRows: scheduleRows,
+                scheduledIDs: scheduledIDs,
+                visibleOrder: projection.visibleOrder,
+                folderVisibleOrder: projection.folderVisibleOrder,
+                sessionsByID: sessionsByID,
+                foldersByID: foldersByID,
+                expandedChats: [],
+                expandedChatsByItem: expandedChatsByItem
+            )
+            derivedRebuildCount = orderingMemo.rebuildCount
+        } else {
+            base = derived!
+        }
+
+        let expandedIDs = SidebarSelectionPolicy.expandedChatIDs(
+            selection: selection,
+            orderedSessionIDs: base.orderedSessionIDs,
+            scheduledSessionIDs: base.scheduledIDs,
+            folderMembership: membership
         )
         let next = SidebarDerivedData(
-            sections: projection.sections,
-            scheduleRows: scheduleRows,
-            scheduledIDs: Set(scheduleRows.map(\.sessionID)),
-            visibleOrder: projection.visibleOrder,
-            folderVisibleOrder: projection.folderVisibleOrder,
-            sessionsByID: sessionsByID,
-            foldersByID: foldersByID
+            selection: selection,
+            orderedSessionIDs: base.orderedSessionIDs,
+            sections: base.sections,
+            scheduleRows: base.scheduleRows,
+            scheduledIDs: base.scheduledIDs,
+            visibleOrder: base.visibleOrder,
+            folderVisibleOrder: base.folderVisibleOrder,
+            sessionsByID: base.sessionsByID,
+            foldersByID: base.foldersByID,
+            expandedChats: expandedIDs.compactMap { base.sessionsByID[$0] },
+            expandedChatsByItem: base.expandedChatsByItem
         )
         derived = next
-        derivedRebuildCount = orderingMemo.rebuildCount
         return next
     }
 }

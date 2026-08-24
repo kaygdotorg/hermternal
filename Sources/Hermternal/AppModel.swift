@@ -11,13 +11,29 @@ import Observation
 @MainActor
 enum HermternalSwitchTrace {
     private static var gate = DebugModuleGate(mask: .none)
+    private static var debugModules: (any DebugModuleCapability)?
+    /// Counts are cumulative over the samples retained since the capability's
+    /// last clear. The next accepted event observes an emptied ring and resets
+    /// these counters before contributing to a new sample series.
+    private static var selectionCount = 0
+    private static var publicationCount = 0
+    private static var hasRecordedMetricSample = false
     /// The one publication that has not reached a terminal paint outcome.
     /// A newer publication closes this record as superseded before replacing
     /// it, so the trace cannot silently lose a publication.
-    private static var pendingTranscriptPublication: (id: String, generation: Int)?
+    private static var pendingTranscriptPublication: (
+        id: String,
+        generation: Int,
+        publishedAtNanoseconds: UInt64
+    )?
 
-    static func configure(gate: DebugModuleGate) {
-        self.gate = gate
+    static func configure(capability: any DebugModuleCapability) {
+        debugModules = capability
+        gate = capability.gate
+        pendingTranscriptPublication = nil
+        selectionCount = 0
+        publicationCount = 0
+        hasRecordedMetricSample = false
         HermternalSelectionOccupancyTrace.configure(gate: gate)
     }
 
@@ -32,9 +48,11 @@ enum HermternalSwitchTrace {
         messages: Int? = nil,
         renderedRows: Int? = nil,
         detail: String? = nil,
-        module: DebugModule = .switchPhases
+        module: DebugModule = .switchPhases,
+        timestampNanoseconds: UInt64? = nil
     ) {
         guard gate.isEnabled(module) else { return }
+        let eventTimestamp = timestampNanoseconds ?? DispatchTime.now().uptimeNanoseconds
         if event == "selection.publish", let id, let generation {
             if let pending = pendingTranscriptPublication {
                 session(
@@ -45,7 +63,13 @@ enum HermternalSwitchTrace {
                     module: .visiblePaint
                 )
             }
-            pendingTranscriptPublication = (id: id, generation: generation)
+            resetCountersIfMetricsCleared()
+            publicationCount &+= 1
+            pendingTranscriptPublication = (
+                id: id,
+                generation: generation,
+                publishedAtNanoseconds: eventTimestamp
+            )
         }
         emit(
             prefix: "[DEBUG-switch-7F3A]",
@@ -55,7 +79,8 @@ enum HermternalSwitchTrace {
             messages: messages,
             renderedRows: renderedRows,
             detail: detail,
-            seed: 0x01
+            seed: 0x01,
+            timestampNanoseconds: eventTimestamp
         )
     }
 
@@ -66,7 +91,9 @@ enum HermternalSwitchTrace {
         id: String,
         generation: Int,
         messages: Int,
-        renderedRows: Int
+        renderedRows: Int,
+        visibleAtNanoseconds: UInt64,
+        largestRowCharacterCount: () -> Int?
     ) -> Bool {
         guard gate.isEnabled(.visiblePaint) else { return true }
         guard let pending = pendingTranscriptPublication,
@@ -76,13 +103,25 @@ enum HermternalSwitchTrace {
             return false
         }
         pendingTranscriptPublication = nil
+        resetCountersIfMetricsCleared()
+        debugModules?.record(
+            DebugSelectionAggregate(
+                publishToVisibleNanoseconds: visibleAtNanoseconds &- pending.publishedAtNanoseconds,
+                selectionCount: selectionCount,
+                publicationCount: publicationCount,
+                largestRowCharacterCount: largestRowCharacterCount()
+            ),
+            for: .visiblePaint
+        )
+        hasRecordedMetricSample = true
         session(
             "transcript.visible",
             id: id,
             generation: generation,
             messages: messages,
             renderedRows: renderedRows,
-            module: .visiblePaint
+            module: .visiblePaint,
+            timestampNanoseconds: visibleAtNanoseconds
         )
         return true
     }
@@ -122,6 +161,10 @@ enum HermternalSwitchTrace {
         module: DebugModule = .sidebarAndFolderSelection
     ) {
         guard gate.isEnabled(module) else { return }
+        if event == "sidebarSelection.onChange" {
+            resetCountersIfMetricsCleared()
+            selectionCount &+= 1
+        }
         let id: String?
         let seed: UInt64
         if selection.count == 1, let item = selection.first {
@@ -153,8 +196,18 @@ enum HermternalSwitchTrace {
             messages: messages,
             detail: detail,
             seed: seed,
-            fallbackToken: "count-\(selection.count)"
+            fallbackToken: "count-\(selection.count)",
+            timestampNanoseconds: DispatchTime.now().uptimeNanoseconds
         )
+    }
+    private static func resetCountersIfMetricsCleared() {
+        guard hasRecordedMetricSample,
+              gate.isEnabled(.visiblePaint),
+              debugModules?.metrics == nil
+        else { return }
+        selectionCount = 0
+        publicationCount = 0
+        hasRecordedMetricSample = false
     }
 
     private static func emit(
@@ -166,9 +219,10 @@ enum HermternalSwitchTrace {
         renderedRows: Int? = nil,
         detail: String? = nil,
         seed: UInt64,
-        fallbackToken: String = "none"
+        fallbackToken: String = "none",
+        timestampNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) {
-        let line = "\(prefix) ns=\(DispatchTime.now().uptimeNanoseconds)"
+        let line = "\(prefix) ns=\(timestampNanoseconds)"
             + " event=\(event)"
             + " gen=\(generation.map { String($0) } ?? "-")"
             + " messages=\(messages.map { String($0) } ?? "-")"
@@ -198,8 +252,9 @@ private struct TranscriptMatchCache {
 @MainActor
 @Observable
 final class AppModel {
-    /// The process capability injected by the composition root. Trace probes
-    /// retain only its live gate, so a toggle is one integer test at the site.
+    /// The process capability injected by the composition root. The trace
+    /// owner retains this same reference so a paint can record without global
+    /// capability lookup or a second registry.
     let debugModules: any DebugModuleCapability
 
     enum Phase: Equatable {
@@ -396,7 +451,7 @@ final class AppModel {
         self.toastPresenter = toastPresenter
         self.organizationStore = organizationStore
         self.warmStore = warmStore
-        HermternalSwitchTrace.configure(gate: debugModules.gate)
+        HermternalSwitchTrace.configure(capability: debugModules)
         guard let historyDirectory = HistoryCache.defaultDirectory() else {
             self.cache = cache
             self.searchQuerying = nil

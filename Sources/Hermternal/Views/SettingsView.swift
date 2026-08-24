@@ -405,6 +405,21 @@ private struct DebugModulesGroup: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
+                // Instruction rather than a warning: the pane's job here is
+                // to teach the operator to narrow the module set, so it reads
+                // as ordinary footer prose with no icon, colour, or banner.
+                Text(
+                    "Each module costs something on the path it observes, so "
+                        + "leaving them all on measures the instrumentation as "
+                        + "much as the question you asked — most visibly under "
+                        + "rapid arrow-key navigation, where the synchronous "
+                        + "stderr writes land inside each selection. Enable "
+                        + "the smallest set that can answer one question, and "
+                        + "measure that."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
                 HStack {
                     Spacer()
                     Button("Clear Samples") {

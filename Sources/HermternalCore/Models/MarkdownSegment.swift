@@ -498,7 +498,7 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
 
             if line.hasPrefix("```") {
                 if inFence {
-                    flushCode(at: textLength)
+                    flushCode(at: lineStart)
                     inFence = false
                 } else {
                     flushProse(at: lineStart)

@@ -28,21 +28,24 @@ public enum DebugModule: String, CaseIterable, Codable, Sendable, Identifiable {
     }
 
     /// One line suitable for a Settings row. The final clause states the
-    /// principal cost so an operator can make an informed toggle choice.
+    /// principal cost of the module as its probes actually execute, not as a
+    /// summary adjective: none of these is free, and each one either writes
+    /// synchronously to stderr, times a hot path, or both. Keep the wording
+    /// answerable from the probe sites, so a reader can check it.
     public var description: String {
         switch self {
         case .switchPhases:
-            "Records session-switch phase timestamps; adds one timestamp at each phase."
+            "Times every session-switch phase; writes about a dozen synchronous stderr lines per selection, all on the main actor."
         case .sidebarAndFolderSelection:
-            "Records sidebar and folder selection transitions; adds a small event and timestamp per selection."
+            "Records sidebar and folder selection transitions; writes three or more synchronous stderr lines per selection, including a before/after pair around each selection write."
         case .mainActorOccupancy:
-            "Records main-actor occupancy and body evaluation summaries; adds counters and elapsed-time sampling per selection."
+            "Counts the sidebar work one selection causes; increments a counter inside every row body, reads the clock twice per sidebar body and per ordering resolve, and posts one flush task per selection."
         case .resourceContention:
-            "Records cache and warm-store wait aggregates; adds wait counters and elapsed-time sampling while work is contended."
+            "Measures cache and warm-store waits; takes a lock and two clock reads per guarded acquisition, and writes one stderr line per contended resource each selection."
         case .textLayoutAttribution:
-            "Attributes text layout work to messages and segments; adds lightweight counters around layout evaluation."
+            "Times and counts text work; measures each row's UTF-16 length inside the row body, times every parse and string conversion, and writes six stderr lines per selection."
         case .visiblePaint:
-            "Records the publish-to-visible interval; adds one bounded timing sample per visible selection."
+            "Times publish to visible pixels, and carries every statistic below; adds a one-point AppKit overlay that reports from each transcript paint pass, and appends one bounded ring sample per selection."
         }
     }
 

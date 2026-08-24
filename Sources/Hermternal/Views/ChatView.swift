@@ -248,7 +248,9 @@ struct ChatView: View {
         sessionID: String?,
         generation: Int,
         routeIdentity: String,
-        renderedRows: Int
+        renderedRows: Int,
+        visibleAtNanoseconds: UInt64,
+        largestRowCharacterCount: () -> Int?
     ) {
         guard !transcriptVisibilityEmitted,
               let sessionID,
@@ -266,11 +268,21 @@ struct ChatView: View {
             id: sessionID,
             generation: generation,
             messages: model.messages.count,
-            renderedRows: renderedRows
+            renderedRows: renderedRows,
+            visibleAtNanoseconds: visibleAtNanoseconds,
+            largestRowCharacterCount: largestRowCharacterCount
         ) else {
             return
         }
         transcriptVisibilityEmitted = true
+    }
+    private func largestRenderedRowCharacterCount(
+        makeMessages: () -> [ChatMessage]
+    ) -> Int? {
+        guard model.debugModules.isEnabled(.visiblePaint),
+              model.debugModules.isEnabled(.textLayoutAttribution)
+        else { return nil }
+        return makeMessages().lazy.map { $0.text.utf16.count }.max()
     }
 
 
@@ -720,13 +732,23 @@ struct ChatView: View {
             .id(transcriptIdentity)
             .overlay(alignment: .topLeading) {
                 if HermternalSwitchTrace.isEnabled {
-                    TranscriptPaintProbe {
-                        markTranscriptVisible(
-                            sessionID: model.selectedSessionID,
-                            generation: visibilityGeneration,
-                            routeIdentity: transcriptIdentity,
-                            renderedRows: window.range.count
-                        )
+                    TranscriptPaintProbe { visibleAtNanoseconds in
+                        // Draw can run inside AppKit's display and constraint transaction.
+                        // Defer every state and capability mutation to the next actor turn.
+                        Task { @MainActor in
+                            markTranscriptVisible(
+                                sessionID: model.selectedSessionID,
+                                generation: visibilityGeneration,
+                                routeIdentity: transcriptIdentity,
+                                renderedRows: window.range.count,
+                                visibleAtNanoseconds: visibleAtNanoseconds,
+                                largestRowCharacterCount: {
+                                    largestRenderedRowCharacterCount {
+                                        windowedMessages
+                                    }
+                                }
+                            )
+                        }
                     }
                     .frame(width: 1, height: 1)
                     .allowsHitTesting(false)
@@ -863,7 +885,13 @@ struct ChatView: View {
             .scrollTargetLayout()
             .padding(.horizontal, 22)
             .padding(.vertical, 20)
-            .frame(maxWidth: 680, alignment: .leading)
+            // Sized to the measures in `MessageTypography`, not chosen freely:
+            // a user row spends 60pt of leading inset and the stack's default
+            // spacing before its bubble, so the column has to clear
+            // 60 + 8 + `userBubbleMeasure` plus these 44pt of gutters for the
+            // bubble to reach its cap. Lowering this silently narrows user
+            // messages while leaving assistant prose untouched.
+            .frame(maxWidth: 720, alignment: .leading)
             .frame(maxWidth: .infinity)
         }
         // The anchor also decides how content smaller than the container
@@ -886,13 +914,23 @@ struct ChatView: View {
         // leaves the window's last row below the viewport.
         .overlay(alignment: .topLeading) {
             if HermternalSwitchTrace.isEnabled {
-                TranscriptPaintProbe {
-                    markTranscriptVisible(
-                        sessionID: model.selectedSessionID,
-                        generation: visibilityGeneration,
-                        routeIdentity: routeIdentity,
-                        renderedRows: window.range.count
-                    )
+                TranscriptPaintProbe { visibleAtNanoseconds in
+                    // Draw can run inside AppKit's display and constraint transaction.
+                    // Defer every state and capability mutation to the next actor turn.
+                    Task { @MainActor in
+                        markTranscriptVisible(
+                            sessionID: model.selectedSessionID,
+                            generation: visibilityGeneration,
+                            routeIdentity: routeIdentity,
+                            renderedRows: window.range.count,
+                            visibleAtNanoseconds: visibleAtNanoseconds,
+                            largestRowCharacterCount: {
+                                largestRenderedRowCharacterCount {
+                                    Array(messages[window.range])
+                                }
+                            }
+                        )
+                    }
                 }
                 .frame(width: 1, height: 1)
                 .allowsHitTesting(false)
@@ -1037,7 +1075,7 @@ struct ChatView: View {
 /// has laid out its scroll content; unlike `onAppear`, it cannot report a
 /// view that exists only in the graph.
 private struct TranscriptPaintProbe: NSViewRepresentable {
-    let onPaint: () -> Void
+    let onPaint: (UInt64) -> Void
 
     func makeNSView(context: Context) -> PaintView {
         PaintView(onPaint: onPaint)
@@ -1048,12 +1086,13 @@ private struct TranscriptPaintProbe: NSViewRepresentable {
         nsView.needsDisplay = true
     }
     final class PaintView: NSView {
-        var onPaint: () -> Void
+        var onPaint: (UInt64) -> Void
 
-        init(onPaint: @escaping () -> Void) {
+        init(onPaint: @escaping (UInt64) -> Void) {
             self.onPaint = onPaint
             super.init(frame: .zero)
         }
+
 
         @available(*, unavailable)
         required init?(coder: NSCoder) {
@@ -1062,7 +1101,8 @@ private struct TranscriptPaintProbe: NSViewRepresentable {
 
         override func draw(_ dirtyRect: NSRect) {
             super.draw(dirtyRect)
-            onPaint()
+            // Capture only. Recording from draw can re-enter SwiftUI constraint updates.
+            onPaint(DispatchTime.now().uptimeNanoseconds)
         }
     }
 }
@@ -1222,7 +1262,7 @@ private struct AssistantMark: View {
     ///
     /// The column is `size` wide, so with the row's 10pt spacing the gutter is
     /// 20 + 10pt — what `MessageTypography.readingMeasure` subtracts from the
-    /// 680pt column, along with its 44pt of padding and 96pt of trailing air.
+    /// 720pt column, along with its 44pt of padding and 90pt of trailing air.
     private static let lineBox: CGFloat = 16
 }
 

@@ -35,14 +35,16 @@ enum MessageTypography {
     /// not push its own text off the row.
     static let maxListDepth = 4
 
-    /// The reading measure for assistant prose: the 680pt column, less 44pt
-    /// of gutters, less the mark's 20pt column and its 10pt gap, less 96pt
-    /// of trailing air. About 80 characters at 13pt, which the 1.46 line
-    /// height carries comfortably; wider than this and the eye starts
-    /// losing the line return. Applied as a cap rather than a fixed inset,
-    /// so a narrow window hands the space back to the text instead of
-    /// holding an empty gutter open.
-    static let readingMeasure: CGFloat = 510
+    /// The reading measure for assistant prose: the 720pt column, less 44pt
+    /// of gutters, less the mark's 20pt column and its 10pt gap, less 90pt
+    /// of trailing air. About 87 characters at 13pt — still inside the
+    /// 45–90 band that the 1.46 line height carries comfortably, and wide
+    /// enough that a desktop window stops reading like a phone. Past 90 the
+    /// eye starts losing the line return, so this is close to the ceiling
+    /// rather than a value with room left in it. Applied as a cap rather
+    /// than a fixed inset, so a narrow window hands the space back to the
+    /// text instead of holding an empty gutter open.
+    static let readingMeasure: CGFloat = 556
 
     /// Minimum trailing air on an assistant row, so its ragged right edge
     /// never lands on the same boundary as a right-aligned user bubble.
@@ -55,6 +57,15 @@ enum MessageTypography {
     /// Applied to a transparent trailing-aligned container rather than to
     /// the bubble, because a greedy `maxWidth` on the bubble itself would
     /// stop it hugging its text and stretch every one-line message.
+    ///
+    /// This only holds while the transcript column is wide enough for the
+    /// bubble to reach the cap: a user row spends 60pt on its leading
+    /// inset plus the stack's default spacing before the bubble starts, so
+    /// the column needs `60 + 8 + userBubbleMeasure` of content width. At
+    /// 720pt less 44pt of gutters there is 24pt to spare. Raise the measure
+    /// without raising the column and the bubble is silently clipped, which
+    /// costs a user message its parity with a reply at exactly the widest
+    /// window — the one place the extra width was wanted.
     static let userBubbleMeasure: CGFloat = readingMeasure + bubblePadding * 2
 
     static func headingFont(_ level: Int) -> Font {

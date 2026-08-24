@@ -71,9 +71,10 @@ struct SidebarSections: View {
     let selection: Set<SidebarSelectionID>
     let visibleOrder: [SidebarSelectionID]
     let folderVisibleOrder: [SidebarSelectionID]
-    let sessionsByID: [String: ChatSession]
     let foldersByID: [String: SidebarFolderTarget]
     let scheduledIDs: Set<String>
+    let expandedChats: [ChatSession]
+    let expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
     let onOpen: (ChatSession) -> Void
     let onPin: ([ChatSession], Bool) -> Void
     let onArchive: ([ChatSession]) -> Void
@@ -139,10 +140,8 @@ struct SidebarSections: View {
                         isExpanded: folderExpansion(for: run.target.id),
                         selection: selection,
                         visibleOrder: folderVisibleOrder,
-                        sessionVisibleOrder: visibleOrder,
                         foldersByID: foldersByID,
-                        sessionsByID: sessionsByID,
-                        membership: membership,
+                        expandedChats: expandedChats(for: .folder(run.target.id)),
                         onRename: onRenameFolder,
                         onSelect: onSelectFolder,
                         onPin: onPin,
@@ -247,9 +246,8 @@ struct SidebarSections: View {
                 session: row.session,
                 folders: folders,
                 membership: membership,
-                sessionsByID: sessionsByID,
+                contextChats: expandedChats(for: .chat(row.sessionID)),
                 selection: selection,
-                visibleOrder: visibleOrder,
                 scheduledIDs: scheduledIDs,
                 onOpen: onOpen,
                 onPin: onPin,
@@ -272,6 +270,13 @@ struct SidebarSections: View {
                 )
             }
         }
+    }
+    /// Selection expansion is resolved by SidebarDerivationCache. Rows only
+    /// receive the finished chat values for their clicked target.
+    private func expandedChats(for clicked: SidebarSelectionID) -> [ChatSession] {
+        selection.contains(clicked)
+            ? expandedChats
+            : expandedChatsByItem[clicked] ?? []
     }
 
     /// Drag selection is resolved at gesture start, not while constructing
