@@ -224,7 +224,7 @@ struct ChatView: View {
     }
 
     @MainActor
-    private func resetAppKitTranscriptRoute() {
+    private func resetTranscriptRendererRoute() {
         pendingScrollTask?.cancel()
         pendingScrollTask = nil
         windowGrowthTask?.cancel()
@@ -468,6 +468,9 @@ struct ChatView: View {
         )
         let windowedMatches = windowedProjection.matches
         let activeWindowMatchIndex = windowedProjection.activeIndex
+        let windowedBlocks = windowedMessages.flatMap {
+            TranscriptBlockSegmenter.blocks(for: $0)
+        }
         // Capture the publication generation, not the latest streaming
         // generation. A stream can begin while the first rows are painting.
         let visibilityGeneration = (
@@ -475,8 +478,53 @@ struct ChatView: View {
             ? transcriptVisibilityGeneration
             : nil
         ) ?? model.openGeneration
+        let rendererInput = TranscriptRendererInput(
+            blocks: windowedBlocks,
+            messages: windowedMessages,
+            window: window,
+            routeIdentity: transcriptIdentity,
+            isReadOnly: isReadOnly,
+            isStreaming: messages.last?.isStreaming == true,
+            findQuery: query,
+            findMatches: windowedMatches,
+            activeFindIndex: activeWindowMatchIndex,
+            pendingMessageID: initialMessageTarget,
+            onRequestOlder: {
+                guard window.hasMoreOlderMessages, !messages.isEmpty else { return }
+                isPrimingTranscriptWindow = false
+                transcriptWindowState = TranscriptWindowPolicy.grow(
+                    totalMessageCount: messages.count,
+                    requestedWindowSize: Self.transcriptWindowSize,
+                    currentState: window.state
+                ).state
+            },
+            onCopyCode: { code in
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(code, forType: .string)
+            },
+            onPaint: { visibleAtNanoseconds in
+                guard HermternalSwitchTrace.isEnabled else { return }
+                Task { @MainActor in
+                    markTranscriptVisible(
+                        sessionID: model.selectedSessionID,
+                        generation: visibilityGeneration,
+                        routeIdentity: transcriptIdentity,
+                        renderedRows: windowedBlocks.count,
+                        visibleAtNanoseconds: visibleAtNanoseconds,
+                        largestRowCharacterCount: {
+                            largestRenderedRowCharacterCount {
+                                windowedMessages
+                            }
+                        }
+                    )
+                }
+            }
+        )
+
         Group {
-        if !Self.usesAppKitTranscript {
+        // One input seam feeds both adapters; keep the SwiftUI branch concrete
+        // to avoid type erasure on the default transcript path.
+        if !Self.usesBlockTranscript {
             ScrollViewReader { proxy in
             transcriptScrollView(
                 using: proxy,
@@ -704,56 +752,8 @@ struct ChatView: View {
             }
             }
         } else {
-            AppKitTranscript(
-                messages: windowedMessages,
-                routeIdentity: transcriptIdentity,
-                isReadOnly: isReadOnly,
-                isStreaming: messages.last?.isStreaming == true,
-                findQuery: query,
-                findMatches: windowedMatches,
-                activeFindIndex: activeWindowMatchIndex,
-                pendingMessageID: initialMessageTarget,
-                onRequestOlder: {
-                    guard window.hasMoreOlderMessages,
-                          !messages.isEmpty
-                    else { return }
-                    isPrimingTranscriptWindow = false
-                    transcriptWindowState = TranscriptWindowPolicy.grow(
-                        totalMessageCount: messages.count,
-                        requestedWindowSize: Self.transcriptWindowSize,
-                        currentState: window.state
-                    ).state
-                },
-                onCopyCode: { code in
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(code, forType: .string)
-                }
-            )
-            .id(transcriptIdentity)
-            .overlay(alignment: .topLeading) {
-                if HermternalSwitchTrace.isEnabled {
-                    TranscriptPaintProbe { visibleAtNanoseconds in
-                        // Draw can run inside AppKit's display and constraint transaction.
-                        // Defer every state and capability mutation to the next actor turn.
-                        Task { @MainActor in
-                            markTranscriptVisible(
-                                sessionID: model.selectedSessionID,
-                                generation: visibilityGeneration,
-                                routeIdentity: transcriptIdentity,
-                                renderedRows: window.range.count,
-                                visibleAtNanoseconds: visibleAtNanoseconds,
-                                largestRowCharacterCount: {
-                                    largestRenderedRowCharacterCount {
-                                        windowedMessages
-                                    }
-                                }
-                            )
-                        }
-                    }
-                    .frame(width: 1, height: 1)
-                    .allowsHitTesting(false)
-                }
-            }
+            BlockTranscriptView(input: rendererInput)
+                .id(transcriptIdentity)
             .onChange(of: model.pendingMessageLocation) {
                 if model.pendingMessageLocation == nil {
                     scrollPosition = nil
@@ -776,7 +776,7 @@ struct ChatView: View {
                 includeActiveFindTarget(matches: matches)
             }
             .onChange(of: model.selectedSessionID) { _, _ in
-                resetAppKitTranscriptRoute()
+                resetTranscriptRendererRoute()
                 if model.pendingMessageLocation != nil {
                     _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                 } else {
@@ -784,7 +784,7 @@ struct ChatView: View {
                 }
             }
             .onChange(of: model.viewingArchivedSessionID) { _, _ in
-                resetAppKitTranscriptRoute()
+                resetTranscriptRendererRoute()
                 if model.pendingMessageLocation != nil {
                     _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                 } else {
@@ -1059,10 +1059,10 @@ struct ChatView: View {
 
     private static let haloRamp: CGFloat = 34
 
-    /// AppKit transcript rendering is opt-in while the SwiftUI route remains
-    /// the default.
-    private static let usesAppKitTranscript =
-        ProcessInfo.processInfo.environment["HERMTERNAL_APPKIT_TRANSCRIPT"] == "1"
+    /// The block renderer is opt-in; SwiftUI remains the default until parity
+    /// is measured. This is the only renderer selection site.
+    private static let usesBlockTranscript =
+        ProcessInfo.processInfo.environment["HERMTERNAL_BLOCK_TRANSCRIPT"] == "1"
 
     private static let transcriptWindowSize = TranscriptWindowPolicy.defaultWindowSize
     private static let bottomAnchor = "transcript.bottom"
@@ -1092,7 +1092,6 @@ private struct TranscriptPaintProbe: NSViewRepresentable {
             self.onPaint = onPaint
             super.init(frame: .zero)
         }
-
 
         @available(*, unavailable)
         required init?(coder: NSCoder) {
