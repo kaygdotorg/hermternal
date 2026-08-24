@@ -762,7 +762,10 @@ public actor HistoryCache: TranscriptPersisting {
     public nonisolated func read(
         for id: String
     ) async -> (transcript: CachedTranscript?, epoch: UInt64) {
-        let request = ContentionTrace.beginInteractive(resource: "history-read")
+        let request = ContentionTrace.beginInteractive(
+            resource: "history-read",
+            owner: .historyCache
+        )
         let result = await readIsolatedAsync(for: id, request: request)
         return (result.transcript, result.epoch)
     }

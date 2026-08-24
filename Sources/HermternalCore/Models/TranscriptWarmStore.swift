@@ -98,7 +98,10 @@ public final class TranscriptWarmStore: @unchecked Sendable {
             retainedBytes: cost
         )
 
-        var contentionRequest = ContentionTrace.beginInteractive(resource: "warm-store")
+        var contentionRequest = ContentionTrace.beginInteractive(
+            resource: "warm-store",
+            owner: .warmStore
+        )
         let lockStartedAt = contentionRequest == nil
             ? 0
             : DispatchTime.now().uptimeNanoseconds
@@ -143,7 +146,10 @@ public final class TranscriptWarmStore: @unchecked Sendable {
         for sessionID: String,
         minimumServerTotal: Int? = nil
     ) -> WarmTranscriptProjection? {
-        var contentionRequest = ContentionTrace.beginInteractive(resource: "warm-store")
+        var contentionRequest = ContentionTrace.beginInteractive(
+            resource: "warm-store",
+            owner: .warmStore
+        )
         let lockStartedAt = contentionRequest == nil
             ? 0
             : DispatchTime.now().uptimeNanoseconds
@@ -169,7 +175,10 @@ public final class TranscriptWarmStore: @unchecked Sendable {
 
     /// Removes the specified sessions from the warm map.
     public func remove(sessionIDs: Set<String>) {
-        var contentionRequest = ContentionTrace.beginInteractive(resource: "warm-store")
+        var contentionRequest = ContentionTrace.beginInteractive(
+            resource: "warm-store",
+            owner: .warmStore
+        )
         let lockStartedAt = contentionRequest == nil
             ? 0
             : DispatchTime.now().uptimeNanoseconds
@@ -188,7 +197,10 @@ public final class TranscriptWarmStore: @unchecked Sendable {
 
     /// Keeps only the specified sessions in the warm map.
     public func retain(sessionIDs: Set<String>) {
-        var contentionRequest = ContentionTrace.beginInteractive(resource: "warm-store")
+        var contentionRequest = ContentionTrace.beginInteractive(
+            resource: "warm-store",
+            owner: .warmStore
+        )
         let lockStartedAt = contentionRequest == nil
             ? 0
             : DispatchTime.now().uptimeNanoseconds
@@ -209,7 +221,10 @@ public final class TranscriptWarmStore: @unchecked Sendable {
 
     /// Removes all projections and resets accounting.
     public func clear() {
-        var contentionRequest = ContentionTrace.beginInteractive(resource: "warm-store")
+        var contentionRequest = ContentionTrace.beginInteractive(
+            resource: "warm-store",
+            owner: .warmStore
+        )
         let lockStartedAt = contentionRequest == nil
             ? 0
             : DispatchTime.now().uptimeNanoseconds
@@ -224,7 +239,10 @@ public final class TranscriptWarmStore: @unchecked Sendable {
     }
 
     public var metrics: Metrics {
-        var contentionRequest = ContentionTrace.beginInteractive(resource: "warm-store")
+        var contentionRequest = ContentionTrace.beginInteractive(
+            resource: "warm-store",
+            owner: .warmStore
+        )
         let lockStartedAt = contentionRequest == nil
             ? 0
             : DispatchTime.now().uptimeNanoseconds

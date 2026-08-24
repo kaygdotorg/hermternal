@@ -1,6 +1,7 @@
 import Foundation
 
 /// Closed attribution vocabulary shared by the process-local measurement probes.
+/// Each owner names the causing subsystem, not a kind of work.
 public enum TraceOwner: String, CaseIterable, Hashable, Sendable {
     case blockPreparation = "block-preparation"
     case blockRowConfiguration = "block-row-configuration"
@@ -9,6 +10,8 @@ public enum TraceOwner: String, CaseIterable, Hashable, Sendable {
     case searchPanel = "search-panel"
     case sidebarRow = "sidebar-row"
     case backgroundPrefetch = "background-prefetch"
+    case warmStore = "warm-store"
+    case historyCache = "history-cache"
     case unattributed = "unattributed"
 }
 
