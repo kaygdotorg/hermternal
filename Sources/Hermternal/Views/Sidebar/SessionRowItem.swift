@@ -59,6 +59,7 @@ struct SessionRowItem: View {
     let onMove: ([ChatSession], String?) -> Void
 
     var body: some View {
+        let _ = HermternalSelectionOccupancyTrace.sessionRowBodyEvaluated()
         SessionRow(session: session)
             .accessibilityLabel(session.displayTitle)
             .accessibilityValue(sessionRowDetail(session))
@@ -66,8 +67,37 @@ struct SessionRowItem: View {
             // The row surface belongs to List, but VoiceOver still needs the
             // same default activation that the old row Button provided.
             .accessibilityAction {
+                HermternalSwitchTrace.session(
+                    "selection.observed.accessibility",
+                    id: session.id,
+                    messages: session.messageCount
+                )
                 onOpen(session)
             }
+            // List remains the owner of selection. A simultaneous tap only
+            // observes the completed primary click, so it cannot swallow
+            // native selection, hover, drag, swipe actions, or context menus.
+            .simultaneousGesture(
+                TapGesture(count: 1)
+                    .onEnded {
+                        let allowed = SidebarSelectionEventAdapter.allowsPrimaryActivation()
+                        HermternalSwitchTrace.session(
+                            "selection.tapGate",
+                            id: session.id,
+                            messages: session.messageCount,
+                            detail: allowed ? "allowed" : "blocked"
+                        )
+                        guard allowed else {
+                            return
+                        }
+                        HermternalSwitchTrace.session(
+                            "selection.observed.pointer",
+                            id: session.id,
+                            messages: session.messageCount
+                        )
+                        onOpen(session)
+                    }
+            )
             .swipeActions(edge: .leading, allowsFullSwipe: false) {
                 pinButton
             }
@@ -80,18 +110,20 @@ struct SessionRowItem: View {
     }
 
     private var contextChats: [ChatSession] {
-        let targets = SidebarSelectionPolicy.contextTargets(
+        let contextSelection = SidebarSelectionPolicy.contextTargets(
             clicked: .chat(session.id),
             selected: selection
         )
-        var seen = Set<String>()
-        return visibleOrder.compactMap { item in
-            guard case let .chat(id) = item,
-                  targets.contains(item),
-                  seen.insert(id).inserted
-            else { return nil }
+        let authoritativeSessions = visibleOrder.compactMap { item -> ChatSession? in
+            guard case let .chat(id) = item else { return nil }
             return sessionsByID[id]
         }
+        let expandedIDs = SidebarSelectionPolicy.expandedChatIDs(
+            selection: contextSelection,
+            authoritativeSessions: authoritativeSessions,
+            folderMembership: membership
+        )
+        return expandedIDs.compactMap { sessionsByID[$0] }
     }
 
     private var moveChats: [ChatSession] {
@@ -101,40 +133,78 @@ struct SessionRowItem: View {
     @ViewBuilder
     private var contextMenu: some View {
         let chats = contextChats
+        let contextSelection = SidebarSelectionPolicy.contextTargets(
+            clicked: .chat(session.id),
+            selected: selection
+        )
+        let folderIDs = contextSelection.compactMap { item -> String? in
+            guard case let .folder(id) = item else { return nil }
+            return id
+        }
         let chatNoun = chats.count == 1 ? "Chat" : "Chats"
         let linkNoun = chats.count == 1 ? "Link" : "Links"
+        let folderPhrase: String? = if folderIDs.isEmpty {
+            nil
+        } else if folderIDs.count == 1 {
+            "Folder"
+        } else {
+            "\(folderIDs.count) Folders"
+        }
+        let chatScope = "\(chats.count) \(chatNoun)"
+            + (folderPhrase.map { " in \($0)" } ?? "")
+        let linkScope = folderPhrase.map {
+            "\(chats.count) Deep \(linkNoun) in \($0)"
+        } ?? "\(chats.count) Deep \(linkNoun)"
         let action = SidebarSelectionPolicy.convergingPinAction(
             for: chats.map(\.pinned)
         )
         if let action {
             Button(
-                action == .pin ? "Pin \(chats.count) \(chatNoun)" : "Unpin \(chats.count) \(chatNoun)",
+                action == .pin ? "Pin \(chatScope)" : "Unpin \(chatScope)",
                 systemImage: action == .pin ? "pin" : "pin.slash"
             ) {
                 onPin(chats, action == .pin)
             }
         }
-        Button("Archive \(chats.count) \(chatNoun)", systemImage: "archivebox") {
+        Button("Archive \(chatScope)", systemImage: "archivebox") {
             onArchive(chats)
         }
-        Button("Copy \(chats.count) Deep \(linkNoun)", systemImage: "link") {
+        Button("Copy \(linkScope)", systemImage: "link") {
             onCopyDeepLinks(chats)
         }
-        Button("Delete Selected Chats Permanently", systemImage: "trash.fill", role: .destructive) {
-            onPurge(chats.map(\.id), [], .chatsOnly)
-        }
-        .disabled(!purgeAvailable)
-        .help(purgeAvailable ? "Permanently delete selected chats" : purgeUnavailableReason)
-        let folderIDs = Set(chats.compactMap { membership[$0.id] })
-        if !folderIDs.isEmpty {
-            Button("Delete Folders and Chats Permanently", systemImage: "folder.badge.minus", role: .destructive) {
-                onPurge(chats.map(\.id), Array(folderIDs), .foldersAndChats)
+        if let folderPhrase {
+            Button(
+                folderIDs.count == 1
+                    ? "Permanently Delete Folder and Chats…"
+                    : "Permanently Delete \(folderIDs.count) Folders and Chats…",
+                systemImage: "trash.fill",
+                role: .destructive
+            ) {
+                let selectedFolderIDs = contextSelection.compactMap { item -> String? in
+                    guard case let .folder(id) = item else { return nil }
+                    return id
+                }
+                onPurge(chats.map(\.id), selectedFolderIDs, .foldersAndChats)
             }
             .disabled(!purgeAvailable)
-            .help(purgeAvailable ? "Permanently delete selected folders and chats" : purgeUnavailableReason)
+            .help(
+                purgeAvailable
+                    ? "Permanently delete all chats inside \(folderPhrase)"
+                    : purgeUnavailableReason
+            )
+        } else {
+            Button(
+                "Permanently Delete \(chats.count) \(chatNoun)…",
+                systemImage: "trash.fill",
+                role: .destructive
+            ) {
+                onPurge(chats.map(\.id), [], .chatsOnly)
+            }
+            .disabled(!purgeAvailable)
+            .help(purgeAvailable ? "Permanently delete \(chats.count) \(chatNoun)" : purgeUnavailableReason)
         }
         if !moveChats.isEmpty {
-            moveMenu(moveChats)
+            moveMenu(moveChats, folderCount: folderIDs.count)
         }
         Divider()
         Button("Rename", systemImage: "pencil") {
@@ -143,9 +213,18 @@ struct SessionRowItem: View {
         .disabled(chats.count != 1)
     }
     @ViewBuilder
-    private func moveMenu(_ chats: [ChatSession]) -> some View {
+    private func moveMenu(_ chats: [ChatSession], folderCount: Int) -> some View {
         let noun = chats.count == 1 ? "Chat" : "Chats"
-        Menu("Move \(chats.count) \(noun) to Folder", systemImage: "folder") {
+        let folderPhrase: String? = if folderCount == 0 {
+            nil
+        } else if folderCount == 1 {
+            "Folder"
+        } else {
+            "\(folderCount) Folders"
+        }
+        let scope = "\(chats.count) \(noun)"
+            + (folderPhrase.map { " in \($0)" } ?? "")
+        Menu("Move \(scope) to Folder", systemImage: "folder") {
             if folders.isEmpty {
                 Button("No Folders Yet") {}.disabled(true)
             } else {

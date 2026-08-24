@@ -236,6 +236,18 @@ private struct ArchivedSidebarRow: View {
             .accessibilityAction {
                 onOpen(session)
             }
+            // List remains the owner of selection. The simultaneous tap
+            // observes only the completed primary click and leaves native
+            // selection and the context menu untouched.
+            .simultaneousGesture(
+                TapGesture(count: 1)
+                    .onEnded {
+                        guard SidebarSelectionEventAdapter.allowsPrimaryActivation() else {
+                            return
+                        }
+                        onOpen(session)
+                    }
+            )
     }
 
     @ViewBuilder

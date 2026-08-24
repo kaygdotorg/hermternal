@@ -100,6 +100,42 @@ func purgePlanCapturesArchivedMembershipAndCounts() {
     #expect(plan.folderMembership["archived"] == "folder")
 }
 
+@Test("Purge plan uses explicit folders without inferring containing folders")
+func purgePlanHonorsExplicitFolderTargets() {
+    let selectedChat = ChatSession(from: .object([
+        "id": .string("selected-chat"),
+        "profile": .string("default")
+    ]))
+    let folderChat = ChatSession(from: .object([
+        "id": .string("folder-chat"),
+        "profile": .string("default")
+    ]))
+    let unrelatedChat = ChatSession(from: .object([
+        "id": .string("unrelated"),
+        "profile": .string("default")
+    ]))
+    let plan = SessionPurgePolicy.plan(
+        selectedChatIDs: ["selected-chat"],
+        selectedFolderIDs: ["selected-folder"],
+        mode: .foldersAndChats,
+        membership: [
+            "selected-chat": "unselected-containing-folder",
+            "folder-chat": "selected-folder",
+            "unrelated": "unselected-containing-folder"
+        ],
+        visibleChatIDs: ["selected-chat", "folder-chat", "unrelated"],
+        activeSessionID: nil,
+        isStreaming: false,
+        authoritativeSessions: [selectedChat, folderChat, unrelatedChat]
+    )
+
+    #expect(plan.folderIDs == ["selected-folder"])
+    #expect(plan.chatIDs == ["selected-chat", "folder-chat"])
+    #expect(plan.folderCount == 1)
+    #expect(plan.chatCount == 2)
+    #expect(plan.confirmationCount == 2)
+}
+
 @Test("empty folder plan has no gateway chat target")
 func emptyFolderPlanIsValid() {
     let plan = SessionPurgePolicy.plan(

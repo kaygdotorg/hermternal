@@ -81,6 +81,8 @@ struct SidebarSections: View {
     let onCopyDeepLinks: ([ChatSession]) -> Void
     let onMove: ([ChatSession], String?) -> Void
     let onRenameFolder: (SidebarFolderTarget) -> Void
+    /// Selects a folder without changing the active transcript.
+    let onSelectFolder: (String) -> Void
     let onDeleteFolder: ([SidebarFolderTarget]) -> Void
     let onNewFolder: () -> Void
     let onPurge: ([String], [String], SessionPurgeActionMode) -> Void
@@ -137,8 +139,14 @@ struct SidebarSections: View {
                         isExpanded: folderExpansion(for: run.target.id),
                         selection: selection,
                         visibleOrder: folderVisibleOrder,
+                        sessionVisibleOrder: visibleOrder,
                         foldersByID: foldersByID,
+                        sessionsByID: sessionsByID,
+                        membership: membership,
                         onRename: onRenameFolder,
+                        onSelect: onSelectFolder,
+                        onPin: onPin,
+                        onArchive: onArchive,
                         onPurge: onPurge,
                         purgeAvailable: purgeAvailable,
                         purgeUnavailableReason: purgeUnavailableReason,
@@ -234,23 +242,7 @@ struct SidebarSections: View {
     /// The session rows of one section, typed as `DynamicViewContent` so a
     /// caller can attach a drop handler to the `ForEach` rather than to a row.
     private func sessionRows(for section: SidebarSection) -> some DynamicViewContent {
-        var dragIDsBySessionID = [String: [String]]()
-        if section.kind != .schedules {
-            for item in visibleOrder {
-                guard case let .chat(id) = item else { continue }
-                dragIDsBySessionID[id] = SidebarSelectionPolicy.applicableDragTargets(
-                    dragged: .chat(id),
-                    selected: selection,
-                    visibleOrder: visibleOrder
-                )
-                .compactMap { item in
-                    guard case let .chat(id) = item, !scheduledIDs.contains(id) else { return nil }
-                    return id
-                }
-            }
-        }
-        return ForEach(section.rows) { row in
-            let draggedIDs = dragIDsBySessionID[row.sessionID] ?? []
+        ForEach(section.rows) { row in
             SessionRowItem(
                 session: row.session,
                 folders: folders,
@@ -271,7 +263,35 @@ struct SidebarSections: View {
             )
             .tag(SidebarSelectionID.chat(row.sessionID))
             .selectionDisabled(false)
-            .onDrag { SidebarDragPayload.provider(sessionIDs: draggedIDs) }
+            .onDrag {
+                SidebarDragPayload.provider(
+                    sessionIDs: dragSessionIDs(
+                        for: row.sessionID,
+                        in: section.kind
+                    )
+                )
+            }
+        }
+    }
+
+    /// Drag selection is resolved at gesture start, not while constructing
+    /// every section. Held-arrow selection changes therefore do not rebuild a
+    /// per-section drag table.
+    private func dragSessionIDs(
+        for sessionID: String,
+        in sectionKind: SidebarSectionKind
+    ) -> [String] {
+        guard sectionKind != .schedules else { return [] }
+        return SidebarSelectionPolicy.applicableDragTargets(
+            dragged: .chat(sessionID),
+            selected: selection,
+            visibleOrder: visibleOrder
+        )
+        .compactMap { item in
+            guard case let .chat(id) = item, !scheduledIDs.contains(id) else {
+                return nil
+            }
+            return id
         }
     }
 

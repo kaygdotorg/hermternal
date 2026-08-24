@@ -47,7 +47,7 @@ func cachedPhasePrecedesResume() async throws {
         generations: generations
     )
     let generation = generations.begin()
-    var phases = opener.openPhases(
+    var phases = opener.openInteractionPhases(
         sessionID: "session",
         serverTotal: 1,
         generation: generation,
@@ -67,6 +67,46 @@ func cachedPhasePrecedesResume() async throws {
     #expect(final.liveSessionID == "live")
     #expect(final.messages.map(\.text) == ["cached"])
     #expect(await phases.next() == nil)
+    #expect(await source.resumeCalls == 1)
+}
+
+@Test("read-only cached open never resumes")
+func cachedReadDoesNotResume() async throws {
+    let directory = try openStateTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let cache = HistoryCache(directory: directory)
+    let snapshot = AuthoritativeTranscriptSnapshot(
+        sessionID: "session",
+        serverTotal: 1,
+        fetchedRows: 1,
+        projectedMessages: 1,
+        truncated: false,
+        fetchedAt: Date()
+    )
+    _ = await cache.store(
+        [ChatMessage(role: .assistant, text: "cached")],
+        snapshot: snapshot,
+        for: "session"
+    )
+    let source = OpenStateSuspendedSource(suspendResume: false)
+    let opener = TranscriptOpener(
+        source: source,
+        cache: cache,
+        cacheEnabled: true,
+        generations: OpenGenerationController()
+    )
+    let generation = opener.generations.begin()
+    var phases = opener.openPhases(
+        sessionID: "session",
+        serverTotal: 1,
+        generation: generation,
+        sessionTitle: ""
+    ).makeAsyncIterator()
+
+    let first = try #require(await phases.next())
+    #expect(first.messages.map(\.text) == ["cached"])
+    #expect(await phases.next() == nil)
+    #expect(await source.resumeCalls == 0)
 }
 
 @Test("a cache miss emits an empty provisional phase")
@@ -97,6 +137,7 @@ func cacheMissEmitsEmptyPhase() async throws {
     }
     await source.finishAuthoritative()
     _ = try #require(await phases.next())
+    #expect(await source.resumeCalls == 0)
 }
 
 @Test("a disabled cache emits an empty provisional phase")
@@ -188,7 +229,7 @@ func delayedResumeCannotRestoreAfterCacheDisable() async throws {
     )
     let generation = generations.begin()
     let task = Task {
-        await opener.open(
+        await opener.openForInteraction(
             sessionID: "session",
             serverTotal: 1,
             generation: generation,
@@ -235,7 +276,7 @@ func delayedRESTCannotRestoreAfterCacheDisable() async throws {
     )
     let generation = generations.begin()
     let task = Task {
-        await opener.open(
+        await opener.openForInteraction(
             sessionID: "session",
             serverTotal: 2,
             generation: generation,
@@ -272,7 +313,7 @@ func delayedRESTStoreAfterCacheClearIsRejected() async throws {
     )
     let generation = generations.begin()
     let task = Task {
-        await opener.open(
+        await opener.openForInteraction(
             sessionID: "session",
             serverTotal: 1,
             generation: generation,
@@ -373,12 +414,88 @@ func staleTerminalReconciliationIsDiscarded() async throws {
             sessionTitle: ""
         )
     }
-    while await source.authoritativeCalls == 0 {
-        await Task.yield()
-    }
     _ = generations.begin()
     await source.finishAuthoritative()
     #expect(await task.value == nil)
+}
+
+@Test("superseded open handles terminate one-for-one")
+func supersededOpenHandlesTerminateOneForOne() async throws {
+    let directory = try openStateTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let source = OpenStateSuspendedSource()
+    let opener = TranscriptOpener(
+        source: source,
+        cache: HistoryCache(directory: directory),
+        cacheEnabled: false,
+        generations: OpenGenerationController()
+    )
+    var handles: [TranscriptOpenHandle] = []
+    for index in 0..<4 {
+        let generation = opener.generations.begin()
+        let handle = TranscriptOpenHandle()
+        var phases = opener.openInteractionPhases(
+            sessionID: "session-\(index)",
+            serverTotal: 1,
+            generation: generation,
+            sessionTitle: "",
+            handle: handle
+        ).makeAsyncIterator()
+        _ = await phases.next()
+        while !(await source.resumeStarted) {
+            await Task.yield()
+        }
+        if let previous = handles.last {
+            previous.cancel()
+        }
+        handles.append(handle)
+    }
+    handles.last?.cancel()
+    #expect(handles.count == handles.filter(\.isTerminated).count)
+}
+
+@Test("cancelling an open clears captured transcript state")
+func cancellingOpenClearsCapturedTranscriptState() async throws {
+    let directory = try openStateTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let cache = HistoryCache(directory: directory)
+    let snapshot = AuthoritativeTranscriptSnapshot(
+        sessionID: "session",
+        serverTotal: 1,
+        fetchedRows: 1,
+        projectedMessages: 1,
+        truncated: false,
+        fetchedAt: Date()
+    )
+    _ = await cache.store(
+        [ChatMessage(role: .assistant, text: "retained until cancellation")],
+        snapshot: snapshot,
+        for: "session"
+    )
+    let source = OpenStateSuspendedSource()
+    let opener = TranscriptOpener(
+        source: source,
+        cache: cache,
+        cacheEnabled: true,
+        generations: OpenGenerationController()
+    )
+    let handle = TranscriptOpenHandle()
+    var phases = opener.openInteractionPhases(
+        sessionID: "session",
+        serverTotal: 1,
+        generation: opener.generations.begin(),
+        sessionTitle: "",
+        handle: handle
+    ).makeAsyncIterator()
+    _ = try #require(await phases.next())
+    while !(await source.resumeStarted) {
+        await Task.yield()
+    }
+    #expect(handle.retainedMessageCount == 1)
+    handle.cancel()
+    #expect(handle.isTerminated)
+    #expect(handle.retainedMessageCount == 0)
+    #expect(await phases.next() == nil)
 }
 
 private actor OpenStateGate {
@@ -403,6 +520,7 @@ private actor OpenStateSuspendedSource: TranscriptSource {
     private var resumeContinuation: CheckedContinuation<ResumedTranscript, Error>?
     private var authoritativeContinuation: CheckedContinuation<AuthoritativeTranscript, Error>?
     private(set) var resumeStarted = false
+    private(set) var resumeCalls = 0
     private(set) var authoritativeCalls = 0
 
     init(
@@ -417,6 +535,7 @@ private actor OpenStateSuspendedSource: TranscriptSource {
     }
 
     func resume(sessionID _: String) async throws -> ResumedTranscript {
+        resumeCalls += 1
         resumeStarted = true
         guard suspendResume else { return resumed }
         return try await withCheckedThrowingContinuation { continuation in

@@ -88,57 +88,32 @@ struct FindBar: View {
 
 struct FindHighlightedMessage: View {
     let text: String
-    let isStreaming: Bool
+    /// Streaming replies and user messages are drawn as one plain run:
+    /// streaming would re-segment on every delta, and a user message is not
+    /// markdown on the unhighlighted path either, so segmenting it only when
+    /// Find is open would make the same text render two different ways.
+    let isPlainText: Bool
     let matchRanges: [Range<Int>]
     let isActive: Bool
 
     var body: some View {
         Group {
-            if isStreaming {
+            if isPlainText {
                 Text(FindTextHighlighting.mark(
                     AttributedString(text),
                     ranges: matchRanges
                 ))
+                .font(.body)
+                .foregroundStyle(.primary)
+                .lineSpacing(MessageTypography.bodyLineSpacing)
                 .textSelection(.enabled)
             } else {
-                let segments = MarkdownSegment.parse(text)
-                let sourceSegments = FindTextHighlighting.sourceSegments(for: text)
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
-                        let source = sourceSegments.indices.contains(index)
-                            ? sourceSegments[index]
-                            : .init(sourceRange: 0..<text.utf16.count)
-                        switch segment {
-                        case .prose(_, let attributed):
-                            Text(FindTextHighlighting.mark(
-                                attributed,
-                                ranges: FindTextHighlighting.project(
-                                    matchRanges.filter { source.sourceRange.contains($0.lowerBound) },
-                                    from: text,
-                                    to: String(attributed.characters)
-                                )
-                            ))
-                            .textSelection(.enabled)
-                        case .code(_, let language, let body):
-                            FindHighlightedCodeBlock(
-                                language: language,
-                                code: body,
-                                languageRanges: FindTextHighlighting.project(
-                                    matchRanges.filter {
-                                        source.languageRange?.contains($0.lowerBound) == true
-                                    },
-                                    from: text,
-                                    to: language
-                                ),
-                                codeRanges: FindTextHighlighting.project(
-                                    matchRanges.filter { source.sourceRange.contains($0.lowerBound) },
-                                    from: text,
-                                    to: body
-                                )
-                            )
-                        }
-                    }
-                }
+                // Same renderer as the unhighlighted transcript, so type,
+                // spacing, and code chrome cannot drift between the two.
+                MarkdownBlocks(
+                    text: text,
+                    matches: MessageFindMatches(text: text, ranges: matchRanges)
+                )
             }
         }
         .padding(.vertical, isActive ? 4 : 0)
@@ -158,80 +133,8 @@ struct FindHighlightedMessage: View {
     }
 }
 
-private struct FindHighlightedCodeBlock: View {
-    let language: String
-    let code: String
-    let languageRanges: [Range<Int>]
-    let codeRanges: [Range<Int>]
-    @State private var didCopy = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text(
-                    FindTextHighlighting.mark(
-                        AttributedString(language.isEmpty ? "code" : language),
-                        ranges: languageRanges
-                    )
-                )
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    copy()
-                } label: {
-                    Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
-                        .font(.caption2)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help("Copy")
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            Divider().opacity(0.5)
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(FindTextHighlighting.mark(
-                    AttributedString(code),
-                    ranges: codeRanges
-                ))
-                .font(.system(.callout, design: .monospaced))
-                .textSelection(.enabled)
-                .padding(10)
-            }
-        }
-        .background(
-            .background.secondary,
-            in: .rect(cornerRadius: AppShapeScale.compact, style: .continuous)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: AppShapeScale.compact, style: .continuous)
-                .strokeBorder(.separator, lineWidth: 0.5)
-        )
-    }
-
-    private func copy() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(code, forType: .string)
-        didCopy = true
-        Task {
-            try? await Task.sleep(for: .seconds(1.4))
-            didCopy = false
-        }
-    }
-}
-
-private enum FindTextHighlighting {
-    struct SourceSegment {
-        let sourceRange: Range<Int>
-        let languageRange: Range<Int>?
-
-        init(sourceRange: Range<Int>, languageRange: Range<Int>? = nil) {
-            self.sourceRange = sourceRange
-            self.languageRange = languageRange
-        }
-    }
-
+/// Shared by the transcript's plain and highlighted renderers.
+enum FindTextHighlighting {
     static func mark(
         _ source: AttributedString,
         ranges: [Range<Int>]
@@ -251,67 +154,6 @@ private enum FindTextHighlighting {
             )
             result[start..<end].inlinePresentationIntent = .stronglyEmphasized
             result[start..<end].foregroundColor = offset == 0 ? .orange : .yellow
-        }
-        return result
-    }
-
-    static func sourceSegments(for text: String) -> [SourceSegment] {
-        var result: [SourceSegment] = []
-        var offset = 0
-        var inFence = false
-        var proseStart: Int?
-        var proseHasContent = false
-        var codeStart = 0
-        var languageRange: Range<Int>?
-
-        func flushProse(at end: Int) {
-            guard let start = proseStart, proseHasContent, start < end else {
-                proseStart = nil
-                proseHasContent = false
-                return
-            }
-            result.append(SourceSegment(sourceRange: start..<end, languageRange: nil))
-            proseStart = nil
-            proseHasContent = false
-        }
-
-        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            let lineStart = offset
-            let lineEnd = lineStart + line.utf16.count
-            if line.hasPrefix("```") {
-                if inFence {
-                    result.append(SourceSegment(
-                        sourceRange: min(codeStart, lineStart)..<lineStart,
-                        languageRange: languageRange
-                    ))
-                    inFence = false
-                    languageRange = nil
-                } else {
-                    flushProse(at: lineStart)
-                    inFence = true
-                    codeStart = min(lineEnd + 1, text.utf16.count)
-                    languageRange = (lineStart + 3)..<lineEnd
-                }
-            } else if inFence {
-                // The body range starts after the opening fence and extends
-                // through the closing fence (or the end for an open fence).
-                codeStart = min(codeStart, lineStart)
-            } else {
-                proseStart = proseStart ?? lineStart
-                proseHasContent = proseHasContent
-                    || line.contains(where: { !$0.isWhitespace })
-            }
-            offset = lineEnd + 1
-        }
-
-        let end = text.utf16.count
-        if inFence {
-            result.append(SourceSegment(
-                sourceRange: min(codeStart, end)..<end,
-                languageRange: languageRange
-            ))
-        } else {
-            flushProse(at: end)
         }
         return result
     }

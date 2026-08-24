@@ -67,6 +67,9 @@ public struct SessionPurgeReconciliation: Equatable, Sendable {
     }
 }
 public enum SessionPurgePolicy {
+    /// Prepares the immutable set of folder and chat targets for permanent
+    /// deletion. `selectedFolderIDs` is authoritative: folders are never
+    /// inferred from a selected chat's membership.
     public static func plan(
         selectedChatIDs: [String],
         selectedFolderIDs: [String],
@@ -81,20 +84,25 @@ public enum SessionPurgePolicy {
         let folderIDs = mode == .chatsOnly ? [] : unique(selectedFolderIDs)
         let explicitChats = mode == .foldersOnly ? [] : unique(selectedChatIDs)
         var chats = explicitChats.filter { visibleSet.contains($0) }
+        let sessionsByID = Dictionary(
+            authoritativeSessions.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         if !folderIDs.isEmpty {
             for chatID in visibleChatIDs {
                 guard let folderID = membership[chatID],
                       folderIDs.contains(folderID),
                       !chats.contains(chatID)
                 else { continue }
+                if let session = sessionsByID[chatID],
+                   SidebarOrderingConstants.isScheduled(session)
+                {
+                    continue
+                }
                 chats.append(chatID)
             }
         }
         chats = unique(chats)
-        let sessionsByID = Dictionary(
-            authoritativeSessions.map { ($0.id, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
         let selectedSessions = chats.compactMap { sessionsByID[$0] }
         var grouped: [String: [String]] = [:]
         for session in selectedSessions {

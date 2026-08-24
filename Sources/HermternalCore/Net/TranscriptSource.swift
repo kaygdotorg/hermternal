@@ -69,20 +69,26 @@ public struct BoundedPrefetchCoordinator: Sendable {
         self.limit = max(1, limit)
     }
 
+    /// Delivers each successful load as soon as its lane completes.
+    ///
+    /// The callback is awaited before another lane is started, so the
+    /// coordinator never accumulates completed payloads between deliveries.
+    /// This keeps peak transcript residency bounded by `limit` rather than by
+    /// the number of requested items.
     public func prefetch<Item: Sendable, Result: Sendable>(
         _ items: [Item],
-        operation: @escaping @Sendable (Item) async throws -> Result?
-    ) async -> [Result] {
-        guard !items.isEmpty else { return [] }
-        return await withTaskGroup(of: (Int, Result?).self, returning: [Result].self) { group in
+        operation: @escaping @Sendable (Item) async throws -> Result?,
+        onResult: @escaping @Sendable (Result) async -> Void
+    ) async {
+        guard !items.isEmpty else { return }
+        await withTaskGroup(of: Result?.self) { group in
             var next = 0
-            var results: [(Int, Result)] = []
 
             func add(_ index: Int) {
                 guard !Task.isCancelled else { return }
                 group.addTask {
-                    guard !Task.isCancelled else { return (index, nil) }
-                    return (index, try? await operation(items[index]))
+                    guard !Task.isCancelled else { return nil }
+                    return try? await operation(items[index])
                 }
             }
 
@@ -90,8 +96,14 @@ public struct BoundedPrefetchCoordinator: Sendable {
                 add(next)
                 next += 1
             }
-            while let (index, result) = await group.next() {
-                if let result { results.append((index, result)) }
+            while let result = await group.next() {
+                guard !Task.isCancelled else {
+                    group.cancelAll()
+                    break
+                }
+                if let result {
+                    await onResult(result)
+                }
                 guard !Task.isCancelled else {
                     group.cancelAll()
                     break
@@ -100,7 +112,6 @@ public struct BoundedPrefetchCoordinator: Sendable {
                 add(next)
                 next += 1
             }
-            return results.sorted { $0.0 < $1.0 }.map(\.1)
         }
     }
 }

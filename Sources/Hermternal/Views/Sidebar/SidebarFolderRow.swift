@@ -141,8 +141,15 @@ struct SidebarFolderRow: View {
     @Binding var isExpanded: Bool
     let selection: Set<SidebarSelectionID>
     let visibleOrder: [SidebarSelectionID]
+    let sessionVisibleOrder: [SidebarSelectionID]
     let foldersByID: [String: SidebarFolderTarget]
+    let sessionsByID: [String: ChatSession]
+    let membership: [String: String]
     let onRename: (SidebarFolderTarget) -> Void
+    /// Selects this folder without opening a transcript.
+    let onSelect: (String) -> Void
+    let onPin: ([ChatSession], Bool) -> Void
+    let onArchive: ([ChatSession]) -> Void
     let onPurge: ([String], [String], SessionPurgeActionMode) -> Void
     let purgeAvailable: Bool
     let purgeUnavailableReason: String
@@ -153,89 +160,20 @@ struct SidebarFolderRow: View {
     let onDropFolders: ([String], String) -> Void
 
     @State private var isTargeted = false
+    @State private var isHovered = false
 
     var body: some View {
+        let _ = HermternalSelectionOccupancyTrace.folderRowBodyEvaluated()
         HStack(spacing: 0) {
             disclosure
             label
         }
+        // List owns folder selection. The full row shape lets native
+        // selection receive clicks on the title and trailing blank space.
+        .contentShape(.rect)
+        .onHover { isHovered = $0 }
         .tag(SidebarSelectionID.folder(target.id))
         .selectionDisabled(false)
-        .contextMenu {
-            folderContextMenu
-        }
-    }
-
-    /// The folder's caret, always visible.
-    ///
-    /// A section header may keep its caret for hover, because the header
-    /// title is part of the same button. A folder title selects the folder
-    /// instead, so the caret is the only control that opens the folder and it
-    /// has to be there before the pointer is.
-    private var disclosure: some View {
-        Button {
-            isExpanded.toggle()
-        } label: {
-            Image(systemName: "chevron.right")
-                .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                .imageScale(.small)
-                .foregroundStyle(.secondary)
-                .frame(width: SidebarMetrics.folderIndent, alignment: .leading)
-                // The gutter is narrow, so the target takes the height of the
-                // row and not the height of the glyph.
-                .frame(maxHeight: .infinity)
-                .contentShape(.rect)
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(
-            isExpanded ? "Collapse \(target.name)" : "Expand \(target.name)"
-        )
-    }
-
-    private var folderTargets: [SidebarFolderTarget] {
-        let targets = SidebarSelectionPolicy.contextTargets(
-            clicked: .folder(target.id),
-            selected: selection
-        )
-        var seen = Set<String>()
-        return visibleOrder.compactMap { item in
-            guard case let .folder(id) = item,
-                  targets.contains(item),
-                  seen.insert(id).inserted
-            else { return nil }
-            return foldersByID[id]
-        }
-    }
-
-    @ViewBuilder
-    private var folderContextMenu: some View {
-        let targets = folderTargets
-        Button("Rename Folder…", systemImage: "pencil") {
-            if targets.count == 1, let target = targets.first { onRename(target) }
-        }
-        .disabled(targets.count != 1)
-        Button("Delete \(targets.count) Folders…", systemImage: "trash", role: .destructive) {
-            onDelete(targets)
-        }
-        Button("Delete Folders and Chats Permanently", systemImage: "trash.fill", role: .destructive) {
-            onPurge([], targets.map(\.id), .foldersAndChats)
-        }
-        .disabled(!purgeAvailable)
-        .help(purgeAvailable ? "Permanently delete chats in these folders" : purgeUnavailableReason)
-    }
-    private var label: some View {
-        Label {
-            Text(target.name)
-                .lineLimit(1)
-                .foregroundStyle(isTargeted ? Color.accentColor : Color.primary)
-        } icon: {
-            Image(systemName: "folder")
-                .symbolVariant(isTargeted ? .fill : SymbolVariants.none)
-                .foregroundStyle(isTargeted ? Color.accentColor : Color.secondary)
-        }
-        .font(.body)
-        .help(target.name)
-        .frame(maxWidth: .infinity, alignment: .leading)
         .onDrag {
             let ids = SidebarSelectionPolicy.applicableDragTargets(
                 dragged: .folder(target.id),
@@ -266,5 +204,164 @@ struct SidebarFolderRow: View {
             return true
         }
         .animation(.easeOut(duration: 0.12), value: isTargeted)
+        .contextMenu {
+            folderContextMenu
+        }
+    }
+
+    /// The folder's caret, visible while the row is hovered.
+    ///
+    /// The slot follows hover so the label has no reserved indentation at
+    /// rest. Hit testing follows visibility so the zero-width button cannot
+    /// intercept the row's selection surface.
+    private var disclosure: some View {
+        Button {
+            isExpanded.toggle()
+        } label: {
+            Image(systemName: "chevron.right")
+                .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                .imageScale(.small)
+                .foregroundStyle(.secondary)
+                .opacity(isHovered ? 1 : 0)
+                .frame(
+                    width: isHovered ? SidebarMetrics.headerControlSlot : 0,
+                    alignment: .leading
+                )
+                .clipped()
+                .animation(.easeOut(duration: 0.12), value: isHovered)
+                // The gutter is narrow, so the target takes the height of the
+                // row and not the height of the glyph.
+                .frame(maxHeight: .infinity)
+                .contentShape(.rect)
+        }
+        .allowsHitTesting(isHovered)
+        .buttonStyle(.plain)
+        .accessibilityLabel(
+            isExpanded ? "Collapse \(target.name)" : "Expand \(target.name)"
+        )
+    }
+
+    private var folderTargets: [SidebarFolderTarget] {
+        let targets = SidebarSelectionPolicy.contextTargets(
+            clicked: .folder(target.id),
+            selected: selection
+        )
+        var seen = Set<String>()
+        return visibleOrder.compactMap { item -> SidebarFolderTarget? in
+            guard case let .folder(id) = item,
+                  targets.contains(item),
+                  seen.insert(id).inserted
+            else { return nil }
+            return foldersByID[id]
+        }
+    }
+
+    private var contentChats: [ChatSession] {
+        let contextSelection = SidebarSelectionPolicy.contextTargets(
+            clicked: .folder(target.id),
+            selected: selection
+        )
+        let authoritativeSessions = sessionVisibleOrder.compactMap { item -> ChatSession? in
+            guard case let .chat(id) = item else { return nil }
+            return sessionsByID[id]
+        }
+        let expandedIDs = SidebarSelectionPolicy.expandedChatIDs(
+            selection: contextSelection,
+            authoritativeSessions: authoritativeSessions,
+            folderMembership: membership
+        )
+        return expandedIDs.compactMap { sessionsByID[$0] }
+    }
+
+    @ViewBuilder
+    private var folderContextMenu: some View {
+        let targets = folderTargets
+        let chats = contentChats
+        let chatNoun = chats.count == 1 ? "Chat" : "Chats"
+        let folderPhrase = targets.count == 1
+            ? "Folder"
+            : "\(targets.count) Folders"
+        let chatScope = "\(chats.count) \(chatNoun) in \(folderPhrase)"
+        let action = SidebarSelectionPolicy.convergingPinAction(
+            for: chats.map(\.pinned)
+        )
+        if let action, !chats.isEmpty {
+            Button(
+                action == .pin ? "Pin \(chatScope)" : "Unpin \(chatScope)",
+                systemImage: action == .pin ? "pin" : "pin.slash"
+            ) {
+                onPin(chats, action == .pin)
+            }
+        }
+        if !chats.isEmpty {
+            Button("Archive \(chatScope)", systemImage: "archivebox") {
+                onArchive(chats)
+            }
+        }
+        Button("Rename Folder…", systemImage: "pencil") {
+            if targets.count == 1, let target = targets.first { onRename(target) }
+        }
+        .disabled(targets.count != 1)
+        Button(
+            targets.count == 1 ? "Delete Folder…" : "Delete \(targets.count) Folders…",
+            systemImage: "trash",
+            role: .destructive
+        ) {
+            onDelete(targets)
+        }
+        Button(
+            targets.count == 1
+                ? "Permanently Delete Folder and Chats…"
+                : "Permanently Delete \(targets.count) Folders and Chats…",
+            systemImage: "trash.fill",
+            role: .destructive
+        ) {
+            onPurge(chats.map(\.id), targets.map(\.id), .foldersAndChats)
+        }
+        .disabled(!purgeAvailable)
+        .help(
+            purgeAvailable
+                ? "Permanently delete all chats inside \(folderPhrase)"
+                : purgeUnavailableReason
+        )
+    }
+    private var label: some View {
+        Label {
+            Text(target.name)
+                .lineLimit(1)
+                .foregroundStyle(isTargeted ? Color.accentColor : Color.primary)
+        } icon: {
+            Image(systemName: "folder")
+                .symbolVariant(isTargeted ? .fill : SymbolVariants.none)
+                .foregroundStyle(isTargeted ? Color.accentColor : Color.secondary)
+        }
+        .font(.body)
+        .help(target.name)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // Observe only taps in the label-and-blank-space portion of the row.
+        // The caret is a sibling Button, so it cannot reach this seam.
+        .contentShape(.rect)
+        .simultaneousGesture(
+            TapGesture(count: 1)
+                .onEnded {
+                    let allowed = SidebarSelectionEventAdapter.allowsPrimaryActivation()
+                    HermternalSwitchTrace.folder(
+                        "folder.labelTapGate",
+                        id: target.id,
+                        messages: 0,
+                        detail: allowed ? "allowed" : "blocked"
+                    )
+                    guard allowed else {
+                        return
+                    }
+                    HermternalSwitchTrace.folder(
+                        "folder.selection.observed.pointer",
+                        id: target.id,
+                        messages: 0
+                    )
+                    onSelect(target.id)
+                }
+        )
     }
 }
+

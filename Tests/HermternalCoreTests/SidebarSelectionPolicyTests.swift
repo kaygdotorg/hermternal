@@ -2,6 +2,59 @@ import Foundation
 import HermternalCore
 import Testing
 
+@Test("A rapid selection burst keeps every highlight and publishes only final")
+func rapidSelectionBurstPublishesOnce() {
+    var coalescer = SelectionCoalescer<String>()
+    var highlighted: [String] = []
+    var tickets: [SelectionCoalescer<String>.Ticket] = []
+    for index in 1...24 {
+        let id = "chat-\(index)"
+        highlighted.append(id)
+        tickets.append(coalescer.submit(id))
+    }
+    var publications: [String] = []
+
+    for ticket in tickets {
+        if coalescer.consume(ticket) {
+            publications.append(ticket.value)
+        }
+    }
+
+    #expect(highlighted.count == 24)
+    #expect(highlighted.last == "chat-24")
+    #expect(publications == ["chat-24"])
+    #expect(publications.count == 1)
+}
+
+@Test("A single selection consumes and publishes immediately")
+func singleSelectionPublishesImmediately() {
+    var coalescer = SelectionCoalescer<String>()
+    let ticket = coalescer.submit("chat-single")
+    let highlighted = [ticket.value]
+    let publishedImmediately = coalescer.consume(ticket)
+
+    #expect(highlighted.count == 1)
+    #expect(publishedImmediately)
+    #expect(!coalescer.hasPendingSelection)
+}
+
+@Test("Superseded selections perform no transcript assignment")
+func supersededSelectionsDoNotAssignTranscript() {
+    var coalescer = SelectionCoalescer<String>()
+    let first = coalescer.submit("chat-first")
+    let final = coalescer.submit("chat-final")
+    var assignments: [String] = []
+
+    if coalescer.consume(first) {
+        assignments.append(first.value)
+    }
+    if coalescer.consume(final) {
+        assignments.append(final.value)
+    }
+
+    #expect(assignments == ["chat-final"])
+}
+
 @Test("Context targets preserve a mixed selected chat and folder set")
 func contextTargetsSupportMixedSelection() {
     let selected: Set<SidebarSelectionID> = [.chat("chat-1"), .folder("work")]
@@ -14,17 +67,87 @@ func contextTargetsSupportMixedSelection() {
     )
 }
 
-@Test("Drag targets filter by type, visible order, and logical identity")
+@Test("Folder selection expands active chats in authoritative order")
+func folderSelectionExpandsContents() {
+    let sessions = [
+        selectionSession(id: "second"),
+        selectionSession(id: "first"),
+        selectionSession(id: "cron", source: "cron"),
+        selectionSession(id: "outside")
+    ]
+    let selection: Set<SidebarSelectionID> = [.folder("work")]
+
+    #expect(
+        SidebarSelectionPolicy.expandedChatIDs(
+            selection: selection,
+            authoritativeSessions: sessions,
+            folderMembership: [
+                "first": "work",
+                "second": "work",
+                "cron": "work",
+                "outside": "other"
+            ]
+        ) == ["second", "first"]
+    )
+}
+
+@Test("Mixed chat and folder selection unions and de-duplicates")
+func mixedSelectionExpandsAndDeduplicates() {
+    let sessions = [
+        selectionSession(id: "folder-chat"),
+        selectionSession(id: "explicit"),
+        selectionSession(id: "duplicate"),
+        selectionSession(id: "duplicate")
+    ]
+    let selection: Set<SidebarSelectionID> = [.chat("explicit"), .folder("work")]
+
+    #expect(
+        SidebarSelectionPolicy.expandedChatIDs(
+            selection: selection,
+            authoritativeSessions: sessions,
+            folderMembership: [
+                "folder-chat": "work",
+                "explicit": "work",
+                "duplicate": "work"
+            ]
+        ) == ["folder-chat", "explicit", "duplicate"]
+    )
+}
+
+@Test("An unselected clicked row remains the only context target")
+func unselectedClickScopesToOneTarget() {
+    let selected: Set<SidebarSelectionID> = [.chat("already-selected")]
+    let context = SidebarSelectionPolicy.contextTargets(
+        clicked: .folder("work"),
+        selected: selected
+    )
+
+    #expect(
+        SidebarSelectionPolicy.expandedChatIDs(
+            selection: context,
+            authoritativeSessions: [
+                selectionSession(id: "folder-chat"),
+                selectionSession(id: "already-selected")
+            ],
+            folderMembership: [
+                "folder-chat": "work",
+                "already-selected": "other"
+            ]
+        ) == ["folder-chat"]
+    )
+}
+
+@Test("Drag targets filter by type and unique visible order")
 func dragTargetsFilterTypedSelection() {
     let selected: Set<SidebarSelectionID> = [.chat("chat-1"), .chat("chat-2"), .folder("work")]
     let visibleOrder: [SidebarSelectionID] = [
         .folder("work"),
         .chat("chat-2"),
         .chat("chat-1"),
-        .chat("chat-1"),
         .folder("home")
     ]
 
+    #expect(Set(visibleOrder).count == visibleOrder.count)
     #expect(
         SidebarSelectionPolicy.applicableDragTargets(
             dragged: .chat("chat-1"),
@@ -48,20 +171,18 @@ func dragTargetsFilterTypedSelection() {
     )
 }
 
-@Test("Visible chat actions deduplicate pinned copies")
-func visibleChatActionsDeduplicatePinnedCopies() {
+@Test("Selection policy keeps the unique visible identity invariant")
+func selectionPolicyUsesUniqueVisibleIdentityOrder() {
     let selected: Set<SidebarSelectionID> = [.chat("chat-1"), .chat("chat-2")]
-    let visibleOrder: [SidebarSelectionID] = [
-        .chat("chat-1"),
-        .chat("chat-1"),
-        .folder("work"),
-        .chat("chat-2"),
-        .chat("chat-2")
-    ]
+    let visibleOrder: [SidebarSelectionID] = [.chat("chat-2"), .chat("chat-1")]
 
+    #expect(Set(visibleOrder).count == visibleOrder.count)
     #expect(
-        SidebarSelectionPolicy.visibleUniqueChatIDs(selected: selected, visibleOrder: visibleOrder)
-            == ["chat-1", "chat-2"]
+        SidebarSelectionPolicy.applicableDragTargets(
+            dragged: .chat("chat-1"),
+            selected: selected,
+            visibleOrder: visibleOrder
+        ) == visibleOrder
     )
 }
 
@@ -169,6 +290,13 @@ func emptyFolderDeletionDoesNotWrite() async throws {
 
     #expect(result == .init(deletedFolderIDs: [], affectedSessionIDs: []))
     #expect(fileSystem.atomicWriteCount == 0)
+}
+
+private func selectionSession(id: String, source: String = "") -> ChatSession {
+    ChatSession(from: .object([
+        "id": .string(id),
+        "source": .string(source)
+    ]))
 }
 
 private func makeSelectionOrganizationTestDirectory() throws -> URL {

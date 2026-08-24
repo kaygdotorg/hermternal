@@ -38,10 +38,12 @@ while IFS= read -r line; do
             ;;
     esac
 done <"$log"
+printf '%-30s | %-60s\n' 'warm switch pure work' 'GATED: 16 ms frame, 12 ms pure-work budget, <= 32 deterministic units'
+printf '%-30s | %-60s\n' 'cache-hit row parse/measure' 'GATED: counting fake requires parse=0 and measure=0'
 printf '%-30s | %-60s\n' 'markdown parse invocation count' 'NOT GATED: no parser invocation counter seam'
+printf '%-30s | %-60s\n' 'allocation-free transcript reuse' 'NOT GATED: no allocation counter seam'
 printf '%-30s | %-60s\n' 'projection rebuild count' 'NOT GATED: no AppModel projection/open counter seam'
 printf '%-30s | %-60s\n' 'actual search row visits' 'NOT GATED: no SQLite trace seam for executed query'
-printf '%-30s | %-60s\n' 'allocation-free transcript reuse' 'NOT GATED: no allocation counter seam'
 printf '\n'
 
 if (( status != 0 )); then

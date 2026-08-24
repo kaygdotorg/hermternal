@@ -67,6 +67,191 @@ public struct SidebarSection: Identifiable, Hashable, Sendable {
         self.rows = rows
     }
 }
+/// The ordering and identity-independent rows used by every sidebar surface.
+///
+/// Selection is intentionally absent from this projection. A selection change
+/// can therefore reuse the resident ordering without walking sessions, folders,
+/// or membership again.
+public struct SidebarOrderingProjection: Equatable, Sendable {
+    public let sections: [SidebarSection]
+    public let visibleOrder: [SidebarSelectionID]
+    public let folderVisibleOrder: [SidebarSelectionID]
+
+    public init(sections: [SidebarSection]) {
+        self.sections = sections
+        visibleOrder = sections.flatMap { section in
+            section.rows.map { SidebarSelectionID.chat($0.sessionID) }
+        }
+        folderVisibleOrder = sections.compactMap { section in
+            if case let .folder(id, _) = section.kind {
+                return SidebarSelectionID.folder(id)
+            }
+            return nil
+        }
+    }
+}
+
+/// Inputs that can change sidebar ordering.
+///
+/// This is a value seam rather than an incidental SwiftUI cache key, so its
+/// invalidation rules are explicit and directly testable.
+public struct SidebarOrderingInputs: Equatable {
+    public let sessions: [ChatSession]
+    public let folders: [Folder]
+    public let membership: [String: String]
+    public let sortMode: SortMode
+    public let groupByDate: Bool
+    public let calendar: Calendar
+    public let now: Date
+
+    /// The identity of each collection's copy-on-write storage, plus scalars.
+    ///
+    /// A repeated body pass copies the same storage. The memo retains the
+    /// previous input strongly, so its storage cannot be deallocated while
+    /// this token is compared. Allocator reuse therefore cannot make a new
+    /// collection appear unchanged. A representation change only causes the
+    /// equality fallback and cannot return stale data.
+    ///
+    /// A mutation must copy storage while the memo retains the previous input,
+    /// so this check cannot return a stale projection. The equality fallback
+    /// handles equal values that use separate storage.
+    fileprivate let storageValidity: SidebarOrderingStorageValidity
+
+    public init(
+        sessions: [ChatSession],
+        folders: [Folder],
+        membership: [String: String],
+        sortMode: SortMode,
+        groupByDate: Bool,
+        calendar: Calendar,
+        now: Date
+    ) {
+        self.sessions = sessions
+        self.folders = folders
+        self.membership = membership
+        self.sortMode = sortMode
+        self.groupByDate = groupByDate
+        self.calendar = calendar
+        self.now = now
+        storageValidity = SidebarOrderingStorageValidity(
+            sessions: sessions,
+            folders: folders,
+            membership: membership,
+            sortMode: sortMode,
+            groupByDate: groupByDate,
+            calendar: calendar,
+            now: now
+        )
+    }
+
+    public static func == (lhs: SidebarOrderingInputs, rhs: SidebarOrderingInputs) -> Bool {
+        lhs.sessions == rhs.sessions
+            && lhs.folders == rhs.folders
+            && lhs.membership == rhs.membership
+            && lhs.sortMode == rhs.sortMode
+            && lhs.groupByDate == rhs.groupByDate
+            && lhs.calendar == rhs.calendar
+            && lhs.now == rhs.now
+    }
+}
+
+fileprivate struct SidebarOrderingStorageValidity: Equatable {
+    private let sessionsStorage: UInt
+    private let sessionsCount: Int
+    private let foldersStorage: UInt
+    private let foldersCount: Int
+    private let membershipStorage: UInt64
+    private let membershipCount: Int
+    private let sortMode: SortMode
+    private let groupByDate: Bool
+    private let calendar: Calendar
+    private let now: Date
+
+    init(
+        sessions: [ChatSession],
+        folders: [Folder],
+        membership: [String: String],
+        sortMode: SortMode,
+        groupByDate: Bool,
+        calendar: Calendar,
+        now: Date
+    ) {
+        sessionsStorage = arrayStorageIdentity(sessions)
+        sessionsCount = sessions.count
+        foldersStorage = arrayStorageIdentity(folders)
+        foldersCount = folders.count
+        membershipStorage = dictionaryStorageIdentity(membership)
+        membershipCount = membership.count
+        self.sortMode = sortMode
+        self.groupByDate = groupByDate
+        self.calendar = calendar
+        self.now = now
+    }
+}
+
+private func arrayStorageIdentity<Element>(_ values: [Element]) -> UInt {
+    values.withUnsafeBufferPointer { buffer in
+        guard let baseAddress = buffer.baseAddress else { return 0 }
+        return UInt(bitPattern: UnsafeRawPointer(baseAddress))
+    }
+}
+
+private func dictionaryStorageIdentity(_ values: [String: String]) -> UInt64 {
+    // Dictionary has no public storage-address API. Its value representation
+    // is a fixed-size COW handle, so reading those bytes is an O(1) identity
+    // token. SidebarOrderingMemo retains the prior input, which keeps the
+    // storage alive and prevents allocator reuse from making this token stale.
+    // A future representation change can only force the equality fallback.
+    withUnsafeBytes(of: values) { bytes in
+        var token = UInt64(0)
+        for (index, byte) in bytes.prefix(MemoryLayout<UInt64>.size).enumerated() {
+            token |= UInt64(byte) << UInt64(index * 8)
+        }
+        return token
+    }
+}
+
+/// Memoizes the pure sidebar ordering projection until an ordering input
+/// changes. The owner is the main-actor sidebar view; this value type keeps the
+/// cache's behavior easy to exercise without SwiftUI.
+public struct SidebarOrderingMemo {
+    // Retain the collections while their storage tokens are resident.
+    private var input: SidebarOrderingInputs?
+    private var projection: SidebarOrderingProjection?
+    public private(set) var rebuildCount = 0
+
+    public init() {}
+
+    public mutating func resolve(_ input: SidebarOrderingInputs) -> SidebarOrderingProjection {
+        if let cachedInput = self.input, let projection {
+            if cachedInput.storageValidity == input.storageValidity {
+                return projection
+            }
+            // Different storage can still contain equal values. Keep this
+            // fallback because storage identity is only a fast-path proof.
+            if cachedInput == input {
+                self.input = input
+                return projection
+            }
+        }
+        let next = SidebarOrderingProjection(
+            sections: sidebarRows(
+                sessions: input.sessions,
+                folders: input.folders,
+                membership: input.membership,
+                sortMode: input.sortMode,
+                groupByDate: input.groupByDate,
+                calendar: input.calendar,
+                now: input.now
+            )
+        )
+        self.input = input
+        projection = next
+        rebuildCount += 1
+        return next
+    }
+}
+
 
 /// Rebuilds the complete sidebar ordering from immutable inputs.
 public func sidebarRows(
@@ -102,22 +287,20 @@ public func sidebarRows(
     for session in sessions {
         let index = prepared.count
         prepared.append(PreparedSidebarSession(session: session))
-        let isScheduled = session.source == SidebarOrderingConstants.cronSource
+        let isScheduled = SidebarOrderingConstants.isScheduled(session)
 
+        // Every session belongs to exactly one bucket. Schedules take
+        // precedence over filing and pinning; a valid folder takes
+        // precedence over the pinned section while retaining the row's
+        // pinned state for its indicator.
         if isScheduled {
             scheduledIndexes.append(index)
-        }
-
-        // A scheduled session is more informative than its pin, so Schedules
-        // wins and the session is not repeated in Pinned.
-        if session.pinned && !isScheduled {
-            pinnedIndexes.append(index)
-        }
-
-        if let folderID = membership[session.id],
-           let folderIndex = folderIndexByID[folderID] {
+        } else if let folderID = membership[session.id],
+                  let folderIndex = folderIndexByID[folderID] {
             folderIndexes[folderIndex].append(index)
-        } else if !session.pinned && !isScheduled {
+        } else if session.pinned {
+            pinnedIndexes.append(index)
+        } else {
             unfiledIndexes.append(index)
         }
     }
@@ -210,9 +393,13 @@ public func sidebarRows(
     return sections
 }
 
-private enum SidebarOrderingConstants {
+enum SidebarOrderingConstants {
     static let titleLocale = Locale(identifier: "en_US_POSIX")
-    static let cronSource = "cron"
+    private static let cronSource = "cron"
+
+    static func isScheduled(_ session: ChatSession) -> Bool {
+        session.source == cronSource
+    }
 }
 
 private struct PreparedSidebarSession {

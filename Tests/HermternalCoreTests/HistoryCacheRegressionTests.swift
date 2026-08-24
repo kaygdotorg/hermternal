@@ -62,6 +62,159 @@ func warmCacheReadAvoidsDisk() async throws {
     #expect(fileSystem.dataReadCount == readsAfterStore)
 }
 
+@Test("warming disk reads do not retain cold transcripts")
+func warmingReadDoesNotPopulateMemory() async throws {
+    let directory = try historyCacheTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let writer = HistoryCache(directory: directory)
+    _ = await writer.store([ChatMessage(role: .assistant, text: "cold")], for: "session")
+
+    let fileSystem = CountingCacheFileSystem()
+    let reader = HistoryCache(directory: directory, fileSystem: fileSystem)
+    let warming = await reader.readForWarming(for: "session")
+    #expect(warming.transcript?.messages.first?.text == "cold")
+    #expect(fileSystem.dataReadCount == 1)
+
+    // A normal read must decode again because the warming read is non-retaining.
+    let normal = await reader.read(for: "session")
+    #expect(normal.transcript?.messages.first?.text == "cold")
+    #expect(fileSystem.dataReadCount == 2)
+}
+
+@Test("cancelled cache reads skip decoding and preserve bounded accounting")
+func cancelledReadSkipsDecodeAndRetainsAccounting() async throws {
+    let directory = try historyCacheTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let writer = HistoryCache(directory: directory)
+    _ = await writer.store(
+        [ChatMessage(role: .assistant, text: "cancel me")],
+        for: "session"
+    )
+
+    let codec = DecodeCountingCacheCodec()
+    let reader = HistoryCache(directory: directory, codec: codec)
+    let release = ReadReleaseGate()
+    let cancelled = Task {
+        await release.waitForRelease()
+        return await reader.read(for: "session")
+    }
+    await release.waitUntilWaiting()
+    cancelled.cancel()
+    await release.release()
+    let cancelledResult = await cancelled.value
+
+    #expect(cancelledResult.transcript == nil)
+    #expect(codec.decodeCount == 0)
+    #expect((await reader.memoryStatistics()).bytes == 0)
+
+    let normal = await reader.read(for: "session")
+    #expect(normal.transcript?.messages.first?.text == "cancel me")
+    #expect(codec.decodeCount == 1)
+}
+
+@Test("same-session reads join one in-flight decode")
+func sameSessionReadsJoinInFlightDecode() async throws {
+    let directory = try historyCacheTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let writer = HistoryCache(directory: directory)
+    _ = await writer.store(
+        [ChatMessage(role: .assistant, text: "join me")],
+        for: "session"
+    )
+
+    let gate = DecodeReleaseGate()
+    let codec = GatedDecodeCountingCacheCodec(gate: gate)
+    let reader = HistoryCache(
+        directory: directory,
+        codec: codec,
+        memoryBudgetBytes: 1
+    )
+    let first = Task { await reader.read(for: "session") }
+    gate.waitUntilDecodeStarts()
+
+    let joined = (0..<8).map { _ in
+        Task { await reader.read(for: "session") }
+    }
+    for _ in 0..<8 { await Task.yield() }
+    gate.releaseDecode()
+
+    let firstResult = await first.value
+    var joinedResults = [(transcript: CachedTranscript?, epoch: UInt64)]()
+    for task in joined {
+        joinedResults.append(await task.value)
+    }
+    #expect(firstResult.transcript?.messages.first?.text == "join me")
+    #expect(joinedResults.allSatisfy { $0.transcript?.messages.first?.text == "join me" })
+    #expect(codec.decodeCount == 1)
+}
+
+@Test("warming stores write disk without retaining decoded payloads")
+func warmingStoreDoesNotPopulateMemory() async throws {
+    let directory = try historyCacheTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let fileSystem = CountingCacheFileSystem()
+    let cache = HistoryCache(directory: directory, fileSystem: fileSystem)
+    _ = await cache.storeForWarming(
+        [ChatMessage(role: .assistant, text: "warm")],
+        snapshot: nil,
+        title: "",
+        for: "session",
+        expectedEpoch: nil
+    )
+
+    #expect(await cache.memoryEntryCount() == 0)
+    #expect((await cache.read(for: "session")).transcript?.messages.first?.text == "warm")
+    #expect(await cache.memoryEntryCount() == 1)
+}
+
+@Test("ordinary cache memory is byte bounded and evicts decoded payloads")
+func ordinaryCacheMemoryIsByteBounded() async throws {
+    let directory = try historyCacheTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let budget = 4_096
+    let cache = HistoryCache(directory: directory, memoryBudgetBytes: budget)
+
+    for index in 0..<200 {
+        _ = await cache.store(
+            [ChatMessage(role: .assistant, text: String(repeating: "x", count: 512))],
+            for: "session-\(index)"
+        )
+        let metrics = await cache.memoryStatistics()
+        #expect(metrics.bytes <= Int64(budget))
+    }
+
+    let bounded = await cache.memoryStatistics()
+    #expect(bounded.entryCount < 200)
+    #expect(bounded.bytes <= Int64(budget))
+    #expect(await cache.memoryEntryCount() == bounded.entryCount)
+
+    _ = await cache.clear()
+    #expect((await cache.memoryStatistics()).bytes == 0)
+}
+
+@Test("decoded-cache eviction releases the payload before a later disk read")
+func decodedCacheEvictionReleasesPayload() async throws {
+    let directory = try historyCacheTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let fileSystem = CountingCacheFileSystem()
+    let cache = HistoryCache(
+        directory: directory,
+        fileSystem: fileSystem,
+        memoryBudgetBytes: 1_500
+    )
+    let messages = [ChatMessage(role: .assistant, text: String(repeating: "y", count: 1_000))]
+    _ = await cache.store(messages, for: "first")
+    _ = await cache.store(messages, for: "second")
+
+    let afterWrites = await cache.memoryStatistics()
+    #expect(afterWrites.bytes <= 1_500)
+    #expect(afterWrites.entryCount <= 1)
+
+    let readsBefore = fileSystem.dataReadCount
+    _ = await cache.read(for: "first")
+    #expect(fileSystem.dataReadCount > readsBefore)
+}
+
 @Test("reconcile statistics use file metadata without decoding transcripts")
 func reconcileStatisticsAvoidTranscriptDecoding() async throws {
     let directory = try historyCacheTemporaryDirectory()
@@ -117,25 +270,28 @@ func delayedPrefetchStoreCannotResurrectClearedCache() async throws {
     let cache = HistoryCache(directory: directory)
     let expectedEpoch = await cache.currentEpoch()
     let gate = PrefetchGate()
-    let prefetch = Task {
-        await BoundedPrefetchCoordinator(limit: 1).prefetch(["session"]) { id in
-            await gate.markStarted()
-            await gate.waitForRelease()
-            let result = await cache.store(
-                [ChatMessage(role: .assistant, text: "stale")],
-                for: id,
-                expectedEpoch: expectedEpoch
-            )
-            return result.addedEntry ? result : nil
-        }
+    let prefetch: Task<Void, Never> = Task {
+        await BoundedPrefetchCoordinator(limit: 1).prefetch(
+            ["session"],
+            operation: { id in
+                await gate.markStarted()
+                await gate.waitForRelease()
+                let result = await cache.store(
+                    [ChatMessage(role: .assistant, text: "stale")],
+                    for: id,
+                    expectedEpoch: expectedEpoch
+                )
+                return result.addedEntry ? result : nil
+            },
+            onResult: { _ in }
+        )
     }
 
     await gate.waitForStart()
     #expect(await cache.clear())
     await gate.release()
-    let results = await prefetch.value
+    await prefetch.value
 
-    #expect(results.isEmpty)
     #expect(!FileManager.default.fileExists(
         atPath: directory.appending(path: "session.json").path
     ))
@@ -273,6 +429,89 @@ private actor PrefetchGate {
         let waiters = releaseWaiters
         releaseWaiters.removeAll()
         waiters.forEach { $0.resume() }
+    }
+}
+
+private actor ReadReleaseGate {
+    private var released = false
+    private var waiting = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waitingObservers: [CheckedContinuation<Void, Never>] = []
+
+    func waitForRelease() async {
+        waiting = true
+        let observers = waitingObservers
+        waitingObservers.removeAll()
+        observers.forEach { $0.resume() }
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func waitUntilWaiting() async {
+        guard !waiting else { return }
+        await withCheckedContinuation { continuation in
+            waitingObservers.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
+private final class DecodeReleaseGate: @unchecked Sendable {
+    private let started = DispatchSemaphore(value: 0)
+    private let release = DispatchSemaphore(value: 0)
+
+    func waitUntilDecodeStarts() {
+        started.wait()
+    }
+
+    func markDecodeStarted() {
+        started.signal()
+        release.wait()
+    }
+
+    func releaseDecode() {
+        release.signal()
+    }
+}
+
+private final class GatedDecodeCountingCacheCodec: CacheCodec, @unchecked Sendable {
+    private let base = JSONCacheCodec()
+    private let gate: DecodeReleaseGate
+    private let lock = NSLock()
+    private var count = 0
+
+    init(gate: DecodeReleaseGate) {
+        self.gate = gate
+    }
+
+    var decodeCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    func encode(_ transcript: CachedTranscript) throws -> Data {
+        try base.encode(transcript)
+    }
+
+    func decode(_ data: Data) throws -> CachedTranscript {
+        lock.lock()
+        count += 1
+        lock.unlock()
+        gate.markDecodeStarted()
+        return try base.decode(data)
+    }
+
+    func validate(_ data: Data) throws -> Bool {
+        try base.validate(data)
     }
 }
 

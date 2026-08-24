@@ -2,6 +2,120 @@ import AppKit
 import Foundation
 import HermternalCore
 import Observation
+/// Launch: `HERMTERNAL_SWITCH_TRACE=1 /home/kayg/Developer/hermternal-apple/build/Hermternal.app/Contents/MacOS/Hermternal > /tmp/herm-switch-trace.log 2>&1`
+/// Cleanup search: `rtk rg -n "DEBUG-(switch|folder)-7F3A" Sources/Hermternal Sources/HermternalCore`
+/// Temporary, opt-in trace sink for session switching and sidebar selection.
+enum HermternalSwitchTrace {
+    private static let enabled = ProcessInfo.processInfo.environment["HERMTERNAL_SWITCH_TRACE"] == "1"
+
+    static func session(
+        _ event: String,
+        id: String?,
+        generation: Int? = nil,
+        messages: Int? = nil,
+        renderedRows: Int? = nil,
+        detail: String? = nil
+    ) {
+        guard enabled else { return }
+        emit(
+            prefix: "[DEBUG-switch-7F3A]",
+            event: event,
+            token: id.map { token($0, seed: 0x01) } ?? "none",
+            generation: generation,
+            messages: messages,
+            renderedRows: renderedRows,
+            detail: detail
+        )
+    }
+
+    static func folder(
+        _ event: String,
+        id: String?,
+        generation: Int? = nil,
+        messages: Int? = nil,
+        detail: String? = nil
+    ) {
+        guard enabled else { return }
+        emit(
+            prefix: "[DEBUG-folder-7F3A]",
+            event: event,
+            token: id.map { token($0, seed: 0x02) } ?? "none",
+            generation: generation,
+            messages: messages,
+            detail: detail
+        )
+    }
+
+    static func selection(
+        _ event: String,
+        selection: Set<SidebarSelectionID>,
+        messages: Int,
+        detail: String? = nil
+    ) {
+        guard enabled else { return }
+        let id: String?
+        let seed: UInt64
+        if selection.count == 1, let item = selection.first {
+            switch item {
+            case let .chat(value):
+                id = value
+                seed = 0x01
+            case let .folder(value):
+                id = value
+                seed = 0x02
+            }
+        } else {
+            id = nil
+            seed = 0x03
+        }
+        let hasFolder = selection.contains { item in
+            switch item {
+            case .folder(_):
+                true
+            case .chat(_):
+                false
+            }
+        }
+        emit(
+            prefix: hasFolder ? "[DEBUG-folder-7F3A]" : "[DEBUG-switch-7F3A]",
+            event: event,
+            token: id.map { token($0, seed: seed) } ?? "count-\(selection.count)",
+            generation: nil,
+            messages: messages,
+            detail: detail
+        )
+    }
+    private static func emit(
+        prefix: String,
+        event: String,
+        token: String,
+        generation: Int?,
+        messages: Int?,
+        renderedRows: Int? = nil,
+        detail: String? = nil
+    ) {
+        guard enabled else { return }
+        let line = "\(prefix) ns=\(DispatchTime.now().uptimeNanoseconds)"
+            + " event=\(event)"
+            + " gen=\(generation.map { String($0) } ?? "-")"
+            + " messages=\(messages.map { String($0) } ?? "-")"
+            + (renderedRows.map { " rows=\($0)" } ?? "")
+            + " token=\(token)"
+            + (detail.map { " detail=\($0)" } ?? "")
+            + "\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+
+    private static func token(_ value: String, seed: UInt64) -> String {
+        var hash = 14695981039346656037 ^ seed
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1099511628211
+        }
+        return String(hash, radix: 16)
+    }
+}
+
 
 @MainActor
 @Observable
@@ -30,6 +144,7 @@ final class AppModel {
     /// A routed message target that ChatView reads during the transcript's
     /// initial layout. It is single-use and owned by its open generation.
     var pendingMessageLocation: MessageLocation? { pendingMessageRoute?.location }
+    var openGeneration: Int { openGenerations.current() }
 
     var isAwaitingReply = false
     /// Reserved for the read-only archived transcript route. It remains nil
@@ -112,6 +227,7 @@ final class AppModel {
     private let injectedTranscriptSource: (any TranscriptSource)?
     private var eventTask: Task<Void, Never>?
     private let cache: any TranscriptPersisting
+    private let warmStore: TranscriptWarmStore
     private var accountIdentity: AccountIdentity?
     private var discoveredProvider: AuthProvider?
     private var gatewayAdvertisedMethods = AuthMethod.clientSupported
@@ -130,6 +246,14 @@ final class AppModel {
     private var pendingMessageRoute: PendingMessageRoute?
     private var pendingExternalRoute = PendingRouteCoordinator()
 
+    /// The current opener is explicitly cancelled before another selection
+    /// starts. Its handle clears producer-owned transcript state synchronously.
+    private var activeOpenTask: Task<Void, Never>?
+    private var activeOpenHandle: TranscriptOpenHandle?
+    /// Each sidebar request owns one ticket. A newer request invalidates an
+    /// older ticket before it can build or publish a transcript projection.
+    private var selectionCoalescer = SelectionCoalescer<String>()
+    private var externalRouteTask: Task<Void, Never>?
     private let openGenerations = OpenGenerationController()
     private var streamingReducer = StreamingEventReducer()
 
@@ -152,12 +276,13 @@ final class AppModel {
         cache: HistoryCache = HistoryCache(),
         transcriptSource: (any TranscriptSource)? = nil,
         toastPresenter: ToastPresenter = ToastPresenter(),
-        organizationStore: SessionOrganizationStore = SessionOrganizationStore()
+        organizationStore: SessionOrganizationStore = SessionOrganizationStore(),
+        warmStore: TranscriptWarmStore = TranscriptWarmStore()
     ) {
         self.injectedTranscriptSource = transcriptSource
         self.toastPresenter = toastPresenter
         self.organizationStore = organizationStore
-
+        self.warmStore = warmStore
         guard let historyDirectory = HistoryCache.defaultDirectory() else {
             self.cache = cache
             self.searchQuerying = nil
@@ -182,7 +307,6 @@ final class AppModel {
     }
 
     // MARK: - Lifecycle
-
     /// Reconnect silently when a stored session is already present, so a
     /// relaunch lands straight in the chat.
     func restoreOrPromptSignIn() async {
@@ -191,6 +315,7 @@ final class AppModel {
         // on auth or network success. Recover an interrupted purge before
         // attempting either.
         if !cacheEnabled {
+            warmStore.clear()
             let cleared = (try? await cache.clear()) == true
             if !cleared {
                 Log.error("cache: could not finish disabled-on-launch purge")
@@ -291,19 +416,18 @@ final class AppModel {
         pendingExternalRoute.clearPending()
         pendingMessageRoute = nil
         sessionsLoadedCompletely = false
+        warmStore.clear()
         // Clear all account-owned rows before the first suspension point.
         sessions = []
         archivedSessions = []
         archivedSessionsLoading = false
         archivedSessionsError = nil
-        selectedSessionID = nil
+        setSelectedSessionID(nil, event: "selectedSessionID.signOut")
         viewingArchivedSessionID = nil
         phase = .signedOut
         eventTask?.cancel()
         eventTask = nil
-        prefetchTask?.cancel()
-        prefetchGeneration += 1
-        prefetchTask = nil
+        cancelPrefetch()
         cacheControlTask?.cancel()
         cacheControlTask = nil
         cacheControlGeneration += 1
@@ -416,16 +540,17 @@ final class AppModel {
         guard let rest else { return }
         sessionsLoadedCompletely = false
         do {
-            // The gateway already denies tool and kanban rows. Subagent rows are
-            // machine sessions, not chats, and they outnumber real chats several
-            // times over, so the server excludes them rather than sending rows
-            // the sidebar would discard.
+            // The gateway already denies tool and kanban rows. Subagent rows
+            // are machine sessions, not chats, and the server excludes them.
             let rows = try await rest.allSessions(excludeSources: Self.nonChatSources)
             sessions = rows.compactMap { row in
                 let session = ChatSession(from: row)
                 guard !session.id.isEmpty else { return nil }
                 return session
             }
+            // A complete authoritative list supersedes every in-flight warm
+            // pass before retention or disk/index reconciliation can run.
+            cancelPrefetch()
             sessions.sort(by: Self.sessionComesBefore)
             if viewingArchivedSessionID == nil,
                let selectedSessionID,
@@ -433,11 +558,19 @@ final class AppModel {
                 clearActiveTranscriptIfNeeded(selectedSessionID)
             }
             sessionsLoadedCompletely = true
+            warmStore.retain(sessionIDs: Set(sessions.map(\.id)))
             drainPendingExternalRouteIfReady()
             cacheTotalCount = sessions.count
             Log.info("REST session list returned \(sessions.count) sessions")
-            await refreshCacheStatistics()
-            prefetchTranscripts()
+            let expectedAccountGeneration = accountGeneration
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.refreshCacheStatistics()
+                guard self.accountGeneration == expectedAccountGeneration,
+                      self.sessionsLoadedCompletely
+                else { return }
+                self.prefetchTranscripts()
+            }
         } catch {
             Log.error("REST session list failed: \(error)")
             postError("Could not load sessions", detail: error.localizedDescription)
@@ -669,7 +802,10 @@ final class AppModel {
 
     /// Executes the exact immutable plan shown by the confirmation surface.
     func purge(plan: SessionPurgePlan) async {
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled else {
+            cancelPrefetch()
+            return
+        }
         let requestAccountGeneration = accountGeneration
         guard !plan.blockedByActiveStream else {
             postError("Cannot delete the active chat", detail: "Wait for its response to finish.")
@@ -693,6 +829,7 @@ final class AppModel {
             }
             return
         }
+        cancelPrefetch()
 
         guard let rest else {
             postError("Complete deletion unavailable", detail: sessionPurgeUnavailableReason)
@@ -759,9 +896,8 @@ final class AppModel {
         // The server result reconciles rows even when local storage fails.
         _ = openGenerations.begin()
         pendingMessageRoute = nil
-        prefetchTask?.cancel()
-        prefetchGeneration += 1
-        prefetchTask = nil
+        cancelPrefetch()
+        warmStore.remove(sessionIDs: confirmed)
         var cleanupFailures: [String] = []
         for id in confirmed.sorted() {
             do {
@@ -780,7 +916,7 @@ final class AppModel {
         sessions.removeAll { confirmed.contains($0.id) }
         archivedSessions.removeAll { confirmed.contains($0.id) }
         if let selectedSessionID, confirmed.contains(selectedSessionID) {
-            self.selectedSessionID = nil
+            self.setSelectedSessionID(nil, event: "selectedSessionID.purge")
             viewingArchivedSessionID = nil
             liveSessionID = nil
             messages = []
@@ -849,7 +985,7 @@ final class AppModel {
     }
     private func clearActiveTranscriptIfNeeded(_ sessionID: String) {
         guard selectedSessionID == sessionID else { return }
-        selectedSessionID = nil
+        setSelectedSessionID(nil, event: "selectedSessionID.clear")
         viewingArchivedSessionID = nil
         liveSessionID = nil
         pendingMessageRoute = nil
@@ -865,7 +1001,7 @@ final class AppModel {
         pendingExternalRoute.clearPending()
         pendingMessageRoute = nil
         viewingArchivedSessionID = nil
-        selectedSessionID = nil
+        setSelectedSessionID(nil, event: "selectedSessionID.leaveArchived")
         liveSessionID = nil
         messages = []
         composerText = ""
@@ -1220,7 +1356,8 @@ final class AppModel {
     func setArchived(_ selected: [ChatSession], archived: Bool) async {
         var unique = [ChatSession]()
         var seen = Set<String>()
-        for session in selected where seen.insert(session.id).inserted {
+        for session in selected
+        where session.archived != archived && seen.insert(session.id).inserted {
             unique.append(session)
         }
         guard !unique.isEmpty else { return }
@@ -1374,9 +1511,10 @@ final class AppModel {
         UserDefaults.standard.set(enabled, forKey: "cache.enabled")
         cacheControlGeneration += 1
         let generation = cacheControlGeneration
-        prefetchTask?.cancel()
-        prefetchGeneration += 1
-        prefetchTask = nil
+        cancelPrefetch()
+        if !enabled {
+            warmStore.clear()
+        }
         cacheControlTask?.cancel()
         cacheControlTask = Task { [weak self] in
             guard let self else { return }
@@ -1406,11 +1544,11 @@ final class AppModel {
     /// Clear and immediately repopulate because caching remains enabled.
     func rebuildCache() {
         guard cacheEnabled else { return }
+        _ = openGenerations.begin()
         cacheControlGeneration += 1
         let generation = cacheControlGeneration
-        prefetchTask?.cancel()
-        prefetchGeneration += 1
-        prefetchTask = nil
+        cancelPrefetch()
+        warmStore.clear()
         cacheControlTask?.cancel()
         cacheControlTask = Task { [weak self] in
             guard let self else { return }
@@ -1429,6 +1567,7 @@ final class AppModel {
 
     private func refreshCacheStatistics() async {
         guard cacheEnabled else {
+            warmStore.clear()
             // Ensures a disabled cache is eventually purged even if the app
             // was terminated before the toggle's asynchronous clear finished.
             guard (try? await cache.clear()) == true else {
@@ -1450,11 +1589,19 @@ final class AppModel {
             return
         }
         guard let statistics = try? await cache.reconcile(validIDs: sessions.map(\.id)) else {
+            isCacheWarming = false
             postError("Could not reconcile the local chat cache.")
             return
         }
         cacheCachedCount = statistics.entryCount
         cacheBytes = statistics.bytes
+    }
+
+    private func cancelPrefetch() {
+        prefetchTask?.cancel()
+        prefetchTask = nil
+        prefetchGeneration += 1
+        isCacheWarming = false
     }
 
     /// Warm the transcript cache in the background so switching chats never
@@ -1464,13 +1611,22 @@ final class AppModel {
     /// live server-side session, so warming every row through it would spin
     /// up one live agent per chat. Concurrency is bounded so a long chat list
     /// does not fan out into one request per row.
+    /// Reconcile cached transcripts in a cancellable background pass. This
+    /// path is deliberately independent of selection: it only consumes the
+    /// authoritative session list or an explicit refresh request.
+    ///
+    /// The pass updates durable cache/search and the warm store only. It never
+    /// mutates the visible transcript: live streaming owns the active chat,
+    /// and fresher content applies at the next activation.
     private func prefetchTranscripts() {
-        guard cacheEnabled, let rest else {
+        guard cacheEnabled,
+              let source = transcriptSource(sessionID: nil, serverTotal: nil)
+        else {
             isCacheWarming = false
             return
         }
         let ordered = sessions.map(\.id)
-        guard cacheCachedCount < ordered.count else {
+        guard !ordered.isEmpty else {
             isCacheWarming = false
             return
         }
@@ -1478,55 +1634,110 @@ final class AppModel {
         prefetchTask?.cancel()
         prefetchGeneration += 1
         let generation = prefetchGeneration
-        let totals = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0.messageCount) })
-        let titles = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0.title) })
+        let expectedAccountGeneration = accountGeneration
+        let requests = sessions.map {
+            TranscriptSyncRequest(
+                id: $0.id,
+                serverTotal: $0.messageCount,
+                title: $0.title
+            )
+        }
+        let coordinator = TranscriptSyncCoordinator(concurrency: 4)
         isCacheWarming = true
-        prefetchTask = Task { [weak self, cache] in
-            // Capture the cache epoch before any REST request. A clear or
-            // rebuild that completes while warming is in flight must reject
-            // every store derived from this prefetch batch.
+        prefetchTask = Task { [weak self, cache, source] in
+            guard let self else { return }
+            defer {
+                // A superseded task must not clear state owned by a newer
+                // account/cache/list generation.
+                if generation == self.prefetchGeneration,
+                   expectedAccountGeneration == self.accountGeneration {
+                    self.isCacheWarming = false
+                }
+            }
+
             let expectedEpoch = await cache.currentEpoch()
-            let coordinator = BoundedPrefetchCoordinator(limit: 4)
-            let results: [CacheStoreResult] = await coordinator.prefetch(ordered) { id in
-                guard (await cache.read(for: id)).transcript == nil,
-                      !Task.isCancelled,
-                      let rows = try? await rest.sessionMessages(durableID: id),
-                      !Task.isCancelled
-                else { return nil }
-                let projected = ChatMessage.projectREST(historyRows: rows)
-                let snapshot = CacheFirstOpenPolicy.snapshot(
-                    sessionID: id,
-                    rows: rows,
-                    projectedMessages: projected.count,
-                    serverTotal: totals[id]
-                )
-                guard let result = try? await cache.store(
-                    projected,
-                    snapshot: snapshot,
-                    title: titles[id] ?? "",
-                    for: id,
-                    expectedEpoch: expectedEpoch
-                ) else { return nil }
-                return result
-            }
-            guard let self,
-                  generation == self.prefetchGeneration,
-                  self.cacheEnabled
+            guard generation == self.prefetchGeneration,
+                  expectedAccountGeneration == self.accountGeneration,
+                  self.cacheEnabled,
+                  !Task.isCancelled
             else { return }
-            for result in results {
-                guard generation == self.prefetchGeneration, self.cacheEnabled else { return }
-                self.applyCacheStore(result)
-            }
-            self.isCacheWarming = false
-            Log.info(
-                "prefetch: cached \(self.cacheCachedCount)/\(self.cacheTotalCount) "
-                + "transcripts"
+
+            await coordinator.reconcile(
+                requests,
+                cache: cache,
+                source: source,
+                onResult: { @MainActor result in
+                    guard generation == self.prefetchGeneration,
+                          expectedAccountGeneration == self.accountGeneration,
+                          self.cacheEnabled,
+                          !Task.isCancelled,
+                          result.messages.count == result.snapshot.projectedMessages
+                    else { return }
+
+                    // Re-check after the coordinator's suspension points. A purge
+                    // or account change must not let a completed request publish
+                    // into the next cache epoch.
+                    let currentEpoch = await cache.currentEpoch()
+                    guard generation == self.prefetchGeneration,
+                          expectedAccountGeneration == self.accountGeneration,
+                          self.cacheEnabled,
+                          !Task.isCancelled,
+                          currentEpoch == expectedEpoch
+                    else { return }
+
+                    let serverTotal = requests.first(where: { $0.id == result.id })?.serverTotal
+                    HermternalSwitchTrace.session(
+                        "transcript.presegment",
+                        id: result.id,
+                        messages: result.messages.count,
+                        renderedRows: result.presegmentedRows,
+                        detail: "source=warm"
+                    )
+                    let resident = self.warmStore.projection(
+                        for: result.id,
+                        minimumServerTotal: serverTotal
+                    )
+                    let duplicate = resident.map {
+                        self.snapshotMatches($0.snapshot, result.snapshot)
+                    } ?? false
+                    if !duplicate {
+                        _ = self.warmStore.publish(
+                            messages: result.messages,
+                            snapshot: result.snapshot,
+                            for: result.id,
+                            minimumServerTotal: serverTotal
+                        )
+                    }
+                    if let cacheStore = result.cacheStore {
+                        self.applyCacheStore(cacheStore)
+                    }
+                }
             )
         }
     }
     private func postError(_ title: String, detail: String? = nil) {
         toastPresenter.error(title, detail: detail)
     }
+    private func setSelectedSessionID(
+        _ value: String?,
+        event: String,
+        generation: Int? = nil
+    ) {
+        HermternalSwitchTrace.session(
+            "\(event).before",
+            id: selectedSessionID,
+            generation: generation,
+            messages: messages.count
+        )
+        selectedSessionID = value
+        HermternalSwitchTrace.session(
+            "\(event).after",
+            id: value,
+            generation: generation,
+            messages: messages.count
+        )
+    }
+
 
 
     private func applyCacheStore(_ result: CacheStoreResult) {
@@ -1549,7 +1760,7 @@ final class AppModel {
             isAwaitingReply = streamingReducer.isAwaitingReply
             // `session.create` does not persist a row until the first
             // prompt, so there is nothing to select in the sidebar yet.
-            selectedSessionID = nil
+            setSelectedSessionID(nil, event: "selectedSessionID.newChat")
             Log.info("session.create -> live id \(liveSessionID ?? "nil")")
         } catch {
             Log.error("session.create failed: \(error)")
@@ -1559,9 +1770,9 @@ final class AppModel {
 
     /// Open a sidebar row.
     ///
-    /// Renders the cached transcript synchronously so the click feels
-    /// instant, then resumes over the socket to bind the live ephemeral id
-    /// that `prompt.submit` requires and to reconcile any drift.
+    /// Publishes a resident warm projection on the turn after selection, then
+    /// reconciles over the socket to bind the live ephemeral id that
+    /// `prompt.submit` requires and to reconcile any drift.
     private func transcriptSource(for session: ChatSession) -> (any TranscriptSource)? {
         if let injectedTranscriptSource { return injectedTranscriptSource }
         guard let gateway, let rest else { return nil }
@@ -1585,7 +1796,7 @@ final class AppModel {
     /// Routes a validated external destination after session authority exists.
     /// A route received during restore replaces any older queued destination.
     func route(_ destination: MessageDeepLink.Destination) {
-
+        cancelActiveOpen()
         let generation = openGenerations.begin()
         pendingMessageRoute = nil
         let decision = pendingExternalRoute.route(
@@ -1604,6 +1815,7 @@ final class AppModel {
     /// Invalidates a queued external route when the user starts navigation.
     /// This runs before the delayed transcript open can begin.
     func userNavigationDidBegin() {
+        cancelActiveOpen()
         pendingExternalRoute.clearPending()
         _ = openGenerations.begin()
         pendingMessageRoute = nil
@@ -1630,13 +1842,13 @@ final class AppModel {
             generation: generation
         )
     }
-
     private func dispatchExternalRoute(
         _ destination: MessageDeepLink.Destination,
         routeGeneration: Int,
         generation: Int
     ) {
-        Task { @MainActor [weak self] in
+        externalRouteTask?.cancel()
+        let task = Task { @MainActor [weak self] in
             guard let self,
                   self.pendingExternalRoute.isCurrent(routeGeneration),
                   self.openGenerations.isCurrent(generation)
@@ -1647,13 +1859,17 @@ final class AppModel {
                 generation: generation
             )
         }
+        externalRouteTask = task
     }
-
     private func openExternalDestination(
         _ destination: MessageDeepLink.Destination,
         routeGeneration: Int,
         generation: Int
     ) async {
+        activeOpenHandle?.cancel()
+        activeOpenTask?.cancel()
+        activeOpenHandle = nil
+        activeOpenTask = nil
         guard pendingExternalRoute.isCurrent(routeGeneration),
               openGenerations.isCurrent(generation)
         else { return }
@@ -1664,23 +1880,171 @@ final class AppModel {
             await open(at: location, generation: generation)
         }
     }
+    private func cancelActiveOpen() {
+        externalRouteTask?.cancel()
+        externalRouteTask = nil
+        activeOpenHandle?.cancel()
+        activeOpenTask?.cancel()
+        activeOpenHandle = nil
+        activeOpenTask = nil
+    }
+
+    /// Selection bookkeeping is synchronous so the sidebar highlight can
+    /// commit before transcript observation starts. Projection publication is
+    /// deferred to the next main-actor turn; reconciliation remains
+    /// generation-guarded.
+    @discardableResult
+    func requestOpen(_ session: ChatSession) -> Task<Void, Never> {
+        cancelActiveOpen()
+        pendingExternalRoute.clearPending()
+        let generation = openGenerations.begin()
+        let ticket = selectionCoalescer.submit(session.id)
+        let handle = TranscriptOpenHandle()
+        activeOpenHandle = handle
+        pendingMessageRoute = nil
+        viewingArchivedSessionID = nil
+        liveSessionID = nil
+        ContentionTrace.reset()
+        HermternalSwitchTrace.session(
+            "selection.begin",
+            id: session.id,
+            generation: generation,
+            messages: messages.count
+        )
+        setSelectedSessionID(
+            session.id,
+            event: "selectedSessionID.mutation",
+            generation: generation
+        )
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Force projection onto the turn after the synchronous selection
+            // bookkeeping, rather than allowing the task to run inline with
+            // the click's actor turn.
+            await Task.yield()
+            guard self.openGenerations.isCurrent(generation),
+                  self.selectionCoalescer.isCurrent(ticket),
+                  !Task.isCancelled
+            else {
+                return
+            }
+
+            // Keep all transcript work here so the selection highlight can
+            // commit on its own frame.
+            let warm = self.cacheEnabled
+                ? self.warmStore.projection(
+                    for: session.id,
+                    minimumServerTotal: session.messageCount
+                )
+                : nil
+            guard self.openGenerations.isCurrent(generation),
+                  self.selectionCoalescer.consume(ticket),
+                  !Task.isCancelled
+            else {
+                return
+            }
+            if let warm {
+                self.streamingReducer.reset(messages: warm.messages)
+                self.messages = warm.messages
+                self.isAwaitingReply = self.streamingReducer.isAwaitingReply
+                HermternalSwitchTrace.session(
+                    "selection.publish",
+                    id: session.id,
+                    generation: generation,
+                    messages: warm.messages.count,
+                    detail: "warm.publish"
+                )
+                ContentionTrace.snapshotAndReset(phase: "first-publish")
+                HermternalSwitchTrace.session(
+                    "warm.publish",
+                    id: session.id,
+                    generation: generation,
+                    messages: warm.messages.count
+                )
+            } else {
+                // A cold miss must not leave the prior chat painted while
+                // the opener obtains its first authoritative phase.
+                self.streamingReducer.reset()
+                self.messages = []
+                self.isAwaitingReply = self.streamingReducer.isAwaitingReply
+                HermternalSwitchTrace.session(
+                    "selection.publish",
+                    id: session.id,
+                    generation: generation,
+                    messages: 0,
+                    detail: "cold.publish"
+                )
+                ContentionTrace.snapshotAndReset(phase: "first-publish")
+                HermternalSwitchTrace.session(
+                    "cold.publish",
+                    id: session.id,
+                    generation: generation,
+                    messages: 0
+                )
+            }
+
+            // Keep cache reads and network setup off the publication turn.
+            // Yielding also gives a newer held-arrow selection a chance to
+            // invalidate this generation before reconciliation starts.
+            await Task.yield()
+            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+            _ = await self.open(
+                session,
+                generation: generation,
+                skipWarmProjection: warm,
+                selectionAlreadyPublished: true,
+                handle: handle
+            )
+        }
+        activeOpenTask = task
+        return task
+    }
 
     @discardableResult
     func open(_ session: ChatSession) async -> Bool {
+        cancelActiveOpen()
         pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
+        HermternalSwitchTrace.session(
+            "open.generation.begins",
+            id: session.id,
+            generation: generation,
+            messages: messages.count
+        )
         pendingMessageRoute = nil
         viewingArchivedSessionID = nil
-        return await open(session, generation: generation)
+        let handle = TranscriptOpenHandle()
+        activeOpenHandle = handle
+        return await open(session, generation: generation, handle: handle)
     }
-
-    private func open(_ session: ChatSession, generation: Int) async -> Bool {
+    private func open(
+        _ session: ChatSession,
+        generation: Int,
+        skipWarmProjection: WarmTranscriptProjection? = nil,
+        selectionAlreadyPublished: Bool = false,
+        handle: TranscriptOpenHandle? = nil
+    ) async -> Bool {
+        let handle = handle
+            ?? (activeOpenHandle?.isTerminated == false ? activeOpenHandle : nil)
+            ?? TranscriptOpenHandle()
+        activeOpenHandle = handle
+        // Browsing never binds a live server-side session. Any live id belongs
+        // to the previously selected chat and must not leak into a later send.
+        if selectedSessionID != session.id {
+            liveSessionID = nil
+        }
         guard let source = transcriptSource(for: session) else {
             postError("Could not open chat \(session.id)", detail: "The gateway is unavailable.")
             return false
         }
 
-        selectedSessionID = session.id
+        if !selectionAlreadyPublished {
+            setSelectedSessionID(
+                session.id,
+                event: "selectedSessionID.mutation",
+                generation: generation
+            )
+        }
 
         let opener = TranscriptOpener(
             source: source,
@@ -1692,35 +2056,119 @@ final class AppModel {
             sessionID: session.id,
             serverTotal: session.messageCount,
             generation: generation,
-            sessionTitle: session.title
+            sessionTitle: session.title,
+            handle: handle
         ) {
             guard openGenerations.isCurrent(generation), !Task.isCancelled else { return false }
             if !result.isCachedPhase {
                 liveSessionID = result.liveSessionID
             }
-            streamingReducer.reset(messages: result.messages)
-            messages = result.messages
-            isAwaitingReply = streamingReducer.isAwaitingReply
+
+            let resident = cacheEnabled
+                ? warmStore.projection(
+                    for: session.id,
+                    minimumServerTotal: session.messageCount
+                )
+                : nil
+            let sameResidentSnapshot = result.snapshot.map { snapshot in
+                resident.map {
+                    snapshotMatches(snapshot, $0.snapshot)
+                } ?? false
+            } ?? false
+            let isInitialWarmPhase = result.isCachedPhase && skipWarmProjection != nil
+            let sameWarmProjection = sameResidentSnapshot
+                || (skipWarmProjection.map { warm in
+                    guard let snapshot = result.snapshot else { return false }
+                    return snapshotMatches(snapshot, warm.snapshot)
+                } ?? false)
+            let validatedProjection = resident ?? skipWarmProjection
+            let sameValidatedProjection = resident != nil
+                ? sameResidentSnapshot
+                : sameWarmProjection
+            let rejectsCacheDerivedDowngrade =
+                !result.didFetchREST
+                    && validatedProjection != nil
+                    && !sameValidatedProjection
+
+            // Resume/cache completions are not authoritative. Once a
+            // validated warm projection exists, they must not replace it with
+            // an older or weaker snapshot; only a REST result may reconcile it.
+
+            // A validated synchronous warm projection is already complete
+            // against the current session total. The opener's initial disk
+            // phase cannot replace it, even when its snapshot is older or
+            // otherwise differs. Resume/REST phases may still be newer.
+            if let snapshot = result.snapshot,
+               cacheEnabled,
+               !isInitialWarmPhase,
+               !rejectsCacheDerivedDowngrade,
+               !sameResidentSnapshot,
+               result.messages.count == snapshot.projectedMessages {
+                _ = warmStore.publish(
+                    messages: result.messages,
+                    snapshot: snapshot,
+                    for: session.id,
+                    minimumServerTotal: session.messageCount
+                )
+            }
+            if !isInitialWarmPhase
+                && !rejectsCacheDerivedDowngrade
+                && !sameWarmProjection {
+                streamingReducer.reset(messages: result.messages)
+                messages = result.messages
+                isAwaitingReply = streamingReducer.isAwaitingReply
+            }
+            let phase = result.isCachedPhase
+                ? "cache.publish"
+                : (result.didFetchREST ? "rest.publish" : "resume.complete")
+            HermternalSwitchTrace.session(
+                phase,
+                id: session.id,
+                generation: generation,
+                messages: result.messages.count
+            )
+            if phase == "rest.publish" {
+                ContentionTrace.snapshotAndReset(phase: "authoritative-publish")
+            }
             if let notice = result.notice {
                 postError("Could not fully open chat \(session.id)", detail: notice)
                 Log.error("open \(session.id): \(notice)")
             }
-            if let cacheStore = result.cacheStore {
+            if !rejectsCacheDerivedDowngrade,
+               let cacheStore = result.cacheStore {
                 applyCacheStore(cacheStore)
             }
             Log.info(
                 "open \(session.id): \(result.messages.count) messages"
-                + (result.didFetchREST ? " from REST" : " from cache")
+                    + (result.didFetchREST ? " from REST" : " from cache")
             )
         }
         return true
+    }
+    private func snapshotMatches(
+        _ lhs: AuthoritativeTranscriptSnapshot,
+        _ rhs: AuthoritativeTranscriptSnapshot
+    ) -> Bool {
+        lhs.sessionID == rhs.sessionID
+            && lhs.serverTotal == rhs.serverTotal
+            && lhs.fetchedRows == rhs.fetchedRows
+            && lhs.projectedMessages == rhs.projectedMessages
+            && lhs.truncated == rhs.truncated
+            && lhs.fetchedAt == rhs.fetchedAt
     }
     /// Opens an archived transcript from cache, then refreshes it from REST.
     /// This path never resumes a live gateway session.
     @discardableResult
     func openArchived(_ session: ChatSession) async -> Bool {
+        cancelActiveOpen()
         pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
+        HermternalSwitchTrace.session(
+            "open.generation.begins.archived",
+            id: session.id,
+            generation: generation,
+            messages: messages.count
+        )
         pendingMessageRoute = nil
         guard let source = transcriptSource(for: session) else {
             postError(
@@ -1731,7 +2179,11 @@ final class AppModel {
         }
 
         viewingArchivedSessionID = session.id
-        selectedSessionID = session.id
+        setSelectedSessionID(
+            session.id,
+            event: "selectedSessionID.mutation.archived",
+            generation: generation
+        )
         liveSessionID = nil
         let cached: CachedTranscript?
         let cacheEpoch: UInt64?
@@ -1747,6 +2199,12 @@ final class AppModel {
         streamingReducer.reset(messages: cached?.messages ?? [])
         messages = cached?.messages ?? []
         isAwaitingReply = streamingReducer.isAwaitingReply
+        HermternalSwitchTrace.session(
+            "cache.publish.archived",
+            id: session.id,
+            generation: generation,
+            messages: messages.count
+        )
         Log.info("open archived \(session.id): \(messages.count) messages from cache")
 
         let authoritative: AuthoritativeTranscript
@@ -1770,6 +2228,24 @@ final class AppModel {
             projectedMessages: projected.count,
             serverTotal: authoritative.serverTotal ?? session.messageCount
         )
+        if cacheEnabled,
+           projected.count == snapshot.projectedMessages {
+            let resident = warmStore.projection(
+                for: session.id,
+                minimumServerTotal: session.messageCount
+            )
+            let duplicate = resident.map {
+                snapshotMatches($0.snapshot, snapshot)
+            } ?? false
+            if !duplicate {
+                _ = warmStore.publish(
+                    messages: projected,
+                    snapshot: snapshot,
+                    for: session.id,
+                    minimumServerTotal: session.messageCount
+                )
+            }
+        }
         var cacheStore: CacheStoreResult?
         if cacheEnabled {
             cacheStore = try? await cache.store(
@@ -1784,6 +2260,12 @@ final class AppModel {
         streamingReducer.reset(messages: projected)
         messages = projected
         isAwaitingReply = streamingReducer.isAwaitingReply
+        HermternalSwitchTrace.session(
+            "rest.publish.archived",
+            id: session.id,
+            generation: generation,
+            messages: messages.count
+        )
         if let cacheStore {
             applyCacheStore(cacheStore)
         }
@@ -1791,6 +2273,7 @@ final class AppModel {
         return true
     }
     func openChat(sessionID: String) async {
+        cancelActiveOpen()
         pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
         await openChat(sessionID: sessionID, generation: generation)
@@ -1805,12 +2288,14 @@ final class AppModel {
         }
         _ = await open(session, generation: generation)
     }
+
     func open(at location: MessageLocation) async {
+        cancelActiveOpen()
         pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
         await open(at: location, generation: generation)
-    }
 
+    }
     private func open(at location: MessageLocation, generation: Int) async {
         pendingMessageRoute = nil
         viewingArchivedSessionID = nil
@@ -1842,6 +2327,43 @@ final class AppModel {
     }
     // MARK: - Prompting
 
+    /// Establishes the ephemeral session only for an interaction that needs
+    /// gateway state. Browsing uses `openPhases` and never calls this helper.
+    private func establishLiveSessionForInteraction() async -> Bool {
+        guard let sessionID = selectedSessionID,
+              let session = sessions.first(where: { $0.id == sessionID }),
+              let source = transcriptSource(for: session)
+        else {
+            return liveSessionID != nil
+        }
+        let generation = openGenerations.current()
+        let opener = TranscriptOpener(
+            source: source,
+            cache: cache,
+            cacheEnabled: cacheEnabled,
+            generations: openGenerations
+        )
+        var established = false
+        for await result in opener.openInteractionPhases(
+            sessionID: session.id,
+            serverTotal: session.messageCount,
+            generation: generation,
+            sessionTitle: session.title
+        ) {
+            guard openGenerations.isCurrent(generation), !Task.isCancelled else {
+                return false
+            }
+            if let liveSessionID = result.liveSessionID {
+                self.liveSessionID = liveSessionID
+                established = true
+            }
+            if let cacheStore = result.cacheStore {
+                applyCacheStore(cacheStore)
+            }
+        }
+        return established
+    }
+
     func send() async {
         guard !isViewingArchivedTranscript else { return }
         let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1849,11 +2371,14 @@ final class AppModel {
 
         // A first message with no session yet needs one created first.
         if liveSessionID == nil {
-            await newChat()
-            guard !Task.isCancelled else { return }
+            if selectedSessionID != nil {
+                guard await establishLiveSessionForInteraction() else { return }
+            } else {
+                await newChat()
+                guard !Task.isCancelled else { return }
+            }
         }
         guard let sessionID = liveSessionID else { return }
-
         composerText = ""
         // A new turn supersedes any terminal reconciliation still awaiting
         // REST. Its result must not replace this turn or clear its state.
@@ -1878,7 +2403,11 @@ final class AppModel {
     }
     func interrupt() async {
         guard !isViewingArchivedTranscript else { return }
-        guard let gateway, let sessionID = liveSessionID else { return }
+        guard let gateway else { return }
+        if liveSessionID == nil {
+            guard await establishLiveSessionForInteraction() else { return }
+        }
+        guard let sessionID = liveSessionID else { return }
         let generation = openGenerations.current()
         _ = try? await gateway.call("session.interrupt", params: ["session_id": sessionID])
         guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
@@ -1950,6 +2479,26 @@ final class AppModel {
         guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
         streamingReducer.reset(messages: result.messages)
         messages = result.messages
+        if let snapshot = result.snapshot,
+           let selectedSessionID,
+           cacheEnabled,
+           result.messages.count == snapshot.projectedMessages {
+            let resident = warmStore.projection(
+                for: selectedSessionID,
+                minimumServerTotal: serverTotal
+            )
+            let duplicate = resident.map {
+                snapshotMatches($0.snapshot, snapshot)
+            } ?? false
+            if !duplicate {
+                _ = warmStore.publish(
+                    messages: result.messages,
+                    snapshot: snapshot,
+                    for: selectedSessionID,
+                    minimumServerTotal: serverTotal
+                )
+            }
+        }
         isAwaitingReply = streamingReducer.isAwaitingReply
         if let notice = result.notice {
             postError("Transcript reconciliation failed", detail: notice)

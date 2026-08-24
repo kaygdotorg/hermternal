@@ -21,6 +21,32 @@ func reconciliationStoresAndRemoves() async throws {
     try? FileManager.default.removeItem(at: root)
 }
 
+@Test("warming reconciliation indexes without retaining cache payload")
+func warmingReconciliationDoesNotPopulateCacheMemory() async throws {
+    let root = FileManager.default.temporaryDirectory.appending(path: "HermternalReconcile-\(UUID().uuidString)")
+    let cache = HistoryCache(directory: root.appending(path: "cache"))
+    let index = try SearchIndex(url: root.appending(path: "search.sqlite"))
+    let coordinator = SearchIndexReconciliation(cache: cache, index: index)
+    let snapshot = AuthoritativeTranscriptSnapshot(
+        sessionID: "s",
+        serverTotal: 1,
+        fetchedRows: 1,
+        projectedMessages: 1,
+        truncated: false,
+        fetchedAt: Date()
+    )
+    _ = await coordinator.storeForWarming(
+        [ChatMessage(id: .server(ServerMessageID(rawValue: 1)), role: .user, text: "needle")],
+        snapshot: snapshot,
+        title: "Chat",
+        for: "s"
+    )
+    #expect(await cache.memoryEntryCount() == 0)
+    #expect(try await index.indexedMessageCount(sessionID: "s") == 1)
+    try await index.disable()
+    try? FileManager.default.removeItem(at: root)
+}
+
 @Test("stale epoch reconciliation does not write")
 func staleEpochReconciliationDoesNotWrite() async throws {
     let root = FileManager.default.temporaryDirectory.appending(path: "HermternalReconcile-\(UUID().uuidString)")

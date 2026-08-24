@@ -2,7 +2,7 @@ import Foundation
 import HermternalCore
 import Testing
 
-@Test("Pinned filed sessions have distinct row identities and empty folders remain visible")
+@Test("Pinned filed sessions appear only in their folder and empty folders remain visible")
 func sidebarRowsKeepPinnedAndFolderRows() {
     let pinned = testSession(id: "pinned", title: "Pinned", startedAt: 100, lastActive: 300, pinned: true)
     let filed = testSession(id: "filed", title: "Filed", startedAt: 200, lastActive: 200)
@@ -22,16 +22,37 @@ func sidebarRowsKeepPinnedAndFolderRows() {
 
     let workKind = SidebarSectionKind.folder(id: "work", name: "Work")
     let emptyKind = SidebarSectionKind.folder(id: "empty", name: "Empty")
-    #expect(sections.map(\.kind) == [.pinned, workKind, emptyKind, .ungrouped])
-    #expect(sections[0].rows.map(\.sessionID) == ["pinned"])
-    #expect(sections[1].rows.map(\.sessionID) == ["pinned", "filed"])
-    #expect(sections[2].rows.isEmpty)
-    #expect(sections[3].rows.map(\.sessionID) == ["unfiled"])
+    #expect(sections.map(\.kind) == [workKind, emptyKind, .ungrouped])
+    #expect(sections[0].rows.map(\.sessionID) == ["pinned", "filed"])
+    #expect(sections[0].rows[0].session.pinned)
+    #expect(sections[1].rows.isEmpty)
+    #expect(sections[2].rows.map(\.sessionID) == ["unfiled"])
+}
 
-    let pinnedRowID = sections[0].rows[0].id
-    let filedRowID = sections[1].rows[0].id
-    #expect(pinnedRowID != filedRowID)
-    #expect(sections[0].rows[0].sessionID == sections[1].rows[0].sessionID)
+@Test("Every session has one unique selection identity across sidebar buckets")
+func sidebarRowsKeepSelectionIdentitiesUnique() {
+    let folder = Folder(id: "work", name: "Work", order: 0)
+    let sessions = [
+        testSession(id: "cron", title: "Cron", startedAt: 400, lastActive: 400, pinned: true, source: "cron"),
+        testSession(id: "pinned", title: "Pinned", startedAt: 300, lastActive: 300, pinned: true),
+        testSession(id: "filed", title: "Filed", startedAt: 200, lastActive: 200),
+        testSession(id: "plain", title: "Plain", startedAt: 100, lastActive: 100)
+    ]
+
+    let sections = sidebarRows(
+        sessions: sessions,
+        folders: [folder],
+        membership: ["cron": "work", "filed": "work"],
+        sortMode: .lastActivity,
+        groupByDate: true,
+        calendar: Calendar(identifier: .gregorian),
+        now: Date(timeIntervalSince1970: 500)
+    )
+
+    let selectionIDs = sections.flatMap { $0.rows }.map { SidebarSelectionID.chat($0.sessionID) }
+    #expect(selectionIDs.count == sessions.count)
+    #expect(Set(selectionIDs).count == selectionIDs.count)
+    #expect(Set(selectionIDs) == Set(sessions.map { SidebarSelectionID.chat($0.id) }))
 }
 
 @Test("Cron sessions appear in Schedules and not in date buckets")
@@ -347,6 +368,174 @@ func sidebarRowsPerformanceContract() {
     }
 
     print("PERF|sidebar rebuild|" + measurements.joined(separator: " "))
+}
+
+@Test("Ordering memo ignores selection-only passes and refreshes on ordering inputs")
+func sidebarOrderingMemoInvalidation() {
+    let calendar = Calendar(identifier: .gregorian)
+    let now = Date(timeIntervalSince1970: 2_000_000)
+    let baseSession = testSession(
+        id: "memo",
+        title: "Memo",
+        startedAt: 1,
+        lastActive: 2
+    )
+    let baseFolder = Folder(id: "folder", name: "Folder", order: 0)
+    let baseInput = SidebarOrderingInputs(
+        sessions: [baseSession],
+        folders: [baseFolder],
+        membership: [:],
+        sortMode: .lastActivity,
+        groupByDate: true,
+        calendar: calendar,
+        now: now
+    )
+
+    var memo = SidebarOrderingMemo()
+    let first = memo.resolve(baseInput)
+    let selectionOnlyPass = memo.resolve(baseInput)
+    #expect(first == selectionOnlyPass)
+    #expect(memo.rebuildCount == 1)
+
+    let equivalentInput = SidebarOrderingInputs(
+        sessions: baseInput.sessions.map { $0 },
+        folders: baseInput.folders.map { $0 },
+        membership: Dictionary(
+            baseInput.membership.map { ($0.key, $0.value) },
+            uniquingKeysWith: { first, _ in first }
+        ),
+        sortMode: baseInput.sortMode,
+        groupByDate: baseInput.groupByDate,
+        calendar: baseInput.calendar,
+        now: baseInput.now
+    )
+    let equivalentProjection = memo.resolve(equivalentInput)
+    #expect(equivalentProjection == first)
+    #expect(memo.rebuildCount == 1)
+
+    let sessionRefresh = SidebarOrderingInputs(
+        sessions: [baseSession.withTitle("Renamed")],
+        folders: baseInput.folders,
+        membership: baseInput.membership,
+        sortMode: baseInput.sortMode,
+        groupByDate: baseInput.groupByDate,
+        calendar: baseInput.calendar,
+        now: baseInput.now
+    )
+    _ = memo.resolve(sessionRefresh)
+    #expect(memo.rebuildCount == 2)
+    _ = memo.resolve(sessionRefresh)
+    #expect(memo.rebuildCount == 2)
+
+    let membershipRefresh = SidebarOrderingInputs(
+        sessions: sessionRefresh.sessions,
+        folders: sessionRefresh.folders,
+        membership: ["memo": "folder"],
+        sortMode: sessionRefresh.sortMode,
+        groupByDate: sessionRefresh.groupByDate,
+        calendar: sessionRefresh.calendar,
+        now: sessionRefresh.now
+    )
+    let moved = memo.resolve(membershipRefresh)
+    #expect(memo.rebuildCount == 3)
+    _ = memo.resolve(membershipRefresh)
+    #expect(memo.rebuildCount == 3)
+    #expect(
+        moved.sections.contains {
+            if case .folder(id: "folder", name: "Folder") = $0.kind {
+                return $0.rows.map(\.sessionID) == ["memo"]
+            }
+            return false
+        }
+    )
+
+    let membershipValueRefresh = SidebarOrderingInputs(
+        sessions: membershipRefresh.sessions,
+        folders: membershipRefresh.folders,
+        membership: ["memo": "other"],
+        sortMode: membershipRefresh.sortMode,
+        groupByDate: membershipRefresh.groupByDate,
+        calendar: membershipRefresh.calendar,
+        now: membershipRefresh.now
+    )
+    _ = memo.resolve(membershipValueRefresh)
+    #expect(memo.rebuildCount == 4)
+    _ = memo.resolve(membershipValueRefresh)
+    #expect(memo.rebuildCount == 4)
+
+    let folderRefresh = SidebarOrderingInputs(
+        sessions: membershipValueRefresh.sessions,
+        folders: [Folder(id: "folder", name: "Renamed Folder", order: 0)],
+        membership: membershipValueRefresh.membership,
+        sortMode: membershipValueRefresh.sortMode,
+        groupByDate: membershipValueRefresh.groupByDate,
+        calendar: membershipValueRefresh.calendar,
+        now: membershipValueRefresh.now
+    )
+    let renamed = memo.resolve(folderRefresh)
+    #expect(memo.rebuildCount == 5)
+    _ = memo.resolve(folderRefresh)
+    #expect(memo.rebuildCount == 5)
+    #expect(
+        renamed.sections.contains {
+            if case .folder(id: "folder", name: "Renamed Folder") = $0.kind {
+                return true
+            }
+            return false
+        }
+    )
+
+    let sortRefresh = SidebarOrderingInputs(
+        sessions: folderRefresh.sessions,
+        folders: folderRefresh.folders,
+        membership: folderRefresh.membership,
+        sortMode: .title,
+        groupByDate: folderRefresh.groupByDate,
+        calendar: folderRefresh.calendar,
+        now: folderRefresh.now
+    )
+    _ = memo.resolve(sortRefresh)
+    #expect(memo.rebuildCount == 6)
+
+    let groupingRefresh = SidebarOrderingInputs(
+        sessions: sortRefresh.sessions,
+        folders: sortRefresh.folders,
+        membership: sortRefresh.membership,
+        sortMode: sortRefresh.sortMode,
+        groupByDate: false,
+        calendar: sortRefresh.calendar,
+        now: sortRefresh.now
+    )
+    _ = memo.resolve(groupingRefresh)
+    #expect(memo.rebuildCount == 7)
+
+    var timeZoneRefreshCalendar = groupingRefresh.calendar
+    timeZoneRefreshCalendar.timeZone = TimeZone(secondsFromGMT: 3_600)!
+    let calendarRefresh = SidebarOrderingInputs(
+        sessions: groupingRefresh.sessions,
+        folders: groupingRefresh.folders,
+        membership: groupingRefresh.membership,
+        sortMode: groupingRefresh.sortMode,
+        groupByDate: groupingRefresh.groupByDate,
+        calendar: timeZoneRefreshCalendar,
+        now: groupingRefresh.now
+    )
+    _ = memo.resolve(calendarRefresh)
+    #expect(memo.rebuildCount == 8)
+
+    let nowRefresh = SidebarOrderingInputs(
+        sessions: calendarRefresh.sessions,
+        folders: calendarRefresh.folders,
+        membership: calendarRefresh.membership,
+        sortMode: calendarRefresh.sortMode,
+        groupByDate: calendarRefresh.groupByDate,
+        calendar: calendarRefresh.calendar,
+        now: calendarRefresh.now.addingTimeInterval(86_400)
+    )
+    _ = memo.resolve(nowRefresh)
+    #expect(memo.rebuildCount == 9)
+    _ = memo.resolve(nowRefresh)
+    #expect(memo.rebuildCount == 9)
 }
 
 private func rowID(_ section: SidebarSectionKind, _ sessionID: String) -> SidebarRowID {

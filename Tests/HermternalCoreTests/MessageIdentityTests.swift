@@ -97,14 +97,23 @@ func cacheOpenRefetchPolicy() {
     ))
 }
 
-@Test("prefetch coordinator is bounded and deterministic")
-func prefetchIsDeterministic() async {
+@Test("prefetch coordinator delivers completed items incrementally")
+func prefetchIsIncremental() async {
     let coordinator = BoundedPrefetchCoordinator(limit: 2)
-    let values = await coordinator.prefetch([0, 1, 2, 3]) { value in
-        try? await Task.sleep(for: .milliseconds(value == 0 ? 20 : 1))
-        return value * 2
-    }
-    #expect(values == [0, 2, 4, 6])
+    let delivered = PrefetchValueCollector()
+    await coordinator.prefetch(
+        [0, 1, 2, 3],
+        operation: { value in
+            try? await Task.sleep(for: .milliseconds(value == 0 ? 20 : 1))
+            return value * 2
+        },
+        onResult: { value in
+            await delivered.append(value)
+        }
+    )
+    let values = await delivered.values
+    #expect(Set(values) == Set([0, 2, 4, 6]))
+    #expect(values.count == 4)
 }
 
 @Test("NDJSON parser and accumulator preserve frame boundaries")
@@ -127,6 +136,13 @@ private func historyRow(id: Int64, timestamp: JSONValue, role: Role, text: Strin
         "role": .string(role.rawValue),
         "content": .string(text)
     ])
+}
+private actor PrefetchValueCollector {
+    private(set) var values: [Int] = []
+
+    func append(_ value: Int) {
+        values.append(value)
+    }
 }
 
 private func makeTemporaryDirectory() throws -> URL {

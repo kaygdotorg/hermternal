@@ -23,7 +23,7 @@ struct MoveToFolderMenu: View {
     let onMove: (ChatSession, String?) -> Void
 
     var body: some View {
-        Menu("Move to Folder", systemImage: "folder") {
+        Menu("Move 1 Chat to Folder", systemImage: "folder") {
             if folders.isEmpty {
                 // An empty menu looks broken, so the reason is stated.
                 Button("No Folders Yet") {}

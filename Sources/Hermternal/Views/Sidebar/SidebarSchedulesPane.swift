@@ -18,6 +18,7 @@ struct SidebarSchedulesPane: View {
     let rows: [SidebarRow]
     let folders: [Folder]
     let membership: [String: String]
+    let visibleOrder: [SidebarSelectionID]
     let sessionsByID: [String: ChatSession]
     let scheduledIDs: Set<String>
     @Binding var selection: Set<SidebarSelectionID>
@@ -37,9 +38,7 @@ struct SidebarSchedulesPane: View {
     /// assuming it. Content height does not depend on the frame we derive
     /// from it, so there is no feedback between the two.
     @State private var contentHeight: CGFloat?
-
     var body: some View {
-        let visibleOrder = rows.map { SidebarSelectionID.chat($0.sessionID) }
         return VStack(alignment: .leading, spacing: 0) {
             // The divider that separates the pane from the chat list is
             // owned by the column layout, so the pane draws none of its own.
