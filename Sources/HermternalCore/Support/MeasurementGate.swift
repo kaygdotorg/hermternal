@@ -23,4 +23,16 @@ public enum MeasurementGate {
     public static func isEnabled(_ module: DebugModule) -> Bool {
         (installedMask & module.bit) != 0
     }
+ 
+    /// Returns a hot-path measurement value only when its module is enabled.
+    /// The autoclosure keeps callers from observing or computing frequently
+    /// mutated model properties while instrumentation is disabled.
+    @inline(__always)
+    public static func value(
+        for module: DebugModule,
+        _ make: @autoclosure () -> Int
+    ) -> Int? {
+        guard isEnabled(module) else { return nil }
+        return make()
+    }
 }

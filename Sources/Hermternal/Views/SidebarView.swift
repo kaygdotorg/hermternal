@@ -92,7 +92,7 @@ enum HermternalSelectionOccupancyTrace {
 
     static func beginIfNeeded(
         selection: Set<SidebarSelectionID>,
-        messages: Int
+        messages: @autoclosure () -> Int
     ) {
         guard gate.isEnabled(.mainActorOccupancy) else { return }
         guard !selection.isEmpty else { return }
@@ -102,7 +102,13 @@ enum HermternalSelectionOccupancyTrace {
         if let current = state, current.selection == selection {
             return
         }
-        flush()
+        // The app gate tracks Settings toggles; MeasurementGate is the Core
+        // mask. Keep both: the first controls this trace, the second defers
+        // the hot model read shared by Core instrumentation.
+        guard let messages = MeasurementGate.value(
+            for: .mainActorOccupancy,
+            messages()
+        ) else { return }
         state = State(selection: selection, messages: messages)
         flushTask?.cancel()
         flushTask = Task { @MainActor in
@@ -115,7 +121,7 @@ enum HermternalSelectionOccupancyTrace {
 
     static func observerInvoked(
         forChatID id: String?,
-        messages: Int
+        messages: @autoclosure () -> Int
     ) {
         guard gate.isEnabled(.mainActorOccupancy) else { return }
         guard let id else {
@@ -123,7 +129,7 @@ enum HermternalSelectionOccupancyTrace {
             return
         }
         let selection: Set<SidebarSelectionID> = [.chat(id)]
-        beginIfNeeded(selection: selection, messages: messages)
+        beginIfNeeded(selection: selection, messages: messages())
         observerInvoked()
     }
 
@@ -400,7 +406,15 @@ struct SidebarView: View {
         // the layer could not do this: it is behind-window vibrancy and
         // cannot obscure an in-window sibling. One continuous gradient,
         // never stacked opacity bands, and never hit-testing.
-        .mask { chatListDissolve }
+        //
+        // Installed through a modifier rather than written as `.mask` here,
+        // so a measurement build can leave it out. A mask covers the whole
+        // layer it modifies, and that layer is the scrolling viewport, so
+        // the open question is whether the offscreen pass it forces costs
+        // more than the rows do. The modifier removes the mask outright
+        // rather than flattening its gradient, because a mask whose ramps
+        // are opaque still makes the compositing group under test.
+        .modifier(SidebarDissolveMask(ramp: chatListDissolve))
         // This is a SwiftUI focus identity rather than an AppKit responder
         // lookup. The default is applied only when the window is choosing its
         // initial focus; Composer requests focus explicitly after New Chat.
@@ -1429,6 +1443,23 @@ private struct SidebarFolderDeletionTarget: Identifiable {
 /// the last row out of the bottom one. Split across two literals they
 /// would drift, and the drift is invisible until a row is unreadable.
 private enum SidebarDissolve {
+    /// Whether the ramps are installed at all.
+    ///
+    /// `HERMTERNAL_NO_SIDEBAR_MASK=1` leaves the chat list unmasked, so one
+    /// build can be scrolled both ways and the mask's cost can be measured
+    /// instead of assumed. Read once per process, like
+    /// `HERMTERNAL_BLOCK_TRANSCRIPT` in `ChatView`: a switch that cannot
+    /// change while the app runs must not be re-read on a body pass.
+    ///
+    /// Compare with:
+    /// `HERMTERNAL_NO_SIDEBAR_MASK=1 /home/kayg/Developer/hermternal-apple/build/Hermternal.app/Contents/MacOS/Hermternal`
+    ///
+    /// Unmasked, the top edge is hard and rows read through the floating
+    /// layer. Both are expected: this is a measurement switch, not a
+    /// treatment, and nothing else moves to accommodate it.
+    static let isEnabled =
+        ProcessInfo.processInfo.environment["HERMTERNAL_NO_SIDEBAR_MASK"] != "1"
+
     /// Distances from the chrome edge each ramp belongs to: up from the
     /// floating layer's top edge at the bottom, down from the list's own
     /// frame edge at the top.
@@ -1470,5 +1501,31 @@ private enum SidebarDissolve {
             startPoint: .top,
             endPoint: .bottom
         )
+    }
+}
+
+/// Installs the chat list's content mask, or leaves the list alone.
+///
+/// A `ViewModifier` so the switch stays one term in the list's chain. The
+/// chain is a single expression, and this file has twice gone over the type
+/// checker's budget when that expression grew, so a branch wrapped around it
+/// would cost more than a branch inside a modifier of its own.
+///
+/// The condition is fixed for the life of the process, so the graph settles
+/// into one of the two shapes at first evaluation and never flips between
+/// them. No view identity churns on it.
+private struct SidebarDissolveMask<Ramp: View>: ViewModifier {
+    let ramp: Ramp
+
+    // `@ViewBuilder` written out rather than inherited from the protocol
+    // requirement, so the branch below does not depend on where the builder
+    // is declared.
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if SidebarDissolve.isEnabled {
+            content.mask { ramp }
+        } else {
+            content
+        }
     }
 }

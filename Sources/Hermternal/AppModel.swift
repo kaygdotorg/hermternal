@@ -45,7 +45,7 @@ enum HermternalSwitchTrace {
         _ event: String,
         id: String?,
         generation: Int? = nil,
-        messages: Int? = nil,
+        messages: @autoclosure () -> Int? = nil,
         renderedRows: Int? = nil,
         detail: String? = nil,
         module: DebugModule = .switchPhases,
@@ -76,7 +76,7 @@ enum HermternalSwitchTrace {
             event: event,
             id: id,
             generation: generation,
-            messages: messages,
+            messages: messages(),
             renderedRows: renderedRows,
             detail: detail,
             seed: 0x01,
@@ -138,7 +138,7 @@ enum HermternalSwitchTrace {
         _ event: String,
         id: String?,
         generation: Int? = nil,
-        messages: Int? = nil,
+        messages: @autoclosure () -> Int? = nil,
         detail: String? = nil
     ) {
         guard gate.isEnabled(.sidebarAndFolderSelection) else { return }
@@ -147,7 +147,7 @@ enum HermternalSwitchTrace {
             event: event,
             id: id,
             generation: generation,
-            messages: messages,
+            messages: messages(),
             detail: detail,
             seed: 0x02
         )
@@ -156,7 +156,7 @@ enum HermternalSwitchTrace {
     static func selection(
         _ event: String,
         selection: Set<SidebarSelectionID>,
-        messages: Int,
+        messages: @autoclosure () -> Int,
         detail: String? = nil,
         module: DebugModule = .sidebarAndFolderSelection
     ) {
@@ -193,7 +193,7 @@ enum HermternalSwitchTrace {
             event: event,
             id: id,
             generation: nil,
-            messages: messages,
+            messages: messages(),
             detail: detail,
             seed: seed,
             fallbackToken: "count-\(selection.count)",

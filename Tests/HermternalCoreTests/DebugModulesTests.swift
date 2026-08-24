@@ -17,6 +17,34 @@ func disabledModuleRecordsNothing() {
     #expect(controller.metrics == nil)
     #expect(store.writeCount == 0)
 }
+ 
+@Test("a disabled measurement value does not evaluate its producer")
+func disabledMeasurementValueDoesNotEvaluateProducer() {
+    MeasurementGate.install(mask: 0)
+    defer { MeasurementGate.install(mask: 0) }
+    var evaluations = 0
+    let counted: () -> Int = {
+        evaluations += 1
+        return 42
+    }
+
+    let disabled = MeasurementGate.value(
+        for: .mainActorOccupancy,
+        counted()
+    )
+
+    #expect(disabled == nil)
+    #expect(evaluations == 0)
+
+    MeasurementGate.install(mask: DebugModule.mainActorOccupancy.bit)
+    let enabled = MeasurementGate.value(
+        for: .mainActorOccupancy,
+        counted()
+    )
+
+    #expect(enabled == 42)
+    #expect(evaluations == 1)
+}
 
 @Test("a changed toggle persists once and an unchanged toggle does not write")
 func togglePersistsExactlyOncePerChange() {
