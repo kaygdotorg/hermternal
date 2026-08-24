@@ -19,9 +19,15 @@ struct ChatView: View {
     @State private var windowGrowthTask: Task<Void, Never>?
     @State private var isGrowingWindow = false
     @State private var isPrimingTranscriptWindow = true
+    /// The selection generation captured at publication. A later stream
+    /// update may advance `openGeneration`, but it must not turn an old row
+    /// paint into a second visibility event for this selection.
+    @State private var transcriptVisibilitySessionID: String?
+    @State private var transcriptVisibilityGeneration: Int?
+    @State private var transcriptVisibilityEmitted = false
     /// Incremented by New Chat and by the selected-session transition that
-    /// follows it. Composer consumes this through SwiftUI focus state rather
-    /// than taking first responder during every launch.
+    /// follows it. Composer consumes this through SwiftUI focus state
+    /// rather than taking first responder during every launch.
     @State private var composerFocusRequest = 0
     var body: some View {
         transcript
@@ -94,11 +100,36 @@ struct ChatView: View {
                 forChatID: newID,
                 messages: model.messages.count
             )
+            resetTranscriptVisibility(for: newID)
             // New Chat clears the durable selection after creating its
             // ephemeral session. That transition is the natural point to
             // return focus to the composer, without stealing it at launch.
             guard !isReadOnly, oldID != nil, newID == nil else { return }
             composerFocusRequest &+= 1
+        }
+        .onChange(of: model.openGeneration) { _, newGeneration in
+            // Re-selecting the already-active chat still creates a new
+            // publication generation without changing selectedSessionID.
+            // Ignore unrelated generation changes (for example cache or
+            // account work) unless this generation is a traced publication.
+            guard let sessionID = model.selectedSessionID,
+                  transcriptVisibilitySessionID == sessionID,
+                  HermternalSwitchTrace.hasPublishedSelection(
+                      id: sessionID,
+                      generation: newGeneration
+                  )
+            else {
+                return
+            }
+            resetTranscriptVisibility(for: sessionID)
+        }
+        .onAppear {
+            // Do not reset on a temporary disappearance/reappearance. The
+            // same route still represents the same selection.
+            guard transcriptVisibilitySessionID != model.selectedSessionID else {
+                return
+            }
+            resetTranscriptVisibility(for: model.selectedSessionID)
         }
         .onChange(of: findQuery) {
             activeFindIndex = 0
@@ -123,17 +154,6 @@ struct ChatView: View {
     }
 
 
-    private var findMatches: [TranscriptMatch] {
-        TranscriptMatcher.matches(
-            in: model.messages.map(\.text),
-            query: findQuery
-        )
-    }
-
-    private var activeFindMatch: TranscriptMatch? {
-        guard findMatches.indices.contains(activeFindIndex) else { return nil }
-        return findMatches[activeFindIndex]
-    }
     private var initialMessageTarget: MessageIdentity? {
         if messageTargetActive {
             // A nil write-back means the user has scrolled away. Do not fall
@@ -165,12 +185,11 @@ struct ChatView: View {
         )
     }
     @MainActor
-    private func capturePendingMessageTarget() -> Bool {
+    private func capturePendingMessageTarget(targetIndex: Int?) -> Bool {
         guard let location = model.pendingMessageLocation,
               model.selectedSessionID == location.sessionID,
-              let targetIndex = model.messages.firstIndex(where: {
-                  $0.id == .server(location.messageID)
-              })
+              let targetIndex,
+              model.messages.indices.contains(targetIndex)
         else { return false }
         isPrimingTranscriptWindow = false
 
@@ -188,12 +207,13 @@ struct ChatView: View {
         return true
     }
     @MainActor
-    private func includeActiveFindTarget() {
+    private func includeActiveFindTarget(matches: [TranscriptMatch]) {
         guard isFindPresented,
               model.pendingMessageLocation == nil,
-              let targetIndex = activeFindMatch?.messageIndex,
-              model.messages.indices.contains(targetIndex)
+              matches.indices.contains(activeFindIndex)
         else { return }
+        let targetIndex = matches[activeFindIndex].messageIndex
+        guard model.messages.indices.contains(targetIndex) else { return }
         isPrimingTranscriptWindow = false
         transcriptWindowState = TranscriptWindowPolicy.including(
             targetIndex: targetIndex,
@@ -215,6 +235,42 @@ struct ChatView: View {
         scrollPosition = nil
         messageTargetActive = false
         replacementScrollSessionID = nil
+    }
+    @MainActor
+    private func resetTranscriptVisibility(for sessionID: String?) {
+        transcriptVisibilitySessionID = sessionID
+        transcriptVisibilityGeneration = sessionID == nil ? nil : model.openGeneration
+        transcriptVisibilityEmitted = false
+    }
+
+    @MainActor
+    private func markTranscriptVisible(
+        sessionID: String?,
+        generation: Int,
+        routeIdentity: String,
+        renderedRows: Int
+    ) {
+        guard !transcriptVisibilityEmitted,
+              let sessionID,
+              model.selectedSessionID == sessionID,
+              transcriptVisibilitySessionID == sessionID,
+              transcriptVisibilityGeneration == generation,
+              transcriptIdentity == routeIdentity,
+              HermternalSwitchTrace.hasPublishedSelection(
+                  id: sessionID,
+                  generation: generation
+              )
+        else { return }
+
+        guard HermternalSwitchTrace.transcriptVisible(
+            id: sessionID,
+            generation: generation,
+            messages: model.messages.count,
+            renderedRows: renderedRows
+        ) else {
+            return
+        }
+        transcriptVisibilityEmitted = true
     }
 
 
@@ -365,6 +421,11 @@ struct ChatView: View {
     @ViewBuilder
     private var transcript: some View {
         let messages = model.messages
+        let query = isFindPresented ? findQuery : ""
+        let matches = model.transcriptMatches(for: query)
+        let activeFindMatch = matches.indices.contains(activeFindIndex)
+            ? matches[activeFindIndex]
+            : nil
         let resolvedWindow = isPrimingTranscriptWindow
             ? TranscriptWindowPolicy.initial(totalMessageCount: messages.count)
             : TranscriptWindowPolicy.resolve(
@@ -387,24 +448,21 @@ struct ChatView: View {
                 currentState: resolvedWindow.state
             )
         } ?? resolvedWindow
-        let query = isFindPresented ? findQuery : ""
-        let matches = query.isEmpty
-            ? []
-            : TranscriptMatcher.matches(in: messages.map(\.text), query: query)
         let windowedMessages = Array(messages[window.range])
-        let windowedMatches = matches.compactMap { match -> TranscriptMatch? in
-            guard window.range.contains(match.messageIndex) else { return nil }
-            return TranscriptMatch(
-                messageIndex: match.messageIndex - window.range.lowerBound,
-                range: match.range
-            )
-        }
-        let activeWindowMatchIndex = activeFindMatch.flatMap { activeMatch in
-            windowedMatches.firstIndex(of: TranscriptMatch(
-                messageIndex: activeMatch.messageIndex - window.range.lowerBound,
-                range: activeMatch.range
-            ))
-        }
+        let windowedProjection = Self.projectFindMatches(
+            matches,
+            window: window,
+            activeFindIndex: activeFindIndex
+        )
+        let windowedMatches = windowedProjection.matches
+        let activeWindowMatchIndex = windowedProjection.activeIndex
+        // Capture the publication generation, not the latest streaming
+        // generation. A stream can begin while the first rows are painting.
+        let visibilityGeneration = (
+            transcriptVisibilitySessionID == model.selectedSessionID
+            ? transcriptVisibilityGeneration
+            : nil
+        ) ?? model.openGeneration
         Group {
         if !Self.usesAppKitTranscript {
             ScrollViewReader { proxy in
@@ -413,7 +471,14 @@ struct ChatView: View {
                 messages: messages,
                 window: window,
                 query: query,
-                matches: matches
+                windowedMatches: windowedMatches,
+                activeMessageID: activeFindMatch.flatMap { match in
+                    messages.indices.contains(match.messageIndex)
+                        ? messages[match.messageIndex].id
+                        : nil
+                },
+                visibilityGeneration: visibilityGeneration,
+                routeIdentity: transcriptIdentity
             )
             .id(transcriptIdentity)
             .onChange(of: model.pendingMessageLocation) {
@@ -421,7 +486,7 @@ struct ChatView: View {
                     scrollPosition = nil
                     messageTargetActive = false
                 } else {
-                    _ = capturePendingMessageTarget()
+                    _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                 }
             }
             .onChange(of: isFindPresented) {
@@ -463,7 +528,7 @@ struct ChatView: View {
                             pendingScrollTask = nil
                             return
                         }
-                        _ = capturePendingMessageTarget()
+                        _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                         pendingScrollTask = nil
                     }
                     return
@@ -484,10 +549,7 @@ struct ChatView: View {
                             return
                         }
                         let currentMessages = model.messages
-                        let currentMatches = TranscriptMatcher.matches(
-                            in: currentMessages.map(\.text),
-                            query: findQuery
-                        )
+                        let currentMatches = model.transcriptMatches(for: findQuery)
                         activateFindMatch(using: proxy, matches: currentMatches, messages: currentMessages)
                         pendingScrollTask = nil
                     }
@@ -540,16 +602,13 @@ struct ChatView: View {
                 messageTargetActive = false
                 replacementScrollSessionID = nil
                 if model.pendingMessageLocation != nil {
-                    _ = capturePendingMessageTarget()
+                    _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                     return
                 }
                 guard isFindPresented else { return }
                 isPrimingTranscriptWindow = false
                 let currentMessages = model.messages
-                let currentMatches = TranscriptMatcher.matches(
-                    in: currentMessages.map(\.text),
-                    query: findQuery
-                )
+                let currentMatches = model.transcriptMatches(for: findQuery)
                 activateFindMatch(
                     using: proxy,
                     matches: currentMatches,
@@ -583,7 +642,7 @@ struct ChatView: View {
                     replacementScrollSessionID = nil
                     pendingScrollTask?.cancel()
                     pendingScrollTask = nil
-                    _ = capturePendingMessageTarget()
+                    _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                     return
                 }
 
@@ -621,7 +680,7 @@ struct ChatView: View {
                 }
             }
             .onAppear {
-                _ = capturePendingMessageTarget()
+                _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
             }
             .onDisappear {
                 pendingScrollTask?.cancel()
@@ -659,48 +718,62 @@ struct ChatView: View {
                 }
             )
             .id(transcriptIdentity)
+            .overlay(alignment: .topLeading) {
+                if HermternalSwitchTrace.isEnabled {
+                    TranscriptPaintProbe {
+                        markTranscriptVisible(
+                            sessionID: model.selectedSessionID,
+                            generation: visibilityGeneration,
+                            routeIdentity: transcriptIdentity,
+                            renderedRows: window.range.count
+                        )
+                    }
+                    .frame(width: 1, height: 1)
+                    .allowsHitTesting(false)
+                }
+            }
             .onChange(of: model.pendingMessageLocation) {
                 if model.pendingMessageLocation == nil {
                     scrollPosition = nil
                     messageTargetActive = false
                 } else {
-                    _ = capturePendingMessageTarget()
+                    _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                 }
             }
             .onChange(of: isFindPresented) {
                 if isFindPresented {
                     isPrimingTranscriptWindow = false
-                    includeActiveFindTarget()
+                    includeActiveFindTarget(matches: matches)
                 }
             }
             .onChange(of: findQuery) {
                 activeFindIndex = 0
-                includeActiveFindTarget()
+                includeActiveFindTarget(matches: matches)
             }
             .onChange(of: activeFindIndex) {
-                includeActiveFindTarget()
+                includeActiveFindTarget(matches: matches)
             }
             .onChange(of: model.selectedSessionID) { _, _ in
                 resetAppKitTranscriptRoute()
                 if model.pendingMessageLocation != nil {
-                    _ = capturePendingMessageTarget()
+                    _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                 } else {
-                    includeActiveFindTarget()
+                    includeActiveFindTarget(matches: matches)
                 }
             }
             .onChange(of: model.viewingArchivedSessionID) { _, _ in
                 resetAppKitTranscriptRoute()
                 if model.pendingMessageLocation != nil {
-                    _ = capturePendingMessageTarget()
+                    _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                 } else {
-                    includeActiveFindTarget()
+                    includeActiveFindTarget(matches: matches)
                 }
             }
             .onChange(of: model.messages.count) {
                 if model.pendingMessageLocation != nil {
-                    _ = capturePendingMessageTarget()
+                    _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                 } else if isFindPresented {
-                    includeActiveFindTarget()
+                    includeActiveFindTarget(matches: matches)
                 } else if !model.messages.isEmpty {
                     isPrimingTranscriptWindow = false
                     transcriptWindowState = TranscriptWindowPolicy.reset(
@@ -711,21 +784,18 @@ struct ChatView: View {
             }
             .onAppear {
                 if model.pendingMessageLocation != nil {
-                    _ = capturePendingMessageTarget()
+                    _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                 } else {
-                    includeActiveFindTarget()
+                    includeActiveFindTarget(matches: matches)
                 }
             }
         }
         }
         .overlay(alignment: .top) {
             if isFindPresented {
-                let activeMatch = matches.indices.contains(activeFindIndex)
-                    ? matches[activeFindIndex]
+                let selectedMatchNumber = matches.indices.contains(activeFindIndex)
+                    ? activeFindIndex + 1
                     : nil
-                let selectedMatchNumber = activeMatch.flatMap {
-                    matches.firstIndex(of: $0).map { $0 + 1 }
-                }
                 FindBar(
                     query: $findQuery,
                     matchCount: matches.count,
@@ -740,23 +810,43 @@ struct ChatView: View {
         }
     }
 
+    private static func projectFindMatches(
+        _ matches: [TranscriptMatch],
+        window: TranscriptWindow,
+        activeFindIndex: Int
+    ) -> (matches: [TranscriptMatch], activeIndex: Int?) {
+        var windowedMatches: [TranscriptMatch] = []
+        windowedMatches.reserveCapacity(min(matches.count, window.range.count))
+        var activeWindowMatchIndex: Int?
+        for (matchIndex, match) in matches.enumerated() {
+            guard window.range.contains(match.messageIndex) else { continue }
+            if matchIndex == activeFindIndex {
+                activeWindowMatchIndex = windowedMatches.count
+            }
+            windowedMatches.append(
+                TranscriptMatch(
+                    messageIndex: match.messageIndex - window.range.lowerBound,
+                    range: match.range
+                )
+            )
+        }
+        return (windowedMatches, activeWindowMatchIndex)
+    }
     private func transcriptScrollView(
         using proxy: ScrollViewProxy,
         messages: [ChatMessage],
         window: TranscriptWindow,
         query: String,
-        matches: [TranscriptMatch]
+        windowedMatches: [TranscriptMatch],
+        activeMessageID: ChatMessage.ID?,
+        visibilityGeneration: Int,
+
+        routeIdentity: String
     ) -> some View {
         let rangesByMessageID = Dictionary(
-            grouping: matches.filter { window.range.contains($0.messageIndex) },
-            by: { messages[$0.messageIndex].id }
+            grouping: windowedMatches,
+            by: { messages[$0.messageIndex + window.range.lowerBound].id }
         ).mapValues { $0.map(\.range) }
-        let activeMatch = matches.indices.contains(activeFindIndex)
-            ? matches[activeFindIndex]
-            : nil
-        let activeMessageID = activeMatch.map {
-            messages[$0.messageIndex].id
-        }
         return ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
                 transcriptRows(
@@ -765,7 +855,9 @@ struct ChatView: View {
                     window: window,
                     query: query,
                     rangesByMessageID: rangesByMessageID,
-                    activeMessageID: activeMessageID
+                    activeMessageID: activeMessageID,
+                    visibilityGeneration: visibilityGeneration,
+                    routeIdentity: routeIdentity
                 )
             }
             .scrollTargetLayout()
@@ -786,6 +878,26 @@ struct ChatView: View {
             transaction.animation = nil
         }
         .overlay(alignment: .top) { Self.topFade }
+        // The viewport overlay is drawn after its scroll content. Unlike a
+        // row's `onAppear` or the zero-height first-frame anchor, this probe
+        // cannot run until layout has produced a paint pass for the rows
+        // currently on screen. One probe per transcript keeps the cost below
+        // one probe per row and also works when deep-link/Find positioning
+        // leaves the window's last row below the viewport.
+        .overlay(alignment: .topLeading) {
+            if HermternalSwitchTrace.isEnabled {
+                TranscriptPaintProbe {
+                    markTranscriptVisible(
+                        sessionID: model.selectedSessionID,
+                        generation: visibilityGeneration,
+                        routeIdentity: routeIdentity,
+                        renderedRows: window.range.count
+                    )
+                }
+                .frame(width: 1, height: 1)
+                .allowsHitTesting(false)
+            }
+        }
     }
 
     @ViewBuilder
@@ -795,7 +907,9 @@ struct ChatView: View {
         window: TranscriptWindow,
         query: String,
         rangesByMessageID: [ChatMessage.ID: [Range<Int>]],
-        activeMessageID: ChatMessage.ID?
+        activeMessageID: ChatMessage.ID?,
+        visibilityGeneration: Int,
+        routeIdentity: String
     ) -> some View {
         if messages.isEmpty {
             // Placed by the centered alignment anchor below, so
@@ -831,6 +945,9 @@ struct ChatView: View {
             )
             .id(message.id)
         }
+        // This anchor remains a positioning control signal, not the visible
+        // marker: its zero-height `onAppear` only proves graph insertion and
+        // may run before the transcript rows have reached a paint pass.
         // Zero-height anchor: scrolling to the last message id
         // lands short while its own height is still growing.
         Color.clear
@@ -913,6 +1030,41 @@ struct ChatView: View {
     private static let bottomAnchor = "transcript.bottom"
     private static let topAnchor = "transcript.top"
     private static let firstFrameAnchor = "transcript.first-frame"
+}
+
+/// DEBUG-switch-7F3A: a one-point AppKit overlay used on the transcript
+/// viewport. `draw(_:)` runs from the viewport's paint pass, after SwiftUI
+/// has laid out its scroll content; unlike `onAppear`, it cannot report a
+/// view that exists only in the graph.
+private struct TranscriptPaintProbe: NSViewRepresentable {
+    let onPaint: () -> Void
+
+    func makeNSView(context: Context) -> PaintView {
+        PaintView(onPaint: onPaint)
+    }
+
+    func updateNSView(_ nsView: PaintView, context: Context) {
+        nsView.onPaint = onPaint
+        nsView.needsDisplay = true
+    }
+    final class PaintView: NSView {
+        var onPaint: () -> Void
+
+        init(onPaint: @escaping () -> Void) {
+            self.onPaint = onPaint
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        override func draw(_ dirtyRect: NSRect) {
+            super.draw(dirtyRect)
+            onPaint()
+        }
+    }
 }
 
 private struct EmptyState: View {

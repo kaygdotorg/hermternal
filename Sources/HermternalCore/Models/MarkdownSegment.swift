@@ -46,8 +46,11 @@ public enum ContentionTrace {
         var waitMax: UInt64 = 0
     }
 
-    private static let enabled =
-        ProcessInfo.processInfo.environment["HERMTERNAL_SWITCH_TRACE"] == "1"
+    @inline(__always)
+    private static func isEnabled() -> Bool {
+        MeasurementGate.isEnabled(.resourceContention)
+    }
+
 
     private final class State: @unchecked Sendable {
         let lock = NSLock()
@@ -60,7 +63,8 @@ public enum ContentionTrace {
 
     /// Resets all measurements at the beginning of one selection.
     public static func reset() {
-        guard enabled else { return }
+        TextWorkTrace.reset()
+        guard isEnabled() else { return }
         state.lock.lock()
         state.aggregates.removeAll(keepingCapacity: true)
         state.generation &+= 1
@@ -72,7 +76,8 @@ public enum ContentionTrace {
     /// The tagged lines use nanoseconds and contain only aggregate fields.
     @discardableResult
     public static func snapshotAndReset(phase: String = "selection") -> Snapshot {
-        guard enabled else {
+        guard isEnabled() else {
+            TextWorkTrace.emitAndReset(phase: phase)
             return Snapshot(resources: [:], backgroundWorkInFlight: 0)
         }
         state.lock.lock()
@@ -84,12 +89,13 @@ public enum ContentionTrace {
         state.generation &+= 1
         state.lock.unlock()
         emit(snapshot, phase: phase)
+        TextWorkTrace.emitAndReset(phase: phase)
         return snapshot
     }
 
     /// Marks one background lane as active.
     public static func beginBackgroundWork() {
-        guard enabled else { return }
+        guard isEnabled() else { return }
         state.lock.lock()
         state.backgroundWorkInFlight += 1
         state.lock.unlock()
@@ -97,14 +103,18 @@ public enum ContentionTrace {
 
     /// Marks one background lane as inactive.
     public static func endBackgroundWork() {
-        guard enabled else { return }
+        guard isEnabled() else { return }
         state.lock.lock()
         state.backgroundWorkInFlight = max(0, state.backgroundWorkInFlight - 1)
         state.lock.unlock()
     }
 
-    static func beginInteractive(resource: String) -> Request? {
-        guard enabled else { return nil }
+    private static func begin(
+        resource: String,
+        requireMainThread: Bool
+    ) -> Request? {
+        guard isEnabled() else { return nil }
+        guard !requireMainThread || Thread.isMainThread else { return nil }
         state.lock.lock()
         let backgroundAtBegin = state.backgroundWorkInFlight
         let generation = state.generation
@@ -117,15 +127,22 @@ public enum ContentionTrace {
         )
     }
 
+    static func beginInteractive(resource: String) -> Request? {
+        begin(resource: resource, requireMainThread: false)
+    }
+
     static func beginMainInteractive(resource: String) -> Request? {
-        guard enabled, Thread.isMainThread else { return nil }
-        return beginInteractive(resource: resource)
+        begin(resource: resource, requireMainThread: true)
     }
 
     static func recordLockWait(
         _ request: inout Request?,
         startedAt: UInt64
     ) {
+        guard isEnabled() else {
+            request = nil
+            return
+        }
         guard var value = request else { return }
         let elapsed = DispatchTime.now().uptimeNanoseconds &- startedAt
         value.waitTotal &+= elapsed
@@ -134,6 +151,10 @@ public enum ContentionTrace {
     }
 
     static func finishInteractive(_ request: inout Request?) {
+        guard isEnabled() else {
+            request = nil
+            return
+        }
         guard let value = request else { return }
         state.lock.lock()
         guard state.generation == value.generation else {
@@ -186,6 +207,161 @@ public enum ContentionTrace {
             FileHandle.standardError.write(Data(line.utf8))
         }
     }
+}
+/// Opt-in aggregate accounting for text work performed while SwiftUI evaluates
+/// transcript rows. This deliberately records only counters and monotonic
+/// durations; it never retains or emits message contents.
+public enum TextWorkTrace {
+    public enum Category: String, CaseIterable, Hashable, Sendable {
+        case markdownParseHit = "markdown.parse.hit"
+        case markdownParseMiss = "markdown.parse.miss"
+        case markdownParseSpans = "markdown.parse.spans"
+        case attributedConstruction = "attributed.construction"
+        case stringConversion = "string.conversion"
+        case appLayout = "app.layout"
+    }
+
+    public struct Token: Sendable {
+        fileprivate let startedAt: UInt64
+        fileprivate let generation: UInt64
+    }
+
+    private struct Aggregate {
+        var count = 0
+        var characters = 0
+        var totalNanoseconds: UInt64 = 0
+    }
+
+    private final class State: @unchecked Sendable {
+        let lock = NSLock()
+        var generation: UInt64 = 0
+        var aggregates: [Category: Aggregate] = [:]
+        var largestRowCharacters = 0
+    }
+
+    @inline(__always)
+    private static func isEnabled() -> Bool {
+        MeasurementGate.isEnabled(.textLayoutAttribution)
+    }
+    private static let state = State()
+
+    static func reset() {
+        guard isEnabled() else { return }
+        state.lock.lock()
+        state.generation &+= 1
+        state.aggregates.removeAll(keepingCapacity: true)
+        state.largestRowCharacters = 0
+        state.lock.unlock()
+    }
+
+    public static func begin() -> Token? {
+        guard isEnabled() else { return nil }
+        state.lock.lock()
+        let generation = state.generation
+        state.lock.unlock()
+        return Token(
+            startedAt: DispatchTime.now().uptimeNanoseconds,
+            generation: generation
+        )
+    }
+
+    public static func finish(
+        _ token: Token?,
+        category: Category,
+        characters: Int
+    ) {
+        guard isEnabled(), let token else { return }
+        finishMeasured(token, category: category, characters: characters)
+    }
+
+    private static func finishMeasured(
+        _ token: Token,
+        category: Category,
+        characters: Int
+    ) {
+        let elapsed = DispatchTime.now().uptimeNanoseconds &- token.startedAt
+        state.lock.lock()
+        guard state.generation == token.generation else {
+            state.lock.unlock()
+            return
+        }
+        var aggregate = state.aggregates[category] ?? Aggregate()
+        aggregate.count &+= 1
+        aggregate.characters &+= max(0, characters)
+        aggregate.totalNanoseconds &+= elapsed
+        state.aggregates[category] = aggregate
+        state.lock.unlock()
+    }
+
+    public static func finish(
+        _ token: Token?,
+        category: Category,
+        text: String
+    ) {
+        guard isEnabled(), let token else { return }
+        finishMeasured(
+            token,
+            category: category,
+            characters: text.utf16.count
+        )
+    }
+
+
+    public static func recordRow(text: String) {
+        guard isEnabled() else { return }
+        let characters = text.utf16.count
+        state.lock.lock()
+        state.largestRowCharacters = max(state.largestRowCharacters, characters)
+        state.lock.unlock()
+    }
+
+    static func emitAndReset(phase: String) {
+        guard isEnabled() else { return }
+        state.lock.lock()
+        let aggregates = state.aggregates
+        let largestRowCharacters = state.largestRowCharacters
+        state.aggregates.removeAll(keepingCapacity: true)
+        state.largestRowCharacters = 0
+        state.generation &+= 1
+        state.lock.unlock()
+
+        for category in Category.allCases {
+            let aggregate = aggregates[category] ?? Aggregate()
+            let line = "[DEBUG-contention-7F3A] ns="
+                + "\(DispatchTime.now().uptimeNanoseconds)"
+                + " event=text.aggregate"
+                + " phase=\(phase)"
+                + " category=\(category.rawValue)"
+                + " count=\(aggregate.count)"
+                + " chars_total=\(aggregate.characters)"
+                + " total_ns=\(aggregate.totalNanoseconds)"
+                + " largest_row_chars=\(largestRowCharacters)\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
+    }
+}
+
+
+fileprivate func tracedStringConversion(_ value: Substring) -> String {
+    let token = TextWorkTrace.begin()
+    let result = String(value)
+    TextWorkTrace.finish(
+        token,
+        category: .stringConversion,
+        text: result
+    )
+    return result
+}
+
+fileprivate func tracedStringConversion(_ value: Character) -> String {
+    let token = TextWorkTrace.begin()
+    let result = String(value)
+    TextWorkTrace.finish(
+        token,
+        category: .stringConversion,
+        text: result
+    )
+    return result
 }
 
 /// A message body split into inline-rendered blocks and fenced-code runs.
@@ -271,7 +447,13 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
                 proseEnd = nil
                 return
             }
+            let joinToken = includeSegments ? TextWorkTrace.begin() : nil
             let joined = includeSegments ? proseBuffer.joined(separator: "\n") : ""
+            TextWorkTrace.finish(
+                joinToken,
+                category: .stringConversion,
+                text: joined
+            )
             proseBuffer.removeAll(keepingCapacity: true)
             proseStart = nil
             proseEnd = nil
@@ -286,7 +468,13 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
         }
 
         func flushCode(at end: Int) {
+            let joinToken = includeSegments ? TextWorkTrace.begin() : nil
             let body = includeSegments ? codeBuffer.joined(separator: "\n") : ""
+            TextWorkTrace.finish(
+                joinToken,
+                category: .stringConversion,
+                text: body
+            )
             codeBuffer.removeAll(keepingCapacity: true)
             if includeSegments {
                 let id = stableID(
@@ -314,7 +502,8 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
                     inFence = false
                 } else {
                     flushProse(at: lineStart)
-                    language = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+                    language = tracedStringConversion(line.dropFirst(3))
+                        .trimmingCharacters(in: .whitespaces)
                     languageRange = (lineStart + 3)..<lineEnd
                     codeStart = min(lineEnd + 1, textLength)
                     inFence = true
@@ -429,7 +618,7 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
             return nil
         }
         let content = afterHashes.drop { $0 == " " || $0 == "\t" }
-        return (hashes.count, String(content))
+        return (hashes.count, tracedStringConversion(content))
     }
 
     private static func bullet(in line: Substring) -> (marker: String, depth: Int, content: String)? {
@@ -439,7 +628,11 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
         let afterMarker = remainder.dropFirst()
         guard afterMarker.first == " " || afterMarker.first == "\t" else { return nil }
         let content = afterMarker.drop { $0 == " " || $0 == "\t" }
-        return (String(marker), indentationDepth(indentation), String(content))
+        return (
+            tracedStringConversion(marker),
+            indentationDepth(indentation),
+            tracedStringConversion(content)
+        )
     }
 
     private static func numbered(in line: Substring) -> (
@@ -461,10 +654,10 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
         guard let number = Int(digits) else { return nil }
         let content = afterDelimiter.drop { $0 == " " || $0 == "\t" }
         return (
-            String(digits) + String(delimiter),
+            tracedStringConversion(digits) + tracedStringConversion(delimiter),
             number,
             indentationDepth(indentation),
-            String(content)
+            tracedStringConversion(content)
         )
     }
 
@@ -489,12 +682,19 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
     }
 
     private static func attributed(from markdown: String) -> AttributedString {
+        let token = TextWorkTrace.begin()
         let options = AttributedString.MarkdownParsingOptions(
             interpretedSyntax: .inlineOnlyPreservingWhitespace,
             failurePolicy: .returnPartiallyParsedIfPossible
         )
-        return (try? AttributedString(markdown: markdown, options: options))
+        let result = (try? AttributedString(markdown: markdown, options: options))
             ?? AttributedString(markdown)
+        TextWorkTrace.finish(
+            token,
+            category: .attributedConstruction,
+            text: markdown
+        )
+        return result
     }
 }
  
@@ -640,7 +840,14 @@ private final class MarkdownParseCache: @unchecked Sendable {
     func sourceSpans(for key: String) -> [
         (source: Range<Int>, language: Range<Int>?)
     ] {
-        lookupOrParse(key, includeSourceSpans: true, measureWait: false).sourceSpans
+        let token = TextWorkTrace.begin()
+        let result = lookupOrParse(key, includeSourceSpans: true, measureWait: false)
+        TextWorkTrace.finish(
+            token,
+            category: .markdownParseSpans,
+            text: key
+        )
+        return result.sourceSpans
     }
 
     private func lookupOrParse(
@@ -648,6 +855,7 @@ private final class MarkdownParseCache: @unchecked Sendable {
         includeSourceSpans: Bool,
         measureWait: Bool
     ) -> MarkdownParseResult {
+        let textToken = includeSourceSpans ? nil : TextWorkTrace.begin()
         var contentionRequest = measureWait
             ? ContentionTrace.beginMainInteractive(resource: "markdown-parse")
             : nil
@@ -660,6 +868,11 @@ private final class MarkdownParseCache: @unchecked Sendable {
         }
         if let cached {
             ContentionTrace.finishInteractive(&contentionRequest)
+            TextWorkTrace.finish(
+                textToken,
+                category: .markdownParseHit,
+                characters: 0
+            )
             if includeSourceSpans {
                 return MarkdownParseResult(
                     segments: cached,
@@ -698,6 +911,11 @@ private final class MarkdownParseCache: @unchecked Sendable {
             return nil
         }
         ContentionTrace.finishInteractive(&contentionRequest)
+        TextWorkTrace.finish(
+            textToken,
+            category: .markdownParseMiss,
+            text: key
+        )
         if let raced {
             return MarkdownParseResult(
                 segments: raced,
@@ -706,6 +924,7 @@ private final class MarkdownParseCache: @unchecked Sendable {
         }
         return parsed
     }
+
 
     private func estimateByteCost(
         for key: String,
@@ -720,8 +939,14 @@ private final class MarkdownParseCache: @unchecked Sendable {
                  .heading(_, _, let attributed),
                  .bullet(_, _, _, let attributed),
                  .numbered(_, _, _, _, let attributed):
-                let bytes = String(attributed.characters).utf8.count
-                estimate += bytes.multipliedReportingOverflow(by: 4).partialValue
+                let token = TextWorkTrace.begin()
+                let rendered = String(attributed.characters)
+                TextWorkTrace.finish(
+                    token,
+                    category: .stringConversion,
+                    text: rendered
+                )
+                let bytes = rendered.utf8.count
             case .code(_, let language, let body):
                 estimate += language.utf8.count.multipliedReportingOverflow(by: 2).partialValue
                 estimate += body.utf8.count.multipliedReportingOverflow(by: 2).partialValue

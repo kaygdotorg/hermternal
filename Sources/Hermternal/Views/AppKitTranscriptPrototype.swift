@@ -59,7 +59,6 @@ struct AppKitTranscript: NSViewRepresentable {
         private var positionedMessageID: MessageIdentity?
         private var positionedFindMessageID: MessageIdentity?
         private weak var container: AppKitTranscriptContainerView?
-        private var positioningWorkItem: DispatchWorkItem?
         private var positioningGeneration = 0
         private weak var tableView: AppKitTranscriptTableView?
         private var scrollObserver: NSObjectProtocol?
@@ -160,8 +159,6 @@ struct AppKitTranscript: NSViewRepresentable {
 
         func dismantle(container: AppKitTranscriptContainerView) {
             positioningGeneration &+= 1
-            positioningWorkItem?.cancel()
-            positioningWorkItem = nil
             container.tableView.delegate = nil
             container.tableView.dataSource = nil
             if let scrollObserver {
@@ -310,14 +307,17 @@ struct AppKitTranscript: NSViewRepresentable {
         private func schedulePositioning(routeChanged: Bool) {
             positioningGeneration &+= 1
             let generation = positioningGeneration
-            positioningWorkItem?.cancel()
-            positioningWorkItem = nil
             guard !messages.isEmpty else { return }
 
-            let workItem = DispatchWorkItem { @MainActor [weak self] in
+            // Do not replace this with DispatchWorkItem: the malformed
+            // @MainActor work-item construction crashed in _Block_copy,
+            // before any positioning work ran. A generation-gated main-queue
+            // closure coalesces rapid updates without cancellation or
+            // double-perform state. Every stale closure returns before
+            // touching the table.
+            DispatchQueue.main.async { @MainActor [weak self] in
                 guard let self, generation == self.positioningGeneration else { return }
                 guard let tableView = self.tableView else { return }
-                self.positioningWorkItem = nil
                 tableView.layoutSubtreeIfNeeded()
                 if let pending = self.pendingMessageID {
                     guard let index = self.messages.firstIndex(where: { $0.id == pending }) else { return }
@@ -339,8 +339,6 @@ struct AppKitTranscript: NSViewRepresentable {
                 guard !self.isReadOnly, routeChanged || self.isStreaming else { return }
                 self.scrollToBottom()
             }
-            positioningWorkItem = workItem
-            DispatchQueue.main.async(execute: workItem)
         }
 
         private func requestOlderIfNeeded() {

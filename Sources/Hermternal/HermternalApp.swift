@@ -18,15 +18,39 @@ struct HermternalApp: App {
     @State private var appearance = AppearanceSettings()
     @State private var registry: CapabilityRegistry
     private let fixtureMode: Bool
+    /// The one instrumentation capability for the process, decided here and
+    /// injected. Held behind its protocol so a real controller, an in-memory
+    /// fake, or an omission are the same seam to every consumer.
+    private let debugModules: any DebugModuleCapability
 
     init() {
+        // The app's only reads of the instrumentation environment. Composition
+        // owns both decisions and hands them down as Bools, so no view and no
+        // hot path consults the environment.
+        //
+        // HERMTERNAL_DEBUG reveals the Modules pane and turns every module on
+        // by default. HERMTERNAL_SWITCH_TRACE forces the mask on for a single
+        // launch without revealing the pane, which is how headless automation
+        // keeps measuring. With neither present the gate is a hard zero and
+        // the persisted mask is neither read nor written, so a module enabled
+        // during an earlier debug session cannot come back in a normal one.
+        let environment = ProcessInfo.processInfo.environment
+        let debugModules = DebugModuleController(
+            debugMode: environment["HERMTERNAL_DEBUG"] == "1",
+            forceAllModulesOn: environment["HERMTERNAL_SWITCH_TRACE"] == "1"
+        )
+        self.debugModules = debugModules
+
         #if DEBUG
         let fixtureMode = SidebarFixtures.isEnabled
         let model: AppModel = {
-            guard fixtureMode else { return AppModel() }
+            guard fixtureMode else { return AppModel(debugModules: debugModules) }
             // Keep fixture authority in memory only. Never write it to the
             // production server setting or credential stores.
-            let model = AppModel(transcriptSource: SidebarFixtures.transcriptSource)
+            let model = AppModel(
+                transcriptSource: SidebarFixtures.transcriptSource,
+                debugModules: debugModules
+            )
             model.serverText = SidebarFixtures.gatewayURL.absoluteString
             model.sessions = SidebarFixtures.sessions.filter { !$0.archived }
             model.archivedSessions = SidebarFixtures.sessions.filter(\.archived)
@@ -37,7 +61,7 @@ struct HermternalApp: App {
         }()
         #else
         let fixtureMode = false
-        let model = AppModel()
+        let model = AppModel(debugModules: debugModules)
         #endif
         self.fixtureMode = fixtureMode
         _model = State(initialValue: model)
@@ -162,7 +186,8 @@ struct HermternalApp: App {
                     SettingsWindowController.shared.show(
                         appearance: appearance,
                         model: model,
-                        registry: registry
+                        registry: registry,
+                        debugModules: debugModules
                     )
                 }
                 .keyboardShortcut(",", modifiers: .command)

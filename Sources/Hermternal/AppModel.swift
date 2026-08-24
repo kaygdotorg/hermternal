@@ -3,10 +3,27 @@ import Foundation
 import HermternalCore
 import Observation
 /// Launch: `HERMTERNAL_SWITCH_TRACE=1 /home/kayg/Developer/hermternal-apple/build/Hermternal.app/Contents/MacOS/Hermternal > /tmp/herm-switch-trace.log 2>&1`
-/// Cleanup search: `rtk rg -n "DEBUG-(switch|folder)-7F3A" Sources/Hermternal Sources/HermternalCore`
+/// Summarize coverage and latency: `awk '{ ns=event=token=gen=""; for (i=1;i<=NF;i++) { split($i,p,"="); if (p[1]=="ns") ns=p[2]; else if (p[1]=="event") event=p[2]; else if (p[1]=="token") token=p[2]; else if (p[1]=="gen") gen=p[2] } key=token "/" gen; if (event=="selection.publish") { publications++; pub[key]=ns } else if (event=="transcript.visible" && (key in pub)) { paints++; print "LATENCY ms=" (ns-pub[key])/1000000; delete pub[key] } else if (event=="transcript.superseded" && (key in pub)) { superseded++; delete pub[key] } } END { terminal=paints+superseded; coverage=publications ? 100*terminal/publications : 100; printf "COVERAGE publications=%d paints=%d superseded=%d terminal=%d coverage=%.1f%%\\n", publications, paints, superseded, terminal, coverage }' /tmp/herm-switch-trace.log | tee /tmp/herm-switch-coverage.log; awk '$1=="LATENCY" { split($2,p,"="); print p[2] }' /tmp/herm-switch-coverage.log | sort -n | awk '{ v[NR]=$1 } END { if (NR) printf "LATENCY count=%d median=%.1fms p90=%.1fms max=%.1fms\\n", NR, v[int((NR+1)/2)], v[int((90*NR+99)/100)], v[NR] }'`
+/// Each `selection.publish` has exactly one terminal event: either
+/// `transcript.visible` after a real paint or `transcript.superseded` when a
+/// newer publication wins before that paint.
 /// Temporary, opt-in trace sink for session switching and sidebar selection.
+@MainActor
 enum HermternalSwitchTrace {
-    private static let enabled = ProcessInfo.processInfo.environment["HERMTERNAL_SWITCH_TRACE"] == "1"
+    private static var gate = DebugModuleGate(mask: .none)
+    /// The one publication that has not reached a terminal paint outcome.
+    /// A newer publication closes this record as superseded before replacing
+    /// it, so the trace cannot silently lose a publication.
+    private static var pendingTranscriptPublication: (id: String, generation: Int)?
+
+    static func configure(gate: DebugModuleGate) {
+        self.gate = gate
+        HermternalSelectionOccupancyTrace.configure(gate: gate)
+    }
+
+    static var isEnabled: Bool {
+        gate.isEnabled(.visiblePaint)
+    }
 
     static func session(
         _ event: String,
@@ -14,18 +31,68 @@ enum HermternalSwitchTrace {
         generation: Int? = nil,
         messages: Int? = nil,
         renderedRows: Int? = nil,
-        detail: String? = nil
+        detail: String? = nil,
+        module: DebugModule = .switchPhases
     ) {
-        guard enabled else { return }
+        guard gate.isEnabled(module) else { return }
+        if event == "selection.publish", let id, let generation {
+            if let pending = pendingTranscriptPublication {
+                session(
+                    "transcript.superseded",
+                    id: pending.id,
+                    generation: pending.generation,
+                    detail: "beforePaint",
+                    module: .visiblePaint
+                )
+            }
+            pendingTranscriptPublication = (id: id, generation: generation)
+        }
         emit(
             prefix: "[DEBUG-switch-7F3A]",
             event: event,
-            token: id.map { token($0, seed: 0x01) } ?? "none",
+            id: id,
             generation: generation,
             messages: messages,
             renderedRows: renderedRows,
-            detail: detail
+            detail: detail,
+            seed: 0x01
         )
+    }
+
+    /// The viewport paint is deliberately a separate event from
+    /// `transcript.firstFrame`: that anchor is a graph/positioning callback,
+    /// not evidence that transcript pixels were drawn.
+    static func transcriptVisible(
+        id: String,
+        generation: Int,
+        messages: Int,
+        renderedRows: Int
+    ) -> Bool {
+        guard gate.isEnabled(.visiblePaint) else { return true }
+        guard let pending = pendingTranscriptPublication,
+              pending.id == id,
+              pending.generation == generation
+        else {
+            return false
+        }
+        pendingTranscriptPublication = nil
+        session(
+            "transcript.visible",
+            id: id,
+            generation: generation,
+            messages: messages,
+            renderedRows: renderedRows,
+            module: .visiblePaint
+        )
+        return true
+    }
+
+    /// The graph can receive the selected ID before its deferred publication.
+    /// Keep the paint probe behind the corresponding publication event.
+    static func hasPublishedSelection(id: String, generation: Int) -> Bool {
+        guard gate.isEnabled(.visiblePaint) else { return true }
+        guard let pending = pendingTranscriptPublication else { return false }
+        return pending.id == id && pending.generation == generation
     }
 
     static func folder(
@@ -35,14 +102,15 @@ enum HermternalSwitchTrace {
         messages: Int? = nil,
         detail: String? = nil
     ) {
-        guard enabled else { return }
+        guard gate.isEnabled(.sidebarAndFolderSelection) else { return }
         emit(
             prefix: "[DEBUG-folder-7F3A]",
             event: event,
-            token: id.map { token($0, seed: 0x02) } ?? "none",
+            id: id,
             generation: generation,
             messages: messages,
-            detail: detail
+            detail: detail,
+            seed: 0x02
         )
     }
 
@@ -50,9 +118,10 @@ enum HermternalSwitchTrace {
         _ event: String,
         selection: Set<SidebarSelectionID>,
         messages: Int,
-        detail: String? = nil
+        detail: String? = nil,
+        module: DebugModule = .sidebarAndFolderSelection
     ) {
-        guard enabled else { return }
+        guard gate.isEnabled(module) else { return }
         let id: String?
         let seed: UInt64
         if selection.count == 1, let item = selection.first {
@@ -79,28 +148,32 @@ enum HermternalSwitchTrace {
         emit(
             prefix: hasFolder ? "[DEBUG-folder-7F3A]" : "[DEBUG-switch-7F3A]",
             event: event,
-            token: id.map { token($0, seed: seed) } ?? "count-\(selection.count)",
+            id: id,
             generation: nil,
             messages: messages,
-            detail: detail
+            detail: detail,
+            seed: seed,
+            fallbackToken: "count-\(selection.count)"
         )
     }
+
     private static func emit(
         prefix: String,
         event: String,
-        token: String,
+        id: String?,
         generation: Int?,
         messages: Int?,
         renderedRows: Int? = nil,
-        detail: String? = nil
+        detail: String? = nil,
+        seed: UInt64,
+        fallbackToken: String = "none"
     ) {
-        guard enabled else { return }
         let line = "\(prefix) ns=\(DispatchTime.now().uptimeNanoseconds)"
             + " event=\(event)"
             + " gen=\(generation.map { String($0) } ?? "-")"
             + " messages=\(messages.map { String($0) } ?? "-")"
             + (renderedRows.map { " rows=\($0)" } ?? "")
-            + " token=\(token)"
+            + " token=\(id.map { token($0, seed: seed) } ?? fallbackToken)"
             + (detail.map { " detail=\($0)" } ?? "")
             + "\n"
         FileHandle.standardError.write(Data(line.utf8))
@@ -117,9 +190,18 @@ enum HermternalSwitchTrace {
 }
 
 
+private struct TranscriptMatchCache {
+    let query: String
+    let revision: Int
+    let matches: [TranscriptMatch]
+}
 @MainActor
 @Observable
 final class AppModel {
+    /// The process capability injected by the composition root. Trace probes
+    /// retain only its live gate, so a toggle is one integer test at the site.
+    let debugModules: any DebugModuleCapability
+
     enum Phase: Equatable {
         case signedOut
         case connecting
@@ -138,8 +220,38 @@ final class AppModel {
     var archivedSessionsError: String?
     var folders: [Folder] = []
     var membership: [String: String] = [:]
-    var messages: [ChatMessage] = []
-    /// Durable id of the sidebar selection.
+    var messages: [ChatMessage] = [] {
+        didSet {
+            messagesRevision &+= 1
+            transcriptMatchCache = nil
+        }
+    }
+    /// Monotonic revision for transcript content. Find memoization keys on
+    /// this value rather than repeatedly comparing all message text.
+    private(set) var messagesRevision = 0
+    private var transcriptMatchCache: TranscriptMatchCache?
+
+    /// Returns the memoized Find result for the current transcript revision.
+    ///
+    /// The revision increments from `messages`' didSet, including element
+    /// replacement and streaming text updates. The single-entry cache avoids
+    /// retaining match arrays for old transcripts or queries.
+    func transcriptMatches(for query: String) -> [TranscriptMatch] {
+        let revision = messagesRevision
+        if let cache = transcriptMatchCache,
+           cache.revision == revision,
+           cache.query == query {
+            return cache.matches
+        }
+        // ChatView previously caused five full scans per body pass.
+        let matches = TranscriptFindPass.matches(in: messages, query: query)
+        transcriptMatchCache = TranscriptMatchCache(
+            query: query,
+            revision: revision,
+            matches: matches
+        )
+        return matches
+    }
     var selectedSessionID: String?
     /// A routed message target that ChatView reads during the transcript's
     /// initial layout. It is single-use and owned by its open generation.
@@ -271,18 +383,20 @@ final class AppModel {
         }
         return url
     }
-
     init(
         cache: HistoryCache = HistoryCache(),
         transcriptSource: (any TranscriptSource)? = nil,
         toastPresenter: ToastPresenter = ToastPresenter(),
         organizationStore: SessionOrganizationStore = SessionOrganizationStore(),
-        warmStore: TranscriptWarmStore = TranscriptWarmStore()
+        warmStore: TranscriptWarmStore = TranscriptWarmStore(),
+        debugModules: any DebugModuleCapability = OmittedDebugModuleCapability()
     ) {
+        self.debugModules = debugModules
         self.injectedTranscriptSource = transcriptSource
         self.toastPresenter = toastPresenter
         self.organizationStore = organizationStore
         self.warmStore = warmStore
+        HermternalSwitchTrace.configure(gate: debugModules.gate)
         guard let historyDirectory = HistoryCache.defaultDirectory() else {
             self.cache = cache
             self.searchQuerying = nil

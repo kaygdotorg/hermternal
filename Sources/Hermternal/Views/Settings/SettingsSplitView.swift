@@ -8,6 +8,7 @@ struct SettingsSplitView: NSViewControllerRepresentable {
     let appearance: AppearanceSettings
     let model: AppModel
     let registry: CapabilityRegistry
+    let debugModules: any DebugModuleCapability
     @Binding var selection: SettingsSection?
 
     func makeNSViewController(context: Context) -> SettingsSplitViewController {
@@ -15,6 +16,7 @@ struct SettingsSplitView: NSViewControllerRepresentable {
             appearance: appearance,
             model: model,
             registry: registry,
+            debugModules: debugModules,
             selection: $selection
         )
     }
@@ -27,6 +29,7 @@ struct SettingsSplitView: NSViewControllerRepresentable {
             appearance: appearance,
             model: model,
             registry: registry,
+            debugModules: debugModules,
             selection: $selection
         )
     }
@@ -45,6 +48,7 @@ final class SettingsSplitViewController: NSSplitViewController {
         appearance: AppearanceSettings,
         model: AppModel,
         registry: CapabilityRegistry,
+        debugModules: any DebugModuleCapability,
         selection: Binding<SettingsSection?>
     ) {
         sidebarHosting = NSHostingController(
@@ -55,7 +59,8 @@ final class SettingsSplitViewController: NSSplitViewController {
                 section: selection.wrappedValue ?? .appearance,
                 appearance: appearance,
                 model: model,
-                registry: registry
+                registry: registry,
+                debugModules: debugModules
             )
         )
         sidebarItem = NSSplitViewItem(
@@ -95,6 +100,7 @@ final class SettingsSplitViewController: NSSplitViewController {
         appearance: AppearanceSettings,
         model: AppModel,
         registry: CapabilityRegistry,
+        debugModules: any DebugModuleCapability,
         selection: Binding<SettingsSection?>
     ) {
         sidebarHosting.rootView = SettingsSourceList(selection: selection)
@@ -102,7 +108,8 @@ final class SettingsSplitViewController: NSSplitViewController {
             section: selection.wrappedValue ?? .appearance,
             appearance: appearance,
             model: model,
-            registry: registry
+            registry: registry,
+            debugModules: debugModules
         )
         configureWindow()
     }
@@ -166,14 +173,20 @@ final class SettingsWindowController: NSWindowController {
         fatalError("init(coder:) has not been implemented")
     }
 
-    private var lastContext: (AppearanceSettings, AppModel, CapabilityRegistry)?
+    private var lastContext: (
+        appearance: AppearanceSettings,
+        model: AppModel,
+        registry: CapabilityRegistry,
+        debugModules: any DebugModuleCapability
+    )?
 
     private func refreshColumns() {
         guard let splitController, let lastContext else { return }
         splitController.update(
-            appearance: lastContext.0,
-            model: lastContext.1,
-            registry: lastContext.2,
+            appearance: lastContext.appearance,
+            model: lastContext.model,
+            registry: lastContext.registry,
+            debugModules: lastContext.debugModules,
             selection: selectionBinding
         )
     }
@@ -181,14 +194,21 @@ final class SettingsWindowController: NSWindowController {
     func show(
         appearance: AppearanceSettings,
         model: AppModel,
-        registry: CapabilityRegistry
+        registry: CapabilityRegistry,
+        debugModules: any DebugModuleCapability
     ) {
-        lastContext = (appearance, model, registry)
+        lastContext = (
+            appearance: appearance,
+            model: model,
+            registry: registry,
+            debugModules: debugModules
+        )
         if let splitController {
             splitController.update(
                 appearance: appearance,
                 model: model,
                 registry: registry,
+                debugModules: debugModules,
                 selection: selectionBinding
             )
         } else {
@@ -196,6 +216,7 @@ final class SettingsWindowController: NSWindowController {
                 appearance: appearance,
                 model: model,
                 registry: registry,
+                debugModules: debugModules,
                 selection: selectionBinding
             )
             self.splitController = splitController

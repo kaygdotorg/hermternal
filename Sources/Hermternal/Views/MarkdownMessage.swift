@@ -144,6 +144,7 @@ struct MarkdownMessage: View {
 
     var body: some View {
         if isStreaming {
+            let _ = TextWorkTrace.recordRow(text: text)
             Text(text)
                 .font(.body)
                 .foregroundStyle(.primary)
@@ -165,6 +166,7 @@ struct MarkdownBlocks: View {
     var matches: MessageFindMatches?
 
     var body: some View {
+        let _ = TextWorkTrace.recordRow(text: text)
         // `parse` and `sourceSpans` are both cached in Core and keyed by the
         // message text, so this is a lookup rather than a parse, and the
         // segment ids are stable across invalidations for `ForEach` reuse.
@@ -281,9 +283,28 @@ struct MarkdownBlocks: View {
     }
 
     private func marked(_ content: AttributedString, span: MarkdownSourceSpan?) -> AttributedString {
-        let ranges = projected(span?.source, onto: String(content.characters))
+        guard let matches, let span else { return content }
+        guard matches.ranges.contains(where: { span.source.contains($0.lowerBound) }) else {
+            return content
+        }
+
+        let conversionToken = TextWorkTrace.begin()
+        let rendered = String(content.characters)
+        TextWorkTrace.finish(
+            conversionToken,
+            category: .stringConversion,
+            text: rendered
+        )
+        let ranges = projected(span.source, onto: rendered)
         guard !ranges.isEmpty else { return content }
-        return FindTextHighlighting.mark(content, ranges: ranges)
+        let constructionToken = TextWorkTrace.begin()
+        let highlighted = FindTextHighlighting.mark(content, ranges: ranges)
+        TextWorkTrace.finish(
+            constructionToken,
+            category: .attributedConstruction,
+            text: rendered
+        )
+        return highlighted
     }
 
     /// Narrows the message's matches to the ones that start inside this
@@ -293,6 +314,48 @@ struct MarkdownBlocks: View {
         let inSpan = matches.ranges.filter { span.contains($0.lowerBound) }
         guard !inSpan.isEmpty else { return [] }
         return FindTextHighlighting.project(inSpan, from: matches.text, to: rendered)
+    }
+}
+/// Reuses highlighted code values while preserving the shared byte-bounded
+/// cache policy used by the Markdown parser.
+private enum TranscriptCodeHighlightCache {
+    private struct Key: Hashable {
+        let source: String
+        let ranges: [Range<Int>]
+        let highlightingVersion = 1
+    }
+
+    private static let storage = ByteBoundedCache<Key, AttributedString>(
+        byteBudget: MarkdownSegment.parseCacheByteBudget
+    )
+
+    static func marked(source: String, ranges: [Range<Int>]) -> AttributedString {
+        let key = Key(source: source, ranges: ranges)
+        if let cached = storage.value(for: key) {
+            return cached
+        }
+
+        let token = TextWorkTrace.begin()
+        let marked = FindTextHighlighting.mark(
+            AttributedString(source),
+            ranges: ranges
+        )
+        TextWorkTrace.finish(
+            token,
+            category: .attributedConstruction,
+            text: source
+        )
+        let sourceCost = source.utf8.count.multipliedReportingOverflow(by: 4).partialValue
+        let rangeCost = ranges.count
+            .multipliedReportingOverflow(by: MemoryLayout<Range<Int>>.stride)
+            .partialValue
+        let cost = sourceCost
+            .addingReportingOverflow(rangeCost)
+            .partialValue
+            .addingReportingOverflow(64)
+            .partialValue
+        storage.insert(marked, for: key, byteCost: max(cost, 1))
+        return marked
     }
 }
 
@@ -313,10 +376,16 @@ struct TranscriptCodeBlock: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text(FindTextHighlighting.mark(
-                    AttributedString(Self.label(for: language)),
-                    ranges: languageRanges
-                ))
+                Group {
+                    if languageRanges.isEmpty {
+                        Text(Self.label(for: language))
+                    } else {
+                        Text(TranscriptCodeHighlightCache.marked(
+                            source: Self.label(for: language),
+                            ranges: languageRanges
+                        ))
+                    }
+                }
                 .font(.caption2.weight(.medium))
                 .foregroundStyle(.secondary)
                 Spacer()
@@ -336,10 +405,19 @@ struct TranscriptCodeBlock: View {
             Divider().opacity(0.5)
 
             ScrollView(.horizontal, showsIndicators: false) {
-                Text(FindTextHighlighting.mark(AttributedString(code), ranges: codeRanges))
-                    .font(.system(.callout, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(10)
+                Group {
+                    if codeRanges.isEmpty {
+                        Text(code)
+                    } else {
+                        Text(TranscriptCodeHighlightCache.marked(
+                            source: code,
+                            ranges: codeRanges
+                        ))
+                    }
+                }
+                .font(.system(.callout, design: .monospaced))
+                .textSelection(.enabled)
+                .padding(10)
             }
         }
         .background(

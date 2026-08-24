@@ -68,8 +68,11 @@ enum SidebarSelectionEventAdapter {
 /// identifiers or row content.
 @MainActor
 enum HermternalSelectionOccupancyTrace {
-    private static let enabled =
-        ProcessInfo.processInfo.environment["HERMTERNAL_SWITCH_TRACE"] == "1"
+    private static var gate = DebugModuleGate(mask: .none)
+
+    static func configure(gate: DebugModuleGate) {
+        self.gate = gate
+    }
 
     private struct State {
         let selection: Set<SidebarSelectionID>
@@ -91,7 +94,7 @@ enum HermternalSelectionOccupancyTrace {
         selection: Set<SidebarSelectionID>,
         messages: Int
     ) {
-        guard enabled else { return }
+        guard gate.isEnabled(.mainActorOccupancy) else { return }
         guard !selection.isEmpty else { return }
         if state == nil, completedSelection == selection {
             return
@@ -103,9 +106,6 @@ enum HermternalSelectionOccupancyTrace {
         state = State(selection: selection, messages: messages)
         flushTask?.cancel()
         flushTask = Task { @MainActor in
-            // SwiftUI may construct List children immediately after the
-            // parent body. Two yields let those child bodies and observers
-            // contribute before the single aggregate line is emitted.
             await Task.yield()
             await Task.yield()
             guard !Task.isCancelled else { return }
@@ -117,7 +117,7 @@ enum HermternalSelectionOccupancyTrace {
         forChatID id: String?,
         messages: Int
     ) {
-        guard enabled else { return }
+        guard gate.isEnabled(.mainActorOccupancy) else { return }
         guard let id else {
             observerInvoked()
             return
@@ -126,45 +126,46 @@ enum HermternalSelectionOccupancyTrace {
         beginIfNeeded(selection: selection, messages: messages)
         observerInvoked()
     }
+
     static func observerInvoked() {
-        guard enabled else { return }
+        guard gate.isEnabled(.mainActorOccupancy) else { return }
         state?.observers += 1
     }
 
     static func sidebarBodyBegan() -> UInt64? {
-        guard enabled else { return nil }
+        guard gate.isEnabled(.mainActorOccupancy) else { return nil }
         state?.sidebarBodies += 1
         return DispatchTime.now().uptimeNanoseconds
     }
 
     static func sidebarBodyEnded(_ start: UInt64?) {
-        guard enabled, let start else { return }
+        guard gate.isEnabled(.mainActorOccupancy), let start else { return }
         state?.sidebarBodyNanoseconds += DispatchTime.now().uptimeNanoseconds - start
     }
 
     static func orderingResolveBegan() -> UInt64? {
-        guard enabled else { return nil }
+        guard gate.isEnabled(.mainActorOccupancy) else { return nil }
         state?.orderingResolves += 1
         return DispatchTime.now().uptimeNanoseconds
     }
 
     static func orderingResolveEnded(_ start: UInt64?) {
-        guard enabled, let start else { return }
+        guard gate.isEnabled(.mainActorOccupancy), let start else { return }
         state?.orderingNanoseconds += DispatchTime.now().uptimeNanoseconds - start
     }
 
     static func sessionRowBodyEvaluated() {
-        guard enabled else { return }
+        guard gate.isEnabled(.mainActorOccupancy) else { return }
         state?.sessionRows += 1
     }
 
     static func folderRowBodyEvaluated() {
-        guard enabled else { return }
+        guard gate.isEnabled(.mainActorOccupancy) else { return }
         state?.folderRows += 1
     }
 
     private static func flush() {
-        guard enabled, let state else { return }
+        guard gate.isEnabled(.mainActorOccupancy), let state else { return }
         HermternalSwitchTrace.selection(
             "selection.occupancy.summary",
             selection: state.selection,
@@ -175,7 +176,8 @@ enum HermternalSelectionOccupancyTrace {
                 + " folderRows=\(state.folderRows)"
                 + " orderingResolves=\(state.orderingResolves)"
                 + " orderingNs=\(state.orderingNanoseconds)"
-                + " observers=\(state.observers)"
+                + " observers=\(state.observers)",
+            module: .mainActorOccupancy
         )
         completedSelection = state.selection
         Self.state = nil

@@ -99,10 +99,16 @@ struct FindHighlightedMessage: View {
     var body: some View {
         Group {
             if isPlainText {
-                Text(FindTextHighlighting.mark(
-                    AttributedString(text),
-                    ranges: matchRanges
-                ))
+                Group {
+                    if matchRanges.isEmpty {
+                        Text(text)
+                    } else {
+                        Text(FindTextHighlighting.mark(
+                            AttributedString(text),
+                            ranges: matchRanges
+                        ))
+                    }
+                }
                 .font(.body)
                 .foregroundStyle(.primary)
                 .lineSpacing(MessageTypography.bodyLineSpacing)
@@ -139,8 +145,8 @@ enum FindTextHighlighting {
         _ source: AttributedString,
         ranges: [Range<Int>]
     ) -> AttributedString {
-        let rendered = String(source.characters)
         guard !ranges.isEmpty else { return source }
+        let rendered = String(source.characters)
 
         var result = source
         for (offset, range) in ranges.enumerated() {

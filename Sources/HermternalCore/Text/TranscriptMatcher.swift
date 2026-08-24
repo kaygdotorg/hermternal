@@ -124,3 +124,16 @@ public enum TranscriptMatcher {
         }
     }
 }
+
+/// One transcript Find pass. Empty queries stop before projecting message text,
+/// and a non-empty query invokes the supplied matcher exactly once.
+public enum TranscriptFindPass {
+    public static func matches(
+        in messages: [ChatMessage],
+        query: String,
+        using matcher: @Sendable ([String], String) -> [TranscriptMatch] = TranscriptMatcher.matches
+    ) -> [TranscriptMatch] {
+        guard !query.split(whereSeparator: \.isWhitespace).isEmpty else { return [] }
+        return matcher(messages.map(\.text), query)
+    }
+}

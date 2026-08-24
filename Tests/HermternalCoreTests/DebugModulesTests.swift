@@ -1,0 +1,181 @@
+import HermternalCore
+import Testing
+
+@Test("a disabled module performs no measurement work")
+func disabledModuleRecordsNothing() {
+    let store = InMemoryDebugModuleStateStore(storedMask: 0)
+    let controller = DebugModuleController(debugMode: true, store: store)
+    let sample = DebugSelectionAggregate(
+        publishToVisibleNanoseconds: 42,
+        selectionCount: 1,
+        publicationCount: 1,
+        largestRowCharacterCount: 12
+    )
+
+    controller.record(sample, for: .visiblePaint)
+
+    #expect(controller.metrics == nil)
+    #expect(store.writeCount == 0)
+}
+
+@Test("a changed toggle persists once and an unchanged toggle does not write")
+func togglePersistsExactlyOncePerChange() {
+    let store = InMemoryDebugModuleStateStore()
+    let controller = DebugModuleController(debugMode: true, store: store)
+    #expect(DebugModule.allCases.allSatisfy { controller.isEnabled($0) })
+    #expect(store.writeCount == 0)
+
+    controller.setEnabled(false, for: .visiblePaint)
+    #expect(MeasurementGate.isEnabled(.visiblePaint) == false)
+    #expect(MeasurementGate.isEnabled(.switchPhases))
+    #expect(controller.isEnabled(.visiblePaint) == false)
+
+    controller.setEnabled(false, for: .visiblePaint)
+    #expect(store.writeCount == 1)
+
+    controller.setEnabled(true, for: .visiblePaint)
+    #expect(store.writeCount == 2)
+    #expect(controller.isEnabled(.visiblePaint))
+}
+
+@Test("omitted capability is unavailable and safe to query")
+func omittedCapabilityIsUnavailable() {
+    let capability = OmittedDebugModuleCapability()
+
+    #expect(capability.state == .unavailable(reason: "Debug modules capability was omitted"))
+    #expect(capability.modules.isEmpty)
+    #expect(capability.isEnabled(.switchPhases) == false)
+    capability.setEnabled(true, for: .switchPhases)
+    capability.record(DebugSelectionAggregate(publishToVisibleNanoseconds: 1), for: .visiblePaint)
+    capability.clearMetrics()
+    #expect(capability.metrics == nil)
+}
+
+@Test("the in-memory capability implements the same toggle and metrics seam")
+func inMemoryCapabilityIsAUsableFake() {
+    let capability = InMemoryDebugModuleCapability()
+    capability.setEnabled(false, for: .visiblePaint)
+    capability.record(DebugSelectionAggregate(publishToVisibleNanoseconds: 7), for: .visiblePaint)
+
+    #expect(capability.isEnabled(.visiblePaint) == false)
+    #expect(capability.metrics == nil)
+
+    capability.setEnabled(true, for: .visiblePaint)
+    capability.record(
+        DebugSelectionAggregate(
+            publishToVisibleNanoseconds: 7,
+            selectionCount: 2,
+            publicationCount: 3,
+            largestRowCharacterCount: 4
+        ),
+        for: .visiblePaint
+    )
+    #expect(capability.metrics?.sampleSize == 1)
+}
+
+@Test("the non-debug outer gate ignores a previously enabled persisted mask")
+func nonDebugModeHardZerosPersistedMask() {
+    let store = InMemoryDebugModuleStateStore(storedMask: DebugModule.allMask)
+    let controller = DebugModuleController(debugMode: false, store: store)
+
+    for module in DebugModule.allCases {
+        #expect(controller.isEnabled(module) == false)
+    }
+    #expect(controller.modules.isEmpty)
+    #expect(controller.state == .unavailable(reason: "Debug modules require HERMTERNAL_DEBUG=1"))
+    #expect(store.writeCount == 0)
+    #expect(DebugModule.allCases.allSatisfy { MeasurementGate.isEnabled($0) == false })
+}
+
+@Test("a forced launch installs measurement without revealing the Modules pane")
+func forceLaunchInstallsAllModulesWithoutPersistence() {
+    let store = InMemoryDebugModuleStateStore(storedMask: 0)
+    let controller = DebugModuleController(
+        debugMode: false,
+        forceAllModulesOn: true,
+        store: store
+    )
+
+    #expect(controller.state == .unavailable(reason: "Debug modules require HERMTERNAL_DEBUG=1"))
+    #expect(controller.modules.isEmpty)
+    #expect(DebugModule.allCases.allSatisfy { MeasurementGate.isEnabled($0) })
+    #expect(store.writeCount == 0)
+}
+
+@Test("the metrics ring is bounded by its explicit capacity")
+func metricsRingNeverExceedsCapacity() {
+    let ring = DebugMetricsRingBuffer(capacity: 3)
+
+    for value in 1...10 {
+        ring.append(DebugSelectionAggregate(publishToVisibleNanoseconds: UInt64(value)))
+        #expect(ring.count <= 3)
+    }
+
+    #expect(ring.count == 3)
+    #expect(ring.samples.map(\.publishToVisibleNanoseconds) == [8, 9, 10])
+    #expect(ring.capacity == 3)
+    #expect(ring.retainedBytesCeiling == 3 * MemoryLayout<DebugSelectionAggregate>.stride)
+}
+
+
+@Test("metrics expose unavailable producer fields instead of zero")
+func metricsRespectProducerAvailability() {
+    let visibleOnly = DebugModuleMask([DebugModule.visiblePaint])
+    let controller = DebugModuleController(
+        debugMode: true,
+        store: InMemoryDebugModuleStateStore(storedMask: visibleOnly.rawValue)
+    )
+    controller.record(
+        DebugSelectionAggregate(
+            publishToVisibleNanoseconds: 11,
+            selectionCount: 4,
+            publicationCount: 5,
+            largestRowCharacterCount: 6
+        ),
+        for: .visiblePaint
+    )
+
+    #expect(controller.metrics?.publishToVisibleMedianNanoseconds == 11)
+    #expect(controller.metrics?.selectionCount == nil)
+    #expect(controller.metrics?.publicationCount == nil)
+    #expect(controller.metrics?.largestRowCharacterCount == nil)
+}
+
+@Test("publish-to-visible statistics use the retained sample series")
+func metricsStatisticsMatchKnownSeries() {
+    let controller = DebugModuleController(debugMode: true, store: InMemoryDebugModuleStateStore())
+    for value in stride(from: 100, through: 1_000, by: 100) {
+        controller.record(
+            DebugSelectionAggregate(
+                publishToVisibleNanoseconds: UInt64(value),
+                selectionCount: value / 100,
+                publicationCount: value / 50,
+                largestRowCharacterCount: value
+            ),
+            for: .visiblePaint
+        )
+    }
+
+    let metrics = controller.metrics
+    #expect(metrics?.publishToVisibleMedianNanoseconds == 550)
+    #expect(metrics?.publishToVisibleP90Nanoseconds == 900)
+    #expect(metrics?.publishToVisibleMaxNanoseconds == 1_000)
+    #expect(metrics?.sampleSize == 10)
+    #expect(metrics?.selectionCount == 10)
+    #expect(metrics?.publicationCount == 20)
+    #expect(metrics?.largestRowCharacterCount == 1_000)
+}
+
+@Test("module identities and display metadata are stable and complete")
+func moduleIdentitySetIsStable() {
+    #expect(DebugModule.allCases.map(\.id) == [
+        "switch-phases",
+        "sidebar-folder-selection",
+        "main-actor-occupancy",
+        "resource-contention",
+        "text-layout-attribution",
+        "visible-paint"
+    ])
+    #expect(DebugModule.allCases.allSatisfy { !$0.title.isEmpty && !$0.description.isEmpty })
+    #expect(DebugModule.allMask == DebugModule.allCases.reduce(into: UInt64(0)) { $0 |= $1.bit })
+}

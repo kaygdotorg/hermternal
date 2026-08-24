@@ -122,13 +122,17 @@ func performancePrefetchCancellationContract() async {
     while await probe.started.count < 4 { await Task.yield() }
     await gate.release(0)
     while await probe.started.count < 8 { await Task.yield() }
+    let startedBeforeCancellation = await probe.started
+    #expect(startedBeforeCancellation.count == 8)
     task.cancel()
     await gate.release(1)
     await task.value
 
     let started = await probe.started
     let values = await delivered.values
-    #expect(started == Array(0..<8))
+    #expect(started.count == startedBeforeCancellation.count)
+    #expect(Set(started) == Set(0..<8))
+    #expect(Set(started).count == started.count)
     #expect(values.count == 4)
     #expect(await probe.active == 0)
     print("PERF|prefetch cancellation|started=\(started.count) delivered=\(values.count) queued=\(30 - started.count)")

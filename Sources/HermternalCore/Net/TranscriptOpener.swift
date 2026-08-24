@@ -1,6 +1,5 @@
 import Foundation
 private enum TranscriptSwitchTrace {
-    private static let enabled = ProcessInfo.processInfo.environment["HERMTERNAL_SWITCH_TRACE"] == "1"
 
     static func opener(
         _ event: String,
@@ -9,7 +8,7 @@ private enum TranscriptSwitchTrace {
         messages: Int? = nil,
         detail: String? = nil
     ) {
-        guard enabled else { return }
+        guard MeasurementGate.isEnabled(.switchPhases) else { return }
         var hash: UInt64 = 14695981039346656037 ^ 0x01
         for byte in sessionID.utf8 {
             hash ^= UInt64(byte)
@@ -31,7 +30,6 @@ private enum TranscriptSwitchTrace {
         messages: Int,
         detail: String
     ) {
-        guard enabled else { return }
         opener(
             "resume.complete",
             sessionID: sessionID,

@@ -77,6 +77,38 @@ func transcriptProjectionScansOnceForLargeTranscripts() {
     }
 }
 
+@Test("one transcript Find pass invokes its matcher once")
+func transcriptFindPassInvokesMatcherOnce() {
+    let messages = [
+        ChatMessage(role: .user, text: "target"),
+        ChatMessage(role: .assistant, text: "other")
+    ]
+    let counter = MatcherInvocationCounter()
+    let matches = TranscriptFindPass.matches(
+        in: messages,
+        query: "target",
+        using: { texts, query in
+            counter.increment()
+            #expect(texts == ["target", "other"])
+            #expect(query == "target")
+            return [TranscriptMatch(messageIndex: 0, range: 0..<6)]
+        }
+    )
+
+    #expect(matches == [TranscriptMatch(messageIndex: 0, range: 0..<6)])
+    #expect(counter.value == 1)
+    let empty = TranscriptFindPass.matches(
+        in: messages,
+        query: "   ",
+        using: { _, _ in
+            counter.increment()
+            return []
+        }
+    )
+    #expect(empty.isEmpty)
+    #expect(counter.value == 1)
+}
+
 private final class MatcherInvocationCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
