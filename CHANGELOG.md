@@ -5,6 +5,13 @@ All notable changes to Hermternal are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow Semantic Versioning.
 
+## [Unreleased]
+
+### Changed
+
+- Build and release tooling now refuses stale, incomplete, unsigned, or
+  provenance-mismatched app bundles instead of handing them to callers.
+
 ## [v0.0.4] — 2026-08-23
 
 This release gives the application a native app icon and tightens sidebar and

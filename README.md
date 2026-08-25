@@ -112,7 +112,7 @@ The released application is a Swift Package executable target. SwiftUI supplies 
 
 `AppModel` is the main-actor coordinator for sign-in, gateway state, chats, messages, and cache state. `AuthClient` performs the native PKCE flow, receives the loopback callback, exchanges the code for bearer credentials, and requests a WebSocket ticket. `CredentialStore` stores credentials in an owner-only file keyed by the gateway origin.
 
-`GatewayClient` is an actor that uses `URLSessionWebSocketTask` for newline-delimited JSON-RPC calls and gateway events. `RestClient` loads session history over HTTP. `HistoryCache` is an actor that stores versioned transcript JSON files under the macOS cache directory. `MarkdownMessage` parses completed replies into prose and fenced-code segments; streaming text is shown without reparsing the whole message on every delta.
+`GatewayClient` is an actor that uses `URLSessionWebSocketTask` for newline-delimited JSON-RPC calls and gateway events. `RestClient` loads session history over HTTP. `HistoryCache` is an actor that stores versioned transcript JSON files under the macOS cache directory. The AppKit block transcript renderer parses completed replies into prose and fenced-code blocks; streaming text is shown without reparsing the whole message on every delta.
 
 ## Contributing
 

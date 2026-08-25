@@ -99,6 +99,34 @@ else
 fi
 
 step() { printf '\n==> %s\n' "$1"; }
+verify_signed_app() {
+	[[ -d "$APP" ]] || fail 'signed app is missing; run the build stage first'
+	local output expected_commit found_commit tree_clean configuration build_time build_info
+	if ! output="$(codesign --verify --deep --strict "$APP" 2>&1)"; then
+		printf '%s\n' "$output" >&2
+		fail 'app bundle is not a valid signed build'
+	fi
+	expected_commit="$(git rev-parse HEAD 2>/dev/null)" ||
+		fail 'could not resolve the current source commit'
+	[[ -z "$(git status --porcelain=v1)" ]] ||
+		fail 'source tree is dirty; refusing to release an untracked build'
+	build_info="$APP/Contents/Resources/HermternalBuildInfo"
+	[[ -f "$build_info" ]] ||
+		fail 'signed app has no build provenance stamp; rebuild it before releasing'
+	found_commit="$(sed -n 's/^commit=//p' "$build_info")"
+	if [[ "$found_commit" != "$expected_commit" ]]; then
+		fail "build commit mismatch: expected $expected_commit, found ${found_commit:-<missing>}"
+	fi
+	tree_clean="$(sed -n 's/^tree_clean=//p' "$build_info")"
+	[[ "$tree_clean" == true ]] ||
+		fail "build provenance is not clean (tree_clean=${tree_clean:-<missing>})"
+	configuration="$(sed -n 's/^configuration=//p' "$build_info")"
+	[[ "$configuration" == release ]] ||
+		fail "build configuration mismatch: expected release, found ${configuration:-<missing>}"
+	build_time="$(sed -n 's/^build_time=//p' "$build_info")"
+	[[ -n "$build_time" ]] ||
+		fail 'build provenance stamp has no build time'
+}
 
 CREDENTIAL_DIR="$HOME/.config/appstoreconnect"
 SIGNING_P12_PATH="${CODESIGN_P12_PATH:-}"
@@ -130,7 +158,8 @@ EPHEMERAL_KEYCHAIN=""
 KEYCHAIN_DIR=""
 CODESIGN_SELECTOR=""
 ORIGINAL_KEYCHAIN_BYTES=""
-declare -a ORIGINAL_KEYCHAINS=()
+ORIGINAL_KEYCHAIN_COUNT=0
+declare -a ORIGINAL_KEYCHAINS
 cleanup_signing_keychain() {
 	local status=$?
 	trap - EXIT INT TERM
@@ -187,9 +216,12 @@ setup_signing_keychain() {
 		keychain="${keychain#"${keychain%%[!$' \t\r\n']*}"}"
 		keychain="${keychain#\"}"
 		keychain="${keychain%\"}"
-		[[ -n "$keychain" ]] && ORIGINAL_KEYCHAINS+=("$keychain")
+		if [[ -n "$keychain" ]]; then
+			ORIGINAL_KEYCHAINS+=("$keychain")
+			ORIGINAL_KEYCHAIN_COUNT=$((ORIGINAL_KEYCHAIN_COUNT + 1))
+		fi
 	done <<<"$ORIGINAL_KEYCHAIN_BYTES"
-	((${#ORIGINAL_KEYCHAINS[@]} > 0)) || fail 'cannot determine the keychain search list'
+	(( ORIGINAL_KEYCHAIN_COUNT > 0 )) || fail 'cannot determine the keychain search list'
 	KEYCHAIN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hermternal-signing.XXXXXX")" ||
 		fail 'could not create a temporary signing directory'
 	local keychain_password
@@ -243,9 +275,10 @@ run_build() {
 			CONFIG=release CODESIGN_IDENTITY="$CODESIGN_IDENTITY" bash Scripts/build-app.sh
 		) || fail 'the signed release build failed'
 	fi
+	verify_signed_app
 }
 run_notarize() {
-	[[ -f "$APP/Contents/Info.plist" ]] || fail 'signed app is missing; run the build stage first'
+	verify_signed_app
 	mkdir -p "$DIST"
 	step 'Packaging archive for Apple submission'
 	rm -f "$ZIP"
@@ -268,7 +301,7 @@ run_notarize() {
 	fi
 }
 run_staple() {
-	[[ -d "$APP" ]] || fail 'signed app is missing; run the build stage first'
+	verify_signed_app
 	step 'Stapling the ticket'
 	xcrun stapler staple "$APP" || fail 'could not staple the notarization ticket'
 	xcrun stapler validate "$APP" || fail 'stapled ticket did not validate'
@@ -276,7 +309,7 @@ run_staple() {
 }
 run_package() {
 	mkdir -p "$DIST"
-	[[ -d "$APP" ]] || fail 'signed app is missing; run the build stage first'
+	verify_signed_app
 	step 'Building final zip'
 	rm -f "$ZIP"
 	/usr/bin/ditto -c -k --keepParent "$APP" "$ZIP" || fail 'could not build the final archive'

@@ -81,7 +81,10 @@ func warmStoreLifecycleOperations() {
 
 @Test("least recently used eviction is deterministic and releases payload")
 func deterministicLRUEviction() {
-    let store = TranscriptWarmStore(budgetBytes: 1_300)
+    // ChatMessage now reserves persisted reasoning/Codex fields in its
+    // residency charge, even for this text-only fixture. This budget admits
+    // two entries but forces the third to evict the least-recently-used entry.
+    let store = TranscriptWarmStore(budgetBytes: 2_000)
     for (id, fill) in [("one", "x"), ("two", "y")] {
         #expect(store.publish(
             messages: [ChatMessage(role: .assistant, text: String(repeating: fill, count: 44))],

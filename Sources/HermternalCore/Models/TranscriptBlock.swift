@@ -80,25 +80,62 @@ public struct TranscriptBlockResegmentation: Sendable, Equatable {
 public enum TranscriptBlockSegmenter {
     public static let fragmentTargetUTF16Length = 2_000
 
-    /// A bounded first-frame block. It intentionally does not inspect
+    /// Bounded first-frame blocks. These intentionally do not inspect
     /// Markdown; the renderer can draw the source text immediately while the
     /// real segmentation runs off the main actor.
-    public static func placeholder(for message: ChatMessage) -> TranscriptBlock {
+    public static func placeholders(for message: ChatMessage) -> [TranscriptBlock] {
+        let textLength = message.text.utf16.count
+        guard textLength > 0 else {
+            return [
+                TranscriptBlock(
+                    messageID: messageID(for: message),
+                    blockIndex: 0,
+                    kind: .paragraph,
+                    sourceRange: 0..<0,
+                    contentHash: 0
+                )
+            ]
+        }
         let prefix = message.text.prefix(256)
         let firstToken = prefix.drop(while: {
             $0 == " " || $0 == "\t" || $0 == "\n" || $0 == "\r"
         })
-        let kind: TranscriptBlock.Kind = firstToken.hasPrefix("```")
-            ? .code
-            : .paragraph
-        return TranscriptBlock(
-            messageID: messageID(for: message),
-            blockIndex: 0,
-            kind: kind,
-            sourceRange: 0..<message.text.utf16.count,
-            contentHash: 0
-        )
+        let isCode = firstToken.hasPrefix("```")
+        let ranges: [Range<Int>]
+        if isCode {
+            // The real segmenter keeps a fenced block as one logical row.
+            // Bound only the placeholder's first paint; the prepared code row
+            // retains the same stable block ID when its full source arrives.
+            ranges = [0..<min(textLength, fragmentTargetUTF16Length)]
+        } else {
+            // Keep the exact line-break-preferring fragmentation used by the
+            // real prose segmenter, but inspect only a bounded first-frame
+            // prefix. Extend the scan by one target bucket so the last
+            // retained fragment can land on the same line break as the full
+            // segmenter; truncating at an exact multiple would manufacture a
+            // boundary that the prepared projection does not have.
+            let placeholderScanLength = min(
+                textLength,
+                fragmentTargetUTF16Length * 13
+            )
+            ranges = Array(
+                fragmentRanges(0..<placeholderScanLength, in: message.text)
+                    .prefix(12)
+            )
+        }
+        return ranges.enumerated().map { index, range in
+            TranscriptBlock(
+                messageID: messageID(for: message),
+                blockIndex: index,
+                kind: index == 0 ? (isCode ? .code : .paragraph) : .fragmentContinuation,
+                sourceRange: range,
+                contentHash: 0,
+                language: nil,
+                continuationOf: index == 0 ? nil : 0
+            )
+        }
     }
+
 
     public static func blocks(for message: ChatMessage) -> [TranscriptBlock] {
         blocks(for: messageID(for: message), text: message.text)
@@ -307,7 +344,7 @@ public enum TranscriptBlockSegmenter {
         guard !breaks.isEmpty else { return [range] }
 
         var result: [Range<Int>] = []
-        var start = range.lowerBound
+        var start: Int = range.lowerBound
         while start < range.upperBound {
             let target = start + fragmentTargetUTF16Length
             guard target < range.upperBound else {
@@ -336,7 +373,9 @@ public enum TranscriptBlockSegmenter {
     }
 
     private static func lineBreakEnds(in text: String, range: Range<Int>) -> [Int] {
-        let units = Array(text.utf16)
+        // The placeholder path supplies a bounded upper bound. Copy only
+        // through that bound rather than materializing an entire message.
+        let units = Array(text.utf16.prefix(range.upperBound))
         guard range.upperBound <= units.count else { return [] }
         var result: [Int] = []
         for index in range where units[index] == 10 {

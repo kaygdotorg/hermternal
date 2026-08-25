@@ -68,6 +68,10 @@ DIST="$ROOT/dist"
 STATE="$DIST/.ship"
 ZIP="$DIST/Hermternal-$VERSION.zip"
 APP="$ROOT/build/Hermternal.app"
+app_is_valid() {
+	[[ -d "$APP" ]] || return 1
+	codesign --verify --deep --strict "$APP" >/dev/null 2>&1
+}
 META="$STATE/meta.env"
 # Every marker starts with the checkout identity. Publish markers also record
 # the artifact digest and operation, so only the same replacement can resume.
@@ -159,13 +163,14 @@ if ! stage_done preflight; then
 	[[ "$p12" != "~/"* ]] || p12="$HOME/${p12#~/}"
 	[[ "$password_file" != "~/"* ]] || password_file="$HOME/${password_file#~/}"
 	if [[ -z "$p12" && -d "$CREDENTIAL_DIR" ]]; then
-		shopt -s nullglob
-		p12s=("$CREDENTIAL_DIR"/*.p12)
-		shopt -u nullglob
-		if ((${#p12s[@]} > 1)); then
+		p12_count=0
+		for candidate in "$CREDENTIAL_DIR"/*.p12; do
+			[[ -f "$candidate" ]] || continue
+			p12_count=$((p12_count + 1))
+			p12="$candidate"
+		done
+		if (( p12_count > 1 )); then
 			fail 'exactly one signing .p12 is required' 'A person at the Mac must provide exactly one signing .p12, then rerun Scripts/ship.sh.'
-		elif ((${#p12s[@]} == 1)); then
-			p12="${p12s[0]}"
 		fi
 	fi
 	[[ -n "$password_file" || -z "$p12" ]] || password_file="$CREDENTIAL_DIR/password.txt"
@@ -222,12 +227,14 @@ confirm_submission() {
 }
 
 # The build stage owns the signed app. Its marker is valid only while that
-# app exists, so notarization cannot resume against missing or stale output.
-if stage_done build && [[ ! -d "$APP" ]]; then
+# app exists and remains structurally verifiable, so notarization cannot
+# resume against missing, unsigned, or damaged output.
+if stage_done build && ! app_is_valid; then
 	clear_later_stages build
 fi
 run_stage build bash Scripts/release.sh --stage build
-[[ -d "$APP" ]] || fail 'build stage completed without a signed app' 'A person at the Mac must inspect the build output, then rerun Scripts/ship.sh.'
+app_is_valid ||
+	fail 'build stage completed without a valid signed app' 'A person at the Mac must inspect the build output, then rerun Scripts/ship.sh.'
 
 # A changed final archive invalidates the accepted-submission evidence before
 # any resume check. The next notarize stage rebuilds and submits a fresh input.

@@ -47,9 +47,17 @@ enum SidebarSelectionEventAdapter {
         guard let pending else { return nil }
         return (pending.isContextClick, pending.isModified)
     }
+    static func consume() -> (isContextClick: Bool, isModified: Bool)? {
+        defer { pending = nil }
+        return current()
+    }
+
 
     static func allowsPrimaryActivation() -> Bool {
-        guard let pending else { return false }
+        // A tap gesture is already proof of a primary click. A missing monitor
+        // record must not turn that completed click into a silent no-op.
+        defer { pending = nil }
+        guard let pending else { return true }
         return !pending.isContextClick && !pending.isModified
     }
 
@@ -680,121 +688,22 @@ struct SidebarView: View {
     private func sidebarLifecycle(_ content: some View) -> some View {
         content
             .onChange(of: model.selectedSessionID) { _, newValue in
-                HermternalSelectionOccupancyTrace.observerInvoked(
-                    forChatID: newValue,
-                    messages: model.messages.count
-                )
-                synchronizeModelSelection(forceChats: newValue != nil)
+                handleModelSelectionChange(newValue)
             }
             .onChange(of: sidebarSelection) { _, selection in
-                HermternalSelectionOccupancyTrace.beginIfNeeded(
-                    selection: selection,
-                    messages: model.messages.count
-                )
-                HermternalSelectionOccupancyTrace.observerInvoked()
-                HermternalSwitchTrace.selection(
-                    "sidebarSelection.onChange",
-                    selection: selection,
-                    messages: model.messages.count
-                )
-                let event = SidebarSelectionEventAdapter.current()
-                guard selection.count == 1,
-                      let item = selection.first,
-                      case let .chat(id) = item,
-                      model.sessions.contains(where: { $0.id == id })
-                else {
-                    pendingOpenTask?.cancel()
-                    pendingOpenTask = nil
-                    pointerActivatedID = nil
-                    programmaticSelectionID = nil
-                    return
-                }
-                if programmaticSelectionID == id {
-                    programmaticSelectionID = nil
-                    pointerActivatedID = nil
-                    return
-                }
-                if pointerActivatedID == id {
-                    pointerActivatedID = nil
-                    return
-                }
-                guard let event else {
-                    // Mouse-down records belong to the pointer seam. With no
-                    // record, this is keyboard/arrow navigation, which must
-                    // invalidate an obsolete open before opening the new row.
-                    scheduleOpen(for: id)
-                    return
-                }
-                guard !event.isContextClick, !event.isModified else {
-                    pendingOpenTask?.cancel()
-                    pendingOpenTask = nil
-                    pointerActivatedID = nil
-                    return
-                }
-                // A plain pointer click is opened by the row's simultaneous
-                // tap seam. Cancel any older open, but do not open here as
-                // that would race the tap seam.
-                pendingOpenTask?.cancel()
-                pendingOpenTask = nil
-                pointerActivatedID = nil
+                handleSidebarSelectionChange(selection)
             }
             .onChange(of: archivedSelection) { _, selection in
-                let event = SidebarSelectionEventAdapter.current()
-                guard contentMode == .archived,
-                      selection.count == 1,
-                      let id = selection.first,
-                      let session = model.archivedSessions.first(where: { $0.id == id })
-                else {
-                    pendingOpenTask?.cancel()
-                    pendingOpenTask = nil
-                    pointerActivatedID = nil
-                    archivedPointerActivatedID = nil
-                    programmaticArchivedSelectionID = nil
-                    return
-                }
-                if programmaticArchivedSelectionID == id {
-                    programmaticArchivedSelectionID = nil
-                    if archivedPointerActivatedID != id {
-                        archivedPointerActivatedID = nil
-                    }
-                    return
-                }
-                if archivedPointerActivatedID == id {
-                    archivedPointerActivatedID = nil
-                    return
-                }
-                guard let event else {
-                    openArchivedImmediately(session)
-                    return
-                }
-                guard !event.isContextClick, !event.isModified else {
-                    pendingOpenTask?.cancel()
-                    pendingOpenTask = nil
-                    pointerActivatedID = nil
-                    archivedPointerActivatedID = nil
-                    return
-                }
-                pendingOpenTask?.cancel()
-                pendingOpenTask = nil
-                archivedPointerActivatedID = nil
+                handleArchivedSelectionChange(selection)
             }
             .onChange(of: model.viewingArchivedSessionID) { _, _ in
                 synchronizeModelSelection(forceChats: true)
             }
             .onChange(of: contentMode) { _, mode in
-                if mode == .archived {
-                    clearSidebarSelection("sidebarSelection.archiveMode")
-                    programmaticSelectionID = nil
-                } else {
-                    archivedPointerActivatedID = nil
-                    archivedSelection.removeAll()
-                    programmaticArchivedSelectionID = nil
-                    synchronizeModelSelection()
-                }
+                handleContentModeChange(mode)
             }
             .onChange(of: model.archivedSessions) { _, sessions in
-                archivedSelection.formIntersection(Set(sessions.map(\.id)))
-                synchronizeArchivedRouteSelection()
+                handleArchivedSessionsChange(sessions)
             }
             .onChange(of: model.sessions) { _, sessions in
                 pruneSelection(validChatIDs: Set(sessions.map(\.id)))
@@ -816,6 +725,57 @@ struct SidebarView: View {
                 purgeRequestGeneration &+= 1
             }
     }
+    private func handleModelSelectionChange(_ newValue: String?) {
+        HermternalSelectionOccupancyTrace.observerInvoked(
+            forChatID: newValue,
+            messages: model.messages.count
+        )
+        synchronizeModelSelection(forceChats: newValue != nil)
+    }
+    private func handleArchivedSessionsChange(_ sessions: [ChatSession]) {
+        archivedSelection.formIntersection(Set(sessions.map(\.id)))
+        synchronizeArchivedRouteSelection()
+    }
+    private func handleArchivedSelectionChange(_ selection: Set<String>) {
+        let event = SidebarSelectionEventAdapter.consume()
+        guard contentMode == .archived,
+              selection.count == 1,
+              let id = selection.first,
+              let session = model.archivedSessions.first(where: { $0.id == id })
+        else {
+            pendingOpenTask?.cancel()
+            pendingOpenTask = nil
+            pointerActivatedID = nil
+            archivedPointerActivatedID = nil
+            programmaticArchivedSelectionID = nil
+            return
+        }
+        if programmaticArchivedSelectionID == id {
+            programmaticArchivedSelectionID = nil
+            if archivedPointerActivatedID != id {
+                archivedPointerActivatedID = nil
+            }
+            return
+        }
+        if archivedPointerActivatedID == id {
+            archivedPointerActivatedID = nil
+            return
+        }
+        guard let event else {
+            openArchivedImmediately(session)
+            return
+        }
+        guard !event.isContextClick, !event.isModified else {
+            pendingOpenTask?.cancel()
+            pendingOpenTask = nil
+            pointerActivatedID = nil
+            archivedPointerActivatedID = nil
+            return
+        }
+        pendingOpenTask?.cancel()
+        pendingOpenTask = nil
+        archivedPointerActivatedID = nil
+    }
     private func setSidebarSelection(
         _ selection: Set<SidebarSelectionID>,
         event: String
@@ -831,6 +791,17 @@ struct SidebarView: View {
             selection: selection,
             messages: model.messages.count
         )
+    }
+    private func handleContentModeChange(_ mode: SidebarContentMode) {
+        if mode == .archived {
+            clearSidebarSelection("sidebarSelection.archiveMode")
+            programmaticSelectionID = nil
+        } else {
+            archivedPointerActivatedID = nil
+            archivedSelection.removeAll()
+            programmaticArchivedSelectionID = nil
+            synchronizeModelSelection()
+        }
     }
 
     private func clearSidebarSelection(_ event: String) {
@@ -890,6 +861,56 @@ struct SidebarView: View {
         programmaticSelectionID = liveID
         setSidebarSelection(selection, event: "sidebarSelection.modelSynchronization.live")
         pointerActivatedID = nil
+    }
+    private func handleSidebarSelectionChange(
+        _ selection: Set<SidebarSelectionID>
+    ) {
+        HermternalSelectionOccupancyTrace.beginIfNeeded(
+            selection: selection,
+            messages: model.messages.count
+        )
+        HermternalSwitchTrace.selection(
+            "sidebarSelection.onChange",
+            selection: selection,
+            messages: model.messages.count
+        )
+        let event = SidebarSelectionEventAdapter.consume()
+        guard selection.count == 1,
+              let item = selection.first,
+              case let .chat(id) = item,
+              model.sessions.contains(where: { $0.id == id })
+        else {
+            pendingOpenTask?.cancel()
+            pendingOpenTask = nil
+            pointerActivatedID = nil
+            programmaticSelectionID = nil
+            return
+        }
+        if programmaticSelectionID == id {
+            programmaticSelectionID = nil
+            pointerActivatedID = nil
+            return
+        }
+        if pointerActivatedID == id {
+            pointerActivatedID = nil
+            return
+        }
+        if let event {
+            guard !event.isContextClick, !event.isModified,
+                  let session = model.sessions.first(where: { $0.id == id })
+            else {
+                pendingOpenTask?.cancel()
+                pendingOpenTask = nil
+                pointerActivatedID = nil
+                programmaticSelectionID = nil
+                return
+            }
+            activateSession(session, event: "open.requested.pointer")
+            return
+        }
+        // With no mouse-down record, this is keyboard navigation.
+        // It uses the same opener as a plain pointer selection.
+        scheduleOpen(for: id)
     }
 
     /// Archived rows can arrive after the read-only route. Restore only that
@@ -1139,16 +1160,17 @@ struct SidebarView: View {
         folderNameField = ""
     }
 
-    /// Explicit activation (including VoiceOver) opens immediately. Mark the
-    /// id so the model's selection observer does not schedule a second open.
-    private func openImmediately(_ session: ChatSession) {
+    /// Every live-chat entry point uses this opener. The selection observer
+    /// also calls it, so a lost row gesture cannot lose a deliberate click.
+    private func activateSession(
+        _ session: ChatSession,
+        event: String
+    ) {
         HermternalSwitchTrace.session(
-            "open.requested.pointer",
+            event,
             id: session.id,
             messages: model.messages.count
         )
-        // Re-tapping the active, loaded live row has no work to do. Empty
-        // transcripts and a failed gateway remain retryable.
         let isFailed = switch model.phase {
         case .failed: true
         default: false
@@ -1163,6 +1185,12 @@ struct SidebarView: View {
         pointerActivatedID = session.id
         pendingOpenTask?.cancel()
         pendingOpenTask = model.requestOpen(session)
+    }
+
+    /// Explicit activation, including VoiceOver, uses the same opener as
+    /// native List selection and keyboard navigation.
+    private func openImmediately(_ session: ChatSession) {
+        activateSession(session, event: "open.requested.pointer")
     }
 
     /// Explicit archived activation shares cancellation with native singleton
@@ -1185,25 +1213,15 @@ struct SidebarView: View {
         }
     }
 
-    /// Native selection and scrolling update immediately. Each keyboard
-    /// selection cancels prior work, and AppModel coalesces transcript
-    /// publication by selection ticket without delaying one deliberate click.
+    /// Native selection and scrolling update immediately. Keyboard and
+    /// pointer selections share the same cancellation and publication path.
     private func scheduleOpen(for id: String?) {
-        pendingOpenTask?.cancel()
-        pendingOpenTask = nil
         guard let id,
               let session = model.sessions.first(where: { $0.id == id })
         else { return }
-
-        HermternalSwitchTrace.session(
-            "open.requested.keyboard",
-            id: id,
-            messages: model.messages.count
-        )
-        model.userNavigationDidBegin()
-        pointerActivatedID = id
-        pendingOpenTask = model.requestOpen(session)
+        activateSession(session, event: "open.requested.keyboard")
     }
+
 
 }
 
@@ -1525,9 +1543,7 @@ private enum SidebarDissolve {
     ///
     /// `HERMTERNAL_NO_SIDEBAR_MASK=1` leaves the chat list unmasked, so one
     /// build can be scrolled both ways and the mask's cost can be measured
-    /// instead of assumed. Read once per process, like
-    /// `HERMTERNAL_BLOCK_TRANSCRIPT` in `ChatView`: a switch that cannot
-    /// change while the app runs must not be re-read on a body pass.
+    /// instead of assumed. Read once per process, not on every body pass.
     ///
     /// Compare with:
     /// `HERMTERNAL_NO_SIDEBAR_MASK=1 /home/kayg/Developer/hermternal-apple/build/Hermternal.app/Contents/MacOS/Hermternal`

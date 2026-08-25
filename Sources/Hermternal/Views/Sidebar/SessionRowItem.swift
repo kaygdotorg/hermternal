@@ -53,6 +53,7 @@ struct SessionRowItem: View {
     let session: ChatSession
     let folders: [Folder]
     let menu: SidebarSessionMenuDerivation
+    let isSelected: Bool
     let onOpen: (ChatSession) -> Void
     let onPin: ([ChatSession], Bool) -> Void
     let onArchive: ([ChatSession]) -> Void
@@ -83,12 +84,13 @@ extension SessionRowItem {
                 )
                 onOpen(session)
             }
-            // List remains the owner of selection. A simultaneous tap only
-            // observes the completed primary click, so it cannot swallow
-            // native selection, hover, drag, swipe actions, or context menus.
+            // List selection opens unselected rows through SidebarView's
+            // shared opener. The gesture only handles a second click on the
+            // already selected row, which has no selection change to observe.
             .simultaneousGesture(
                 TapGesture(count: 1)
                     .onEnded {
+                        guard isSelected else { return }
                         let allowed = SidebarSelectionEventAdapter.allowsPrimaryActivation()
                         HermternalSwitchTrace.session(
                             "selection.tapGate",

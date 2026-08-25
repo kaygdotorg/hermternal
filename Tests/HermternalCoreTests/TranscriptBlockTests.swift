@@ -99,3 +99,30 @@ func transcriptBlockContentHash() {
     let second = TranscriptBlockSegmenter.blocks(for: message("changed"))[0]
     #expect(first.contentHash != second.contentHash)
 }
+
+@Test("placeholders fragment long prose at the prepared row boundary")
+func transcriptBlockPlaceholdersAreBounded() {
+    let line = String(repeating: "x", count: 500)
+    let text = Array(repeating: line, count: 50).joined(separator: "\n")
+    let placeholders = TranscriptBlockSegmenter.placeholders(for: message(text))
+    let prepared = TranscriptBlockSegmenter.blocks(for: message(text))
+
+    #expect(placeholders.count > 1)
+    #expect(placeholders.allSatisfy { $0.sourceRange.count <= 3_000 })
+    #expect(placeholders.map(\.sourceRange)
+        == prepared.prefix(placeholders.count).map(\.sourceRange))
+    #expect(placeholders.map(\.id)
+        == prepared.prefix(placeholders.count).map(\.id))
+}
+
+@Test("code placeholders bound first paint while retaining one stable row")
+func transcriptBlockCodePlaceholderIsBounded() {
+    let text = "```\n" + Array(repeating: "let value = true", count: 400).joined(separator: "\n") + "\n```"
+    let message = message(text)
+    let placeholders = TranscriptBlockSegmenter.placeholders(for: message)
+    let prepared = TranscriptBlockSegmenter.blocks(for: message)
+
+    #expect(placeholders.count == 1)
+    #expect(placeholders[0].sourceRange.count <= TranscriptBlockSegmenter.fragmentTargetUTF16Length)
+    #expect(placeholders[0].id == prepared[0].id)
+}

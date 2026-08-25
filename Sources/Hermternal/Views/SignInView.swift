@@ -3,14 +3,11 @@ import SwiftUI
 struct SignInView: View {
     @Bindable var model: AppModel
     @State private var isWorking = false
-
     var body: some View {
         VStack(spacing: 0) {
             Spacer()
 
-            Image(systemName: "sparkle")
-                .font(.system(size: 40, weight: .light))
-                .foregroundStyle(.tint)
+            HermternalMarkView(size: 80)
                 .padding(.bottom, 18)
                 .accessibilityHidden(true)
 

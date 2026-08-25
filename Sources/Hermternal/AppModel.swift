@@ -191,6 +191,34 @@ enum HermternalSwitchTrace {
         )
     }
 
+    /// A publication that arrived before the hosted view had a usable size.
+    ///
+    /// The coordinator's update can run before SwiftUI lays the NSView out, so
+    /// the clip view is zero-height and no visible row range exists. Reloading
+    /// then would rebuild every row and start no preparation, which is what
+    /// made every publication take the full-reload path and left the layout
+    /// cache permanently cold. The publication is held and applied once a real
+    /// layout arrives. This records the wait so a reader can tell a first-paint
+    /// deferral from the normal path becoming deferred, which would be a bug.
+    static func transcriptPhaseReloadDeferred(
+        rows: Int,
+        visibleLocation: Int,
+        visibleLength: Int
+    ) {
+        guard gate.isEnabled(.visiblePaint) else { return }
+        let pending = pendingTranscriptPublication
+        session(
+            "transcript.reloadDeferred",
+            id: pending?.id,
+            generation: pending?.generation,
+            renderedRows: rows,
+            detail: "reason=noLayoutYet,visibleLocation=\(visibleLocation),visibleLength=\(visibleLength),action=awaitLayout",
+            owner: .blockRowConfiguration,
+            executor: .main,
+            module: .visiblePaint
+        )
+    }
+
     static func transcriptPhaseTextSlice(start: UInt64, end: UInt64) {
         guard var pending = pendingTranscriptPublication else { return }
         pending.textSliceCount &+= 1

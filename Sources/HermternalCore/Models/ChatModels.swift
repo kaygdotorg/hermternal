@@ -238,25 +238,129 @@ public struct AuthoritativeTranscriptSnapshot: Codable, Sendable {
     }
 }
 
+public enum CodexReasoningAvailability: String, Codable, Equatable, Sendable {
+    case absent
+    case presentButUnparseable
+    case presentButNotDisplayable
+    case presentAndDisplayable
+}
+
+/// A Codex field is retained as supplied and, when possible, exposed as the
+/// dynamic JSON tree. The payload deliberately has no client-defined item
+/// structs: the gateway owns that schema.
+public struct CodexSerializedPayload: Codable, Equatable, Sendable {
+    public let rawValue: String?
+    public let parsedValue: JSONValue?
+
+    public init(rawValue: String?, parsedValue: JSONValue?) {
+        self.rawValue = rawValue
+        self.parsedValue = parsedValue
+    }
+
+    public init(from decoder: Decoder) throws {
+        let value = try JSONValue(from: decoder)
+        if let rawValue = value.stringValue {
+            self.rawValue = rawValue
+            self.parsedValue = try? JSONDecoder().decode(JSONValue.self, from: Data(rawValue.utf8))
+        } else {
+            self.rawValue = nil
+            self.parsedValue = value
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        if let rawValue {
+            try container.encode(rawValue)
+        } else if let parsedValue {
+            try container.encode(parsedValue)
+        } else {
+            try container.encodeNil()
+        }
+    }
+
+    public var isParseable: Bool {
+        parsedValue != nil
+    }
+}
+
 public struct ChatMessage: Identifiable, Codable, Sendable {
     public let id: MessageIdentity
     public var role: Role
     public var text: String
+    /// Reasoning is transcript data and remains in the cache so warm and REST
+    /// projections render the same content.
+    public var reasoning: String?
     public var timestamp: Date?
     public var isStreaming: Bool
+    /// Ordinary Codex message items may be cached. Codex reasoning items are
+    /// excluded when opaque/encrypted, with only their availability marker
+    /// retained so the cache can remain honest without storing unreadable data.
+    public var codexMessageItems: CodexSerializedPayload?
+    public var codexReasoningItems: CodexSerializedPayload?
+    private var persistedCodexReasoningAvailability: CodexReasoningAvailability?
 
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case role
+        case text
+        case reasoning
+        case timestamp
+        case isStreaming
+        case codexMessageItems
+        case codexReasoningItems
+        case codexReasoningAvailability
+
+    }
     public init(
         id: MessageIdentity = .provisional(UUID()),
         role: Role,
         text: String,
+        reasoning: String? = nil,
         timestamp: Date? = nil,
-        isStreaming: Bool = false
+        isStreaming: Bool = false,
+        codexMessageItems: CodexSerializedPayload? = nil,
+        codexReasoningItems: CodexSerializedPayload? = nil
     ) {
         self.id = id
         self.role = role
         self.text = text
+        self.reasoning = reasoning
         self.timestamp = timestamp
         self.isStreaming = isStreaming
+        self.codexMessageItems = codexMessageItems
+        self.codexReasoningItems = codexReasoningItems
+        self.persistedCodexReasoningAvailability = nil
+    }
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(MessageIdentity.self, forKey: .id)
+        role = try container.decode(Role.self, forKey: .role)
+        text = try container.decode(String.self, forKey: .text)
+        reasoning = try container.decodeIfPresent(String.self, forKey: .reasoning)
+        timestamp = try container.decodeIfPresent(Date.self, forKey: .timestamp)
+        isStreaming = try container.decodeIfPresent(Bool.self, forKey: .isStreaming) ?? false
+        codexMessageItems = try container.decodeIfPresent(CodexSerializedPayload.self, forKey: .codexMessageItems)
+        codexReasoningItems = try container.decodeIfPresent(CodexSerializedPayload.self, forKey: .codexReasoningItems)
+        persistedCodexReasoningAvailability = try container.decodeIfPresent(
+            CodexReasoningAvailability.self,
+            forKey: .codexReasoningAvailability
+        )
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(role, forKey: .role)
+        try container.encode(text, forKey: .text)
+        try container.encodeIfPresent(reasoning, forKey: .reasoning)
+        try container.encodeIfPresent(timestamp, forKey: .timestamp)
+        try container.encode(isStreaming, forKey: .isStreaming)
+        try container.encodeIfPresent(codexMessageItems, forKey: .codexMessageItems)
+        if codexReasoningAvailability == .presentAndDisplayable {
+            try container.encodeIfPresent(codexReasoningItems, forKey: .codexReasoningItems)
+        } else if codexReasoningAvailability != .absent {
+            try container.encode(codexReasoningAvailability, forKey: .codexReasoningAvailability)
+        }
     }
 
     /// Project rows from the authoritative REST transcript. Every persisted
@@ -271,7 +375,10 @@ public struct ChatMessage: Identifiable, Codable, Sendable {
                 id: identity,
                 role: role,
                 text: text,
-                timestamp: DateParser.date(from: row["timestamp"])
+                reasoning: mergedReasoning(from: row),
+                timestamp: DateParser.date(from: row["timestamp"]),
+                codexMessageItems: codexPayload(from: row["codex_message_items"]),
+                codexReasoningItems: codexPayload(from: row["codex_reasoning_items"])
             )
         }
     }
@@ -281,6 +388,21 @@ public struct ChatMessage: Identifiable, Codable, Sendable {
         projectREST(historyRows: rows)
     }
 
+    public var codexReasoningAvailability: CodexReasoningAvailability {
+        guard let payload = codexReasoningItems else {
+            return persistedCodexReasoningAvailability ?? .absent
+        }
+        guard let parsedValue = payload.parsedValue else { return .presentButUnparseable }
+        return Self.containsEncryptedReasoning(in: parsedValue)
+            ? .presentButNotDisplayable
+            : .presentAndDisplayable
+    }
+
+    // REST rows also expose session_id, tool_call_id, tool_calls, tool_name,
+    // effect_disposition, token_count, finish_reason, reasoning_details,
+    // platform_message_id, observed, active, compacted, api_content,
+    // display_kind, and display_metadata. We deliberately do not carry those
+    // keys into ChatMessage; display_kind remains an admission filter here.
     private static func historyComponents(from value: JSONValue) -> (Role, String)? {
         guard let rawRole = value["role"]?.stringValue,
               let role = Role(rawValue: rawRole)
@@ -291,6 +413,56 @@ public struct ChatMessage: Identifiable, Codable, Sendable {
         }
         guard !body.hasPrefix("[System:") else { return nil }
         return (role, body)
+    }
+
+    private static func mergedReasoning(from value: JSONValue) -> String? {
+        let reasoning = nonEmptyString(value["reasoning"])
+        let reasoningContent = nonEmptyString(value["reasoning_content"])
+        switch (reasoning, reasoningContent) {
+        case (nil, nil):
+            return nil
+        case (let value?, nil), (nil, let value?):
+            return value
+        case (let first?, let second?) where first == second:
+            return first
+        case (let first?, let second?):
+            // The two fields matched in both available redacted REST rows.
+            // If a future gateway sends different values, retain both rather
+            // than choosing one and silently discarding reasoning.
+            return first + "\n\n" + second
+        }
+    }
+
+    private static func nonEmptyString(_ value: JSONValue?) -> String? {
+        guard let value = value?.stringValue, !value.isEmpty else { return nil }
+        return value
+    }
+
+    private static func codexPayload(from value: JSONValue?) -> CodexSerializedPayload? {
+        guard let value else { return nil }
+        if let rawValue = value.stringValue {
+            let parsedValue = try? JSONDecoder().decode(JSONValue.self, from: Data(rawValue.utf8))
+            return CodexSerializedPayload(rawValue: rawValue, parsedValue: parsedValue)
+        }
+        // A capture contained an already-decoded array. Preserve that shape
+        // instead of forcing it through a client-defined Codex model.
+        return CodexSerializedPayload(rawValue: nil, parsedValue: value)
+    }
+
+    private static func containsEncryptedReasoning(in value: JSONValue) -> Bool {
+        switch value {
+        case .object(let fields):
+            if fields["encrypted_content"] != nil { return true }
+            return fields.values.contains { child in
+                containsEncryptedReasoning(in: child)
+            }
+        case .array(let values):
+            return values.contains { child in
+                containsEncryptedReasoning(in: child)
+            }
+        default:
+            return false
+        }
     }
 
     private static func flatten(_ content: JSONValue?) -> String? {

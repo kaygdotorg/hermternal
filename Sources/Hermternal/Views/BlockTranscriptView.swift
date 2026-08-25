@@ -106,84 +106,58 @@ private struct BlockStyleDigest {
 /// Every appearance-dependent and type-scale value that off-main block
 /// preparation needs, resolved once on the main actor.
 ///
-/// The colours mirror the SwiftUI transcript one for one rather than inventing
-/// a second palette: `MarkdownBlocks` draws prose at `.primary` with
-/// `.secondary` list markers, `TranscriptCodeBlock` draws on
-/// `.background.secondary` inside a `.separator` border, `MessageRow` tints the
-/// user bubble with `.tint.opacity(0.16)` over `.primary` text, and
-/// `FindTextHighlighting` marks the first match in a segment orange and the
-/// rest yellow. Point sizes come from the same text styles
-/// `MessageTypography` names, so the two renderers share one type scale
-/// instead of two lists of numbers.
+/// markers use the secondary label, code uses a secondary background and
+/// separator border, user blocks use a tinted bubble, and Find marks matching
+/// text with the resolved accent. Point sizes come from `MessageTypography`.
+/// This keeps one type scale for every block role.
 private struct BlockRenderStyle: Hashable, Sendable {
     /// Bumped whenever the drawn attributes or the measurement change, so a
-    /// height cached by an older algorithm is never reused. Version 1 drew an
-    /// unstyled string and measured a bare font.
+    /// height cached by an older algorithm is never reused. Version 1 drew
+    /// an unstyled string and measured a bare font.
     static let rendererVersion = 2
 
-    /// `MessageRow`'s user bubble: `.padding(.vertical, 10)`.
+    /// The user block's bubble: `.padding(.vertical, 10)`.
     static let userVerticalInset: CGFloat = 10
     /// The assistant and system rows' own vertical rhythm.
     static let assistantVerticalInset: CGFloat = 8
-    /// `TranscriptCodeBlock`'s `.padding(10)` around the body.
+    /// A code block's `.padding(10)` around the body.
     static let codeVerticalInset: CGFloat = 10
     static let codeHorizontalInset: CGFloat = 10
-    /// `TranscriptCodeBlock`'s header: `.padding(.vertical, 6)`.
+    /// A code block's header: `.padding(.vertical, 6)`.
     static let codeHeaderPadding: CGFloat = 6
     /// The header's `Divider()`.
     static let codeDividerHeight: CGFloat = 1
     /// `.strokeBorder(.separator, lineWidth: 0.5)`.
     static let codeBorderWidth: CGFloat = 0.5
-    /// `FindHighlightedMessage`'s `.strokeBorder(.orange.opacity(0.8), lineWidth: 1)`.
-    static let findBorderWidth: CGFloat = 1
-
     let appearanceName: String
     let isDark: Bool
 
-    /// `.primary`, set once by `MarkdownBlocks` for the whole reply.
+    /// The primary label for prose and assistant blocks.
     let label: BlockInk
-    /// `.secondary`: list markers, the code header, a system message.
+    /// The secondary label for list markers, code headers, and system messages.
     let secondaryLabel: BlockInk
-    /// `TranscriptCodeBlock` sets no foreground of its own, so its body
-    /// inherits `MarkdownBlocks`'s `.primary`.
+    /// Code inherits the prose label.
     let codeForeground: BlockInk
-    /// `.background.secondary`.
     let codeBackground: BlockInk
-    /// `.separator`.
     let codeBorder: BlockInk
-    /// `Divider().opacity(0.5)`.
     let codeDivider: BlockInk
-    /// `.tint.opacity(0.16)`.
     let userBubble: BlockInk
-    /// `.primary` inside the bubble: role is carried by the tint and the
-    /// alignment, never by dimming text.
     let userBubbleForeground: BlockInk
-    /// The tint, which is what `Text` draws a Markdown link in.
     let link: BlockInk
-    /// The Markdown parser has no quote segment, so the SwiftUI transcript
-    /// draws `> …` as prose. Matching it means the same primary label.
     let quote: BlockInk
-    /// `FindTextHighlighting`'s `.yellow`.
+    /// Find match colour from the system accent or the explicit override.
     let findMatch: BlockInk
-    /// `FindTextHighlighting`'s `.orange`, used for the first match in a block.
+    /// Active Find match colour from the same accent source.
     let findActiveMatch: BlockInk
-    /// `FindHighlightedMessage`'s `Color.orange.opacity(0.12)`.
-    let findActiveRow: BlockInk
-    /// `FindHighlightedMessage`'s `.orange.opacity(0.8)` border.
-    let findActiveBorder: BlockInk
-    /// `AssistantMark`'s `.tint`, which only the symbol fallback uses.
+    /// The accent used for native text selection.
+    let selectionHighlight: BlockInk
+    /// The assistant mark tint used by the fallback symbol.
     let assistantMark: BlockInk
 
-    /// `.body`.
     let bodySize: Double
-    /// `.title2`, `.title3`, `.headline` — the 17/15/13 scale
-    /// `MessageTypography.headingFont` names.
     let headingSizes: [Double]
-    /// `.callout`, as `TranscriptCodeBlock` uses for its body.
     let codeSize: Double
-    /// `.caption2`, as `TranscriptCodeBlock` uses for its language label.
     let codeLabelSize: Double
-    /// `.caption`, as `MessageRow` uses for a system message.
     let systemSize: Double
 
     /// The layout key's appearance component.
@@ -229,13 +203,13 @@ private struct BlockRenderStyle: Hashable, Sendable {
         let codeBackground = BlockInk(.controlBackgroundColor)
         let codeBorder = BlockInk(.separatorColor)
         let codeDivider = BlockInk(NSColor.separatorColor.withAlphaComponent(0.5))
-        // The transcript sets no tint of its own, so `.tint` is the accent.
-        let userBubble = BlockInk(NSColor.controlAccentColor.withAlphaComponent(0.16))
-        let link = BlockInk(.controlAccentColor)
-        let findMatch = BlockInk(.systemYellow)
-        let findActiveMatch = BlockInk(.systemOrange)
-        let findActiveRow = BlockInk(NSColor.systemOrange.withAlphaComponent(0.12))
-        let findActiveBorder = BlockInk(NSColor.systemOrange.withAlphaComponent(0.8))
+        let accent = AccentColorStore.resolvedColor()
+        let userBubble = BlockInk(accent.withAlphaComponent(0.16))
+        let link = BlockInk(accent)
+        let findMatch = BlockInk(accent.withAlphaComponent(
+            NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast ? 1 : 0.72
+        ))
+        let findActiveMatch = BlockInk(accent)
 
         self.label = label
         self.secondaryLabel = secondaryLabel
@@ -249,8 +223,7 @@ private struct BlockRenderStyle: Hashable, Sendable {
         quote = label
         self.findMatch = findMatch
         self.findActiveMatch = findActiveMatch
-        self.findActiveRow = findActiveRow
-        self.findActiveBorder = findActiveBorder
+        selectionHighlight = BlockInk(accent.withAlphaComponent(0.24))
         assistantMark = link
 
         let bodySize = Double(NSFont.preferredFont(forTextStyle: .body).pointSize)
@@ -272,8 +245,7 @@ private struct BlockRenderStyle: Hashable, Sendable {
         appearanceDigest.combine(appearanceName)
         for ink in [
             label, secondaryLabel, codeBackground, codeBorder, codeDivider,
-            userBubble, link, findMatch, findActiveMatch, findActiveRow,
-            findActiveBorder
+            userBubble, link, findMatch, findActiveMatch, selectionHighlight
         ] {
             appearanceDigest.combine(ink)
         }
@@ -300,8 +272,7 @@ private extension BlockRenderStyle {
     /// asks AppKit to resolve a text style or a font descriptor collection.
     var bodyFont: NSFont { .systemFont(ofSize: CGFloat(bodySize)) }
 
-    /// `MessageTypography.headingFont`: `.title2`/`.title3` at semibold, then
-    /// `.headline`, which is already semibold.
+    /// Heading sizes use the `.title2`, `.title3`, and `.headline` scale.
     func headingFont(_ level: Int) -> NSFont {
         let index = min(max(level, 1), headingSizes.count) - 1
         return .systemFont(ofSize: CGFloat(headingSizes[index]), weight: .semibold)
@@ -374,8 +345,8 @@ private struct BlockPrepared: Sendable {
 private struct BlockPlan: Sendable {
     let key: BlockLayoutKey
     let role: Role
-    /// `MarkdownMessage` skips segmentation while deltas land, so a streaming
-    /// reply is plain body text with no block structure.
+    /// Streaming blocks use plain text while deltas land, so the renderer
+    /// avoids reparsing the incomplete message.
     let isPlainText: Bool
 }
 
@@ -429,9 +400,7 @@ private enum BlockText {
     ) -> BlockPreparedText {
         switch role {
         case .user:
-            // `MessageRow` draws a user message with `Text(message.text)`:
-            // body type at `.primary`, no Markdown, leading-aligned inside a
-            // trailing-aligned bubble.
+            // User blocks use body text inside a trailing-aligned bubble.
             return paragraph(
                 AttributedString(source),
                 font: style.bodyFont,
@@ -484,8 +453,8 @@ private enum BlockText {
 
         switch segment {
         case .heading(_, let level, let content):
-            // `MessageTypography.headingFont`/`headingTracking`, with no added
-            // leading: a heading is tighter than the body it introduces.
+            // Heading size and tracking have no added leading, so a heading
+            // stays tighter than the body it introduces.
             return paragraph(
                 content,
                 font: style.headingFont(level),
@@ -669,10 +638,8 @@ private enum BlockText {
             copyText: nil
         )
     }
-
-    /// `MarkdownBlocks.listRow`: the marker sits in its own fixed column on the
-    /// first text baseline, and wrapped lines align under the item's text
-    /// rather than under its marker.
+    /// A list block places its marker in a fixed column on the first text
+    /// baseline. Wrapped lines align under the item text.
     private static func listItem(
         _ content: AttributedString,
         marker: String,
@@ -737,10 +704,8 @@ private enum BlockText {
     ) -> BlockPreparedText {
         let body = stripsFence ? codeBody(from: source) : source
         let paragraphStyle = NSMutableParagraphStyle()
-        // `TranscriptCodeBlock` puts its body in a horizontal scroll view and
-        // never wraps. A block row has no scroller of its own, so a long line
-        // wraps by character instead: wrapping on words would leave a wide
-        // ragged gap in a code listing, and clipping would lose the text.
+        // Code blocks do not scroll horizontally. Long lines wrap by
+        // character so content remains visible in the table row.
         paragraphStyle.lineBreakMode = .byCharWrapping
         let value = NSAttributedString(string: body, attributes: [
             .font: style.codeFont,
@@ -756,11 +721,8 @@ private enum BlockText {
         )
     }
 
-    /// A fenced block's body without its delimiters.
-    ///
-    /// `TranscriptBlockSegmenter` gives a code block a source range spanning
-    /// the opening fence through the closing one, while `TranscriptCodeBlock`
-    /// draws only the body and puts the info string in its header.
+    /// A code block's body without its delimiters. The source range spans the
+    /// opening fence through the closing one.
     private static func codeBody(from source: String) -> String {
         var lines = source.components(separatedBy: "\n")
         if lines.first?.trimmingCharacters(in: .whitespaces).hasPrefix("```") == true {
@@ -774,8 +736,7 @@ private enum BlockText {
         return lines.joined(separator: "\n")
     }
 
-    /// Mirrors `MarkdownBlocks.ordinal`, keeping the author's delimiter so
-    /// `3)` stays `3)` and `3.` stays `3.`.
+    /// Keep the author's delimiter, so `3)` stays `3)` and `3.` stays `3)`.
     private static func ordinal(_ number: Int, marker: String) -> String {
         let delimiter = marker.last.map { $0 == ")" ? ")" : "." } ?? "."
         return "\(number)\(delimiter)"
@@ -902,6 +863,14 @@ struct BlockTranscriptView: NSViewRepresentable {
         private weak var tableView: NSTableView?
         private var observers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
         private var generation = 0
+        /// A publication may arrive before SwiftUI lays out the hosted view.
+        /// Keep it pending until a layout reports usable geometry.
+        private var layoutWorkPending = false
+        /// Suppresses the container's layout callback while `update` is
+        /// establishing a publication. The callback from that pass can still
+        /// observe the old zero-sized geometry; only a later real layout may
+        /// consume the pending reload.
+        private var isUpdating = false
         /// Eight rows keeps a small amount of rich content ready during a
         /// wheel tick without shaping blocks outside the visible neighborhood.
         private let overdrawRows = 8
@@ -930,6 +899,9 @@ struct BlockTranscriptView: NSViewRepresentable {
             let result = BlockTranscriptContainerView(tableView: table)
             container = result
             tableView = table
+            result.onLayout = { [weak self] in
+                self?.scheduleLayoutWork()
+            }
             result.onAppearanceChange = { [weak self] in
                 self?.appearanceDidChange()
             }
@@ -979,10 +951,13 @@ struct BlockTranscriptView: NSViewRepresentable {
                 prepared.removeAll(keepingCapacity: true)
                 layoutCacheResetForRoute()
                 selection.clear()
+                layoutWorkPending = false
             }
             let oldRows = rows
             let oldBlocks = blocks
             let oldMessages = messages
+            isUpdating = true
+            defer { isUpdating = false }
 
             container.onPaint = input.onPaint
             self.container = container
@@ -1035,20 +1010,8 @@ struct BlockTranscriptView: NSViewRepresentable {
                 // table frame while preparation below keys from the real clip
                 // width.
                 container.layoutTableDocument()
-                let visible = container.tableView.rows(
-                    in: visibleRect(for: container.tableView)
-                )
-                var visibleIndexes: IndexSet?
-                if visible.location == NSNotFound {
-                    visibleIndexes = nil
-                } else {
-                    let first = max(0, visible.location)
-                    let last = min(rows.count, visible.location + visible.length)
-                    visibleIndexes = first < last
-                        ? IndexSet(integersIn: first..<last)
-                        : nil
-                }
-                if let visibleIndexes {
+                if let visibleIndexes = visibleRowIndexes(in: container.tableView) {
+                    layoutWorkPending = false
                     HermternalSwitchTrace.transcriptPhaseReload(
                         full: false,
                         rows: visibleIndexes.count
@@ -1057,17 +1020,16 @@ struct BlockTranscriptView: NSViewRepresentable {
                         forRowIndexes: visibleIndexes,
                         columnIndexes: IndexSet(integer: 0)
                     )
-                } else if !rows.isEmpty {
-                    HermternalSwitchTrace.transcriptPhaseReloadFallback(
+                } else {
+                    let visible = container.tableView.rows(
+                        in: visibleRect(for: container.tableView)
+                    )
+                    layoutWorkPending = true
+                    HermternalSwitchTrace.transcriptPhaseReloadDeferred(
                         rows: rows.count,
                         visibleLocation: visible.location,
                         visibleLength: visible.length
                     )
-                    HermternalSwitchTrace.transcriptPhaseReload(
-                        full: true,
-                        rows: rows.count
-                    )
-                    container.tableView.reloadData()
                 }
             } else if rowCountChanged || !changed.isEmpty {
                 if rowCountChanged {
@@ -1077,14 +1039,27 @@ struct BlockTranscriptView: NSViewRepresentable {
                 // the delegate's height callback.
                 container.layoutTableDocument()
                 if !changed.isEmpty {
-                    HermternalSwitchTrace.transcriptPhaseReload(
-                        full: false,
-                        rows: changed.count
-                    )
-                    container.tableView.reloadData(
-                        forRowIndexes: changed,
-                        columnIndexes: IndexSet(integer: 0)
-                    )
+                    if visibleRowIndexes(in: container.tableView) != nil {
+                        layoutWorkPending = false
+                        HermternalSwitchTrace.transcriptPhaseReload(
+                            full: false,
+                            rows: changed.count
+                        )
+                        container.tableView.reloadData(
+                            forRowIndexes: changed,
+                            columnIndexes: IndexSet(integer: 0)
+                        )
+                    } else {
+                        let visible = container.tableView.rows(
+                            in: visibleRect(for: container.tableView)
+                        )
+                        layoutWorkPending = true
+                        HermternalSwitchTrace.transcriptPhaseReloadDeferred(
+                            rows: rows.count,
+                            visibleLocation: visible.location,
+                            visibleLength: visible.length
+                        )
+                    }
                 }
             }
             if let diffStart {
@@ -1100,8 +1075,9 @@ struct BlockTranscriptView: NSViewRepresentable {
         func dismantle(container: BlockTranscriptContainerView) {
             generation &+= 1
             preparation.cancel()
+            layoutWorkPending = false
+            container.onLayout = nil
             container.onAppearanceChange = nil
-            container.tableView.delegate = nil
             container.tableView.dataSource = nil
             for observer in observers {
                 observer.center.removeObserver(observer.token)
@@ -1143,13 +1119,20 @@ struct BlockTranscriptView: NSViewRepresentable {
                 findMatches.indices.contains($0)
                     && findMatches[$0].messageIndex == value.messageIndex
             } ?? false
-            let sliceStart = traceEnabled
+            let sliceStart = traceEnabled && preparedValue == nil
                 ? HermternalSwitchTrace.transcriptPhaseClock()
                 : nil
-            let sourceText = BlockText.slice(
-                value.message.text,
-                range: value.block.sourceRange
-            )
+            let sourceText: String
+            if let preparedValue {
+                // Preparation already captured this range off-main. Reuse
+                // that value instead of copying the source again on paint.
+                sourceText = preparedValue.text
+            } else {
+                sourceText = BlockText.slice(
+                    value.message.text,
+                    range: value.block.sourceRange
+                )
+            }
             if let sliceStart {
                 HermternalSwitchTrace.transcriptPhaseTextSlice(
                     start: sliceStart,
@@ -1371,12 +1354,55 @@ struct BlockTranscriptView: NSViewRepresentable {
             )
         }
 
-        private func prepareVisibleBlocks() {
-            guard let tableView, !rows.isEmpty else { return }
+        private func visibleRowIndexes(in tableView: NSTableView) -> IndexSet? {
+            guard tableView.bounds.width > 1,
+                  let clip = tableView.enclosingScrollView?.contentView,
+                  clip.bounds.width > 1,
+                  clip.bounds.height > 1
+            else { return nil }
             let visible = tableView.rows(in: visibleRect(for: tableView))
-            guard visible.location != NSNotFound else { return }
-            let lower = max(0, visible.location - overdrawRows)
-            let upper = min(rows.count, visible.location + visible.length + overdrawRows)
+            guard visible.location != NSNotFound, visible.length > 0 else {
+                return nil
+            }
+            let first = max(0, visible.location)
+            let last = min(rows.count, visible.location + visible.length)
+            guard first < last else { return nil }
+            return IndexSet(integersIn: first..<last)
+        }
+
+        /// Applies a held publication from the first layout with usable
+        /// geometry. This is called by `BlockTranscriptContainerView.layout`,
+        /// not by a timer or an opportunistic main-queue hop.
+        private func scheduleLayoutWork() {
+            guard !isUpdating,
+                  layoutWorkPending,
+                  !rows.isEmpty,
+                  let tableView,
+                  let visibleIndexes = visibleRowIndexes(in: tableView)
+            else {
+                return
+            }
+            layoutWorkPending = false
+            HermternalSwitchTrace.transcriptPhaseReload(
+                full: false,
+                rows: visibleIndexes.count
+            )
+            tableView.reloadData(
+                forRowIndexes: visibleIndexes,
+                columnIndexes: IndexSet(integer: 0)
+            )
+            prepareVisibleBlocks()
+            schedulePositioning(routeChanged: false)
+        }
+
+        private func prepareVisibleBlocks() {
+            guard let tableView, !rows.isEmpty,
+                  let visible = visibleRowIndexes(in: tableView)
+            else { return }
+            let firstVisible = visible.first ?? 0
+            let lastVisible = visible.last.map { $0 + 1 } ?? rows.count
+            let lower = max(0, firstVisible - overdrawRows)
+            let upper = min(rows.count, lastVisible + overdrawRows)
             var candidates: [TranscriptBlock] = []
             var plans: [String: BlockPlan] = [:]
             for row in rows[lower..<upper] {
@@ -1653,7 +1679,7 @@ private final class BlockTranscriptRowView: NSTableCellView {
         addSubview(headerDivider)
 
         copyButton.translatesAutoresizingMaskIntoConstraints = false
-        // `TranscriptCodeBlock` uses a plain, secondary, image-only button.
+        // The code-copy control is a plain secondary image-only button.
         copyButton.title = ""
         copyButton.isBordered = false
         copyButton.imagePosition = .imageOnly
@@ -1764,6 +1790,10 @@ private final class BlockTranscriptRowView: NSTableCellView {
             .foregroundColor: style.link.nsColor,
             .cursor: NSCursor.pointingHand
         ]
+        textView.selectedTextAttributes = [
+            .backgroundColor: style.selectionHighlight.nsColor,
+            .foregroundColor: style.label.nsColor
+        ]
         textView.textStorage?.setAttributedString(content.value)
         applyFindMarks(findRanges, block: block, sourceText: sourceText, style: style)
 
@@ -1775,7 +1805,9 @@ private final class BlockTranscriptRowView: NSTableCellView {
         headerDivider.isHidden = !isCode
         copyButton.isHidden = !isCode
         if isCode {
-            let label = TranscriptCodeBlock.label(for: block.language ?? "")
+            let label = block.language?.isEmpty == false
+                ? block.language ?? "code"
+                : "code"
             languageLabel.stringValue = label
             languageLabel.font = style.codeLabelFont
             languageLabel.textColor = style.secondaryLabel.nsColor
@@ -1800,7 +1832,6 @@ private final class BlockTranscriptRowView: NSTableCellView {
         applySurface(
             role: message.role,
             isCode: isCode,
-            isFindActive: isFindActive,
             isFirstInMessage: isFirstInMessage,
             isLastInMessage: isLastInMessage,
             style: style
@@ -1822,24 +1853,18 @@ private final class BlockTranscriptRowView: NSTableCellView {
     }
     /// The row's background, border, and corner treatment.
     ///
-    /// `MessageRow` tints a user bubble, `TranscriptCodeBlock` draws a bordered
-    /// card, and `FindHighlightedMessage` tints and outlines the active
-    /// message. Active-find styling takes precedence over the role surface on
-    /// every block row so the rows read as one continuous highlighted message.
+    /// User bubbles and code cards use role surfaces. Find never paints a
+    /// row-level surface because a match belongs only to its text range.
     private func applySurface(
         role: Role,
         isCode: Bool,
-        isFindActive: Bool,
         isFirstInMessage: Bool,
         isLastInMessage: Bool,
         style: BlockRenderStyle
     ) {
         let background: BlockInk?
         let radius: CGFloat
-        if isFindActive {
-            background = style.findActiveRow
-            radius = AppShapeScale.row
-        } else if isCode {
+        if isCode {
             background = style.codeBackground
             radius = AppShapeScale.compact
         } else if role == .user {
@@ -1855,11 +1880,7 @@ private final class BlockTranscriptRowView: NSTableCellView {
         surface.layer?.backgroundColor = background?.cgColor ?? NSColor.clear.cgColor
         surface.layer?.cornerRadius = radius
         surface.layer?.maskedCorners = corners
-        if isFindActive {
-            surface.layer?.borderWidth = BlockRenderStyle.findBorderWidth
-            surface.layer?.borderColor = style.findActiveBorder.cgColor
-
-        } else if isCode {
+        if isCode {
             surface.layer?.borderWidth = BlockRenderStyle.codeBorderWidth
             surface.layer?.borderColor = style.codeBorder.cgColor
         } else {
@@ -1920,9 +1941,15 @@ private final class BlockTranscriptRowView: NSTableCellView {
                 location: range.lowerBound,
                 length: range.upperBound - range.lowerBound
             )
+            let matchColor = (offset == 0 ? style.findActiveMatch : style.findMatch).nsColor
             marked.addAttribute(
                 .foregroundColor,
-                value: (offset == 0 ? style.findActiveMatch : style.findMatch).nsColor,
+                value: matchColor,
+                range: nsRange
+            )
+            marked.addAttribute(
+                .backgroundColor,
+                value: matchColor.withAlphaComponent(offset == 0 ? 0.25 : 0.16),
                 range: nsRange
             )
             marked.addAttribute(
@@ -1937,12 +1964,9 @@ private final class BlockTranscriptRowView: NSTableCellView {
         languageLabel.attributedStringValue = marked
     }
 
-    /// Marks find hits the way `MarkdownBlocks` does: the first match inside a
-    /// block is orange, the rest yellow, and every one of them is emphasised.
-    ///
-    /// The drawn string is not the source — Markdown markers are gone and a
-    /// list marker has been added — so the ranges are projected through the
-    /// same helper the SwiftUI transcript uses.
+    /// Mark Find hits with the resolved accent, and bold only the matched text.
+    /// Source ranges are projected onto the displayed block text because
+    /// Markdown markers and list markers are not part of the drawn string.
     private func applyFindMarks(
         _ findRanges: [Range<Int>],
         block: TranscriptBlock,
@@ -1974,9 +1998,15 @@ private final class BlockTranscriptRowView: NSTableCellView {
                 location: range.lowerBound,
                 length: range.upperBound - range.lowerBound
             )
+            let matchColor = (offset == 0 ? style.findActiveMatch : style.findMatch).nsColor
             storage.addAttribute(
                 .foregroundColor,
-                value: (offset == 0 ? style.findActiveMatch : style.findMatch).nsColor,
+                value: matchColor,
+                range: marked
+            )
+            storage.addAttribute(
+                .backgroundColor,
+                value: matchColor.withAlphaComponent(offset == 0 ? 0.25 : 0.16),
                 range: marked
             )
             // Collected first: adding an attribute inside `enumerateAttribute`
@@ -2033,35 +2063,16 @@ private final class BlockTranscriptRowView: NSTableCellView {
     }
 }
 
-/// The app mark drawings an assistant row shows.
+/// The app mark an assistant row shows in its reserved gutter.
 ///
-/// `ChatView`'s `HermternalMark` is file-private to the SwiftUI transcript, so
-/// this renderer loads the same two resources rather than substituting a
-/// different glyph. Each is decoded at most once; main-actor isolation is what
-/// makes a `static let` of a non-`Sendable` `NSImage` legal.
+/// It defers to `HermternalMark`, so the AppKit transcript and the SwiftUI
+/// surfaces draw one asset from one decode. There is deliberately no generic
+/// symbol fallback: a stand-in glyph would misrepresent the product, so a
+/// missing resource draws nothing and is logged by the shared loader.
 @MainActor
 private enum BlockAssistantMark {
     static func image(isDark: Bool) -> NSImage? {
-        (isDark ? dark : light) ?? fallback
-    }
-
-    private static let light = load("HermternalMarkLight")
-    private static let dark = load("HermternalMarkDark")
-    /// `AssistantMark`'s own fallback, for a process running without its
-    /// bundle resources. It is a template image, so it takes the tint.
-    private static let fallback = NSImage(
-        systemSymbolName: "sparkle",
-        accessibilityDescription: "Hermternal"
-    )
-
-    private static func load(_ name: String) -> NSImage? {
-        guard let url = Bundle.main.url(forResource: name, withExtension: "png"),
-              let image = NSImage(contentsOf: url)
-        else {
-            Log.error("Missing bundle resource \(name).png")
-            return nil
-        }
-        return image
+        HermternalMark.image(for: isDark ? .dark : .light)
     }
 }
 
@@ -2111,6 +2122,9 @@ final class BlockTranscriptContainerView: NSView {
     private var lastDocumentWidth: CGFloat = 0
     fileprivate var messageElements: [BlockMessageAccessibilityElement] = []
     var onPaint: ((UInt64) -> Void)?
+    /// Called after layoutTableDocument so a publication deferred before
+    /// SwiftUI geometry exists can be applied on the first usable layout.
+    var onLayout: (() -> Void)?
     /// Called when the effective appearance changes, so the coordinator can
     /// re-resolve its palette and redraw the visible rows with it.
     var onAppearanceChange: (() -> Void)?
@@ -2179,6 +2193,7 @@ final class BlockTranscriptContainerView: NSView {
             }
         }
         tableView.frame.size.height = max(1, tableView.fittingSize.height)
+        onLayout?()
     }
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)

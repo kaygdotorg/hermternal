@@ -180,41 +180,62 @@ public struct StreamingReduction: Sendable {
     public let isAwaitingReply: Bool
     public let terminal: StreamingTerminal?
     public let notice: String?
+    /// Event type names that this client does not know yet.
+    public let unknownEventTypes: [String]
 
     public init(
         messages: [ChatMessage],
         isAwaitingReply: Bool,
         terminal: StreamingTerminal? = nil,
-        notice: String? = nil
+        notice: String? = nil,
+        unknownEventTypes: [String] = []
     ) {
         self.messages = messages
         self.isAwaitingReply = isAwaitingReply
         self.terminal = terminal
         self.notice = notice
+        self.unknownEventTypes = unknownEventTypes
     }
 }
 
 /// Production reducer for the event shapes emitted by GatewayClient.
+///
+/// The reducer consumes events in gateway arrival order. It does not assume
+/// that reasoning ends before answer text starts, or that either stream is
+/// contiguous.
 /// Live rows remain provisional unless the gateway explicitly supplies a
 /// durable id in a future event shape.
 public struct StreamingEventReducer: Sendable {
     public private(set) var messages: [ChatMessage]
     public private(set) var isAwaitingReply: Bool
+    /// Unknown events remain observable for forward compatibility and support
+    /// diagnostics instead of disappearing in the default branch.
+    public private(set) var unknownEventTypes: [String]
 
-    public init(messages: [ChatMessage] = [], isAwaitingReply: Bool = false) {
+    public init(
+        messages: [ChatMessage] = [],
+        isAwaitingReply: Bool = false,
+        unknownEventTypes: [String] = []
+    ) {
         self.messages = messages
         self.isAwaitingReply = isAwaitingReply
+        self.unknownEventTypes = unknownEventTypes
     }
 
-    public mutating func reset(messages: [ChatMessage] = [], isAwaitingReply: Bool = false) {
+    public mutating func reset(
+        messages: [ChatMessage] = [],
+        isAwaitingReply: Bool = false
+    ) {
         self.messages = messages
         self.isAwaitingReply = isAwaitingReply
+        unknownEventTypes.removeAll(keepingCapacity: true)
     }
 
     public mutating func appendUser(_ text: String) {
         messages.append(ChatMessage(role: .user, text: text))
         isAwaitingReply = true
     }
+
     public mutating func cancel() -> StreamingReduction {
         finishStreaming()
         return reduction()
@@ -226,8 +247,8 @@ public struct StreamingEventReducer: Sendable {
     }
 
     public mutating func reduce(_ event: GatewayEvent) -> StreamingReduction {
-        switch event.type {
-        case "message.start":
+        switch event.kind {
+        case .messageStart:
             messages.append(ChatMessage(
                 id: identity(for: event),
                 role: .assistant,
@@ -237,40 +258,45 @@ public struct StreamingEventReducer: Sendable {
             isAwaitingReply = true
             return reduction()
 
-        case "message.delta":
+        case .messageDelta:
             guard let delta = event.text, !delta.isEmpty else { return reduction() }
-            if let index = streamingIndex {
-                messages[index].text += delta
-            } else {
-                messages.append(ChatMessage(
-                    id: identity(for: event),
-                    role: .assistant,
-                    text: delta,
-                    isStreaming: true
-                ))
-            }
-            isAwaitingReply = true
+            appendAnswer(delta, identity: identity(for: event))
             return reduction()
 
-        case "message.complete":
-            if let index = streamingIndex {
-                if let full = event.text, !full.isEmpty { messages[index].text = full }
-                messages[index].isStreaming = false
-            } else if let full = event.text, !full.isEmpty, isAwaitingReply {
-                messages.append(ChatMessage(
-                    id: identity(for: event),
-                    role: .assistant,
-                    text: full
-                ))
+        // The wire names differ, but upstream routes provider reasoning,
+        // Anthropic thinking blocks, and Codex reasoning deltas to one
+        // logical reasoning channel. Arrival order remains authoritative.
+        case .thinkingDelta, .reasoningDelta, .reasoningAvailable:
+            guard let delta = event.text, !delta.isEmpty else { return reduction() }
+            appendReasoning(delta, identity: identity(for: event))
+            return reduction()
+
+        case .messageInterim:
+            guard let interim = event.text, !interim.isEmpty else { return reduction() }
+            if event.payload?["already_streamed"]?.boolValue == true {
+                if let index = streamingIndex { messages[index].text = interim }
+                else { appendAnswer(interim, identity: identity(for: event)) }
+            } else {
+                appendAnswer(interim, identity: identity(for: event))
             }
-            finishStreaming()
+            return reduction()
+
+        case .messageComplete:
+            complete(event)
             return reduction(terminal: .complete)
 
-        case "error":
+        case .error, .messageError:
             finishStreaming()
             return reduction(terminal: .error, notice: event.text ?? "The agent reported an error.")
 
+        case .unknown(let type):
+            unknownEventTypes.append(type)
+            return reduction()
+
         default:
+            // Known lifecycle, tool, MoA, subagent, notification, approval,
+            // voice, and status events remain classified even when this
+            // transcript reducer has no message projection for them yet.
             return reduction()
         }
     }
@@ -282,6 +308,57 @@ public struct StreamingEventReducer: Sendable {
     private func identity(for event: GatewayEvent) -> MessageIdentity {
         if let serverID = event.serverMessageID { return .server(serverID) }
         return .provisional(UUID())
+    }
+
+    private mutating func appendAnswer(_ delta: String, identity: MessageIdentity) {
+        if let index = streamingIndex {
+            messages[index].text += delta
+        } else {
+            messages.append(ChatMessage(
+                id: identity,
+                role: .assistant,
+                text: delta,
+                isStreaming: true
+            ))
+        }
+        isAwaitingReply = true
+    }
+
+    private mutating func appendReasoning(_ delta: String, identity: MessageIdentity) {
+        if let index = streamingIndex {
+            messages[index].reasoning = (messages[index].reasoning ?? "") + delta
+        } else {
+            messages.append(ChatMessage(
+                id: identity,
+                role: .assistant,
+                text: "",
+                reasoning: delta,
+                isStreaming: true
+            ))
+        }
+        isAwaitingReply = true
+    }
+
+    private mutating func complete(_ event: GatewayEvent) {
+        if let index = streamingIndex {
+            if let full = event.text, !full.isEmpty {
+                messages[index].text = full
+            }
+            // A present final value is authoritative, including an empty
+            // string. An absent value preserves streamed reasoning.
+            if let finalReasoning = event.payload?["reasoning"]?.stringValue {
+                messages[index].reasoning = finalReasoning
+            }
+            messages[index].isStreaming = false
+        } else if let full = event.text, !full.isEmpty, isAwaitingReply {
+            messages.append(ChatMessage(
+                id: identity(for: event),
+                role: .assistant,
+                text: full,
+                reasoning: event.payload?["reasoning"]?.stringValue
+            ))
+        }
+        finishStreaming()
     }
 
     private mutating func finishStreaming() {
@@ -297,7 +374,8 @@ public struct StreamingEventReducer: Sendable {
             messages: messages,
             isAwaitingReply: isAwaitingReply,
             terminal: terminal,
-            notice: notice
+            notice: notice,
+            unknownEventTypes: unknownEventTypes
         )
     }
 }

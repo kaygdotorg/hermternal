@@ -1,7 +1,7 @@
 import Foundation
 
 /// Minimal dynamic JSON tree for gateway and REST payloads.
-public enum JSONValue: Codable, Sendable {
+public enum JSONValue: Codable, Equatable, Sendable {
     case null
     case bool(Bool)
     /// A JSON integer that is exactly representable by `Int64`.

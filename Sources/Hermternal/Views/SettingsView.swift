@@ -136,6 +136,13 @@ private struct AppearanceSettingsView: View {
         )
     }
 
+    private var accentBinding: Binding<Color> {
+        Binding(
+            get: { Color(nsColor: appearance.effectiveAccentColor) },
+            set: { appearance.setAccentOverride(AccentColorValue(nsColor: NSColor($0))) }
+        )
+    }
+
     var body: some View {
         Form {
             Section {
@@ -145,6 +152,32 @@ private struct AppearanceSettingsView: View {
                     }
                 }
                 .pickerStyle(.segmented)
+            }
+
+            Section {
+                LabeledContent {
+                    ColorPicker(
+                        "Override",
+                        selection: accentBinding,
+                        supportsOpacity: false
+                    )
+                    .labelsHidden()
+                } label: {
+                    Text("Accent Colour")
+                    Text(
+                        appearance.accentOverride == nil
+                            ? "Highlights and selection use the macOS system accent colour."
+                            : "Highlights and selection use this in-app accent override."
+                    )
+                }
+
+                if appearance.accentOverride != nil {
+                    Button("Use macOS System Accent") {
+                        appearance.useSystemAccent()
+                    }
+                }
+            } header: {
+                Text("Accent")
             }
 
             Section {
@@ -205,6 +238,7 @@ private struct AppearanceSettingsView: View {
         .scrollContentBackground(.hidden)
     }
 }
+
 
 private struct CacheSettingsView: View {
     @Bindable var model: AppModel

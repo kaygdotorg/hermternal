@@ -10,6 +10,7 @@ struct FindBar: View {
     let previous: () -> Void
     let close: () -> Void
 
+    @State private var accentColor = Color(nsColor: AccentColorStore.resolvedColor())
     @FocusState private var fieldFocused: Bool
 
     var body: some View {
@@ -68,8 +69,23 @@ struct FindBar: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+        .tint(accentColor)
         .background(.thickMaterial, in: .capsule)
         .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: AccentColorStore.didChangeNotification
+            )
+        ) { _ in
+            accentColor = Color(nsColor: AccentColorStore.resolvedColor())
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: NSColor.systemColorsDidChangeNotification
+            )
+        ) { _ in
+            accentColor = Color(nsColor: AccentColorStore.resolvedColor())
+        }
         .onAppear {
             // No entrance animation: ⌘F must be ready for the next keystroke.
             fieldFocused = true
@@ -86,60 +102,8 @@ struct FindBar: View {
     }
 }
 
-struct FindHighlightedMessage: View {
-    let text: String
-    /// Streaming replies and user messages are drawn as one plain run:
-    /// streaming would re-segment on every delta, and a user message is not
-    /// markdown on the unhighlighted path either, so segmenting it only when
-    /// Find is open would make the same text render two different ways.
-    let isPlainText: Bool
-    let matchRanges: [Range<Int>]
-    let isActive: Bool
 
-    var body: some View {
-        Group {
-            if isPlainText {
-                Group {
-                    if matchRanges.isEmpty {
-                        Text(text)
-                    } else {
-                        Text(FindTextHighlighting.mark(
-                            AttributedString(text),
-                            ranges: matchRanges
-                        ))
-                    }
-                }
-                .font(.body)
-                .foregroundStyle(.primary)
-                .lineSpacing(MessageTypography.bodyLineSpacing)
-                .textSelection(.enabled)
-            } else {
-                // Same renderer as the unhighlighted transcript, so type,
-                // spacing, and code chrome cannot drift between the two.
-                MarkdownBlocks(
-                    text: text,
-                    matches: MessageFindMatches(text: text, ranges: matchRanges)
-                )
-            }
-        }
-        .padding(.vertical, isActive ? 4 : 0)
-        // This highlight can contain a code block, so it stays larger than
-        // the nested 8pt code shape and smaller than the 14pt message bubble
-        // it can sit inside; the curves remain concentric.
-        .background(
-            isActive ? Color.orange.opacity(0.12) : .clear,
-            in: .rect(cornerRadius: AppShapeScale.row, style: .continuous)
-        )
-        .overlay {
-            if isActive {
-                RoundedRectangle(cornerRadius: AppShapeScale.row, style: .continuous)
-                    .strokeBorder(.orange.opacity(0.8), lineWidth: 1)
-            }
-        }
-    }
-}
-
-/// Shared by the transcript's plain and highlighted renderers.
+/// Shared by Find excerpts and the AppKit block renderer.
 enum FindTextHighlighting {
     static func mark(
         _ source: AttributedString,
@@ -159,7 +123,11 @@ enum FindTextHighlighting {
                 offsetByCharacters: characterOffset(range.upperBound, in: rendered)
             )
             result[start..<end].inlinePresentationIntent = .stronglyEmphasized
-            result[start..<end].foregroundColor = offset == 0 ? .orange : .yellow
+            let accent = AccentColorStore.resolvedColor()
+            result[start..<end].foregroundColor = Color(nsColor: accent)
+            result[start..<end].backgroundColor = Color(
+                nsColor: accent.withAlphaComponent(offset == 0 ? 0.25 : 0.16)
+            )
         }
         return result
     }

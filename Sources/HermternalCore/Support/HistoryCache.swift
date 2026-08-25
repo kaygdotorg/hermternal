@@ -182,22 +182,64 @@ public struct CachedTranscript: Codable, Sendable {
 
     /// The decoded residency charged to the bounded in-memory cache.
     ///
-    /// Message text and snapshot/session strings are the dominant allocations,
-    /// so their UTF-8 storage is charged in full. Value and collection storage
-    /// is charged using its ABI stride plus fixed allocation slack. Dictionary
-    /// buckets and the LRU's reference strings are charged by HistoryCache's
-    /// per-entry overhead; allocator bookkeeping remains uncharged because it
-    /// is bounded by the fixed number of resident entries.
+    /// Message text, transient reasoning, and any readable serialized Codex
+    /// message data are charged in full. Opaque encrypted Codex reasoning is
+    /// not retained; its small availability marker is charged instead.
     public var retainedBytes: Int {
         var total = MemoryLayout<CachedTranscript>.stride + 32
         total = Self.add(total, Self.multiply(MemoryLayout<ChatMessage>.stride, by: messages.count))
         total = Self.add(total, 32)
         for message in messages {
             total = Self.add(total, message.text.utf8.count)
+            if let reasoning = message.reasoning {
+                total = Self.add(total, reasoning.utf8.count)
+            }
+            if let codexMessageItems = message.codexMessageItems {
+                total = Self.add(total, Self.payloadBytes(codexMessageItems))
+            }
+            if let codexReasoningItems = message.codexReasoningItems,
+               message.codexReasoningAvailability == .presentAndDisplayable {
+                total = Self.add(total, Self.payloadBytes(codexReasoningItems))
+            } else if message.codexReasoningAvailability != .absent {
+                total = Self.add(total, message.codexReasoningAvailability.rawValue.utf8.count)
+            }
         }
         if let snapshot {
             total = Self.add(total, MemoryLayout<AuthoritativeTranscriptSnapshot>.stride + 32)
             total = Self.add(total, snapshot.sessionID.utf8.count)
+        }
+        return total
+    }
+
+    private static func payloadBytes(_ payload: CodexSerializedPayload) -> Int {
+        var total = MemoryLayout<CodexSerializedPayload>.stride + 16
+        if let rawValue = payload.rawValue {
+            total = add(total, rawValue.utf8.count)
+        }
+        if let parsedValue = payload.parsedValue {
+            total = add(total, jsonValueBytes(parsedValue))
+        }
+        return total
+    }
+
+    private static func jsonValueBytes(_ value: JSONValue) -> Int {
+        var total = MemoryLayout<JSONValue>.stride + 16
+        switch value {
+        case .null, .bool, .integer, .number:
+            break
+        case .string(let string):
+            total = add(total, string.utf8.count)
+        case .array(let values):
+            total = add(total, multiply(MemoryLayout<JSONValue>.stride, by: values.count))
+            for value in values {
+                total = add(total, jsonValueBytes(value))
+            }
+        case .object(let fields):
+            total = add(total, multiply(MemoryLayout<JSONValue>.stride, by: fields.count))
+            for (key, value) in fields {
+                total = add(total, key.utf8.count)
+                total = add(total, jsonValueBytes(value))
+            }
         }
         return total
     }

@@ -1,8 +1,121 @@
 import Foundation
 
+/// Event types emitted by the Hermes gateway.
+///
+/// The gateway can add event types without a client release. Those values stay
+/// visible through `unknown` instead of being discarded during classification.
+public enum GatewayEventType: Sendable, Equatable {
+    case gatewayReady
+    case skinChanged
+    case sessionInfo
+    case sessionUsage
+    case thinkingDelta
+    case reaction
+    case messageStart
+    case messageDelta
+    case messageInterim
+    case messageComplete
+    case messageError
+    case status
+    case statusUpdate
+    case notificationShow
+    case notificationClear
+    case billingStepUpVerification
+    case voiceStatus
+    case voiceTranscript
+    case wakeDetected
+    case dashboardNewSessionRequested
+    case gatewayStderr
+    case browserProgress
+    case gatewayStartTimeout
+    case gatewayProtocolError
+    case reasoningDelta
+    case reasoningAvailable
+    case moaReference
+    case moaAggregating
+    case moaProgress
+    case moaPhase
+    case toolProgress
+    case toolGenerating
+    case toolStart
+    case toolComplete
+    case clarifyRequest
+    case approvalRequest
+    case sudoRequest
+    case secretRequest
+    case secretExpire
+    case sudoExpire
+    case backgroundComplete
+    case reviewSummary
+    case subagentSpawnRequested
+    case subagentStart
+    case subagentThinking
+    case subagentTool
+    case subagentProgress
+    case subagentComplete
+    case error
+    case unknown(String)
+
+    public init(rawValue: String) {
+        switch rawValue {
+        case "gateway.ready": self = .gatewayReady
+        case "skin.changed": self = .skinChanged
+        case "session.info": self = .sessionInfo
+        case "session.usage": self = .sessionUsage
+        case "thinking.delta": self = .thinkingDelta
+        case "reaction": self = .reaction
+        case "message.start": self = .messageStart
+        case "message.delta": self = .messageDelta
+        case "message.interim": self = .messageInterim
+        case "message.complete": self = .messageComplete
+        case "status": self = .status
+        case "status.update": self = .statusUpdate
+        case "message.error": self = .messageError
+        case "notification.show": self = .notificationShow
+        case "notification.clear": self = .notificationClear
+        case "billing.step_up.verification": self = .billingStepUpVerification
+        case "voice.status": self = .voiceStatus
+        case "voice.transcript": self = .voiceTranscript
+        case "wake.detected": self = .wakeDetected
+        case "dashboard.new_session_requested": self = .dashboardNewSessionRequested
+        case "gateway.stderr": self = .gatewayStderr
+        case "browser.progress": self = .browserProgress
+        case "gateway.start_timeout": self = .gatewayStartTimeout
+        case "gateway.protocol_error": self = .gatewayProtocolError
+        case "reasoning.delta": self = .reasoningDelta
+        case "reasoning.available": self = .reasoningAvailable
+        case "moa.reference": self = .moaReference
+        case "moa.aggregating": self = .moaAggregating
+        case "moa.progress": self = .moaProgress
+        case "moa.phase": self = .moaPhase
+        case "tool.progress": self = .toolProgress
+        case "tool.generating": self = .toolGenerating
+        case "tool.start": self = .toolStart
+        case "tool.complete": self = .toolComplete
+        case "clarify.request": self = .clarifyRequest
+        case "approval.request": self = .approvalRequest
+        case "sudo.request": self = .sudoRequest
+        case "secret.request": self = .secretRequest
+        case "secret.expire": self = .secretExpire
+        case "sudo.expire": self = .sudoExpire
+        case "background.complete": self = .backgroundComplete
+        case "review.summary": self = .reviewSummary
+        case "subagent.spawn_requested": self = .subagentSpawnRequested
+        case "subagent.start": self = .subagentStart
+        case "subagent.thinking": self = .subagentThinking
+        case "subagent.tool": self = .subagentTool
+        case "subagent.progress": self = .subagentProgress
+        case "subagent.complete": self = .subagentComplete
+        case "error": self = .error
+        default: self = .unknown(rawValue)
+        }
+    }
+}
+
 /// A gateway-pushed event: `{"method":"event","params":{"type":…,"payload":…}}`.
 public struct GatewayEvent: Sendable {
     public let type: String
+    public var kind: GatewayEventType { GatewayEventType(rawValue: type) }
     public let sessionID: String?
     public let payload: JSONValue?
     public init(type: String, sessionID: String?, payload: JSONValue?) {

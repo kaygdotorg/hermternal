@@ -5,25 +5,85 @@
 # Info.plist to get a Dock icon, activation policy, and a stable app identity.
 # Assemble one rather than carrying an .xcodeproj.
 set -euo pipefail
-
 CONFIG="${CONFIG:-debug}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+APP="$ROOT/build/Hermternal.app"
+LOCK_DIR="$ROOT/build/.Hermternal-build.lock"
+STAGE_ROOT=""
+OUTPUT_PUBLISHED=0
+LOCK_HELD=0
+cleanup_build() {
+	local status=$?
+	if (( status != 0 && OUTPUT_PUBLISHED )); then
+		# Quarantine this invocation's published output before staging cleanup;
+		# never recursively delete the live output in place.
+		if [[ -e "$APP" || -L "$APP" ]]; then
+			mv -- "$APP" "$STAGE_ROOT/Failed.app" 2>/dev/null || true
+		fi
+	fi
+	if [[ -n "$STAGE_ROOT" ]]; then
+		rm -rf -- "$STAGE_ROOT" || true
+	fi
+	if (( LOCK_HELD )); then
+		rm -rf -- "$LOCK_DIR" || true
+	fi
+	exit "$status"
+}
+trap cleanup_build EXIT
+mkdir -p "$ROOT/build"
+# Refuse concurrent builds without disturbing the last good stamped bundle.
+if ! mkdir -- "$LOCK_DIR" 2>/dev/null; then
+	owner_pid="<missing>"
+	if [[ -f "$LOCK_DIR/pid" ]]; then
+		IFS= read -r owner_pid <"$LOCK_DIR/pid"
+		[[ -n "$owner_pid" ]] || owner_pid="<empty>"
+	fi
+	if [[ "$owner_pid" =~ ^[0-9]+$ ]] &&
+		kill -0 "$owner_pid" 2>/dev/null; then
+		echo "error: build lock exists at $LOCK_DIR (recorded pid $owner_pid is alive); stop that build before retrying" >&2
+	else
+		echo "error: build lock exists at $LOCK_DIR (recorded pid $owner_pid is not running); after confirming no build is active, clear it with: rm -rf -- '$LOCK_DIR'" >&2
+	fi
+	exit 1
+fi
+LOCK_HELD=1
+printf '%s\n' "$$" >"$LOCK_DIR/pid"
+if ! STAGE_ROOT="$(mktemp -d "$ROOT/build/.Hermternal-staging.XXXXXX")"; then
+	rm -rf -- "$APP" || true
+	echo "error: could not create a staging directory" >&2
+	exit 1
+fi
+if [[ -e "$APP" || -L "$APP" ]] &&
+	! mv -- "$APP" "$STAGE_ROOT/Previous.app"; then
+	rm -rf -- "$APP" || true
+	echo "error: could not quarantine previous app bundle at $APP" >&2
+	exit 1
+fi
 swift build -c "$CONFIG"
 
 BIN="$(swift build -c "$CONFIG" --show-bin-path)"
-APP="$ROOT/build/Hermternal.app"
-
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN/Hermternal" "$APP/Contents/MacOS/Hermternal"
+STAGE_APP="$STAGE_ROOT/Hermternal.app"
+mkdir -p "$STAGE_APP/Contents/MacOS" "$STAGE_APP/Contents/Resources"
+cp "$BIN/Hermternal" "$STAGE_APP/Contents/MacOS/Hermternal"
 # The new-chat mark, one drawing per appearance; ChatView loads them by name.
 cp "$ROOT/Resources/HermternalMarkLight.png" \
-	"$APP/Contents/Resources/HermternalMarkLight.png"
+	"$STAGE_APP/Contents/Resources/HermternalMarkLight.png"
 cp "$ROOT/Resources/HermternalMarkDark.png" \
-	"$APP/Contents/Resources/HermternalMarkDark.png"
-cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
+	"$STAGE_APP/Contents/Resources/HermternalMarkDark.png"
+BUILD_COMMIT="$(git rev-parse HEAD 2>/dev/null || printf 'unknown')"
+if [[ "$BUILD_COMMIT" == unknown ]]; then
+	BUILD_TREE_CLEAN=false
+else
+	BUILD_TREE_CLEAN=true
+	[[ -z "$(git status --porcelain=v1 2>/dev/null)" ]] || BUILD_TREE_CLEAN=false
+fi
+BUILD_TIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+printf 'commit=%s\ntree_clean=%s\nconfiguration=%s\nbuild_time=%s\n' \
+	"$BUILD_COMMIT" "$BUILD_TREE_CLEAN" "$CONFIG" "$BUILD_TIME" \
+	> "$STAGE_APP/Contents/Resources/HermternalBuildInfo"
+cp "$ROOT/Resources/Info.plist" "$STAGE_APP/Contents/Info.plist"
 
 # The app icon is an Icon Composer package: two stacked 1024px drawings whose
 # per-appearance visibility is specialized, so macOS picks the light or the dark
@@ -58,7 +118,7 @@ if [[ ! -f "$ICON_BUILD/Assets.car" ]]; then
 	echo "error: actool reported success but produced no Assets.car" >&2
 	exit 1
 fi
-cp "$ICON_BUILD/Assets.car" "$APP/Contents/Resources/Assets.car"
+cp "$ICON_BUILD/Assets.car" "$STAGE_APP/Contents/Resources/Assets.car"
 
 # actool names the compiled icon in a partial plist; read the name from there
 # rather than hardcoding it, so the bundle can never advertise an icon the
@@ -73,7 +133,7 @@ ICON_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' \
 [[ "$ICON_NAME" == AppIcon ]] ||
 	{ echo "error: actool compiled icon '$ICON_NAME', expected AppIcon" >&2; exit 1; }
 /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string $ICON_NAME" \
-	"$APP/Contents/Info.plist" >/dev/null
+	"$STAGE_APP/Contents/Info.plist" >/dev/null
 
 # Prefer a real codesigning identity when one is installed. A real identity
 # gives the bundle a designated requirement based on the certificate, which is
@@ -123,19 +183,18 @@ fi
 # failing a local build.
 SIGN_ARGS=(--force --options runtime
 	--entitlements "$ROOT/Resources/Hermternal.entitlements")
+if [[ -n "$CODESIGN_KEYCHAIN" ]]; then
+	SIGN_ARGS+=(--keychain "$CODESIGN_KEYCHAIN")
+fi
 if [[ "$IDENTITY" == "-" ]]; then
-	codesign "${SIGN_ARGS[@]}" --sign - "$APP" >/dev/null
+	codesign "${SIGN_ARGS[@]}" --sign - "$STAGE_APP" >/dev/null
 else
-	CODESIGN_KEYCHAIN_ARGS=()
-	if [[ -n "$CODESIGN_KEYCHAIN" ]]; then
-		CODESIGN_KEYCHAIN_ARGS=(--keychain "$CODESIGN_KEYCHAIN")
-	fi
 	# Try with a trusted timestamp, then without: `--timestamp` needs the
 	# network and should not break an offline local build.
-	if ! ERR="$(codesign "${SIGN_ARGS[@]}" "${CODESIGN_KEYCHAIN_ARGS[@]}" \
-		--timestamp --sign "$IDENTITY" "$APP" 2>&1)" &&
-	   ! ERR="$(codesign "${SIGN_ARGS[@]}" "${CODESIGN_KEYCHAIN_ARGS[@]}" \
-		--sign "$IDENTITY" "$APP" 2>&1)"; then
+	if ! ERR="$(codesign "${SIGN_ARGS[@]}" \
+		--timestamp --sign "$IDENTITY" "$STAGE_APP" 2>&1)" &&
+	   ! ERR="$(codesign "${SIGN_ARGS[@]}" \
+		--sign "$IDENTITY" "$STAGE_APP" 2>&1)"; then
 		printf '%s\n' "$ERR" >&2
 		# errSecInternalComponent identifies private-key access failure; the recovery
 		# differs for the temporary portable keychain and the installed login keychain.
@@ -179,7 +238,7 @@ else
 	fi
 	# Verify the produced Developer ID signature immediately, before callers
 	# proceed to packaging or notarization.
-	SIGNATURE_INFO="$(codesign -d --verbose=2 "$APP" 2>&1)" ||
+	SIGNATURE_INFO="$(codesign -d --verbose=2 "$STAGE_APP" 2>&1)" ||
 		{ printf '%s\n' "$SIGNATURE_INFO" >&2; exit 1; }
 	SIGNATURE_LINES="$(grep -E '^(CodeDirectory|Signature=|TeamIdentifier)' \
 		<<<"$SIGNATURE_INFO" || true)"
@@ -193,4 +252,22 @@ else
 	fi
 fi
 
+[[ -s "$STAGE_APP/Contents/MacOS/Hermternal" ]] ||
+	{ echo "error: bundle executable is missing or empty" >&2; exit 1; }
+[[ -s "$STAGE_APP/Contents/Info.plist" ]] ||
+	{ echo "error: bundle Info.plist is missing or empty" >&2; exit 1; }
+[[ -s "$STAGE_APP/Contents/Resources/Assets.car" ]] ||
+	{ echo "error: bundle Assets.car is missing or empty" >&2; exit 1; }
+[[ -s "$STAGE_APP/Contents/Resources/HermternalMarkLight.png" ]] ||
+	{ echo "error: bundle light mark is missing or empty" >&2; exit 1; }
+[[ -s "$STAGE_APP/Contents/Resources/HermternalMarkDark.png" ]] ||
+	{ echo "error: bundle dark mark is missing or empty" >&2; exit 1; }
+
+if ! VERIFY_OUTPUT="$(codesign --verify --deep --strict "$STAGE_APP" 2>&1)"; then
+	printf '%s\n' "$VERIFY_OUTPUT" >&2
+	echo "error: codesign verification failed" >&2
+	exit 1
+fi
+OUTPUT_PUBLISHED=1
+mv "$STAGE_APP" "$APP"
 echo "$APP"

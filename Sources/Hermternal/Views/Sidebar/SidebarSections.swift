@@ -246,6 +246,7 @@ struct SidebarSections: View {
                 menu: rowMenuDerivations.sessionByItem[
                     .chat(row.sessionID)
                 ]!,
+                isSelected: selection.contains(.chat(row.sessionID)),
                 onOpen: onOpen,
                 onPin: onPin,
                 onArchive: onArchive,
