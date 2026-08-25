@@ -1379,6 +1379,15 @@ struct SidebarView: View {
             archivedPointerActivatedID = nil
             return
         }
+        guard archivedPointerActivatedID != session.id else {
+            HermternalSwitchTrace.selectionGuard(
+                "openArchived.pointerDeduplication",
+                id: session.id,
+                messages: model.messages.count,
+                reason: "pointerAlreadyActivated"
+            )
+            return
+        }
         archivedPointerActivatedID = session.id
         model.userNavigationDidBegin()
         pendingOpenTask?.cancel()
