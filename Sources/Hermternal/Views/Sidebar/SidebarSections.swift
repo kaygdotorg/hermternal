@@ -71,10 +71,7 @@ struct SidebarSections: View {
     let selection: Set<SidebarSelectionID>
     let visibleOrder: [SidebarSelectionID]
     let folderVisibleOrder: [SidebarSelectionID]
-    let foldersByID: [String: SidebarFolderTarget]
-    let scheduledIDs: Set<String>
-    let expandedChats: [ChatSession]
-    let expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
+    let rowMenuDerivations: SidebarRowMenuDerivations
     let onOpen: (ChatSession) -> Void
     let onPin: ([ChatSession], Bool) -> Void
     let onArchive: ([ChatSession]) -> Void
@@ -140,8 +137,9 @@ struct SidebarSections: View {
                         isExpanded: folderExpansion(for: run.target.id),
                         selection: selection,
                         visibleOrder: folderVisibleOrder,
-                        foldersByID: foldersByID,
-                        expandedChats: expandedChats(for: .folder(run.target.id)),
+                        menu: rowMenuDerivations.folderByItem[
+                            .folder(run.target.id)
+                        ]!,
                         onRename: onRenameFolder,
                         onSelect: onSelectFolder,
                         onPin: onPin,
@@ -245,10 +243,9 @@ struct SidebarSections: View {
             SessionRowItem(
                 session: row.session,
                 folders: folders,
-                membership: membership,
-                contextChats: expandedChats(for: .chat(row.sessionID)),
-                selection: selection,
-                scheduledIDs: scheduledIDs,
+                menu: rowMenuDerivations.sessionByItem[
+                    .chat(row.sessionID)
+                ]!,
                 onOpen: onOpen,
                 onPin: onPin,
                 onArchive: onArchive,
@@ -271,14 +268,6 @@ struct SidebarSections: View {
             }
         }
     }
-    /// Selection expansion is resolved by SidebarDerivationCache. Rows only
-    /// receive the finished chat values for their clicked target.
-    private func expandedChats(for clicked: SidebarSelectionID) -> [ChatSession] {
-        selection.contains(clicked)
-            ? expandedChats
-            : expandedChatsByItem[clicked] ?? []
-    }
-
     /// Drag selection is resolved at gesture start, not while constructing
     /// every section. Held-arrow selection changes therefore do not rebuild a
     /// per-section drag table.
@@ -293,7 +282,9 @@ struct SidebarSections: View {
             visibleOrder: visibleOrder
         )
         .compactMap { item in
-            guard case let .chat(id) = item, !scheduledIDs.contains(id) else {
+            guard case let .chat(id) = item,
+                  !rowMenuDerivations.scheduledIDs.contains(id)
+            else {
                 return nil
             }
             return id

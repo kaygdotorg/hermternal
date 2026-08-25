@@ -82,6 +82,54 @@ func blockLayoutCacheHitSkipsPreparation() throws {
     #expect(second.preparedContent == "prepared")
 }
 
+@Test("measured static block reuses its key and misses every changed input")
+func blockLayoutCacheReusesStaticMeasurementAndInvalidatesInputs() {
+    let cache = BlockLayoutCache(byteBudget: 1_024)
+    let key = layoutKey(
+        contentHash: 0xA11CE,
+        widthBucket: 70,
+        fontSignature: "block-body|assistant|plain=false",
+        displayScaleBits: 2,
+        appearanceMode: "aqua#palette",
+        localeIdentifier: "en_US",
+        rendererVersion: 2
+    )
+    let measured = BlockLayoutValue(
+        preparedContent: "a measured static block",
+        measuredHeight: 42
+    )
+    cache.insert(measured, for: key)
+
+    func variant(
+        contentHash: UInt64 = key.contentHash,
+        widthBucket: Int = key.widthBucket,
+        fontSignature: String = key.fontSignature,
+        displayScaleBits: UInt64 = key.displayScaleBits,
+        appearanceMode: String = key.appearanceMode,
+        localeIdentifier: String = key.localeIdentifier,
+        rendererVersion: Int = key.rendererVersion
+    ) -> BlockLayoutKey {
+        BlockLayoutKey(
+            contentHash: contentHash,
+            widthBucket: widthBucket,
+            fontSignature: fontSignature,
+            displayScaleBits: displayScaleBits,
+            appearanceMode: appearanceMode,
+            localeIdentifier: localeIdentifier,
+            rendererVersion: rendererVersion
+        )
+    }
+
+    #expect(cache.value(for: key) == measured)
+    #expect(cache.value(for: variant(contentHash: key.contentHash &+ 1)) == nil)
+    #expect(cache.value(for: variant(widthBucket: key.widthBucket + 1)) == nil)
+    #expect(cache.value(for: variant(fontSignature: "different-font")) == nil)
+    #expect(cache.value(for: variant(displayScaleBits: key.displayScaleBits &+ 1)) == nil)
+    #expect(cache.value(for: variant(appearanceMode: "dark#palette")) == nil)
+    #expect(cache.value(for: variant(localeIdentifier: "fr_FR")) == nil)
+    #expect(cache.value(for: variant(rendererVersion: key.rendererVersion + 1)) == nil)
+}
+
 @Test("layout cache retains no more than its byte ceiling")
 func blockLayoutCacheHonorsByteCeiling() {
     let cache = BlockLayoutCache(byteBudget: 1_024)

@@ -40,13 +40,19 @@ private func sessionRowDetail(_ session: ChatSession) -> Text {
     return countText + Text(verbatim: ", ") + timeText
 }
 
+struct SidebarSessionMenuDerivation {
+    let chats: [ChatSession]
+    let moveChats: [ChatSession]
+    let folderIDs: [String]
+    let pinAction: SidebarPinAction?
+    let disabledFolderIDs: Set<String>
+    let hasFolderMembership: Bool
+}
+
 struct SessionRowItem: View {
     let session: ChatSession
     let folders: [Folder]
-    let membership: [String: String]
-    let contextChats: [ChatSession]
-    let selection: Set<SidebarSelectionID>
-    let scheduledIDs: Set<String>
+    let menu: SidebarSessionMenuDerivation
     let onOpen: (ChatSession) -> Void
     let onPin: ([ChatSession], Bool) -> Void
     let onArchive: ([ChatSession]) -> Void
@@ -56,10 +62,14 @@ struct SessionRowItem: View {
     let purgeAvailable: Bool
     let purgeUnavailableReason: String
     let onMove: ([ChatSession], String?) -> Void
+}
+
+extension SessionRowItem {
+
 
     var body: some View {
         let _ = HermternalSelectionOccupancyTrace.sessionRowBodyEvaluated()
-        SessionRow(session: session)
+        return SessionRow(session: session)
             .accessibilityLabel(session.displayTitle)
             .accessibilityValue(sessionRowDetail(session))
             .accessibilityIdentifier("session-row-\(session.id)")
@@ -109,21 +119,11 @@ struct SessionRowItem: View {
     }
 
 
-    private var moveChats: [ChatSession] {
-        contextChats.filter { !scheduledIDs.contains($0.id) }
-    }
 
     @ViewBuilder
     private var contextMenu: some View {
-        let chats = contextChats
-        let contextSelection = SidebarSelectionPolicy.contextTargets(
-            clicked: .chat(session.id),
-            selected: selection
-        )
-        let folderIDs = contextSelection.compactMap { item -> String? in
-            guard case let .folder(id) = item else { return nil }
-            return id
-        }
+        let chats = menu.chats
+        let folderIDs = menu.folderIDs
         let chatNoun = chats.count == 1 ? "Chat" : "Chats"
         let linkNoun = chats.count == 1 ? "Link" : "Links"
         let folderPhrase: String? = if folderIDs.isEmpty {
@@ -138,10 +138,7 @@ struct SessionRowItem: View {
         let linkScope = folderPhrase.map {
             "\(chats.count) Deep \(linkNoun) in \($0)"
         } ?? "\(chats.count) Deep \(linkNoun)"
-        let action = SidebarSelectionPolicy.convergingPinAction(
-            for: chats.map(\.pinned)
-        )
-        if let action {
+        if let action = menu.pinAction {
             Button(
                 action == .pin ? "Pin \(chatScope)" : "Unpin \(chatScope)",
                 systemImage: action == .pin ? "pin" : "pin.slash"
@@ -155,7 +152,7 @@ struct SessionRowItem: View {
         Button("Copy \(linkScope)", systemImage: "link") {
             onCopyDeepLinks(chats)
         }
-        if let folderPhrase {
+        if !folderIDs.isEmpty {
             Button(
                 folderIDs.count == 1
                     ? "Permanently Delete Folder and Chats…"
@@ -163,16 +160,12 @@ struct SessionRowItem: View {
                 systemImage: "trash.fill",
                 role: .destructive
             ) {
-                let selectedFolderIDs = contextSelection.compactMap { item -> String? in
-                    guard case let .folder(id) = item else { return nil }
-                    return id
-                }
-                onPurge(chats.map(\.id), selectedFolderIDs, .foldersAndChats)
+                onPurge(chats.map(\.id), folderIDs, .foldersAndChats)
             }
             .disabled(!purgeAvailable)
             .help(
                 purgeAvailable
-                    ? "Permanently delete all chats inside \(folderPhrase)"
+                    ? "Permanently delete all chats inside \(folderPhrase!)"
                     : purgeUnavailableReason
             )
         } else {
@@ -186,8 +179,8 @@ struct SessionRowItem: View {
             .disabled(!purgeAvailable)
             .help(purgeAvailable ? "Permanently delete \(chats.count) \(chatNoun)" : purgeUnavailableReason)
         }
-        if !moveChats.isEmpty {
-            moveMenu(moveChats, folderCount: folderIDs.count)
+        if !menu.moveChats.isEmpty {
+            moveMenu(menu.moveChats, folderCount: folderIDs.count)
         }
         Divider()
         Button("Rename", systemImage: "pencil") {
@@ -215,10 +208,10 @@ struct SessionRowItem: View {
                     Button(folder.name) {
                         onMove(chats, folder.id)
                     }
-                    .disabled(chats.allSatisfy { membership[$0.id] == folder.id })
+                    .disabled(menu.disabledFolderIDs.contains(folder.id))
                 }
             }
-            if chats.contains(where: { membership[$0.id] != nil }) {
+            if menu.hasFolderMembership {
                 Divider()
                 Button("Remove from Folder", systemImage: "folder.badge.minus") {
                     onMove(chats, nil)

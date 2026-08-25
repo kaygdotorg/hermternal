@@ -136,13 +136,18 @@ func sidebarDraggedIDs(
 /// row makes the whole List an outline: every other row in the sidebar,
 /// including Pinned and the date buckets, then carries an indentation
 /// column it never asked for.
+struct SidebarFolderMenuDerivation {
+    let targets: [SidebarFolderTarget]
+    let chats: [ChatSession]
+    let pinAction: SidebarPinAction?
+}
+
 struct SidebarFolderRow: View {
     let target: SidebarFolderTarget
     @Binding var isExpanded: Bool
     let selection: Set<SidebarSelectionID>
     let visibleOrder: [SidebarSelectionID]
-    let foldersByID: [String: SidebarFolderTarget]
-    let expandedChats: [ChatSession]
+    let menu: SidebarFolderMenuDerivation
     let onRename: (SidebarFolderTarget) -> Void
     /// Selects this folder without opening a transcript.
     let onSelect: (String) -> Void
@@ -159,6 +164,7 @@ struct SidebarFolderRow: View {
 
     @State private var isTargeted = false
     @State private var isHovered = false
+
 
     var body: some View {
         let _ = HermternalSelectionOccupancyTrace.folderRowBodyEvaluated()
@@ -239,35 +245,16 @@ struct SidebarFolderRow: View {
         )
     }
 
-    private var folderTargets: [SidebarFolderTarget] {
-        let targets = SidebarSelectionPolicy.contextTargets(
-            clicked: .folder(target.id),
-            selected: selection
-        )
-        var seen = Set<String>()
-        return visibleOrder.compactMap { item -> SidebarFolderTarget? in
-            guard case let .folder(id) = item,
-                  targets.contains(item),
-                  seen.insert(id).inserted
-            else { return nil }
-            return foldersByID[id]
-        }
-    }
-
-
     @ViewBuilder
     private var folderContextMenu: some View {
-        let targets = folderTargets
-        let chats = expandedChats
+        let targets = menu.targets
+        let chats = menu.chats
         let chatNoun = chats.count == 1 ? "Chat" : "Chats"
         let folderPhrase = targets.count == 1
             ? "Folder"
             : "\(targets.count) Folders"
         let chatScope = "\(chats.count) \(chatNoun) in \(folderPhrase)"
-        let action = SidebarSelectionPolicy.convergingPinAction(
-            for: chats.map(\.pinned)
-        )
-        if let action, !chats.isEmpty {
+        if let action = menu.pinAction, !chats.isEmpty {
             Button(
                 action == .pin ? "Pin \(chatScope)" : "Unpin \(chatScope)",
                 systemImage: action == .pin ? "pin" : "pin.slash"

@@ -23,11 +23,31 @@ enum HermternalSwitchTrace {
     /// The one publication that has not reached a terminal paint outcome.
     /// A newer publication closes this record as superseded before replacing
     /// it, so the trace cannot silently lose a publication.
-    private static var pendingTranscriptPublication: (
-        id: String,
-        generation: Int,
-        publishedAtNanoseconds: UInt64
-    )?
+    private struct PendingTranscriptPublication {
+        let id: String
+        let generation: Int
+        let publishedAtNanoseconds: UInt64
+        var updateNSViewNanoseconds: UInt64 = 0
+        var coordinatorDiffNanoseconds: UInt64 = 0
+        var heightCalls = 0
+        var heightCacheHits = 0
+        var heightCacheHitNanoseconds: UInt64 = 0
+        var heightEstimatorCalls = 0
+        var heightEstimatorNanoseconds: UInt64 = 0
+        var rowConfigurations = 0
+        var reusedRowConfigurations = 0
+        var newRowConfigurations = 0
+        var textSliceCount = 0
+        var textSliceNanoseconds: UInt64 = 0
+        var contentHashCount = 0
+        var contentHashNanoseconds: UInt64 = 0
+        var fullReloadRows = 0
+        var targetedReloadRows = 0
+        /// End of the latest updateNSView pass, from the same monotonic clock
+        /// as publication and paint timestamps.
+        var updateEndedAtNanoseconds: UInt64?
+    }
+    private static var pendingTranscriptPublication: PendingTranscriptPublication?
 
     static func configure(capability: any DebugModuleCapability) {
         debugModules = capability
@@ -51,6 +71,8 @@ enum HermternalSwitchTrace {
         messages: @autoclosure () -> Int? = nil,
         renderedRows: Int? = nil,
         detail: String? = nil,
+        owner: TraceOwner? = nil,
+        executor: TraceExecutor? = nil,
         module: DebugModule = .switchPhases,
         timestampNanoseconds: UInt64? = nil
     ) {
@@ -68,7 +90,7 @@ enum HermternalSwitchTrace {
             }
             resetCountersIfMetricsCleared()
             publicationCount &+= 1
-            pendingTranscriptPublication = (
+            pendingTranscriptPublication = PendingTranscriptPublication(
                 id: id,
                 generation: generation,
                 publishedAtNanoseconds: eventTimestamp
@@ -82,10 +104,96 @@ enum HermternalSwitchTrace {
             messages: messages(),
             renderedRows: renderedRows,
             detail: detail,
+            owner: owner?.rawValue,
+            executor: executor?.rawValue,
             seed: 0x01,
             timestampNanoseconds: eventTimestamp
         )
     }
+
+    /// Returns a timestamp only while the visible-paint trace is enabled.
+    /// Callers use this to bracket hot AppKit callbacks without paying for
+    /// clocks or strings in normal launches.
+    static func transcriptPhaseClock() -> UInt64? {
+        guard gate.isEnabled(.visiblePaint) else { return nil }
+        return DispatchTime.now().uptimeNanoseconds
+    }
+
+    static func transcriptPhaseUpdateNSView(start: UInt64, end: UInt64) {
+        pendingTranscriptPublication?.updateNSViewNanoseconds &+= elapsedNanoseconds(
+            start: start,
+            end: end
+        )
+    }
+
+    static func transcriptPhaseCoordinatorDiff(start: UInt64, end: UInt64) {
+        pendingTranscriptPublication?.coordinatorDiffNanoseconds &+= elapsedNanoseconds(
+            start: start,
+            end: end
+        )
+    }
+
+    static func transcriptPhaseHeight(
+        cacheHit: Bool,
+        start: UInt64,
+        end: UInt64
+    ) {
+        guard var pending = pendingTranscriptPublication else { return }
+        let duration = elapsedNanoseconds(start: start, end: end)
+        pending.heightCalls &+= 1
+        if cacheHit {
+            pending.heightCacheHits &+= 1
+            pending.heightCacheHitNanoseconds &+= duration
+        } else {
+            pending.heightEstimatorCalls &+= 1
+            pending.heightEstimatorNanoseconds &+= duration
+        }
+        pendingTranscriptPublication = pending
+    }
+
+    static func transcriptPhaseRowConfiguration(reused: Bool) {
+        guard var pending = pendingTranscriptPublication else { return }
+        pending.rowConfigurations &+= 1
+        if reused {
+            pending.reusedRowConfigurations &+= 1
+        } else {
+            pending.newRowConfigurations &+= 1
+        }
+        pendingTranscriptPublication = pending
+    }
+
+    static func transcriptPhaseReload(full: Bool, rows: Int) {
+        guard var pending = pendingTranscriptPublication else { return }
+        if full {
+            pending.fullReloadRows &+= rows
+        } else {
+            pending.targetedReloadRows &+= rows
+        }
+        pendingTranscriptPublication = pending
+    }
+
+    static func transcriptPhaseTextSlice(start: UInt64, end: UInt64) {
+        guard var pending = pendingTranscriptPublication else { return }
+        pending.textSliceCount &+= 1
+        pending.textSliceNanoseconds &+= elapsedNanoseconds(start: start, end: end)
+        pendingTranscriptPublication = pending
+    }
+
+    static func transcriptPhaseContentHash(start: UInt64, end: UInt64) {
+        guard var pending = pendingTranscriptPublication else { return }
+        pending.contentHashCount &+= 1
+        pending.contentHashNanoseconds &+= elapsedNanoseconds(start: start, end: end)
+        pendingTranscriptPublication = pending
+    }
+
+    static func transcriptPhaseUpdateEnded(at timestamp: UInt64) {
+        pendingTranscriptPublication?.updateEndedAtNanoseconds = timestamp
+    }
+
+    private static func elapsedNanoseconds(start: UInt64, end: UInt64) -> UInt64 {
+        end >= start ? end - start : 0
+    }
+
 
     /// The viewport paint is deliberately a separate event from
     /// `transcript.firstFrame`: that anchor is a graph/positioning callback,
@@ -121,8 +229,22 @@ enum HermternalSwitchTrace {
             )
             return false
         }
+        let updateToPaintNanoseconds = pending.updateEndedAtNanoseconds.map {
+            visibleAtNanoseconds >= $0 ? visibleAtNanoseconds - $0 : 0
+        } ?? 0
+        session(
+            "transcript.phaseBreakdown",
+            id: id,
+            generation: generation,
+            messages: messages,
+            renderedRows: renderedRows,
+            detail: "publishToPaintNs=\(visibleAtNanoseconds - pending.publishedAtNanoseconds),updateNs=\(pending.updateNSViewNanoseconds),diffNs=\(pending.coordinatorDiffNanoseconds),heightCalls=\(pending.heightCalls),heightCacheHits=\(pending.heightCacheHits),heightCacheNs=\(pending.heightCacheHitNanoseconds),heightEstimatorCalls=\(pending.heightEstimatorCalls),heightEstimatorNs=\(pending.heightEstimatorNanoseconds),rowConfigs=\(pending.rowConfigurations),rowReused=\(pending.reusedRowConfigurations),rowNew=\(pending.newRowConfigurations),textSlices=\(pending.textSliceCount),textSliceNs=\(pending.textSliceNanoseconds),contentHashCalls=\(pending.contentHashCount),contentHashNs=\(pending.contentHashNanoseconds),reloadFullRows=\(pending.fullReloadRows),reloadTargetedRows=\(pending.targetedReloadRows),updateToPaintNs=\(updateToPaintNanoseconds)",
+            owner: .blockRowConfiguration,
+            executor: .main,
+            module: .visiblePaint,
+            timestampNanoseconds: visibleAtNanoseconds
+        )
         pendingTranscriptPublication = nil
-        resetCountersIfMetricsCleared()
         debugModules?.record(
             DebugSelectionAggregate(
                 publishToVisibleNanoseconds: visibleAtNanoseconds &- pending.publishedAtNanoseconds,
@@ -238,6 +360,8 @@ enum HermternalSwitchTrace {
         messages: Int?,
         renderedRows: Int? = nil,
         detail: String? = nil,
+        owner: String? = nil,
+        executor: String? = nil,
         seed: UInt64,
         fallbackToken: String = "none",
         timestampNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
@@ -248,6 +372,8 @@ enum HermternalSwitchTrace {
             + " messages=\(messages.map { String($0) } ?? "-")"
             + (renderedRows.map { " rows=\($0)" } ?? "")
             + " token=\(id.map { token($0, seed: seed) } ?? fallbackToken)"
+            + (owner.map { " owner=\($0)" } ?? "")
+            + (executor.map { " executor=\($0)" } ?? "")
             + (detail.map { " detail=\($0)" } ?? "")
             + "\n"
         FileHandle.standardError.write(Data(line.utf8))

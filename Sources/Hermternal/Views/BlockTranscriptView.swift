@@ -825,8 +825,8 @@ private enum BlockText {
 }
 
 /// A block-oriented AppKit transcript. The table owns only visible row views;
-/// source text remains in `TranscriptRendererInput.messages` and is sliced by
-/// each block's UTF-16 range.
+/// source text remains in `TranscriptRendererInput.messages` and is sliced
+/// only for visible row configuration or off-main preparation.
 struct BlockTranscriptView: NSViewRepresentable {
     let input: TranscriptRendererInput
 
@@ -845,7 +845,12 @@ struct BlockTranscriptView: NSViewRepresentable {
 
     @MainActor
     func updateNSView(_ nsView: BlockTranscriptContainerView, context: Context) {
+        let start = HermternalSwitchTrace.transcriptPhaseClock()
         context.coordinator.update(container: nsView, input: input)
+        guard let start else { return }
+        let end = DispatchTime.now().uptimeNanoseconds
+        HermternalSwitchTrace.transcriptPhaseUpdateNSView(start: start, end: end)
+        HermternalSwitchTrace.transcriptPhaseUpdateEnded(at: end)
     }
 
     static func dismantleNSView(
@@ -861,7 +866,6 @@ struct BlockTranscriptView: NSViewRepresentable {
             let block: TranscriptBlock
             let message: ChatMessage
             let messageIndex: Int
-            let text: String
         }
 
         private let preparation = BlockPreparationCoordinator(laneCount: 4)
@@ -901,6 +905,12 @@ struct BlockTranscriptView: NSViewRepresentable {
         /// Eight rows keeps a small amount of rich content ready during a
         /// wheel tick without shaping blocks outside the visible neighborhood.
         private let overdrawRows = 8
+        /// A streaming block's body changes on every publication. Its cache
+        /// identity is a cheap revision token rather than a second full pass
+        /// over the accumulated message text.
+        private var streamingRevision: UInt64 = 0
+        private var streamingIdentityTokens: [String: UInt64] = [:]
+        private var nextStreamingIdentityToken: UInt64 = 1
 
         func makeContainer() -> BlockTranscriptContainerView {
             let table = BlockTranscriptTableView()
@@ -961,6 +971,7 @@ struct BlockTranscriptView: NSViewRepresentable {
         }
 
         func update(container: BlockTranscriptContainerView, input: TranscriptRendererInput) {
+            let diffStart = HermternalSwitchTrace.transcriptPhaseClock()
             let routeChanged = routeIdentity != input.routeIdentity
             if routeChanged {
                 generation &+= 1
@@ -990,6 +1001,9 @@ struct BlockTranscriptView: NSViewRepresentable {
             self.messageTextByID = Dictionary(uniqueKeysWithValues: input.messages.map {
                 (messageID(for: $0), $0.text)
             })
+            if input.messages.contains(where: { $0.role == .assistant && $0.isStreaming }) {
+                streamingRevision &+= 1
+            }
 
             let incomingBlocks = normalizedBlocks(
                 input.blocks,
@@ -1012,17 +1026,56 @@ struct BlockTranscriptView: NSViewRepresentable {
             updateAccessibility(in: container)
 
             let changed = changedRowIndexes(oldRows: oldRows, newRows: rows)
+            let rowCountChanged = oldRows.count != rows.count
             container.tableView.isHidden = rows.isEmpty
             if routeChanged || oldRows.isEmpty && !rows.isEmpty {
                 container.tableView.noteNumberOfRowsChanged()
+                // Establish the document width before any reload can ask
+                // `heightOfRow`. Otherwise those reads use the old one-point
+                // table frame while preparation below keys from the real clip
+                // width.
                 container.layoutTableDocument()
-            } else if !changed.isEmpty {
-                container.tableView.noteNumberOfRowsChanged()
-                container.tableView.reloadData(
-                    forRowIndexes: changed,
-                    columnIndexes: IndexSet(integer: 0)
+                let visible = container.tableView.rows(
+                    in: visibleRect(for: container.tableView)
                 )
+                if visible.location != NSNotFound {
+                    let first = max(0, visible.location)
+                    let last = min(rows.count, visible.location + visible.length)
+                    if first < last {
+                        let visibleIndexes = IndexSet(integersIn: first..<last)
+                        HermternalSwitchTrace.transcriptPhaseReload(
+                            full: false,
+                            rows: visibleIndexes.count
+                        )
+                        container.tableView.reloadData(
+                            forRowIndexes: visibleIndexes,
+                            columnIndexes: IndexSet(integer: 0)
+                        )
+                    }
+                }
+            } else if rowCountChanged || !changed.isEmpty {
+                if rowCountChanged {
+                    container.tableView.noteNumberOfRowsChanged()
+                }
+                // The width must be committed before targeted reload invokes
+                // the delegate's height callback.
                 container.layoutTableDocument()
+                if !changed.isEmpty {
+                    HermternalSwitchTrace.transcriptPhaseReload(
+                        full: false,
+                        rows: changed.count
+                    )
+                    container.tableView.reloadData(
+                        forRowIndexes: changed,
+                        columnIndexes: IndexSet(integer: 0)
+                    )
+                }
+            }
+            if let diffStart {
+                HermternalSwitchTrace.transcriptPhaseCoordinatorDiff(
+                    start: diffStart,
+                    end: DispatchTime.now().uptimeNanoseconds
+                )
             }
             prepareVisibleBlocks()
             schedulePositioning(routeChanged: routeChanged)
@@ -1053,11 +1106,14 @@ struct BlockTranscriptView: NSViewRepresentable {
             viewFor tableColumn: NSTableColumn?,
             row: Int
         ) -> NSView? {
-            guard rows.indices.contains(row),
-                  let view = tableView.makeView(
-                    withIdentifier: BlockTranscriptRowView.identifier,
-                    owner: self
-                  ) as? BlockTranscriptRowView
+            guard rows.indices.contains(row) else { return nil }
+            let traceEnabled = HermternalSwitchTrace.isEnabled
+            let wasReused = traceEnabled
+                && tableView.view(atColumn: 0, row: row, makeIfNecessary: false) != nil
+            guard let view = tableView.makeView(
+                withIdentifier: BlockTranscriptRowView.identifier,
+                owner: self
+            ) as? BlockTranscriptRowView
             else { return nil }
             let value = rows[row]
             let key = layoutKey(for: value.block, message: value.message, tableView: tableView)
@@ -1071,10 +1127,23 @@ struct BlockTranscriptView: NSViewRepresentable {
                 findMatches.indices.contains($0)
                     && findMatches[$0].messageIndex == value.messageIndex
             } ?? false
+            let sliceStart = traceEnabled
+                ? HermternalSwitchTrace.transcriptPhaseClock()
+                : nil
+            let sourceText = BlockText.slice(
+                value.message.text,
+                range: value.block.sourceRange
+            )
+            if let sliceStart {
+                HermternalSwitchTrace.transcriptPhaseTextSlice(
+                    start: sliceStart,
+                    end: DispatchTime.now().uptimeNanoseconds
+                )
+            }
             view.configure(
                 block: value.block,
                 message: value.message,
-                sourceText: value.text,
+                sourceText: sourceText,
                 prepared: preparedValue,
                 style: style,
                 isFirstInMessage: messageStart,
@@ -1086,20 +1155,51 @@ struct BlockTranscriptView: NSViewRepresentable {
                 messageText: { [weak self] id in self?.messageTextByID[id] },
                 onCopyCode: onCopyCode
             )
+            if traceEnabled {
+                HermternalSwitchTrace.transcriptPhaseRowConfiguration(reused: wasReused)
+            }
             return view
         }
 
         func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-            guard rows.indices.contains(row) else { return 24 }
+            let heightStart = HermternalSwitchTrace.transcriptPhaseClock()
+            guard rows.indices.contains(row) else {
+                if let heightStart {
+                    HermternalSwitchTrace.transcriptPhaseHeight(
+                        cacheHit: false,
+                        start: heightStart,
+                        end: DispatchTime.now().uptimeNanoseconds
+                    )
+                }
+                return 24
+            }
             let value = rows[row]
             let key = layoutKey(for: value.block, message: value.message, tableView: tableView)
             if let cached = layoutCache.value(for: key) {
+                if let heightStart {
+                    HermternalSwitchTrace.transcriptPhaseHeight(
+                        cacheHit: true,
+                        start: heightStart,
+                        end: DispatchTime.now().uptimeNanoseconds
+                    )
+                }
                 return cached.measuredHeight
             }
-            return BlockHeightEstimator.estimatedHeight(
-                for: value.block,
-                width: contentWidth(for: value.message, in: tableView)
+            // The fallback is arithmetic over the segmenter's range metadata.
+            // It never slices or otherwise reads the message body.
+            let estimated = BlockHeightEstimator.estimatedHeight(
+                for: value.block.kind,
+                width: contentWidth(for: value.message, in: tableView),
+                contentLength: value.block.sourceRange.count
             )
+            if let heightStart {
+                HermternalSwitchTrace.transcriptPhaseHeight(
+                    cacheHit: false,
+                    start: heightStart,
+                    end: DispatchTime.now().uptimeNanoseconds
+                )
+            }
+            return estimated
         }
 
         func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
@@ -1129,6 +1229,10 @@ struct BlockTranscriptView: NSViewRepresentable {
                 guard let self, self.generation == current, let tableView = self.tableView else {
                     return
                 }
+                HermternalSwitchTrace.transcriptPhaseReload(
+                    full: true,
+                    rows: tableView.numberOfRows
+                )
                 tableView.reloadData()
                 if tableView.numberOfRows > 0 {
                     tableView.noteHeightOfRows(
@@ -1156,7 +1260,7 @@ struct BlockTranscriptView: NSViewRepresentable {
                             blockIndex: 0,
                             kind: .paragraph,
                             sourceRange: 0..<message.text.utf16.count,
-                            contentHash: contentHash(of: message.text)
+                            contentHash: streamingContentHash(for: id)
                         )
                     )
                 } else {
@@ -1208,8 +1312,7 @@ struct BlockTranscriptView: NSViewRepresentable {
                 return Row(
                     block: block,
                     message: message,
-                    messageIndex: index,
-                    text: BlockText.slice(message.text, range: block.sourceRange)
+                    messageIndex: index
                 )
             }
         }
@@ -1334,8 +1437,14 @@ struct BlockTranscriptView: NSViewRepresentable {
 
         private func contentWidth(for message: ChatMessage, in tableView: NSTableView) -> CGFloat {
             let tableWidth = tableView.enclosingScrollView?.contentView.bounds.width ?? tableView.bounds.width
+        private func contentWidth(for message: ChatMessage, in tableView: NSTableView) -> CGFloat {
+            // `layoutTableDocument` commits this document width before
+            // AppKit asks for any row height. Using the table's committed
+            // bounds here makes reads and background writes observe the same
+            // width snapshot instead of mixing a pre-layout frame with the
+            // clip view's next width.
+            let tableWidth = max(1, tableView.bounds.width)
             let outer = max(1, tableWidth - 44)
-            switch message.role {
             case .assistant:
                 return min(outer - MessageTypography.bubblePadding * 2, MessageTypography.readingMeasure)
             case .user:
@@ -1406,7 +1515,12 @@ struct BlockTranscriptView: NSViewRepresentable {
             container.messageElements = Dictionary(grouping: rows, by: { $0.message.id }).values.map {
                 BlockMessageAccessibilityElement(
                     label: $0.first?.message.text ?? "",
-                    blocks: $0.map { BlockAccessibilityElement(label: $0.text) }
+                    blocks: $0.map {
+                        BlockAccessibilityElement(
+                            sourceText: $0.message.text,
+                            sourceRange: $0.block.sourceRange
+                        )
+                    }
                 )
             }
         }
@@ -1427,14 +1541,29 @@ struct BlockTranscriptView: NSViewRepresentable {
             case .provisional(let id): return id.uuidString
             }
         }
-
-        private func contentHash(of text: String) -> UInt64 {
-            var hash: UInt64 = 14_695_981_039_346_656_037
-            for byte in text.utf8 {
-                hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211
+        private func streamingContentHash(for messageID: String) -> UInt64 {
+            let hashStart = HermternalSwitchTrace.transcriptPhaseClock()
+            let token: UInt64
+            if let existing = streamingIdentityTokens[messageID] {
+                token = existing
+            } else {
+                token = nextStreamingIdentityToken
+                nextStreamingIdentityToken &+= 1
+                streamingIdentityTokens[messageID] = token
             }
-            return hash
+            // The token distinguishes simultaneous streaming messages; the
+            // revision distinguishes each publication. As with the previous
+            // FNV digest, this is a bounded cache identity, not user data.
+            let result = token &* 1_000_000_007 &+ streamingRevision
+            if let hashStart {
+                HermternalSwitchTrace.transcriptPhaseContentHash(
+                    start: hashStart,
+                    end: DispatchTime.now().uptimeNanoseconds
+                )
+            }
+            return result
         }
+
     }
 }
 
@@ -2015,6 +2144,13 @@ final class BlockTranscriptContainerView: NSView {
         let width = max(1, scrollView.contentView.bounds.width)
         let widthChanged = abs(lastDocumentWidth - width) > 0.5
         lastDocumentWidth = width
+        // NSTableView asks for row heights synchronously from
+        // `noteHeightOfRows`. Set the document width first, otherwise that
+        // callback can build a width-bucket key from the table's old
+        // pre-layout one-point frame while preparation below uses the clip
+        // view's real width. The measured result is then written under a
+        // different bucket and every subsequent read misses.
+        tableView.frame.size.width = width
         if widthChanged {
             let visibleRect = tableView.enclosingScrollView.map {
                 tableView.convert($0.contentView.bounds, from: $0.contentView)
@@ -2027,7 +2163,6 @@ final class BlockTranscriptContainerView: NSView {
                 )
             }
         }
-        tableView.frame.size.width = width
         tableView.frame.size.height = max(1, tableView.fittingSize.height)
     }
     override func draw(_ dirtyRect: NSRect) {
@@ -2065,16 +2200,20 @@ fileprivate final class BlockMessageAccessibilityElement: NSView {
 
 @MainActor
 fileprivate final class BlockAccessibilityElement: NSView {
-    private let spokenLabel: String
+    private let sourceText: String
+    private let sourceRange: Range<Int>
 
-    init(label: String) {
-        spokenLabel = label
+    init(sourceText: String, sourceRange: Range<Int>) {
+        self.sourceText = sourceText
+        self.sourceRange = sourceRange
         super.init(frame: .zero)
         setAccessibilityElement(true)
         setAccessibilityRole(.staticText)
-        setAccessibilityLabel(label)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    override func accessibilityLabel() -> String? { spokenLabel }
+
+    override func accessibilityLabel() -> String? {
+        BlockText.slice(sourceText, range: sourceRange)
+    }
 }

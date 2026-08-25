@@ -279,12 +279,9 @@ struct SidebarView: View {
         let _ = HermternalSelectionOccupancyTrace.orderingResolveEnded(orderingStart)
         let sections = derived.sections
         let scheduleRows = derived.scheduleRows
-        let scheduledIDs = derived.scheduledIDs
         let visibleOrder = derived.visibleOrder
         let folderVisibleOrder = derived.folderVisibleOrder
-        let foldersByID = derived.foldersByID
-        let expandedChats = derived.expandedChats
-        let expandedChatsByItem = derived.expandedChatsByItem
+        let rowMenuDerivations = derived.rowMenuDerivations
         let content = columnChrome(
             Group {
                 if contentMode == .chats {
@@ -293,16 +290,11 @@ struct SidebarView: View {
                             sections,
                             visibleOrder: visibleOrder,
                             folderVisibleOrder: folderVisibleOrder,
-                            foldersByID: foldersByID,
-                            scheduledIDs: scheduledIDs,
-                            expandedChats: expandedChats,
-                            expandedChatsByItem: expandedChatsByItem
+                            rowMenuDerivations: rowMenuDerivations
                         )
                         floatingLayer(
                             scheduleRows,
-                            scheduledIDs: scheduledIDs,
-                            expandedChats: expandedChats,
-                            expandedChatsByItem: expandedChatsByItem
+                            rowMenuDerivations: rowMenuDerivations
                         )
                     }
                 } else {
@@ -363,20 +355,14 @@ struct SidebarView: View {
         _ sections: [SidebarSection],
         visibleOrder: [SidebarSelectionID],
         folderVisibleOrder: [SidebarSelectionID],
-        foldersByID: [String: SidebarFolderTarget],
-        scheduledIDs: Set<String>,
-        expandedChats: [ChatSession],
-        expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
+        rowMenuDerivations: SidebarRowMenuDerivations
     ) -> some View {
         List(selection: $sidebarSelection) {
             sessionSections(
                 sections,
                 visibleOrder: visibleOrder,
                 folderVisibleOrder: folderVisibleOrder,
-                foldersByID: foldersByID,
-                scheduledIDs: scheduledIDs,
-                expandedChats: expandedChats,
-                expandedChatsByItem: expandedChatsByItem
+                rowMenuDerivations: rowMenuDerivations
             )
         }
         .listStyle(.sidebar)
@@ -436,10 +422,7 @@ struct SidebarView: View {
         _ sections: [SidebarSection],
         visibleOrder: [SidebarSelectionID],
         folderVisibleOrder: [SidebarSelectionID],
-        foldersByID: [String: SidebarFolderTarget],
-        scheduledIDs: Set<String>,
-        expandedChats: [ChatSession],
-        expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
+        rowMenuDerivations: SidebarRowMenuDerivations
     ) -> SidebarSections {
         SidebarSections(
             sections: sections,
@@ -448,10 +431,7 @@ struct SidebarView: View {
             selection: sidebarSelection,
             visibleOrder: visibleOrder,
             folderVisibleOrder: folderVisibleOrder,
-            foldersByID: foldersByID,
-            scheduledIDs: scheduledIDs,
-            expandedChats: expandedChats,
-            expandedChatsByItem: expandedChatsByItem,
+            rowMenuDerivations: rowMenuDerivations,
             onOpen: { session in openImmediately(session) },
             onPin: { sessions, pinned in
                 Task { await model.setPinned(sessions, pinned: pinned) }
@@ -503,17 +483,13 @@ struct SidebarView: View {
     /// and a user cannot create a schedule from here, so absence hides it.
     private func floatingLayer(
         _ scheduleRows: [SidebarRow],
-        scheduledIDs: Set<String>,
-        expandedChats: [ChatSession],
-        expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
+        rowMenuDerivations: SidebarRowMenuDerivations
     ) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             if !scheduleRows.isEmpty {
                 schedulesPane(
                     scheduleRows,
-                    scheduledIDs: scheduledIDs,
-                    expandedChats: expandedChats,
-                    expandedChatsByItem: expandedChatsByItem
+                    rowMenuDerivations: rowMenuDerivations
                 )
             }
             Divider()
@@ -540,17 +516,12 @@ struct SidebarView: View {
 
     private func schedulesPane(
         _ scheduleRows: [SidebarRow],
-        scheduledIDs: Set<String>,
-        expandedChats: [ChatSession],
-        expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
+        rowMenuDerivations: SidebarRowMenuDerivations
     ) -> SidebarSchedulesPane {
         return SidebarSchedulesPane(
             rows: scheduleRows,
             folders: model.folders,
-            membership: model.membership,
-            scheduledIDs: scheduledIDs,
-            expandedChats: expandedChats,
-            expandedChatsByItem: expandedChatsByItem,
+            rowMenuDerivations: rowMenuDerivations,
             selection: $sidebarSelection,
             onOpen: { session in openImmediately(session) },
             onPin: { sessions, pinned in
@@ -1236,6 +1207,13 @@ struct SidebarView: View {
 
 }
 
+/// The member order is intentional: row maps first, then shared drag inputs.
+struct SidebarRowMenuDerivations {
+    let sessionByItem: [SidebarSelectionID: SidebarSessionMenuDerivation]
+    let folderByItem: [SidebarSelectionID: SidebarFolderMenuDerivation]
+    let scheduledIDs: Set<String>
+}
+
 /// The body-level values derived from sidebar ordering and selection inputs.
 private struct SidebarDerivedData {
     let selection: Set<SidebarSelectionID>
@@ -1246,9 +1224,11 @@ private struct SidebarDerivedData {
     let visibleOrder: [SidebarSelectionID]
     let folderVisibleOrder: [SidebarSelectionID]
     let sessionsByID: [String: ChatSession]
+    let pinnedByID: [String: Bool]
     let foldersByID: [String: SidebarFolderTarget]
     let expandedChats: [ChatSession]
     let expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
+    let rowMenuDerivations: SidebarRowMenuDerivations
 }
 
 /// Keeps ordering and selection expansion projections resident across SwiftUI
@@ -1322,9 +1302,19 @@ private final class SidebarDerivationCache {
                 visibleOrder: projection.visibleOrder,
                 folderVisibleOrder: projection.folderVisibleOrder,
                 sessionsByID: sessionsByID,
+                pinnedByID: Dictionary(
+                    uniqueKeysWithValues: sessionsByID.map {
+                        ($0.key, $0.value.pinned)
+                    }
+                ),
                 foldersByID: foldersByID,
                 expandedChats: [],
-                expandedChatsByItem: expandedChatsByItem
+                expandedChatsByItem: expandedChatsByItem,
+                rowMenuDerivations: SidebarRowMenuDerivations(
+                    sessionByItem: [:],
+                    folderByItem: [:],
+                    scheduledIDs: scheduledIDs
+                )
             )
             derivedRebuildCount = orderingMemo.rebuildCount
         } else {
@@ -1337,6 +1327,7 @@ private final class SidebarDerivationCache {
             scheduledSessionIDs: base.scheduledIDs,
             folderMembership: membership
         )
+        let aggregateChats = expandedIDs.compactMap { base.sessionsByID[$0] }
         let next = SidebarDerivedData(
             selection: selection,
             orderedSessionIDs: base.orderedSessionIDs,
@@ -1346,12 +1337,99 @@ private final class SidebarDerivationCache {
             visibleOrder: base.visibleOrder,
             folderVisibleOrder: base.folderVisibleOrder,
             sessionsByID: base.sessionsByID,
+            pinnedByID: base.pinnedByID,
             foldersByID: base.foldersByID,
-            expandedChats: expandedIDs.compactMap { base.sessionsByID[$0] },
-            expandedChatsByItem: base.expandedChatsByItem
+            expandedChats: aggregateChats,
+            expandedChatsByItem: base.expandedChatsByItem,
+            rowMenuDerivations: menuDerivations(
+                base: base,
+                selection: selection,
+                aggregateChats: aggregateChats,
+                membership: membership
+            )
         )
         derived = next
         return next
+
+    }
+    private func menuDerivations(
+        base: SidebarDerivedData,
+        selection: Set<SidebarSelectionID>,
+        aggregateChats: [ChatSession],
+        membership: [String: String]
+    ) -> SidebarRowMenuDerivations {
+        func chats(for item: SidebarSelectionID) -> [ChatSession] {
+            selection.contains(item)
+                ? aggregateChats
+                : base.expandedChatsByItem[item] ?? []
+        }
+        let sessionByItem = Dictionary(
+            uniqueKeysWithValues: base.visibleOrder.compactMap { item
+                -> (SidebarSelectionID, SidebarSessionMenuDerivation)? in
+                guard case .chat(_) = item else { return nil }
+                let contextSelection = SidebarSelectionPolicy.contextTargets(
+                    clicked: item,
+                    selected: selection
+                )
+                let contextChats = chats(for: item)
+                let moveChats = contextChats.filter {
+                    !base.scheduledIDs.contains($0.id)
+                }
+                let folderIDs = contextSelection.compactMap { item -> String? in
+                    guard case let .folder(id) = item else { return nil }
+                    return id
+                }
+                var disabledFolderIDs = Set<String>()
+                if let commonFolderID = moveChats.first.flatMap({ membership[$0.id] }),
+                   moveChats.allSatisfy({ membership[$0.id] == commonFolderID }) {
+                    disabledFolderIDs.insert(commonFolderID)
+                }
+                let derivation = SidebarSessionMenuDerivation(
+                    chats: contextChats,
+                    moveChats: moveChats,
+                    folderIDs: folderIDs,
+                    pinAction: SidebarSelectionPolicy.convergingPinAction(
+                        for: contextChats.compactMap { base.pinnedByID[$0.id] }
+                    ),
+                    disabledFolderIDs: disabledFolderIDs,
+                    hasFolderMembership: moveChats.contains {
+                        membership[$0.id] != nil
+                    }
+                )
+                return (item, derivation)
+            }
+        )
+        let selectedFolderTargets = base.folderVisibleOrder.compactMap { item -> SidebarFolderTarget? in
+            guard case let .folder(id) = item else { return nil }
+            return base.foldersByID[id]
+        }
+        let folderByItem = Dictionary(
+            uniqueKeysWithValues: base.folderVisibleOrder.compactMap { item
+                -> (SidebarSelectionID, SidebarFolderMenuDerivation)? in
+                guard case let .folder(id) = item,
+                      let target = base.foldersByID[id]
+                else { return nil }
+                let targets = selection.contains(item)
+                    ? selectedFolderTargets
+                    : [target]
+                let contextChats = chats(for: item)
+                return (
+                    item,
+                    SidebarFolderMenuDerivation(
+                        targets: targets,
+                        chats: contextChats,
+                        pinAction: SidebarSelectionPolicy.convergingPinAction(
+                            for: contextChats.compactMap { base.pinnedByID[$0.id] }
+                        )
+                    )
+                )
+            }
+        )
+        return SidebarRowMenuDerivations(
+            sessionByItem: sessionByItem,
+            folderByItem: folderByItem,
+            scheduledIDs: base.scheduledIDs
+        )
     }
 }
 
