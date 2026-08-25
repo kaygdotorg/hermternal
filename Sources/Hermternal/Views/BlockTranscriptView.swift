@@ -1115,11 +1115,11 @@ struct BlockTranscriptView: NSViewRepresentable {
         // selection plate may not appear until the transcript is done.
         let transcriptSignpost = SelectionLatencySignposts.beginTranscriptUpdate(
             sessionID: input.routeIdentity,
-            generation: 0
+            generation: input.generation
         )
         let commitSignpost = SelectionLatencySignposts.beginCommit(
             sessionID: input.routeIdentity,
-            generation: 0
+            generation: input.generation
         )
         if commitSignpost != nil {
             // Chain rather than replace: another completion block on this
@@ -1127,7 +1127,10 @@ struct BlockTranscriptView: NSViewRepresentable {
             let existing = CATransaction.completionBlock()
             CATransaction.setCompletionBlock {
                 existing?()
-                SelectionLatencySignposts.endCommit(commitSignpost)
+                SelectionLatencySignposts.endCommit(
+                    commitSignpost,
+                    generation: input.generation
+                )
             }
         }
         context.coordinator.update(container: nsView, input: input)

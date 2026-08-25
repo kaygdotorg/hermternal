@@ -128,9 +128,15 @@ enum SelectionLatencySignposts {
         )
     }
 
-    static func endCommit(_ id: OSSignpostID?) {
+    static func endCommit(
+        _ id: OSSignpostID?,
+        generation: Int
+    ) {
         endInterval(name: "core-animation-commit", id: id)
-        guard enabled, let activeClick else { return }
+        guard enabled,
+              let activeClick,
+              activeClick.generation == generation
+        else { return }
         os_signpost(
             .end,
             log: log,

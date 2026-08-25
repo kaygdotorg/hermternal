@@ -377,6 +377,10 @@ struct ChatView: View {
     }
     @ViewBuilder
     private var transcript: some View {
+        // `selectedSessionID` invalidates this body and SidebarView together.
+        // The route identity changes in that same SwiftUI transaction, so the
+        // representable update can share its Core Animation commit with the
+        // sidebar unless `messages` publishes on a later run-loop turn.
         let messages = model.messages
         let query = isFindPresented ? findQuery : ""
         let matches = model.transcriptMatches(for: query)
@@ -428,6 +432,7 @@ struct ChatView: View {
             messages: windowedMessages,
             window: window,
             routeIdentity: transcriptIdentity,
+            generation: visibilityGeneration,
             isReadOnly: isReadOnly,
             isStreaming: messages.last?.isStreaming == true,
             findQuery: query,
@@ -533,6 +538,7 @@ struct ChatView: View {
                     ThinkingIndicator()
                 }
             }
+        .mask(Self.transcriptTopDissolve)
         .task(id: blockProjectionKey) {
             await prepareTranscriptBlocks(windowedMessages, key: blockProjectionKey)
         }
@@ -600,6 +606,42 @@ struct ChatView: View {
         .padding(.top, -Self.haloRamp)
         .allowsHitTesting(false)
     }
+
+    /// A hint that rows continue under the titlebar, not a visible gradient.
+    ///
+    /// Deliberately much shorter than the sidebar's 48pt ramp and far shorter
+    /// than the 130pt the deleted SwiftUI transcript used: the titlebar's own
+    /// backing is now cleared on every translucent treatment, so this only has
+    /// to soften the last few points before the chrome rather than hide an
+    /// opaque plate. Anything a reader notices is too strong.
+    ///
+    /// Seven stops on a smoothstep rather than three, for the reason the
+    /// sidebar's ramp was reshaped: evenly spaced stops with a single slope
+    /// change leave a visible facet in the mid-alpha range, where the eye
+    /// resolves banding best. The mask is a content mask on the transcript
+    /// itself, since a material plate cannot obscure in-window siblings.
+    private static var transcriptTopDissolve: some View {
+        VStack(spacing: 0) {
+            LinearGradient(
+                stops: [
+                    .init(color: .clear, location: 0.00),
+                    .init(color: .black.opacity(0.06), location: 0.18),
+                    .init(color: .black.opacity(0.20), location: 0.36),
+                    .init(color: .black.opacity(0.42), location: 0.54),
+                    .init(color: .black.opacity(0.66), location: 0.70),
+                    .init(color: .black.opacity(0.86), location: 0.85),
+                    .init(color: .black, location: 1.00)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: Self.topDissolveReach)
+            Rectangle().fill(.black)
+        }
+        .allowsHitTesting(false)
+    }
+
+    private static let topDissolveReach: CGFloat = 28
 
     private static let haloRamp: CGFloat = 34
 

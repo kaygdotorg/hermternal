@@ -11,6 +11,8 @@ struct TranscriptRendererInput {
     let messages: [ChatMessage]
     let window: TranscriptWindow
     let routeIdentity: String
+    /// Publication generation for signposts and stale-route attribution.
+    let generation: Int
     let isReadOnly: Bool
     let isStreaming: Bool
     let findQuery: String

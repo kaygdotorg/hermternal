@@ -2435,11 +2435,67 @@ final class AppModel {
             reason: "taskFinishedOrCancelledOrSuperseded"
         )
     }
+    /// Publishes the first transcript snapshot after the selection turn.
+    ///
+    /// The main-queue hop runs after the current run-loop transaction commits.
+    /// Keep the generation check on the assignment because another selection
+    /// can win while this snapshot waits for its turn.
+    @MainActor
+    private func publishTranscriptAfterSelectionTurn(
+        _ initialMessages: [ChatMessage],
+        session: ChatSession,
+        generation: Int,
+        warm: WarmTranscriptProjection?
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                guard self.openGenerations.isCurrent(generation) else {
+                    HermternalSwitchTrace.selectionGuard(
+                        "requestOpen.afterSelectionTurn",
+                        id: session.id,
+                        generation: generation,
+                        messages: self.messages.count,
+                        reason: "generationSuperseded"
+                    )
+                    continuation.resume(returning: false)
+                    return
+                }
+                self.streamingReducer.reset(messages: initialMessages)
+                self.messages = initialMessages
+                self.isAwaitingReply = self.streamingReducer.isAwaitingReply
+                HermternalSwitchTrace.session(
+                    "transcript.publish",
+                    id: session.id,
+                    generation: generation,
+                    messages: initialMessages.count,
+                    detail: warm == nil ? "route.publish" : "warm.tail.publish"
+                )
+                ContentionTrace.snapshotAndReset(phase: "first-publish")
+                HermternalSwitchTrace.session(
+                    warm == nil ? "route.publish" : "warm.tail.publish",
+                    id: session.id,
+                    generation: generation,
+                    messages: initialMessages.count
+                )
+                continuation.resume(returning: true)
+            }
+        }
+    }
+
 
     /// Publishes the durable selection identity synchronously. Warm-cache
     /// projection and transcript publication begin only after the first actor
     /// suspension, so SwiftUI's List can commit the real selection highlight
-    /// before transcript observation invalidates the chat view.
+    /// before transcript observation invalidates the chat view. The selection
+    /// mutation invalidates both SidebarView and ChatView in one SwiftUI
+    /// transaction. A later actor yield alone does not end that transaction.
+    ///
+    /// Transcript publication therefore crosses a run-loop turn before it
+    /// mutates `messages`. The generation guard remains on that assignment.
     @discardableResult
     func requestOpen(_ session: ChatSession) -> Task<Void, Never> {
         cancelActiveOpen()
@@ -2493,9 +2549,9 @@ final class AppModel {
                     sessionID: session.id
                 )
             }
-            // The first yield is deliberate. Starting the detached lookup
-            // before it can complete and resume onto the main actor while
-            // AppKit is committing the List highlight, recreating this bug.
+            // The first yield keeps warm lookup off the selection turn.
+            // Transcript publication below also crosses the commit boundary;
+            // a yield before lookup alone does not provide that guarantee.
             await Task.yield()
             guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
                 HermternalSwitchTrace.selectionGuard(
@@ -2537,25 +2593,17 @@ final class AppModel {
             let initialMessages = warm.map {
                 Array($0.messages.suffix(TranscriptWindowPolicy.initialWindowSize))
             } ?? []
-            // The first-frame tail is bounded; the opener promotes the
-            // complete projection after its first suspension.
-            self.streamingReducer.reset(messages: initialMessages)
-            self.messages = initialMessages
-            self.isAwaitingReply = self.streamingReducer.isAwaitingReply
-            HermternalSwitchTrace.session(
-                "transcript.publish",
-                id: session.id,
+            // The first-frame tail is bounded. Publish it after the
+            // selection transaction has completed, not after a scheduler
+            // yield that can resume inside the same Core Animation commit.
+            guard await self.publishTranscriptAfterSelectionTurn(
+                initialMessages,
+                session: session,
                 generation: generation,
-                messages: initialMessages.count,
-                detail: warm == nil ? "route.publish" : "warm.tail.publish"
-            )
-            ContentionTrace.snapshotAndReset(phase: "first-publish")
-            HermternalSwitchTrace.session(
-                warm == nil ? "route.publish" : "warm.tail.publish",
-                id: session.id,
-                generation: generation,
-                messages: initialMessages.count
-            )
+                warm: warm
+            ) else {
+                return
+            }
             _ = await self.open(
                 session,
                 generation: generation,
