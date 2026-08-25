@@ -54,6 +54,11 @@ struct ChatView: View {
     /// follows it. Composer consumes this through SwiftUI focus state
     /// rather than taking first responder during every launch.
     @State private var composerFocusRequest = 0
+    /// Route and generation used by the representable. Selection changes
+    /// update these values on the next run-loop turn, after the selection
+    /// transaction commits.
+    @State private var renderedTranscriptIdentity: String?
+    @State private var renderedTranscriptGeneration: Int?
     /// Segmentation is retained only for the current route/window/revision.
     /// A route change or stream revision uses placeholder blocks until the
     /// replacement arrives from the background task.
@@ -151,6 +156,7 @@ struct ChatView: View {
                 return
             }
             resetTranscriptVisibility(for: sessionID)
+            scheduleTranscriptRendererRoute()
         }
         .onAppear {
             // Do not reset on a temporary disappearance/reappearance. The
@@ -182,9 +188,36 @@ struct ChatView: View {
         return "live:\(model.selectedSessionID ?? "none")"
     }
 
+    private var renderedRouteIdentity: String {
+        renderedTranscriptIdentity ?? transcriptIdentity
+    }
+
+    private var renderedRouteGeneration: Int {
+        renderedTranscriptGeneration ?? model.openGeneration
+    }
+    @MainActor
+    private func scheduleTranscriptRendererRoute() {
+        let identity = transcriptIdentity
+        let generation = model.openGeneration
+        DispatchQueue.main.async {
+            guard self.transcriptIdentity == identity,
+                  self.model.openGeneration == generation,
+                  (
+                      self.renderedTranscriptIdentity != identity
+                        || self.renderedTranscriptGeneration != generation
+                  )
+            else { return }
+            self.renderedTranscriptIdentity = identity
+            self.renderedTranscriptGeneration = generation
+            self.isPrimingTranscriptWindow = true
+            self.transcriptWindowState = nil
+        }
+    }
+
 
     private var initialMessageTarget: MessageIdentity? {
-        guard let location = model.pendingMessageLocation,
+        guard renderedRouteIdentity == transcriptIdentity,
+              let location = model.pendingMessageLocation,
               model.selectedSessionID == location.sessionID
         else { return nil }
         return .server(location.messageID)
@@ -227,8 +260,7 @@ struct ChatView: View {
     }
     @MainActor
     private func resetTranscriptRendererRoute() {
-        isPrimingTranscriptWindow = true
-        transcriptWindowState = nil
+        scheduleTranscriptRendererRoute()
     }
     @MainActor
     private func resetTranscriptVisibility(for sessionID: String?) {
@@ -321,7 +353,7 @@ struct ChatView: View {
             return
         }
 
-        guard key.routeIdentity == transcriptIdentity,
+        guard key.routeIdentity == renderedRouteIdentity,
               key.revision == model.messagesRevision,
               key.range == currentTranscriptWindowRange()
         else { return }
@@ -331,7 +363,7 @@ struct ChatView: View {
         // a subsequent keypress may cancel the next parse but cannot cancel
         // this publication turn.
         Task { @MainActor in
-            guard key.routeIdentity == transcriptIdentity,
+            guard key.routeIdentity == renderedRouteIdentity,
                   key.revision == model.messagesRevision,
                   key.range == currentTranscriptWindowRange()
             else { return }
@@ -378,9 +410,9 @@ struct ChatView: View {
     @ViewBuilder
     private var transcript: some View {
         // `selectedSessionID` invalidates this body and SidebarView together.
-        // The route identity changes in that same SwiftUI transaction, so the
-        // representable update can share its Core Animation commit with the
-        // sidebar unless `messages` publishes on a later run-loop turn.
+        // The route identity and generation used by the representable stay
+        // on their previous values until the next run-loop turn, so this
+        // transaction cannot include transcript content or route updates.
         let messages = model.messages
         let query = isFindPresented ? findQuery : ""
         let matches = model.transcriptMatches(for: query)
@@ -412,7 +444,7 @@ struct ChatView: View {
         let windowedMatches = windowedProjection.matches
         let activeWindowMatchIndex = windowedProjection.activeIndex
         let blockProjectionKey = TranscriptBlockProjectionKey(
-            routeIdentity: transcriptIdentity,
+            routeIdentity: renderedRouteIdentity,
             revision: model.messagesRevision,
             range: window.range
         )
@@ -420,18 +452,14 @@ struct ChatView: View {
             for: windowedMessages,
             key: blockProjectionKey
         )
-        // Capture the publication generation, not the latest streaming
-        // generation. A stream can begin while the first rows are painting.
-        let visibilityGeneration = (
-            transcriptVisibilitySessionID == model.selectedSessionID
-            ? transcriptVisibilityGeneration
-            : nil
-        ) ?? model.openGeneration
+        // Capture the generation used by the deferred route, not the latest
+        // model generation that may advance while rows are painting.
+        let visibilityGeneration = renderedRouteGeneration
         let rendererInput = TranscriptRendererInput(
             blocks: windowedBlocks,
             messages: windowedMessages,
             window: window,
-            routeIdentity: transcriptIdentity,
+            routeIdentity: renderedRouteIdentity,
             generation: visibilityGeneration,
             isReadOnly: isReadOnly,
             isStreaming: messages.last?.isStreaming == true,
@@ -458,7 +486,7 @@ struct ChatView: View {
                     markTranscriptVisible(
                         sessionID: model.selectedSessionID,
                         generation: visibilityGeneration,
-                        routeIdentity: transcriptIdentity,
+                        routeIdentity: renderedRouteIdentity,
                         renderedRows: windowedBlocks.count,
                         visibleAtNanoseconds: visibleAtNanoseconds,
                         largestRowCharacterCount: {
@@ -472,7 +500,7 @@ struct ChatView: View {
         )
 
         BlockTranscriptView(input: rendererInput)
-            .id(transcriptIdentity)
+            .id(renderedRouteIdentity)
             .onChange(of: model.pendingMessageLocation) {
                 if model.pendingMessageLocation != nil {
                     _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
@@ -521,6 +549,10 @@ struct ChatView: View {
                 }
             }
             .onAppear {
+                if renderedTranscriptIdentity == nil {
+                    renderedTranscriptIdentity = transcriptIdentity
+                    renderedTranscriptGeneration = model.openGeneration
+                }
                 if model.pendingMessageLocation != nil {
                     _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                 } else {
@@ -538,7 +570,6 @@ struct ChatView: View {
                     ThinkingIndicator()
                 }
             }
-        .mask(Self.transcriptTopDissolve)
         .task(id: blockProjectionKey) {
             await prepareTranscriptBlocks(windowedMessages, key: blockProjectionKey)
         }
@@ -607,42 +638,7 @@ struct ChatView: View {
         .allowsHitTesting(false)
     }
 
-    /// A hint that rows continue under the titlebar, not a visible gradient.
-    ///
-    /// Deliberately much shorter than the sidebar's 48pt ramp and far shorter
-    /// than the 130pt the deleted SwiftUI transcript used: the titlebar's own
-    /// backing is now cleared on every translucent treatment, so this only has
-    /// to soften the last few points before the chrome rather than hide an
-    /// opaque plate. Anything a reader notices is too strong.
-    ///
-    /// Seven stops on a smoothstep rather than three, for the reason the
-    /// sidebar's ramp was reshaped: evenly spaced stops with a single slope
-    /// change leave a visible facet in the mid-alpha range, where the eye
-    /// resolves banding best. The mask is a content mask on the transcript
-    /// itself, since a material plate cannot obscure in-window siblings.
-    private static var transcriptTopDissolve: some View {
-        VStack(spacing: 0) {
-            LinearGradient(
-                stops: [
-                    .init(color: .clear, location: 0.00),
-                    .init(color: .black.opacity(0.06), location: 0.18),
-                    .init(color: .black.opacity(0.20), location: 0.36),
-                    .init(color: .black.opacity(0.42), location: 0.54),
-                    .init(color: .black.opacity(0.66), location: 0.70),
-                    .init(color: .black.opacity(0.86), location: 0.85),
-                    .init(color: .black, location: 1.00)
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .frame(height: Self.topDissolveReach)
-            Rectangle().fill(.black)
-        }
-        .allowsHitTesting(false)
-    }
-
-    private static let topDissolveReach: CGFloat = 28
-
+    /// The composer's ramp height, in points.
     private static let haloRamp: CGFloat = 34
 
 }
