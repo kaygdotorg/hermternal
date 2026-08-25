@@ -2438,8 +2438,7 @@ final class AppModel {
     /// Publishes the first transcript snapshot after the selection turn.
     ///
     /// The main-queue hop runs after the current run-loop transaction commits.
-    /// Keep the generation check on the assignment because another selection
-    /// can win while this snapshot waits for its turn.
+    /// The generation check guards the route and content install together.
     @MainActor
     private func publishTranscriptAfterSelectionTurn(
         _ initialMessages: [ChatMessage],
