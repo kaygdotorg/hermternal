@@ -84,44 +84,17 @@ extension SessionRowItem {
                 )
                 onOpen(session)
             }
-            // List selection opens unselected rows through SidebarView's
-            // shared opener. The gesture only handles a second click on the
-            // already selected row, which has no selection change to observe.
-            .simultaneousGesture(
-                TapGesture(count: 1)
-                    .onEnded {
-                        guard isSelected else {
-                            HermternalSwitchTrace.selectionGuard(
-                                "sessionRow.tapSelection",
-                                id: session.id,
-                                messages: session.messageCount,
-                                reason: "rowNotSelected;ListOwnsSelection"
-                            )
-                            return
-                        }
-                        let allowed = SidebarSelectionEventAdapter.allowsPrimaryActivation()
-                        HermternalSwitchTrace.session(
-                            "selection.tapGate",
-                            id: session.id,
-                            messages: session.messageCount,
-                            detail: allowed ? "allowed" : "blocked"
-                        )
-                        guard allowed else {
-                            HermternalSwitchTrace.selectionGuard(
-                                "sessionRow.tapGate",
-                                id: session.id,
-                                messages: session.messageCount,
-                                reason: "eventAdapterRejectedPrimaryActivation"
-                            )
-                            return
-                        }
-                        HermternalSwitchTrace.session(
-                            "selection.observed.pointer",
-                            id: session.id,
-                            messages: session.messageCount
-                        )
-                        onOpen(session)
-                    }
+            // Unselected rows must leave the primary click entirely to List.
+            // Attaching this recognizer to every row lets it win the click
+            // before List can publish a new selection, which loses activation.
+            // The gesture exists only for the one case List cannot express:
+            // activating the row that is already selected.
+            .modifier(
+                SessionRowTapModifier(
+                    session: session,
+                    isSelected: isSelected,
+                    onOpen: onOpen
+                )
             )
             .swipeActions(edge: .leading, allowsFullSwipe: false) {
                 pinButton
@@ -251,6 +224,50 @@ extension SessionRowItem {
             onArchive([session])
         }
         .tint(.accentColor)
+    }
+}
+
+/// Adds the only pointer recognizer a session row needs. `List` owns clicks
+/// that change selection; this seam is intentionally absent on unselected rows
+/// so their click cannot be consumed before `List` sees it.
+private struct SessionRowTapModifier: ViewModifier {
+    let session: ChatSession
+    let isSelected: Bool
+    let onOpen: (ChatSession) -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isSelected {
+            content.simultaneousGesture(
+                TapGesture(count: 1)
+                    .onEnded {
+                        let allowed = SidebarSelectionEventAdapter.allowsPrimaryActivation()
+                        HermternalSwitchTrace.session(
+                            "selection.tapGate",
+                            id: session.id,
+                            messages: session.messageCount,
+                            detail: allowed ? "allowed" : "blocked"
+                        )
+                        guard allowed else {
+                            HermternalSwitchTrace.selectionGuard(
+                                "sessionRow.tapGate",
+                                id: session.id,
+                                messages: session.messageCount,
+                                reason: "eventAdapterRejectedPrimaryActivation"
+                            )
+                            return
+                        }
+                        HermternalSwitchTrace.session(
+                            "selection.observed.pointer",
+                            id: session.id,
+                            messages: session.messageCount
+                        )
+                        onOpen(session)
+                    }
+            )
+        } else {
+            content
+        }
     }
 }
 
