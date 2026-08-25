@@ -46,7 +46,7 @@ public enum DebugModule: String, CaseIterable, Codable, Sendable, Identifiable {
         case .visiblePaint:
             "Times publish to visible pixels, and carries every statistic below; adds a one-point AppKit overlay that reports from each transcript paint pass, and appends one bounded ring sample per selection."
         case .frameDelivery:
-            "Records display-refresh callbacks only during scroll gestures; one monotonic clock read and one fixed-buffer write per callback, with no work while off."
+            "Records display-refresh callbacks during scroll gestures and after sidebar clicks; one monotonic clock and one fixed-buffer write per callback, with no work while off."
         }
     }
 

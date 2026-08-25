@@ -52,6 +52,7 @@ func frameDeliveryStatisticsMatchKnownSeries() {
                 surface: index.isMultiple(of: 2) ? .sidebar : .transcript,
                 gestureLatencyNanoseconds: index < 3 ? UInt64(index + 1) : nil,
                 clickLatencyNanoseconds: index < 3 ? UInt64(index + 4) : nil
+            )
         )
     }
 

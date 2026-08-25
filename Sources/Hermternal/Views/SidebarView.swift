@@ -937,6 +937,13 @@ struct SidebarView: View {
     /// compositing groups over the same rows, so one gradient holds both
     /// ramps.
     ///
+    /// The two ramps are no longer the same length. The titlebar is glass
+    /// and 44pt of the top ramp lies behind it, where the material washes
+    /// out whatever the mask is doing; the floating layer is opaque and
+    /// sits ON the list, so the whole bottom ramp is in open air. The top
+    /// ramp is therefore the longer of the two, and only its last 16pt do
+    /// work the eye can actually resolve.
+    ///
     /// The code measures both ramps in points from the edge that they
     /// belong to, then converts the points to fractions. Each ramp keeps
     /// its length at any window height.
@@ -1501,39 +1508,70 @@ private struct SidebarFolderDeletionTarget: Identifiable {
 /// one under the floating layer at the bottom.
 ///
 /// Both ramps borrow their SHAPE from what the app already ships, and
-/// neither borrows its distance. `SearchPanel` runs clear through 30pt,
-/// 0.12 at 48pt, 0.55 at 72pt and opaque at 96pt: proportions of
-/// 0.31 / 0.5 / 0.75 / 1. `ChatView` runs its top fade over 130pt at
-/// 0.30 / 0.55 / 0.76 of the way. Those distances were measured in a
-/// full-width results panel and a full-width reading column, where 96pt is
-/// a fraction of one card. This column is about 250pt wide with 32pt rows,
-/// so 96pt would be three whole rows fading at once: a hazy band, which is
-/// the thing rule 3 of the progressive-edge skill exists to prevent.
+/// neither borrows its distance. Every fade here is the same S: flat where
+/// it meets the chrome, steepest in the middle, soft where it meets opaque
+/// content. `SearchPanel` runs that S over 96pt. `ChatView` runs its top
+/// fade over 130pt, derived from its floating pill's frame rather than
+/// hardcoded. Both of those are full-width surfaces with nothing resting
+/// against the edge, so length costs them nothing.
 ///
-/// So the code keeps the proportions and takes the distances from this
-/// column. `reach` is 48pt, which is one and a half rows. A row is fully
-/// opaque at 48pt from the chrome. A row is fully transparent at `gone`,
-/// which is 15pt from the chrome. Only the row that passes under the
-/// chrome fades.
+/// This column has two constraints neither of them has, and between them
+/// they fix the top ramp's length.
 ///
-/// Both edges use the same four distances, in mirror, because both edges
-/// are the same event: a row arrives at fixed chrome. Measurement on the
-/// Mac at true 2x shows that the top edge has the space for it. The list
+/// First, the window's traffic lights sit OVER this column, spanning 14pt
+/// to 26pt down the window. Row ink has to be invisible behind them, so
+/// the ramp starts flat and holds under 0.05 for its first 18pt. Taking
+/// `ChatView`'s proportions directly would put 0.13 to 0.25 of ink there,
+/// which reads as a dirty titlebar and not as a fade.
+///
+/// Second, the first section header RESTS 46pt below the mask's top edge,
+/// so every point of extra length dims it. A 130pt reach would hold it at
+/// 0.25 permanently, and would fade two whole rows at once: the hazy band
+/// that rule 3 of the progressive-edge skill exists to prevent.
+///
+/// So the top ramp is as long as the resting header will bear and no
+/// longer: `topReach` is 60pt, up from the 48pt it shared with the bottom.
+///
+/// The geometry it works in, measured on the Mac at true 2x. The list
 /// frame starts 8pt down the window. It extends 44pt up, under the
 /// titlebar. The bottom edge of the titlebar is 52pt down the window. The
 /// first section header rests at 54pt.
 ///
+/// That 52pt is the window's top safe-area inset, and it is conditional: a
+/// probe on macOS 26.6.2 measures 52pt while the window has toolbar items
+/// and 32pt when it has none. This column's own ellipsis item is what
+/// holds it at 52. Remove that item and every distance below moves 20pt,
+/// silently, with nothing failing to say so.
+///
 /// The top ramp is therefore transparent for its first 15pt, which end at
 /// 23pt down the window, and it keeps ink away from the window buttons.
-/// The ramp fades the rows across the overlap band, where the glass
-/// titlebar draws no background of its own. The ramp is fully opaque at
-/// 48pt, which is 56pt down the window. That point is 2pt inside the
-/// ascenders of the resting header, and above the body of its text.
+/// It reaches 0.55 at 38pt, still inside the overlap band where the glass
+/// titlebar draws no background of its own. It is 0.74 at the titlebar's
+/// bottom edge and only opaque at 60pt, which is 68pt down the window.
 ///
-/// The 6pt ramp that this replaced came from an incorrect measurement.
-/// That measurement put the top of the list frame at the bottom edge of
-/// the titlebar. The ramp had no overlap band to work in, so it faded the
-/// resting header instead.
+/// That last figure is the whole point of the length. The 48pt ramp this
+/// replaced was opaque at 56pt, 4pt below the titlebar: the dissolve
+/// finished while the row was still behind glass, so the row emerged
+/// already solid and the fade read as almost nothing. This one is still
+/// running for 16pt of open air, so a row visibly dissolves on its way
+/// out rather than only under the chrome.
+///
+/// It is paid for by the resting header, which sits at 0.79 across its
+/// ascenders and 0.96 by its baseline instead of 0.93 and 1. That is a
+/// gradient across one line of bold text, in the resting state only: any
+/// scroll carries the header out of the ramp. Of the three things in
+/// tension — clean window buttons, a long enough dissolve, a fully opaque
+/// resting header — the header is the one that degrades gracefully, so it
+/// is the one that gives.
+///
+/// The bottom ramp keeps all four of its original distances. Its chrome is
+/// opaque, so it never had the top ramp's problem, and `reach` also sets
+/// the list's bottom content inset: changing it would move rows.
+///
+/// The 6pt ramp that an earlier pass replaced came from an incorrect
+/// measurement. That measurement put the top of the list frame at the
+/// bottom edge of the titlebar. The ramp had no overlap band to work in,
+/// so it faded the resting header instead.
 ///
 /// One type owns these numbers because two things depend on them: the mask
 /// that draws the ramps, and the list's bottom content margin that keeps
@@ -1555,14 +1593,20 @@ private enum SidebarDissolve {
     static let isEnabled =
         ProcessInfo.processInfo.environment["HERMTERNAL_NO_SIDEBAR_MASK"] != "1"
 
-    /// Distances from the chrome edge each ramp belongs to: up from the
-    /// floating layer's top edge at the bottom, down from the list's own
-    /// frame edge at the top.
+    /// The BOTTOM ramp's four distances, measured up from the floating
+    /// layer's top edge. `reach` is also the list's bottom content inset,
+    /// so the last row can travel the whole ramp; it is the one distance
+    /// here with a second dependent.
     static let reach: CGFloat = 48
     static let strong: CGFloat = 36
     static let soft: CGFloat = 24
-    /// Fully gone, short of the edge, so no ink ever touches it.
+    /// Fully gone, short of the edge, so no ink ever touches it. Shared
+    /// with the top ramp, where it is what keeps the window buttons clean.
     static let gone: CGFloat = 15
+
+    /// The TOP ramp's own reach, measured down from the list frame's top
+    /// edge. Longer than the bottom's, for the reasons on the type.
+    static let topReach: CGFloat = 60
 
     /// One continuous gradient. Stacked opacity bands would step and seam,
     /// and a second mask would be a second compositing group.
@@ -1575,18 +1619,32 @@ private enum SidebarDissolve {
         // meet, but they never cross and invert. The unlimited values
         // increase in order, so the limited values stay in order.
         func up(_ above: CGFloat) -> CGFloat {
-            min(max(boundary - above, reach), height) / height
+            min(max(boundary - above, topReach), height) / height
         }
         func down(_ below: CGFloat) -> CGFloat {
             min(below, height) / height
         }
         return LinearGradient(
             stops: [
+                // The top ramp gets six ink stops, not the bottom's three.
+                // A gradient stop list is a polyline, and three stops over
+                // 60pt would facet: the old ramp changed slope by 2.7x in
+                // one join, at 0.12 to 0.55, which is exactly where a
+                // facet is visible. These six track the S to within 0.024
+                // and no join changes slope by more than 1.7x. The
+                // distances have one consumer each, so they sit beside the
+                // opacity they carry rather than becoming six more names.
                 .init(color: .clear, location: 0),
                 .init(color: .clear, location: down(gone)),
-                .init(color: .black.opacity(0.12), location: down(soft)),
-                .init(color: .black.opacity(0.55), location: down(strong)),
-                .init(color: .black, location: down(reach)),
+                .init(color: .black.opacity(0.11), location: down(22)),
+                .init(color: .black.opacity(0.32), location: down(30)),
+                .init(color: .black.opacity(0.55), location: down(38)),
+                .init(color: .black.opacity(0.77), location: down(45)),
+                .init(color: .black.opacity(0.94), location: down(52)),
+                .init(color: .black, location: down(topReach)),
+                // The bottom ramp, in mirror. Its chrome is opaque and
+                // sits on the list, so the ramp is short and entirely in
+                // open air, and three stops carry it without faceting.
                 .init(color: .black, location: up(reach)),
                 .init(color: .black.opacity(0.55), location: up(strong)),
                 .init(color: .black.opacity(0.12), location: up(soft)),
