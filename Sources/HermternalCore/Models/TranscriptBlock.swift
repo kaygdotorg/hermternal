@@ -80,6 +80,26 @@ public struct TranscriptBlockResegmentation: Sendable, Equatable {
 public enum TranscriptBlockSegmenter {
     public static let fragmentTargetUTF16Length = 2_000
 
+    /// A bounded first-frame block. It intentionally does not inspect
+    /// Markdown; the renderer can draw the source text immediately while the
+    /// real segmentation runs off the main actor.
+    public static func placeholder(for message: ChatMessage) -> TranscriptBlock {
+        let prefix = message.text.prefix(256)
+        let firstToken = prefix.drop(while: {
+            $0 == " " || $0 == "\t" || $0 == "\n" || $0 == "\r"
+        })
+        let kind: TranscriptBlock.Kind = firstToken.hasPrefix("```")
+            ? .code
+            : .paragraph
+        return TranscriptBlock(
+            messageID: messageID(for: message),
+            blockIndex: 0,
+            kind: kind,
+            sourceRange: 0..<message.text.utf16.count,
+            contentHash: 0
+        )
+    }
+
     public static func blocks(for message: ChatMessage) -> [TranscriptBlock] {
         blocks(for: messageID(for: message), text: message.text)
     }

@@ -1038,20 +1038,36 @@ struct BlockTranscriptView: NSViewRepresentable {
                 let visible = container.tableView.rows(
                     in: visibleRect(for: container.tableView)
                 )
-                if visible.location != NSNotFound {
+                var visibleIndexes: IndexSet?
+                if visible.location == NSNotFound {
+                    visibleIndexes = nil
+                } else {
                     let first = max(0, visible.location)
                     let last = min(rows.count, visible.location + visible.length)
-                    if first < last {
-                        let visibleIndexes = IndexSet(integersIn: first..<last)
-                        HermternalSwitchTrace.transcriptPhaseReload(
-                            full: false,
-                            rows: visibleIndexes.count
-                        )
-                        container.tableView.reloadData(
-                            forRowIndexes: visibleIndexes,
-                            columnIndexes: IndexSet(integer: 0)
-                        )
-                    }
+                    visibleIndexes = first < last
+                        ? IndexSet(integersIn: first..<last)
+                        : nil
+                }
+                if let visibleIndexes {
+                    HermternalSwitchTrace.transcriptPhaseReload(
+                        full: false,
+                        rows: visibleIndexes.count
+                    )
+                    container.tableView.reloadData(
+                        forRowIndexes: visibleIndexes,
+                        columnIndexes: IndexSet(integer: 0)
+                    )
+                } else if !rows.isEmpty {
+                    HermternalSwitchTrace.transcriptPhaseReloadFallback(
+                        rows: rows.count,
+                        visibleLocation: visible.location,
+                        visibleLength: visible.length
+                    )
+                    HermternalSwitchTrace.transcriptPhaseReload(
+                        full: true,
+                        rows: rows.count
+                    )
+                    container.tableView.reloadData()
                 }
             } else if rowCountChanged || !changed.isEmpty {
                 if rowCountChanged {
@@ -1436,8 +1452,6 @@ struct BlockTranscriptView: NSViewRepresentable {
         }
 
         private func contentWidth(for message: ChatMessage, in tableView: NSTableView) -> CGFloat {
-            let tableWidth = tableView.enclosingScrollView?.contentView.bounds.width ?? tableView.bounds.width
-        private func contentWidth(for message: ChatMessage, in tableView: NSTableView) -> CGFloat {
             // `layoutTableDocument` commits this document width before
             // AppKit asks for any row height. Using the table's committed
             // bounds here makes reads and background writes observe the same
@@ -1445,6 +1459,7 @@ struct BlockTranscriptView: NSViewRepresentable {
             // clip view's next width.
             let tableWidth = max(1, tableView.bounds.width)
             let outer = max(1, tableWidth - 44)
+            switch message.role {
             case .assistant:
                 return min(outer - MessageTypography.bubblePadding * 2, MessageTypography.readingMeasure)
             case .user:

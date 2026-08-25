@@ -594,7 +594,10 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
     /// `language` is the info-string span for a fenced-code segment.
     ///
     /// Spans are intentionally recomputed for this request and are not
-    /// retained with the decoded attributed payload.
+    /// retained with the decoded attributed payload. This is a full source
+    /// walk: transcript navigation must not call it synchronously. Block
+    /// preparation calls it off the main actor; Find may pay for it while
+    /// Find is active.
     public static func sourceSpans(
         for text: String,
         owner: TraceOwner = .unattributed

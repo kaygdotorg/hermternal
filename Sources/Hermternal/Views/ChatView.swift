@@ -2,37 +2,29 @@ import SwiftUI
 import HermternalCore
 import AppKit
 
-private enum TranscriptBlockWindowCache {
-    private struct Key: Hashable {
-        let messageID: MessageIdentity
-        let contentHash: UInt64
+private struct TranscriptBlockProjectionKey: Hashable, Sendable {
+    let routeIdentity: String
+    let revision: Int
+    let range: Range<Int>
+}
+
+private struct PreparedTranscriptBlocks: Sendable {
+    let key: TranscriptBlockProjectionKey
+    let blocks: [TranscriptBlock]
+}
+
+private enum TranscriptBlockProjection {
+    /// The body only creates bounded source rows. Each placeholder points at
+    /// the real message text, so the first paint is plain prose or monospace
+    /// code rather than an empty rectangle.
+    static func placeholders(for messages: [ChatMessage]) -> [TranscriptBlock] {
+        messages.flatMap { [TranscriptBlockSegmenter.placeholder(for: $0)] }
     }
 
-    private static let storage = ByteBoundedCache<Key, [TranscriptBlock]>(
-        byteBudget: MarkdownSegment.parseCacheByteBudget
-    )
-
-    static func blocks(for message: ChatMessage) -> [TranscriptBlock] {
-        let key = Key(messageID: message.id, contentHash: contentHash(of: message.text))
-        if let cached = storage.value(for: key) {
-            return cached
-        }
-        let blocks = TranscriptBlockSegmenter.blocks(for: message)
-        let textCost = message.text.utf8.count
-        let blockCost = blocks.count.multipliedReportingOverflow(
-            by: MemoryLayout<TranscriptBlock>.stride
-        ).partialValue
-        let cost = max(1, textCost.addingReportingOverflow(blockCost).partialValue)
-        storage.insert(blocks, for: key, byteCost: cost)
-        return blocks
-    }
-
-    private static func contentHash(of text: String) -> UInt64 {
-        var hash: UInt64 = 14_695_981_039_346_656_037
-        for byte in text.utf8 {
-            hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211
-        }
-        return hash
+    /// Markdown segmentation and source-span extraction run after the body
+    /// returns, on a non-main executor.
+    static func prepare(_ messages: [ChatMessage]) -> [TranscriptBlock] {
+        messages.flatMap { TranscriptBlockSegmenter.blocks(for: $0) }
     }
 }
 
@@ -63,6 +55,10 @@ struct ChatView: View {
     /// follows it. Composer consumes this through SwiftUI focus state
     /// rather than taking first responder during every launch.
     @State private var composerFocusRequest = 0
+    /// Segmentation is retained only for the current route/window/revision.
+    /// A route change or stream revision naturally falls back to plain rows
+    /// until its replacement arrives from the background task.
+    @State private var preparedTranscriptBlocks: PreparedTranscriptBlocks?
     var body: some View {
         transcript
             // The archived transcript has no bottom editing surface.
@@ -464,6 +460,32 @@ struct ChatView: View {
     }
 
 
+    @MainActor
+    private func prepareTranscriptBlocks(
+        _ messages: [ChatMessage],
+        key: TranscriptBlockProjectionKey
+    ) async {
+        guard Self.usesBlockTranscript else { return }
+        let blocks = await Task.detached(priority: .userInitiated) {
+            TranscriptBlockProjection.prepare(messages)
+        }.value
+        guard !Task.isCancelled,
+              key.routeIdentity == transcriptIdentity,
+              key.revision == model.messagesRevision
+        else { return }
+        preparedTranscriptBlocks = PreparedTranscriptBlocks(key: key, blocks: blocks)
+    }
+    private func transcriptBlocks(
+        for messages: [ChatMessage],
+        key: TranscriptBlockProjectionKey
+    ) -> [TranscriptBlock] {
+        guard let prepared = preparedTranscriptBlocks,
+              prepared.key == key
+        else {
+            return TranscriptBlockProjection.placeholders(for: messages)
+        }
+        return prepared.blocks
+    }
     @ViewBuilder
     private var transcript: some View {
         let messages = model.messages
@@ -471,6 +493,7 @@ struct ChatView: View {
         let matches = model.transcriptMatches(for: query)
         let activeFindMatch = matches.indices.contains(activeFindIndex)
             ? matches[activeFindIndex]
+
             : nil
         let resolvedWindow = isPrimingTranscriptWindow
             ? TranscriptWindowPolicy.initial(totalMessageCount: messages.count)
@@ -502,9 +525,15 @@ struct ChatView: View {
         )
         let windowedMatches = windowedProjection.matches
         let activeWindowMatchIndex = windowedProjection.activeIndex
-        let windowedBlocks = windowedMessages.flatMap {
-            TranscriptBlockWindowCache.blocks(for: $0)
-        }
+        let blockProjectionKey = TranscriptBlockProjectionKey(
+            routeIdentity: transcriptIdentity,
+            revision: model.messagesRevision,
+            range: window.range
+        )
+        let windowedBlocks = transcriptBlocks(
+            for: windowedMessages,
+            key: blockProjectionKey
+        )
         // Capture the publication generation, not the latest streaming
         // generation. A stream can begin while the first rows are painting.
         let visibilityGeneration = (
@@ -846,6 +875,9 @@ struct ChatView: View {
                 }
             }
         }
+        }
+        .task(id: blockProjectionKey) {
+            await prepareTranscriptBlocks(windowedMessages, key: blockProjectionKey)
         }
         .overlay(alignment: .top) {
             if isFindPresented {

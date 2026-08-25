@@ -172,6 +172,25 @@ enum HermternalSwitchTrace {
         pendingTranscriptPublication = pending
     }
 
+    static func transcriptPhaseReloadFallback(
+        rows: Int,
+        visibleLocation: Int,
+        visibleLength: Int
+    ) {
+        guard gate.isEnabled(.visiblePaint) else { return }
+        let pending = pendingTranscriptPublication
+        session(
+            "transcript.reloadFallback",
+            id: pending?.id,
+            generation: pending?.generation,
+            renderedRows: rows,
+            detail: "reason=emptyVisibleIndexes,visibleLocation=\(visibleLocation),visibleLength=\(visibleLength),action=fullReload",
+            owner: .blockRowConfiguration,
+            executor: .main,
+            module: .visiblePaint
+        )
+    }
+
     static func transcriptPhaseTextSlice(start: UInt64, end: UInt64) {
         guard var pending = pendingTranscriptPublication else { return }
         pending.textSliceCount &+= 1
@@ -228,6 +247,22 @@ enum HermternalSwitchTrace {
                 timestampNanoseconds: visibleAtNanoseconds
             )
             return false
+        }
+        // A non-empty transcript always has a row to configure before a paint.
+        // Zero configured rows means AppKit skipped viewFor, so this is never a valid empty state.
+        if messages > 0, pending.rowConfigurations == 0 {
+            session(
+                "transcript.zeroConfiguredRows",
+                id: id,
+                generation: generation,
+                messages: messages,
+                renderedRows: renderedRows,
+                detail: "rowConfigs=0,rowNew=0,rowReused=0",
+                owner: .blockRowConfiguration,
+                executor: .main,
+                module: .visiblePaint,
+                timestampNanoseconds: visibleAtNanoseconds
+            )
         }
         let updateToPaintNanoseconds = pending.updateEndedAtNanoseconds.map {
             visibleAtNanoseconds >= $0 ? visibleAtNanoseconds - $0 : 0
@@ -2201,9 +2236,9 @@ final class AppModel {
         activeOpenTask = nil
     }
 
-    /// Selection bookkeeping and the warm projection publish synchronously so
-    /// the sidebar highlight and transcript advance in the same interaction
-    /// turn. Only the authoritative opener runs in a cancellable task.
+    /// Publishes identity and route synchronously. Transcript projection and
+    /// block preparation are intentionally deferred below. The publication
+    /// precedes the first suspension, preserving the held-arrow guarantee.
     @discardableResult
     func requestOpen(_ session: ChatSession) -> Task<Void, Never> {
         cancelActiveOpen()
@@ -2227,58 +2262,37 @@ final class AppModel {
             generation: generation
         )
 
-        // Publication is deliberately synchronous. The warm-store lookup is
-        // cheap; doing it before the first suspension means key-repeat task
-        // cancellation cannot suppress a settled selection.
+        // Read the warm store synchronously only to copy the bounded tail.
+        // The complete projection is promoted after the opener suspends.
         let warm = cacheEnabled
             ? warmStore.projection(
                 for: session.id,
                 minimumServerTotal: session.messageCount
             )
             : nil
-        if let warm {
-            streamingReducer.reset(messages: warm.messages)
-            messages = warm.messages
-            isAwaitingReply = streamingReducer.isAwaitingReply
-            HermternalSwitchTrace.session(
-                "selection.publish",
-                id: session.id,
-                generation: generation,
-                messages: warm.messages.count,
-                detail: "warm.publish"
-            )
-            ContentionTrace.snapshotAndReset(phase: "first-publish")
-            HermternalSwitchTrace.session(
-                "warm.publish",
-                id: session.id,
-                generation: generation,
-                messages: warm.messages.count
-            )
-        } else {
-            // A cold miss must not leave the prior chat painted while the
-            // cancellable opener obtains its first authoritative phase.
-            streamingReducer.reset()
-            messages = []
-            isAwaitingReply = streamingReducer.isAwaitingReply
-            HermternalSwitchTrace.session(
-                "selection.publish",
-                id: session.id,
-                generation: generation,
-                messages: 0,
-                detail: "cold.publish"
-            )
-            ContentionTrace.snapshotAndReset(phase: "first-publish")
-            HermternalSwitchTrace.session(
-                "cold.publish",
-                id: session.id,
-                generation: generation,
-                messages: 0
-            )
-        }
-
-        // Only expensive work remains in this task. A newer selection cancels
-        // opener tasks and handles, cache reads, REST fetches, and block
-        // preparation through the generation and TranscriptOpenHandle guards.
+        let initialMessages = warm.map {
+            Array($0.messages.suffix(TranscriptWindowPolicy.initialWindowSize))
+        } ?? []
+        // The synchronous projection is bounded to the first-frame tail.
+        // The opener promotes it to the complete projection after its first
+        // suspension, so older rows remain available without keypress work.
+        streamingReducer.reset(messages: initialMessages)
+        messages = initialMessages
+        isAwaitingReply = streamingReducer.isAwaitingReply
+        HermternalSwitchTrace.session(
+            "selection.publish",
+            id: session.id,
+            generation: generation,
+            messages: initialMessages.count,
+            detail: warm == nil ? "route.publish" : "warm.tail.publish"
+        )
+        ContentionTrace.snapshotAndReset(phase: "first-publish")
+        HermternalSwitchTrace.session(
+            warm == nil ? "route.publish" : "warm.tail.publish",
+            id: session.id,
+            generation: generation,
+            messages: initialMessages.count
+        )
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             await Task.yield()
@@ -2376,6 +2390,9 @@ final class AppModel {
                     guard let snapshot = result.snapshot else { return false }
                     return snapshotMatches(snapshot, warm.snapshot)
                 } ?? false)
+            let warmTailNeedsExpansion = skipWarmProjection.map {
+                messages.count < $0.messages.count
+            } ?? false
             let validatedProjection = resident ?? skipWarmProjection
             let sameValidatedProjection = resident != nil
                 ? sameResidentSnapshot
@@ -2389,10 +2406,9 @@ final class AppModel {
             // validated warm projection exists, they must not replace it with
             // an older or weaker snapshot; only a REST result may reconcile it.
 
-            // A validated synchronous warm projection is already complete
-            // against the current session total. The opener's initial disk
-            // phase cannot replace it, even when its snapshot is older or
-            // otherwise differs. Resume/REST phases may still be newer.
+            // A validated warm projection may have published only its bounded
+            // tail synchronously. The opener expands that tail here without
+            // putting any transcript walk back on the selection keypress.
             if let snapshot = result.snapshot,
                cacheEnabled,
                !isInitialWarmPhase,
@@ -2406,9 +2422,8 @@ final class AppModel {
                     minimumServerTotal: session.messageCount
                 )
             }
-            if !isInitialWarmPhase
-                && !rejectsCacheDerivedDowngrade
-                && !sameWarmProjection {
+            if !rejectsCacheDerivedDowngrade
+                && (!sameWarmProjection || warmTailNeedsExpansion) {
                 streamingReducer.reset(messages: result.messages)
                 messages = result.messages
                 isAwaitingReply = streamingReducer.isAwaitingReply
