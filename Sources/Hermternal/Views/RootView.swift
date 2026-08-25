@@ -27,6 +27,12 @@ struct RootView: View {
                 .environment(model.toastPresenter)
                 .zIndex(2)
         }
+        .overlay(alignment: .topLeading) {
+            FrameDeliveryProbe(capability: model.debugModules)
+                .frame(width: 1, height: 1)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
     }
 }
 

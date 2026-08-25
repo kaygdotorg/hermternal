@@ -1300,14 +1300,15 @@ private final class SidebarDerivationCache {
                 return id
             }
             let contextItems = projection.visibleOrder + projection.folderVisibleOrder
+            let expandedChatIDsByItem = SidebarSelectionPolicy.expandedChatIDsByItem(
+                contextItems,
+                orderedSessionIDs: orderedSessionIDs,
+                scheduledSessionIDs: scheduledIDs,
+                folderMembership: membership
+            )
             let expandedChatsByItem = Dictionary(
                 uniqueKeysWithValues: contextItems.map { item in
-                    let ids = SidebarSelectionPolicy.expandedChatIDs(
-                        selection: [item],
-                        orderedSessionIDs: orderedSessionIDs,
-                        scheduledSessionIDs: scheduledIDs,
-                        folderMembership: membership
-                    )
+                    let ids = expandedChatIDsByItem[item] ?? []
                     return (item, ids.compactMap { sessionsByID[$0] })
                 }
             )

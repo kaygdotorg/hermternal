@@ -19,6 +19,11 @@ enum HermternalSwitchTrace {
     private static var selectionCount = 0
     private static var publicationCount = 0
     private static var stalePaintCount = 0
+    /// Layout-cache hits over the process lifetime, not per publication. A
+    /// route's first publication reads heights before preparation has written
+    /// any, so a per-publication count of zero is expected there and says
+    /// nothing about whether the cache works.
+    private static var heightCacheHitsLifetime = 0
     private static var hasRecordedMetricSample = false
     /// The one publication that has not reached a terminal paint outcome.
     /// A newer publication closes this record as superseded before replacing
@@ -56,6 +61,7 @@ enum HermternalSwitchTrace {
         selectionCount = 0
         publicationCount = 0
         stalePaintCount = 0
+        heightCacheHitsLifetime = 0
         hasRecordedMetricSample = false
         HermternalSelectionOccupancyTrace.configure(gate: gate)
     }
@@ -133,13 +139,25 @@ enum HermternalSwitchTrace {
         )
     }
 
+    /// Height answers, split by whether the layout cache served them.
+    ///
+    /// `heightCacheHits` counts only within one publication, and on a route's
+    /// first publication the height pass runs before background preparation
+    /// has written any measured value, so that field is legitimately zero
+    /// there. It is not evidence of a cold cache: a live run confirmed the
+    /// write and read keys are byte-identical, field for field. Read
+    /// `heightCacheHitsLifetime` to judge whether the cache works at all, and
+    /// the per-publication field only to judge that publication.
     static func transcriptPhaseHeight(
         cacheHit: Bool,
         start: UInt64,
         end: UInt64
     ) {
-        guard var pending = pendingTranscriptPublication else { return }
         let duration = elapsedNanoseconds(start: start, end: end)
+        if cacheHit {
+            heightCacheHitsLifetime &+= 1
+        }
+        guard var pending = pendingTranscriptPublication else { return }
         pending.heightCalls &+= 1
         if cacheHit {
             pending.heightCacheHits &+= 1
@@ -301,7 +319,7 @@ enum HermternalSwitchTrace {
             generation: generation,
             messages: messages,
             renderedRows: renderedRows,
-            detail: "publishToPaintNs=\(visibleAtNanoseconds - pending.publishedAtNanoseconds),updateNs=\(pending.updateNSViewNanoseconds),diffNs=\(pending.coordinatorDiffNanoseconds),heightCalls=\(pending.heightCalls),heightCacheHits=\(pending.heightCacheHits),heightCacheNs=\(pending.heightCacheHitNanoseconds),heightEstimatorCalls=\(pending.heightEstimatorCalls),heightEstimatorNs=\(pending.heightEstimatorNanoseconds),rowConfigs=\(pending.rowConfigurations),rowReused=\(pending.reusedRowConfigurations),rowNew=\(pending.newRowConfigurations),textSlices=\(pending.textSliceCount),textSliceNs=\(pending.textSliceNanoseconds),contentHashCalls=\(pending.contentHashCount),contentHashNs=\(pending.contentHashNanoseconds),reloadFullRows=\(pending.fullReloadRows),reloadTargetedRows=\(pending.targetedReloadRows),updateToPaintNs=\(updateToPaintNanoseconds)",
+            detail: "publishToPaintNs=\(visibleAtNanoseconds - pending.publishedAtNanoseconds),updateToPaintNs=\(updateToPaintNanoseconds),updateNs=\(pending.updateNSViewNanoseconds),diffNs=\(pending.coordinatorDiffNanoseconds),heightCalls=\(pending.heightCalls),heightCacheHits=\(pending.heightCacheHits),heightCacheHitsLifetime=\(heightCacheHitsLifetime),heightCacheNs=\(pending.heightCacheHitNanoseconds),heightEstimatorCalls=\(pending.heightEstimatorCalls),heightEstimatorNs=\(pending.heightEstimatorNanoseconds),rowConfigs=\(pending.rowConfigurations),rowReused=\(pending.reusedRowConfigurations),rowNew=\(pending.newRowConfigurations),textSlices=\(pending.textSliceCount),textSliceNs=\(pending.textSliceNanoseconds),contentHashCalls=\(pending.contentHashCount),contentHashNs=\(pending.contentHashNanoseconds),reloadFullRows=\(pending.fullReloadRows),reloadTargetedRows=\(pending.targetedReloadRows)",
             owner: .blockRowConfiguration,
             executor: .main,
             module: .visiblePaint,
@@ -629,6 +647,11 @@ final class AppModel {
     private var externalRouteTask: Task<Void, Never>?
     private let openGenerations = OpenGenerationController()
     private var streamingReducer = StreamingEventReducer()
+    /// Suppresses gateway deltas while a newly selected transcript is being
+    /// prepared. Selection changes invalidate the previous live stream before
+    /// the first actor yield; without this guard an event arriving in that
+    /// gap could reduce into the newly selected chat's empty reducer.
+    private var isPreparingOpen = false
 
     private static let serverKey = "serverURL"
     private static let defaultServer = "https://hermes-dashboard.kayg.org"
@@ -2262,11 +2285,13 @@ final class AppModel {
         activeOpenTask?.cancel()
         activeOpenHandle = nil
         activeOpenTask = nil
+        isPreparingOpen = false
     }
 
-    /// Publishes identity and route synchronously. Transcript projection and
-    /// block preparation are intentionally deferred below. The publication
-    /// precedes the first suspension, preserving the held-arrow guarantee.
+    /// Publishes the durable selection identity synchronously. Warm-cache
+    /// projection and transcript publication begin only after the first actor
+    /// suspension, so SwiftUI's List can commit the real selection highlight
+    /// before transcript observation invalidates the chat view.
     @discardableResult
     func requestOpen(_ session: ChatSession) -> Task<Void, Never> {
         cancelActiveOpen()
@@ -2277,6 +2302,10 @@ final class AppModel {
         pendingMessageRoute = nil
         viewingArchivedSessionID = nil
         liveSessionID = nil
+        isPreparingOpen = true
+        // Invalidate the previous stream before yielding. Event handling is
+        // also gated below until this open has installed its transcript.
+        streamingReducer.reset()
         ContentionTrace.reset()
         HermternalSwitchTrace.session(
             "selection.begin",
@@ -2289,42 +2318,55 @@ final class AppModel {
             event: "selectedSessionID.mutation",
             generation: generation
         )
-
-        // Read the warm store synchronously only to copy the bounded tail.
-        // The complete projection is promoted after the opener suspends.
-        let warm = cacheEnabled
-            ? warmStore.projection(
-                for: session.id,
-                minimumServerTotal: session.messageCount
-            )
-            : nil
-        let initialMessages = warm.map {
-            Array($0.messages.suffix(TranscriptWindowPolicy.initialWindowSize))
-        } ?? []
-        // The synchronous projection is bounded to the first-frame tail.
-        // The opener promotes it to the complete projection after its first
-        // suspension, so older rows remain available without keypress work.
-        streamingReducer.reset(messages: initialMessages)
-        messages = initialMessages
-        isAwaitingReply = streamingReducer.isAwaitingReply
         HermternalSwitchTrace.session(
             "selection.publish",
             id: session.id,
             generation: generation,
-            messages: initialMessages.count,
-            detail: warm == nil ? "route.publish" : "warm.tail.publish"
+            messages: messages.count,
+            detail: "route.selection"
         )
-        ContentionTrace.snapshotAndReset(phase: "first-publish")
-        HermternalSwitchTrace.session(
-            warm == nil ? "route.publish" : "warm.tail.publish",
-            id: session.id,
-            generation: generation,
-            messages: initialMessages.count
-        )
+        let warmStoreForOpen = warmStore
+        let cacheEnabledForOpen = cacheEnabled
+
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
+            // Let the List's selection transaction reach AppKit before any
+            // transcript state is published. The cache read itself is
+            // detached because warm-store locking and projection copying
+            // must not occupy the main actor's click turn.
             await Task.yield()
             guard self.openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+            let warm = await Task.detached(priority: .userInitiated) {
+                () -> WarmTranscriptProjection? in
+                guard cacheEnabledForOpen else { return nil }
+                return warmStoreForOpen.projection(
+                    for: session.id,
+                    minimumServerTotal: session.messageCount
+                )
+            }.value
+            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+            let initialMessages = warm.map {
+                Array($0.messages.suffix(TranscriptWindowPolicy.initialWindowSize))
+            } ?? []
+            // The first-frame tail is bounded; the opener promotes the
+            // complete projection after its first suspension.
+            self.streamingReducer.reset(messages: initialMessages)
+            self.messages = initialMessages
+            self.isAwaitingReply = self.streamingReducer.isAwaitingReply
+            HermternalSwitchTrace.session(
+                "transcript.publish",
+                id: session.id,
+                generation: generation,
+                messages: initialMessages.count,
+                detail: warm == nil ? "route.publish" : "warm.tail.publish"
+            )
+            ContentionTrace.snapshotAndReset(phase: "first-publish")
+            HermternalSwitchTrace.session(
+                warm == nil ? "route.publish" : "warm.tail.publish",
+                id: session.id,
+                generation: generation,
+                messages: initialMessages.count
+            )
             _ = await self.open(
                 session,
                 generation: generation,
@@ -2332,6 +2374,9 @@ final class AppModel {
                 selectionAlreadyPublished: true,
                 handle: handle
             )
+            if self.openGenerations.isCurrent(generation) {
+                self.isPreparingOpen = false
+            }
         }
         activeOpenTask = task
         return task
@@ -2774,6 +2819,7 @@ final class AppModel {
             return
         }
 
+        guard !isPreparingOpen else { return }
         let reduction = streamingReducer.reduce(event)
         messages = reduction.messages
         isAwaitingReply = reduction.isAwaitingReply

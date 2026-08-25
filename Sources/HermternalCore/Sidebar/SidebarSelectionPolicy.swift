@@ -121,6 +121,82 @@ public enum SidebarSelectionPolicy {
         return (result, work)
     }
 
+    /// Expands every visible row's context in one ordered pass.
+    ///
+    /// Singleton expansion is linear in the ordered session count. Calling
+    /// it once for every row makes ordering quadratic, so this batch seam
+    /// shares the authoritative order scan across all folder rows.
+    public static func expandedChatIDsByItem(
+        _ contextItems: [SidebarSelectionID],
+        orderedSessionIDs: [String],
+        scheduledSessionIDs: Set<String>,
+        folderMembership: [String: String]
+    ) -> [SidebarSelectionID: [String]] {
+        expandedChatIDsByItemWithWork(
+            contextItems,
+            orderedSessionIDs: orderedSessionIDs,
+            scheduledSessionIDs: scheduledSessionIDs,
+            folderMembership: folderMembership
+        ).chatIDsByItem
+    }
+
+    struct BatchExpansionWork: Equatable, Sendable {
+        fileprivate(set) var contextItemsVisited = 0
+        fileprivate(set) var orderedSessionIDsVisited = 0
+
+        var total: Int {
+            contextItemsVisited + orderedSessionIDsVisited
+        }
+    }
+
+    static func expandedChatIDsByItemWithWork(
+        _ contextItems: [SidebarSelectionID],
+        orderedSessionIDs: [String],
+        scheduledSessionIDs: Set<String>,
+        folderMembership: [String: String]
+    ) -> (chatIDsByItem: [SidebarSelectionID: [String]], work: BatchExpansionWork) {
+        var work = BatchExpansionWork()
+        var chatIDsByItem = [SidebarSelectionID: [String]](
+            minimumCapacity: contextItems.count
+        )
+        var folderIDs = Set<String>()
+        folderIDs.reserveCapacity(contextItems.count)
+
+        for item in contextItems {
+            work.contextItemsVisited += 1
+            switch item {
+            case let .chat(id) where !id.isEmpty:
+                chatIDsByItem[item] = [id]
+            case let .folder(id) where !id.isEmpty:
+                chatIDsByItem[item] = []
+                folderIDs.insert(id)
+            case .chat(_), .folder(_):
+                chatIDsByItem[item] = []
+            }
+        }
+
+        guard !folderIDs.isEmpty else {
+            return (chatIDsByItem, work)
+        }
+
+        var seenFolderChatIDs = Set<String>()
+        seenFolderChatIDs.reserveCapacity(folderMembership.count)
+        for sessionID in orderedSessionIDs {
+            work.orderedSessionIDsVisited += 1
+            guard !sessionID.isEmpty,
+                  let folderID = folderMembership[sessionID],
+                  folderIDs.contains(folderID),
+                  !scheduledSessionIDs.contains(sessionID),
+                  seenFolderChatIDs.insert(sessionID).inserted
+            else {
+                continue
+            }
+            chatIDsByItem[.folder(folderID), default: []].append(sessionID)
+        }
+        return (chatIDsByItem, work)
+    }
+
+
     /// Filters a drag to the dragged item's type when that item is selected.
     /// The result follows the unique visible order.
     public static func applicableDragTargets(

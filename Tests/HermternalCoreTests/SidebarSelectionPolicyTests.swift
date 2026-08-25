@@ -178,6 +178,62 @@ func expansionWorkIsBoundedForLargeCorpus() {
     )
 }
 
+@Test("Batch row expansion scans the authoritative order once")
+func batchExpansionWorkIsBoundedByRowsAndSessions() {
+    let sessions = (0..<4_096).map { index in
+        selectionSession(
+            id: "session-\(index)",
+            source: index.isMultiple(of: 211) ? "cron" : ""
+        )
+    }
+    let orderedSessionIDs = sessions.map(\.id)
+    let folderMembership = Dictionary(
+        uniqueKeysWithValues: sessions.enumerated().map { index, session in
+            (session.id, "folder-\(index % 8)")
+        }
+    )
+    let scheduledSessionIDs = Set(
+        sessions.filter { $0.source == "cron" }.map(\.id)
+    )
+    let contextItems: [SidebarSelectionID] =
+        orderedSessionIDs.map { .chat($0) }
+        + (0..<8).map { .folder("folder-\($0)") }
+
+    let expansion = SidebarSelectionPolicy.expandedChatIDsByItemWithWork(
+        contextItems,
+        orderedSessionIDs: orderedSessionIDs,
+        scheduledSessionIDs: scheduledSessionIDs,
+        folderMembership: folderMembership
+    )
+    let expectedFolder3 = orderedSessionIDs.filter {
+        folderMembership[$0] == "folder-3"
+            && !scheduledSessionIDs.contains($0)
+    }
+    let expectedFolder2 = orderedSessionIDs.filter {
+        folderMembership[$0] == "folder-2"
+            && !scheduledSessionIDs.contains($0)
+    }
+
+    #expect(expansion.chatIDsByItem[.chat("session-211")] == ["session-211"])
+    #expect(expansion.chatIDsByItem[.folder("folder-3")] == expectedFolder3)
+    #expect(expansion.chatIDsByItem[.chat("session-37")] == ["session-37"])
+    #expect(expansion.chatIDsByItem[.folder("folder-2")] == expectedFolder2)
+    #expect(!expansion.chatIDsByItem[.folder("folder-3")]!.contains("session-211"))
+    #expect(expansion.work.contextItemsVisited == contextItems.count)
+    #expect(expansion.work.orderedSessionIDsVisited == orderedSessionIDs.count)
+    #expect(
+        expansion.work.total
+            == contextItems.count + orderedSessionIDs.count
+    )
+    // Before batching, every context item rescanned the full order.
+    #expect(expansion.work.total <= contextItems.count * 2)
+    print(
+        "PERF|sidebar row context expansion|"
+            + "beforeOrderedProbes=\(contextItems.count * orderedSessionIDs.count) "
+            + "afterOrderedProbes=\(expansion.work.orderedSessionIDsVisited) "
+            + "rows=\(contextItems.count) sessions=\(orderedSessionIDs.count)"
+    )
+}
 
 @Test("An unselected clicked row remains the only context target")
 func unselectedClickScopesToOneTarget() {

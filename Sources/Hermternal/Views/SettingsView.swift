@@ -176,6 +176,15 @@ private struct AppearanceSettingsView: View {
                         appearance.useSystemAccent()
                     }
                 }
+
+                Toggle(isOn: $appearance.userBubbleUsesAccent) {
+                    Text("Tint your own messages with the accent")
+                    Text(
+                        "Your messages fill a blue bubble, the way Messages "
+                            + "draws one you sent. Turn this on to fill them "
+                            + "with the accent colour instead."
+                    )
+                }
             } header: {
                 Text("Accent")
             }
@@ -365,11 +374,13 @@ private struct DebugModulesGroup: View {
     /// screen. Recording a sample therefore pays nothing for the readout, and
     /// nothing polls once Settings closes.
     @State private var metrics: DebugMetricsSnapshot?
+    @State private var frameMetrics: DebugFrameDeliveryMetrics?
 
     init(capability: any DebugModuleCapability) {
         self.capability = capability
         _enabledMask = State(initialValue: capability.gate.rawValue)
         _metrics = State(initialValue: capability.metrics)
+        _frameMetrics = State(initialValue: capability.frameDeliveryMetrics)
     }
 
     var body: some View {
@@ -400,6 +411,61 @@ private struct DebugModulesGroup: View {
                 sampleSizeValue
             }
             .task { await followMeasurements() }
+            statisticRow(
+                "Refresh interval",
+                frameStatistic { metrics in
+                    formatNanoseconds(metrics.observedRefreshIntervalNanoseconds)
+                }
+            )
+            statisticRow(
+                "Frame interval, median / p90 / p99 / max",
+                frameStatistic { metrics in
+                    formatQuartet(
+                        metrics.frameIntervalMedianNanoseconds,
+                        metrics.frameIntervalP90Nanoseconds,
+                        metrics.frameIntervalP99Nanoseconds,
+                        metrics.frameIntervalMaximumNanoseconds
+                    )
+                }
+            )
+            statisticRow(
+                "Long frames >1× / >2× / longest run",
+                frameStatistic { metrics in
+                    "\(metrics.intervalsExceedingOneRefreshPeriod.formatted()) / "
+                        + "\(metrics.intervalsExceedingTwoRefreshPeriods.formatted()) / "
+                        + "\(metrics.longestConsecutiveLongFrameRun.formatted())"
+                }
+            )
+            statisticRow(
+                "Gesture latency, median / p90 / p99 / max",
+                frameStatistic { metrics in
+                    formatQuartet(
+                        metrics.gestureLatencyMedianNanoseconds,
+                        metrics.gestureLatencyP90Nanoseconds,
+                        metrics.gestureLatencyP99Nanoseconds,
+                        metrics.gestureLatencyMaximumNanoseconds
+                    )
+                }
+            )
+            statisticRow(
+                "Click-to-first-frame latency, median / p90 / p99 / max",
+                frameStatistic { metrics in
+                    formatQuartet(
+                        metrics.clickLatencyMedianNanoseconds,
+                        metrics.clickLatencyP90Nanoseconds,
+                        metrics.clickLatencyP99Nanoseconds,
+                        metrics.clickLatencyMaximumNanoseconds
+                    )
+                }
+            )
+            statisticRow(
+                "Frames by surface, sidebar / transcript / unknown",
+                frameStatistic { metrics in
+                    "\(metrics.sidebarFrameCount.formatted()) / "
+                        + "\(metrics.transcriptFrameCount.formatted()) / "
+                        + "\(metrics.unattributedFrameCount.formatted())"
+                }
+            )
 
             statisticRow(
                 "Publish to visible, median",
@@ -459,8 +525,9 @@ private struct DebugModulesGroup: View {
                     Button("Clear Samples") {
                         capability.clearMetrics()
                         metrics = capability.metrics
+                        frameMetrics = capability.frameDeliveryMetrics
                     }
-                    .disabled(metrics == nil)
+                    .disabled(metrics == nil && frameMetrics == nil)
                 }
             }
         }
@@ -487,6 +554,7 @@ private struct DebugModulesGroup: View {
                 // than its own optimism.
                 enabledMask = capability.gate.rawValue
                 metrics = capability.metrics
+                frameMetrics = capability.frameDeliveryMetrics
             }
         )
     }
@@ -501,7 +569,37 @@ private struct DebugModulesGroup: View {
             return "\(milliseconds.formatted(.number.precision(.fractionLength(1)))) ms"
         }
     }
+    private func frameStatistic(
+        _ value: (DebugFrameDeliveryMetrics) -> String?
+    ) -> DebugStatistic {
+        guard isEnabled(.frameDelivery) else {
+            return .unavailable("\(DebugModule.frameDelivery.title) is off")
+        }
+        guard let frameMetrics, let text = value(frameMetrics) else {
+            return .unavailable("nothing measured yet")
+        }
+        return .measured(text)
+    }
 
+    private func formatNanoseconds(_ value: UInt64?) -> String? {
+        guard let value else { return nil }
+        let milliseconds = Double(value) / 1_000_000
+        return "\(milliseconds.formatted(.number.precision(.fractionLength(2)))) ms"
+    }
+
+    private func formatQuartet(
+        _ median: UInt64?,
+        _ p90: UInt64?,
+        _ p99: UInt64?,
+        _ maximum: UInt64?
+    ) -> String? {
+        guard let median = formatNanoseconds(median),
+              let p90 = formatNanoseconds(p90),
+              let p99 = formatNanoseconds(p99),
+              let maximum = formatNanoseconds(maximum)
+        else { return nil }
+        return "\(median) / \(p90) / \(p99) / \(maximum)"
+    }
     /// The snapshot already reports nil for a count whose producer module was
     /// off across the retained samples, so an absent value and a disabled
     /// module both resolve to unavailable rather than to zero.
@@ -565,6 +663,7 @@ private struct DebugModulesGroup: View {
     private func followMeasurements() async {
         while !Task.isCancelled {
             metrics = capability.metrics
+            frameMetrics = capability.frameDeliveryMetrics
             enabledMask = capability.gate.rawValue
             try? await Task.sleep(for: .seconds(1))
         }

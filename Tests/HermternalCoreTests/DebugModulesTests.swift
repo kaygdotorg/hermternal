@@ -17,6 +17,67 @@ func disabledModuleRecordsNothing() {
     #expect(controller.metrics == nil)
     #expect(store.writeCount == 0)
 }
+@Test("a disabled frame module allocates no frame storage or work")
+func disabledFrameModuleDoesNotAllocateOrRecord() {
+    let store = InMemoryDebugModuleStateStore(storedMask: 0)
+    let controller = DebugModuleController(debugMode: true, store: store)
+    let sample = FrameDeliverySample(
+        presentedAtNanoseconds: 10,
+        intervalNanoseconds: 8_333_333,
+        refreshIntervalNanoseconds: 8_333_333,
+        surface: .sidebar,
+        gestureLatencyNanoseconds: 2_000_000
+    )
+
+    controller.record(sample)
+
+    #expect(controller.frameDeliveryMetrics == nil)
+    #expect(controller.frameDeliveryStorageAllocated == false)
+    #expect(store.writeCount == 0)
+}
+
+@Test("frame delivery statistics preserve cadence, stutter and surface attribution")
+func frameDeliveryStatisticsMatchKnownSeries() {
+    let controller = DebugModuleController(
+        debugMode: true,
+        store: InMemoryDebugModuleStateStore(),
+        capacity: 16
+    )
+    for (index, interval) in [UInt64(8), 8, 17, 18, 8, 25].enumerated() {
+        controller.record(
+            FrameDeliverySample(
+                presentedAtNanoseconds: UInt64(index) * 10,
+                intervalNanoseconds: interval,
+                refreshIntervalNanoseconds: 8,
+                surface: index.isMultiple(of: 2) ? .sidebar : .transcript,
+                gestureLatencyNanoseconds: index < 3 ? UInt64(index + 1) : nil,
+                clickLatencyNanoseconds: index < 3 ? UInt64(index + 4) : nil
+        )
+    }
+
+    let metrics = controller.frameDeliveryMetrics
+    #expect(metrics?.observedRefreshIntervalNanoseconds == 8)
+    #expect(metrics?.frameIntervalMedianNanoseconds == 12)
+    #expect(metrics?.frameIntervalP90Nanoseconds == 25)
+    #expect(metrics?.frameIntervalP99Nanoseconds == 25)
+    #expect(metrics?.frameIntervalMaximumNanoseconds == 25)
+    #expect(metrics?.intervalsExceedingOneRefreshPeriod == 3)
+    #expect(metrics?.intervalsExceedingTwoRefreshPeriods == 3)
+    #expect(metrics?.longestConsecutiveLongFrameRun == 2)
+    #expect(metrics?.gestureLatencyMedianNanoseconds == 2)
+    #expect(metrics?.gestureLatencyP90Nanoseconds == 3)
+    #expect(metrics?.gestureLatencyP99Nanoseconds == 3)
+    #expect(metrics?.gestureLatencyMaximumNanoseconds == 3)
+    #expect(metrics?.clickLatencyMedianNanoseconds == 5)
+    #expect(metrics?.clickLatencyP90Nanoseconds == 6)
+    #expect(metrics?.clickLatencyP99Nanoseconds == 6)
+    #expect(metrics?.clickLatencyMaximumNanoseconds == 6)
+    #expect(metrics?.clickSampleCount == 3)
+    #expect(metrics?.sidebarFrameCount == 3)
+    #expect(metrics?.transcriptFrameCount == 3)
+    #expect(metrics?.unattributedFrameCount == 0)
+}
+
  
 @Test("a disabled measurement value does not evaluate its producer")
 func disabledMeasurementValueDoesNotEvaluateProducer() {
@@ -202,7 +263,8 @@ func moduleIdentitySetIsStable() {
         "main-actor-occupancy",
         "resource-contention",
         "text-layout-attribution",
-        "visible-paint"
+        "visible-paint",
+        "frame-delivery"
     ])
     #expect(DebugModule.allCases.allSatisfy { !$0.title.isEmpty && !$0.description.isEmpty })
     #expect(DebugModule.allMask == DebugModule.allCases.reduce(into: UInt64(0)) { $0 |= $1.bit })

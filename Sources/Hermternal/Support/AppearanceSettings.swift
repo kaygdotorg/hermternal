@@ -100,6 +100,21 @@ enum AccentColorStore {
     }
 }
 
+/// Which fill the user's own message bubbles take.
+///
+/// The transcript palette is resolved from an AppKit appearance with no view
+/// environment to read, so it reads this preference the same way it reads the
+/// accent: straight from `UserDefaults`.
+enum UserBubbleFillStore {
+    static let key = "appearance.userBubbleUsesAccent"
+
+    /// `false` — which is also what an absent key reads as — means the
+    /// platform's system blue, the colour Messages fills a sent bubble with.
+    static func usesAccent(from defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: key)
+    }
+}
+
 /// User-tunable appearance, persisted in `UserDefaults`.
 @MainActor
 @Observable
@@ -126,6 +141,23 @@ final class AppearanceSettings {
                 object: nil
             )
             // Reuse the renderer's existing system-colour invalidation path.
+            NotificationCenter.default.post(
+                name: NSColor.systemColorsDidChangeNotification,
+                object: nil
+            )
+        }
+    }
+
+    /// Fills the user's own message bubbles with the effective accent instead
+    /// of the system blue Messages uses. Written only when it changes, so
+    /// reading the appearance never touches `UserDefaults`.
+    var userBubbleUsesAccent: Bool {
+        didSet {
+            guard oldValue != userBubbleUsesAccent else { return }
+            defaults.set(userBubbleUsesAccent, forKey: UserBubbleFillStore.key)
+            // The renderer's existing palette-invalidation path. Prepared rows
+            // carry concrete colours, including the bubble's text colour, so
+            // they have to be reshaped rather than merely repainted.
             NotificationCenter.default.post(
                 name: NSColor.systemColorsDidChangeNotification,
                 object: nil
@@ -180,8 +212,10 @@ final class AppearanceSettings {
             defaults.object(forKey: Keys.backgroundOpacity) as? Double
                 ?? Self.defaultBackgroundOpacity
         )
-        // `didSet` does not fire for this, so loading costs no write back.
+        // `didSet` does not fire for either of these, so loading the stored
+        // appearance costs no write back.
         usesLiquidGlass = defaults.bool(forKey: Keys.usesLiquidGlass)
+        userBubbleUsesAccent = UserBubbleFillStore.usesAccent(from: defaults)
         applyAppKitAppearance()
     }
 
@@ -230,5 +264,6 @@ final class AppearanceSettings {
         backgroundOpacity = Self.defaultBackgroundOpacity
         persistBackgroundOpacity()
         usesLiquidGlass = false
+        userBubbleUsesAccent = false
     }
 }

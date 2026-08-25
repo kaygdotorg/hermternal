@@ -69,6 +69,217 @@ private struct BlockInk: Hashable, Sendable {
     }
 }
 
+private extension BlockInk {
+    /// WCAG 2.1 relative luminance of the resolved sRGB components.
+    ///
+    /// https://www.w3.org/TR/WCAG21/#dfn-relative-luminance
+    var relativeLuminance: Double {
+        func channel(_ value: Double) -> Double {
+            value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * channel(red)
+            + 0.7152 * channel(green)
+            + 0.0722 * channel(blue)
+    }
+
+    /// WCAG 2.1 contrast ratio against `other`.
+    ///
+    /// Both operands must be opaque: the ratio is defined between two colours,
+    /// and a partly transparent one has no luminance until it is composited
+    /// over a backdrop this type does not know.
+    ///
+    /// https://www.w3.org/TR/WCAG21/#dfn-contrast-ratio
+    func contrast(with other: BlockInk) -> Double {
+        let mine = relativeLuminance
+        let theirs = other.relativeLuminance
+        return (max(mine, theirs) + 0.05) / (min(mine, theirs) + 0.05)
+    }
+
+    static let opaqueWhite = BlockInk(red: 1, green: 1, blue: 1, alpha: 1)
+    static let opaqueBlack = BlockInk(red: 0, green: 0, blue: 0, alpha: 1)
+}
+
+/// A user bubble's silhouette and fill.
+///
+/// The tail is the reason this exists. AppKit draws rounded rectangles, and
+/// nothing in the system draws a Messages balloon, so the outline is
+/// hand-rolled — but as one closed path rather than a rounded rect with a
+/// separate wedge on top. Two stacked shapes share an edge along the join,
+/// where both are antialiased: the coverage there compounds on an opaque fill
+/// and shows a seam on any fill that is not, and the join moves whenever the
+/// corner radius or the fill changes. One path has one silhouette and one
+/// antialiased edge, whatever colour fills it.
+///
+/// Every tail measurement is a ratio of the corner radius, taken off a Retina
+/// capture of a real sent bubble at an assumed 2x scale. The capture's bubble
+/// was a 59px-tall capsule, so its corner radius was 29.5px = 14.75pt, and the
+/// tail measured 10px = 5pt of drop, a tip 12px = 6pt inside the bubble's
+/// widest point, and an underside rejoining the bottom edge 7px = 3.5pt past
+/// the start of the corner. Ratios rather than points, because they survive a
+/// wrong scale assumption; the reproduction tracks the capture's own outline to
+/// within 3px of 29.5, or about 1pt at this radius.
+///
+/// Two things that assumption talk usually gets wrong, both measured rather
+/// than assumed: the tail's tip stays *inside* the bubble's widest point rather
+/// than poking past the trailing edge, so it needs no extra trailing room; and
+/// the corners are circular arcs, because a single-line sent bubble is a
+/// capsule, whose caps are semicircles by definition and where a continuous
+/// curve would have nothing to improve on.
+private struct BlockBubbleShape: Equatable {
+    /// How far the tail drops below the bubble's bottom edge.
+    static let riseRatio: CGFloat = 0.34
+    /// How far inside the trailing edge the tip sits.
+    static let tipRatio: CGFloat = 0.41
+    /// How far past the corner's start the underside rejoins the bottom edge.
+    static let tuckRatio: CGFloat = 0.12
+    /// Where on the bottom-trailing corner the tail leaves the arc, measured
+    /// from the trailing edge.
+    ///
+    /// This is the value a first attempt got wrong. Departing at the arc's
+    /// *start* replaces the whole corner with the tail sweep, and at a 14pt
+    /// radius that collapses into a chamfered corner with no tail in it. In the
+    /// capture the outline tracks the corner arc to within a pixel until 26
+    /// degrees above the arc's foot, so the corner still reads as a corner and
+    /// the tail hangs off the end of it.
+    static let departureAngle: CGFloat = 64 * .pi / 180
+
+    let fill: BlockInk
+    let radius: CGFloat
+    /// A message's blocks are separate rows, so a bubble's caps belong to the
+    /// message's first and last row and the rows between it are square-edged.
+    let roundsTop: Bool
+    let roundsBottom: Bool
+    /// Exactly one row per message: the last one. The tail marks where the
+    /// message ends, not where a block does.
+    let hasTail: Bool
+
+    /// Authored with y increasing *downward*, because that is how the shape
+    /// reads: cap on top, tail underneath. The layer's own space runs the other
+    /// way — measured, not assumed: a first cut authored against `maxY` drew the
+    /// tail above the bubble's top edge — so `mirrored(in:)` is what actually
+    /// hands a path to the layer.
+    func path(in rect: CGRect) -> CGPath {
+        let path = CGMutablePath()
+        let top = roundsTop ? radius : 0
+        let bottom = roundsBottom ? radius : 0
+        let minX = rect.minX, maxX = rect.maxX
+        let minY = rect.minY, maxY = rect.maxY
+        let rise = radius * Self.riseRatio
+
+        path.move(to: CGPoint(x: minX + top, y: minY))
+        path.addLine(to: CGPoint(x: maxX - top, y: minY))
+        path.addArc(
+            tangent1End: CGPoint(x: maxX, y: minY),
+            tangent2End: CGPoint(x: maxX, y: minY + top),
+            radius: top
+        )
+        if hasTail {
+            let corner = CGPoint(x: maxX - radius, y: maxY - radius)
+            path.addLine(to: CGPoint(x: maxX, y: maxY - radius))
+            // Angles run with the authored space: a point on the corner is
+            // `corner + radius * (cos, sin)`, so 0 is the trailing edge and
+            // .pi/2 is the arc's foot on the bottom edge.
+            path.addArc(
+                center: corner,
+                radius: radius,
+                startAngle: 0,
+                endAngle: Self.departureAngle,
+                clockwise: false
+            )
+            // Out to the tip, holding almost vertical: the capture's tail is a
+            // narrow flick, not a diagonal cut across the corner.
+            path.addQuadCurve(
+                to: CGPoint(x: maxX - radius * Self.tipRatio, y: maxY + rise),
+                control: CGPoint(x: maxX - radius * 0.5, y: maxY + rise * 0.15)
+            )
+            // The underside sweeps back under the bubble and meets the bottom
+            // edge tangentially, so the tail reads as grown rather than glued.
+            path.addQuadCurve(
+                to: CGPoint(x: maxX - radius - radius * Self.tuckRatio, y: maxY),
+                control: CGPoint(x: maxX - radius * 0.85, y: maxY + rise * 0.30)
+            )
+        } else {
+            path.addLine(to: CGPoint(x: maxX, y: maxY - bottom))
+            path.addArc(
+                tangent1End: CGPoint(x: maxX, y: maxY),
+                tangent2End: CGPoint(x: maxX - bottom, y: maxY),
+                radius: bottom
+            )
+        }
+        path.addLine(to: CGPoint(x: minX + bottom, y: maxY))
+        path.addArc(
+            tangent1End: CGPoint(x: minX, y: maxY),
+            tangent2End: CGPoint(x: minX, y: maxY - bottom),
+            radius: bottom
+        )
+        path.addLine(to: CGPoint(x: minX, y: minY + top))
+        path.addArc(
+            tangent1End: CGPoint(x: minX, y: minY),
+            tangent2End: CGPoint(x: minX + top, y: minY),
+            radius: top
+        )
+        path.closeSubpath()
+        return path
+    }
+
+    /// The silhouette in the layer's own upward-y space.
+    func mirrored(in rect: CGRect) -> CGPath {
+        var flip = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: rect.maxY + rect.minY)
+        // `path(in:)` closes its subpath, so the copy is a closed path too.
+        return path(in: rect).copy(using: &flip) ?? path(in: rect)
+    }
+}
+
+/// A row's drawn surface: a user bubble, a fenced card, or nothing.
+///
+/// The backing layer is a `CAShapeLayer` so a bubble can be one filled path.
+/// A card stays on the layer's own rounded-rect drawing, which is what a card
+/// is and is cheaper than a path; only the balloon needs geometry AppKit has no
+/// API for.
+@MainActor
+private final class BlockSurfaceView: NSView {
+    /// The bubble to fill, or `nil` for a card or a blank row.
+    var bubble: BlockBubbleShape? {
+        didSet {
+            guard bubble != oldValue else { return }
+            needsLayout = true
+        }
+    }
+
+    override func makeBackingLayer() -> CALayer {
+        let layer = CAShapeLayer()
+        layer.masksToBounds = false
+        // A shape layer's default fill is opaque black, and a row is recycled
+        // into every role, so the fill is only ever set alongside a path.
+        layer.fillColor = nil
+        // Scrolling recycles rows constantly. An implicit path or fill
+        // animation would morph one message's bubble into the next one's.
+        layer.actions = ["path": NSNull(), "fillColor": NSNull()]
+        return layer
+    }
+
+    /// The tail hangs below the bubble's bottom edge, which is also the row's,
+    /// so neither this view nor its layer may clip. Measured, not assumed: with
+    /// the default clipping the tail rendered flush with the bottom edge and
+    /// read as a chamfered corner rather than a tail.
+    override var clipsToBounds: Bool {
+        get { false }
+        set { _ = newValue }
+    }
+
+    override func layout() {
+        super.layout()
+        guard let shape = layer as? CAShapeLayer else { return }
+        guard let bubble, bounds.width > 0, bounds.height > 0 else {
+            shape.path = nil
+            shape.fillColor = nil
+            return
+        }
+        shape.fillColor = bubble.fill.cgColor
+        shape.path = bubble.mirrored(in: bounds)
+    }
+}
+
 /// A deterministic 64-bit FNV-1a digest over a palette.
 ///
 /// `Hasher` is seeded per process, which is fine for a dictionary but reads
@@ -107,7 +318,7 @@ private struct BlockStyleDigest {
 /// preparation needs, resolved once on the main actor.
 ///
 /// markers use the secondary label, code uses a secondary background and
-/// separator border, user blocks use a tinted bubble, and Find marks matching
+/// separator border, a user block fills an opaque bubble, and Find marks
 /// text with the resolved accent. Point sizes come from `MessageTypography`.
 /// This keeps one type scale for every block role.
 private struct BlockRenderStyle: Hashable, Sendable {
@@ -129,6 +340,33 @@ private struct BlockRenderStyle: Hashable, Sendable {
     static let codeDividerHeight: CGFloat = 1
     /// `.strokeBorder(.separator, lineWidth: 0.5)`.
     static let codeBorderWidth: CGFloat = 0.5
+
+    /// The assistant mark's square box.
+    ///
+    /// The drawing is 256x256 with ink filling 99% of its height and 70% of its
+    /// width, so the box draws a glyph 23.7pt tall and 17.9pt wide. Measured
+    /// against the first line it labels — 13pt body text, 16pt line height,
+    /// 9.16pt cap height — that reads as a speaker's mark rather than a badge
+    /// floating beside the answer. The previous 20pt box drew 19.8pt of ink,
+    /// which the user found small next to the same line.
+    static let assistantMarkSize: CGFloat = 24
+    /// Where the mark's box starts, matching the leading a system row uses.
+    static let assistantMarkLeading: CGFloat = 20
+    /// The leading inset for an assistant row's text.
+    ///
+    /// The gutter and the glyph are separate values: growing the mark inside a
+    /// fixed gutter would only close the gap on the mark's left. This is the
+    /// mark's box (20 + 24 = 44), plus 11pt of optical space measured from the
+    /// ink's right edge at 40.95 rather than from the box, less the 14pt of
+    /// horizontal inset the text view adds on its own so the space is not
+    /// counted twice. It was 48, which drew 25pt of optical gap; this draws 11.
+    ///
+    /// Every row of a message uses it, not only the row that draws the mark, so
+    /// an answer stays optically aligned below its first paragraph. It is not
+    /// an input to `contentWidth`, which reads only the table's width and the
+    /// typography constants — so the reading measure is unchanged, the text
+    /// simply starts further left, and no cached layout goes stale.
+    static let assistantTextLeading: CGFloat = 38
     let appearanceName: String
     let isDark: Bool
 
@@ -143,6 +381,8 @@ private struct BlockRenderStyle: Hashable, Sendable {
     let codeDivider: BlockInk
     let userBubble: BlockInk
     let userBubbleForeground: BlockInk
+    /// The wash behind text selected inside a user bubble.
+    let userBubbleSelection: BlockInk
     let link: BlockInk
     let quote: BlockInk
     /// Find match colour from the system accent or the explicit override.
@@ -151,8 +391,6 @@ private struct BlockRenderStyle: Hashable, Sendable {
     let findActiveMatch: BlockInk
     /// The accent used for native text selection.
     let selectionHighlight: BlockInk
-    /// The assistant mark tint used by the fallback symbol.
-    let assistantMark: BlockInk
 
     let bodySize: Double
     let headingSizes: [Double]
@@ -204,7 +442,19 @@ private struct BlockRenderStyle: Hashable, Sendable {
         let codeBorder = BlockInk(.separatorColor)
         let codeDivider = BlockInk(NSColor.separatorColor.withAlphaComponent(0.5))
         let accent = AccentColorStore.resolvedColor()
-        let userBubble = BlockInk(accent.withAlphaComponent(0.16))
+        // Messages fills a sent bubble with the platform's system blue and
+        // sets white text on it, so the bubble reads as the user's own voice
+        // rather than as a tint of whatever else the app is accented with.
+        // `NSColor.systemBlue` *is* that blue by definition instead of by
+        // transcription; measured on macOS 26.6.2 it resolves to #0088FF in
+        // Aqua and #0091FF in Dark Aqua. When the user asks for the accent
+        // instead, it comes from the same resolution above as every other tint
+        // here, so an in-app override is honoured rather than ignored.
+        let bubbleFill = BlockInk(
+            UserBubbleFillStore.usesAccent() ? accent : NSColor.systemBlue
+        )
+        let bubbleForeground = Self.bubbleForeground(on: bubbleFill)
+        let bubbleSelection = Self.bubbleSelection(behind: bubbleForeground)
         let link = BlockInk(accent)
         let findMatch = BlockInk(accent.withAlphaComponent(
             NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast ? 1 : 0.72
@@ -217,14 +467,14 @@ private struct BlockRenderStyle: Hashable, Sendable {
         self.codeBackground = codeBackground
         self.codeBorder = codeBorder
         self.codeDivider = codeDivider
-        self.userBubble = userBubble
-        userBubbleForeground = label
+        userBubble = bubbleFill
+        userBubbleForeground = bubbleForeground
+        userBubbleSelection = bubbleSelection
         self.link = link
         quote = label
         self.findMatch = findMatch
         self.findActiveMatch = findActiveMatch
         selectionHighlight = BlockInk(accent.withAlphaComponent(0.24))
-        assistantMark = link
 
         let bodySize = Double(NSFont.preferredFont(forTextStyle: .body).pointSize)
         let headingSizes = [
@@ -245,7 +495,13 @@ private struct BlockRenderStyle: Hashable, Sendable {
         appearanceDigest.combine(appearanceName)
         for ink in [
             label, secondaryLabel, codeBackground, codeBorder, codeDivider,
-            userBubble, link, findMatch, findActiveMatch, selectionHighlight
+            // The bubble's ink and its selection wash both vary independently
+            // of the fill now: two different fills can want the same text
+            // colour, and one fill can want two different ones depending on
+            // Increase Contrast. Cached shaped text carries the resolved
+            // colour, so all three belong in the key that invalidates it.
+            userBubble, userBubbleForeground, userBubbleSelection,
+            link, findMatch, findActiveMatch, selectionHighlight
         ] {
             appearanceDigest.combine(ink)
         }
@@ -264,6 +520,51 @@ private struct BlockRenderStyle: Hashable, Sendable {
             fontDigest.combine(Double(metric))
         }
         fontSignature = "block-\(fontDigest.hexadecimal)"
+    }
+
+    /// The bubble's text colour, chosen by measurement rather than assertion.
+    ///
+    /// Messages pairs white with the platform's system blue, and AppKit ships
+    /// that same pairing itself: `alternateSelectedControlTextColor` is white
+    /// on `selectedContentBackgroundColor`. Measured on macOS 26.6.2 white on
+    /// system blue is 3.52:1 in Aqua and 3.23:1 in Dark Aqua — past WCAG 2.1's
+    /// 3:1 bar for large and UI text, short of its 4.5:1 small-text bar. White
+    /// is therefore the default, because that is what makes the transcript
+    /// read as Messages.
+    ///
+    /// Two cases must not inherit that default. An accent the user picked can
+    /// be any hue, including ones white disappears on, and Increase Contrast is
+    /// an explicit request for more separation than Apple's own pairing gives.
+    /// Both raise the floor to 4.5:1 and fall back to the darker ink, which is
+    /// why this is computed from the fill instead of written down per
+    /// appearance: neither the accent nor a future system blue is known here.
+    private static func bubbleForeground(on fill: BlockInk) -> BlockInk {
+        let floor = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+            ? 4.5
+            : 3.0
+        let onWhite = fill.contrast(with: .opaqueWhite)
+        if onWhite >= floor { return .opaqueWhite }
+        return onWhite >= fill.contrast(with: .opaqueBlack)
+            ? .opaqueWhite
+            : .opaqueBlack
+    }
+
+    /// The wash behind text selected inside a bubble.
+    ///
+    /// A selection has to register on an opaque fill without eating the text's
+    /// own contrast, and washing the fill in its *own* text colour does exactly
+    /// the wrong thing: white at 25% over system blue lands on #47A9FF, where
+    /// white text falls to 2.50:1. The opposite ink darkens the fill instead,
+    /// reaching #006ABF where white text rises to 5.50:1, so selecting text in
+    /// a bubble makes it easier to read rather than harder.
+    ///
+    /// This is the transcript's one selection colour that is not the accent.
+    /// Assistant and system rows still use `selectionHighlight`, and every Find
+    /// mark is still accent-tinted; only the wash that lands *inside* an opaque
+    /// bubble resolves against the bubble rather than against the window.
+    private static func bubbleSelection(behind foreground: BlockInk) -> BlockInk {
+        let level = foreground.relativeLuminance > 0.5 ? 0.0 : 1.0
+        return BlockInk(red: level, green: level, blue: level, alpha: 0.25)
     }
 }
 
@@ -866,6 +1167,10 @@ struct BlockTranscriptView: NSViewRepresentable {
         /// A publication may arrive before SwiftUI lays out the hosted view.
         /// Keep it pending until a layout reports usable geometry.
         private var layoutWorkPending = false
+        /// Last committed visible rows. SwiftUI can publish while the hosted
+        /// table is between layout passes; the clip view is then zero-sized.
+        /// Reusing this route-local range keeps later publications live.
+        private var lastVisibleRowIndexes: IndexSet?
         /// Suppresses the container's layout callback while `update` is
         /// establishing a publication. The callback from that pass can still
         /// observe the old zero-sized geometry; only a later real layout may
@@ -948,6 +1253,7 @@ struct BlockTranscriptView: NSViewRepresentable {
             if routeChanged {
                 generation &+= 1
                 preparation.cancel()
+                lastVisibleRowIndexes = nil
                 prepared.removeAll(keepingCapacity: true)
                 layoutCacheResetForRoute()
                 selection.clear()
@@ -1010,7 +1316,7 @@ struct BlockTranscriptView: NSViewRepresentable {
                 // table frame while preparation below keys from the real clip
                 // width.
                 container.layoutTableDocument()
-                if let visibleIndexes = visibleRowIndexes(in: container.tableView) {
+                if let visibleIndexes = reloadVisibleRowIndexes(in: container.tableView) {
                     layoutWorkPending = false
                     HermternalSwitchTrace.transcriptPhaseReload(
                         full: false,
@@ -1039,7 +1345,7 @@ struct BlockTranscriptView: NSViewRepresentable {
                 // the delegate's height callback.
                 container.layoutTableDocument()
                 if !changed.isEmpty {
-                    if visibleRowIndexes(in: container.tableView) != nil {
+                    if reloadVisibleRowIndexes(in: container.tableView) != nil {
                         layoutWorkPending = false
                         HermternalSwitchTrace.transcriptPhaseReload(
                             full: false,
@@ -1205,6 +1511,20 @@ struct BlockTranscriptView: NSViewRepresentable {
             false
         }
 
+        /// A row wrapper that does not clip its cell view.
+        ///
+        /// The last row of a user message draws a bubble tail that hangs below
+        /// its own bottom edge. `NSTableRowView` clips, which cut the tail off
+        /// flush and left the bubble reading as a chamfered corner — measured on
+        /// a screenshot, after `clipsToBounds` on the cell view alone changed
+        /// nothing.
+        func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+            tableView.makeView(
+                withIdentifier: BlockTranscriptRowBackgroundView.identifier,
+                owner: self
+            ) as? NSTableRowView ?? BlockTranscriptRowBackgroundView()
+        }
+
         /// Re-resolves the palette and redraws with it.
         ///
         /// Prepared values carry concrete colours, so none of them survive a
@@ -1353,6 +1673,7 @@ struct BlockTranscriptView: NSViewRepresentable {
                 rendererVersion: BlockRenderStyle.rendererVersion
             )
         }
+        
 
         private func visibleRowIndexes(in tableView: NSTableView) -> IndexSet? {
             guard tableView.bounds.width > 1,
@@ -1364,10 +1685,24 @@ struct BlockTranscriptView: NSViewRepresentable {
             guard visible.location != NSNotFound, visible.length > 0 else {
                 return nil
             }
+        
             let first = max(0, visible.location)
             let last = min(rows.count, visible.location + visible.length)
             guard first < last else { return nil }
-            return IndexSet(integersIn: first..<last)
+            let result = IndexSet(integersIn: first..<last)
+            lastVisibleRowIndexes = result
+            return result
+        }
+        
+        private func reloadVisibleRowIndexes(in tableView: NSTableView) -> IndexSet? {
+            if let live = visibleRowIndexes(in: tableView) {
+                return live
+            }
+            guard !rows.isEmpty, let remembered = lastVisibleRowIndexes else {
+                return nil
+            }
+            let bounded = remembered.intersection(IndexSet(integersIn: 0..<rows.count))
+            return bounded.isEmpty ? nil : bounded
         }
 
         /// Applies a held publication from the first layout with usable
@@ -1378,7 +1713,7 @@ struct BlockTranscriptView: NSViewRepresentable {
                   layoutWorkPending,
                   !rows.isEmpty,
                   let tableView,
-                  let visibleIndexes = visibleRowIndexes(in: tableView)
+                  let visibleIndexes = reloadVisibleRowIndexes(in: tableView)
             else {
                 return
             }
@@ -1397,7 +1732,7 @@ struct BlockTranscriptView: NSViewRepresentable {
 
         private func prepareVisibleBlocks() {
             guard let tableView, !rows.isEmpty,
-                  let visible = visibleRowIndexes(in: tableView)
+                  let visible = reloadVisibleRowIndexes(in: tableView)
             else { return }
             let firstVisible = visible.first ?? 0
             let lastVisible = visible.last.map { $0 + 1 } ?? rows.count
@@ -1442,7 +1777,6 @@ struct BlockTranscriptView: NSViewRepresentable {
                 )
             }
         }
-
         private func accept(_ result: BlockPrepared) {
             let oldHeight = layoutCache.value(for: result.key)?.measuredHeight
             prepared[result.key] = result
@@ -1483,6 +1817,10 @@ struct BlockTranscriptView: NSViewRepresentable {
             // bounds here makes reads and background writes observe the same
             // width snapshot instead of mixing a pre-layout frame with the
             // clip view's next width.
+            // This ordering fix is still required: the earlier one-point
+            // width could produce a genuinely different bucket. It was not
+            // the cause of the old zero-hit trace, though; preparation writes
+            // arrive after the publication's first height pass.
             let tableWidth = max(1, tableView.bounds.width)
             let outer = max(1, tableWidth - 44)
             switch message.role {
@@ -1611,18 +1949,52 @@ struct BlockTranscriptView: NSViewRepresentable {
 @MainActor
 private final class BlockTranscriptTableView: NSTableView {
     override func makeView(withIdentifier identifier: NSUserInterfaceItemIdentifier, owner: Any?) -> NSView? {
-        super.makeView(withIdentifier: identifier, owner: owner)
-            ?? (identifier == BlockTranscriptRowView.identifier ? BlockTranscriptRowView() : nil)
+        if let recycled = super.makeView(withIdentifier: identifier, owner: owner) {
+            return recycled
+        }
+        switch identifier {
+        case BlockTranscriptRowView.identifier:
+            return BlockTranscriptRowView()
+        case BlockTranscriptRowBackgroundView.identifier:
+            return BlockTranscriptRowBackgroundView()
+        default:
+            return nil
+        }
     }
+}
+
+/// The row wrapper the table builds, so a bubble tail can hang past its row.
+///
+/// `NSTableRowView` clips its cell view by default; the tail is the only thing
+/// in the transcript that draws outside its row, and it is 4.8pt of a shape
+/// that has nothing to collide with — the row below it starts with transparent
+/// padding.
+@MainActor
+private final class BlockTranscriptRowBackgroundView: NSTableRowView {
+    static let identifier = NSUserInterfaceItemIdentifier("BlockTranscriptRowBackground")
+
+    override var clipsToBounds: Bool {
+        get { false }
+        set { _ = newValue }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        identifier = Self.identifier
+        wantsLayer = true
+        layer?.masksToBounds = false
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
 @MainActor
 private final class BlockTranscriptRowView: NSTableCellView {
     static let identifier = NSUserInterfaceItemIdentifier("BlockTranscriptRow")
-    /// The row's own drawn surface: the user bubble's tint, or a fenced
-    /// block's card. It tracks the text view's frame rather than the cell's,
-    /// so a bubble hugs its column instead of banding the whole row.
-    private let surface = NSView()
+    /// The row's own drawn surface: the user bubble, or a fenced block's card.
+    /// It tracks the text view's frame rather than the cell's, so a bubble hugs
+    /// its column instead of banding the whole row.
+    private let surface = BlockSurfaceView()
     private let textView = BlockTranscriptTextView()
     private let assistantMark = NSImageView()
     private let languageLabel = NSTextField(labelWithString: "")
@@ -1647,10 +2019,16 @@ private final class BlockTranscriptRowView: NSTableCellView {
         super.init(frame: frameRect)
         identifier = Self.identifier
         wantsLayer = true
+        // The last row of a user message draws a tail that hangs past the row's
+        // own bottom edge, into the transparent top of the row below.
+        clipsToBounds = false
+        layer?.masksToBounds = false
 
         surface.translatesAutoresizingMaskIntoConstraints = false
         surface.wantsLayer = true
-        // SwiftUI draws both the bubble and the code card with `.continuous`.
+        // A fenced card is a card: SwiftUI draws it with `.continuous`, and the
+        // layer draws that for free. A bubble ignores this and fills its own
+        // path, because its caps are semicircles and its tail is not a corner.
         surface.layer?.cornerCurve = .continuous
         surface.setAccessibilityElement(false)
         addSubview(surface)
@@ -1724,10 +2102,20 @@ private final class BlockTranscriptRowView: NSTableCellView {
                 constant: -BlockRenderStyle.codeHorizontalInset
             ),
             copyButton.centerYAnchor.constraint(equalTo: languageLabel.centerYAnchor),
-            assistantMark.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
-            assistantMark.topAnchor.constraint(equalTo: topAnchor, constant: 8),
-            assistantMark.widthAnchor.constraint(equalToConstant: 20),
-            assistantMark.heightAnchor.constraint(equalToConstant: 20)
+            assistantMark.leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: BlockRenderStyle.assistantMarkLeading
+            ),
+            assistantMark.topAnchor.constraint(
+                equalTo: topAnchor,
+                constant: BlockRenderStyle.assistantVerticalInset
+            ),
+            assistantMark.widthAnchor.constraint(
+                equalToConstant: BlockRenderStyle.assistantMarkSize
+            ),
+            assistantMark.heightAnchor.constraint(
+                equalToConstant: BlockRenderStyle.assistantMarkSize
+            )
         ])
     }
 
@@ -1790,9 +2178,18 @@ private final class BlockTranscriptRowView: NSTableCellView {
             .foregroundColor: style.link.nsColor,
             .cursor: NSCursor.pointingHand
         ]
+        // Inside an opaque bubble the backdrop is the bubble, not the window,
+        // so both halves of the selection resolve against it: the accent wash
+        // barely registers on a saturated fill and `labelColor` would put black
+        // text on blue. Assistant and system rows are unchanged.
+        let isBubble = message.role == .user
         textView.selectedTextAttributes = [
-            .backgroundColor: style.selectionHighlight.nsColor,
-            .foregroundColor: style.label.nsColor
+            .backgroundColor: isBubble
+                ? style.userBubbleSelection.nsColor
+                : style.selectionHighlight.nsColor,
+            .foregroundColor: isBubble
+                ? style.userBubbleForeground.nsColor
+                : style.label.nsColor
         ]
         textView.textStorage?.setAttributedString(content.value)
         applyFindMarks(findRanges, block: block, sourceText: sourceText, style: style)
@@ -1847,14 +2244,25 @@ private final class BlockTranscriptRowView: NSTableCellView {
             leading.constant = max(60, bounds.width - 24 - outer)
             trailing.constant = -24
         } else {
-            leading.constant = messageRole == .assistant ? 48 : 20
+            leading.constant = messageRole == .assistant
+                ? BlockRenderStyle.assistantTextLeading
+                : 20
             trailing.constant = -max(20, bounds.width - leading.constant - outer)
         }
     }
     /// The row's background, border, and corner treatment.
     ///
-    /// User bubbles and code cards use role surfaces. Find never paints a
-    /// row-level surface because a match belongs only to its text range.
+    /// Role alone decides it: a user block fills a bubble because it is a user
+    /// block, never because Find is active, because a row is selected, or
+    /// because the pointer is over it. Find never paints a row-level surface,
+    /// since a match belongs only to its text range.
+    ///
+    /// The bubble fill is an opaque colour on the layer rather than a material,
+    /// which is also how it satisfies Reduce Transparency: there is no
+    /// vibrancy behind bubble text to reduce. It is applied here at draw time,
+    /// so a palette change repaints it without reshaping; the bubble's *text*
+    /// colour is baked into prepared runs and is invalidated through
+    /// `appearanceSignature`.
     private func applySurface(
         role: Role,
         isCode: Bool,
@@ -1862,31 +2270,33 @@ private final class BlockTranscriptRowView: NSTableCellView {
         isLastInMessage: Bool,
         style: BlockRenderStyle
     ) {
-        let background: BlockInk?
-        let radius: CGFloat
         if isCode {
-            background = style.codeBackground
-            radius = AppShapeScale.compact
-        } else if role == .user {
-            background = style.userBubble
-            radius = AppShapeScale.toast
-        } else {
-            background = nil
-            radius = 0
-        }
-        var corners: CACornerMask = []
-        if isFirstInMessage { corners.formUnion([.layerMinXMinYCorner, .layerMaxXMinYCorner]) }
-        if isLastInMessage { corners.formUnion([.layerMinXMaxYCorner, .layerMaxXMaxYCorner]) }
-        surface.layer?.backgroundColor = background?.cgColor ?? NSColor.clear.cgColor
-        surface.layer?.cornerRadius = radius
-        surface.layer?.maskedCorners = corners
-        if isCode {
+            // Same upward-y layer space the bubble path is mirrored into, so a
+            // card's first row caps its top rather than its bottom.
+            var corners: CACornerMask = []
+            if isFirstInMessage { corners.formUnion([.layerMinXMaxYCorner, .layerMaxXMaxYCorner]) }
+            if isLastInMessage { corners.formUnion([.layerMinXMinYCorner, .layerMaxXMinYCorner]) }
+            surface.bubble = nil
+            surface.layer?.backgroundColor = style.codeBackground.cgColor
+            surface.layer?.cornerRadius = AppShapeScale.compact
+            surface.layer?.maskedCorners = corners
             surface.layer?.borderWidth = BlockRenderStyle.codeBorderWidth
             surface.layer?.borderColor = style.codeBorder.cgColor
-        } else {
-            surface.layer?.borderWidth = 0
-            surface.layer?.borderColor = NSColor.clear.cgColor
+            return
         }
+        surface.layer?.backgroundColor = NSColor.clear.cgColor
+        surface.layer?.cornerRadius = 0
+        surface.layer?.borderWidth = 0
+        surface.layer?.borderColor = NSColor.clear.cgColor
+        surface.bubble = role == .user
+            ? BlockBubbleShape(
+                fill: style.userBubble,
+                radius: AppShapeScale.toast,
+                roundsTop: isFirstInMessage,
+                roundsBottom: isLastInMessage,
+                hasTail: isLastInMessage
+            )
+            : nil
     }
     private func applyLanguageFindMarks(
         _ findRanges: [Range<Int>],
