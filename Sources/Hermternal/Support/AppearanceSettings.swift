@@ -66,6 +66,12 @@ struct AccentColorValue: Hashable, Sendable {
 /// Stores the optional application accent without changing the system colour.
 enum AccentColorStore {
     static let key = "appearance.accentOverride"
+    /// Posted when any in-app palette input changes: the accent override, or
+    /// which fill the user's own message bubbles take.
+    ///
+    /// Deliberately ours. Broadcasting `NSColor.systemColorsDidChangeNotification`
+    /// would be this process telling every observer in it, AppKit's included,
+    /// that the system's colours changed when they did not.
     static let didChangeNotification = Notification.Name(
         "HermternalAccentColorDidChange"
     )
@@ -140,11 +146,6 @@ final class AppearanceSettings {
                 name: AccentColorStore.didChangeNotification,
                 object: nil
             )
-            // Reuse the renderer's existing system-colour invalidation path.
-            NotificationCenter.default.post(
-                name: NSColor.systemColorsDidChangeNotification,
-                object: nil
-            )
         }
     }
 
@@ -155,11 +156,11 @@ final class AppearanceSettings {
         didSet {
             guard oldValue != userBubbleUsesAccent else { return }
             defaults.set(userBubbleUsesAccent, forKey: UserBubbleFillStore.key)
-            // The renderer's existing palette-invalidation path. Prepared rows
-            // carry concrete colours, including the bubble's text colour, so
-            // they have to be reshaped rather than merely repainted.
+            // Prepared transcript rows carry concrete colours, including the
+            // bubble's text colour, so they have to be reshaped rather than
+            // merely repainted.
             NotificationCenter.default.post(
-                name: NSColor.systemColorsDidChangeNotification,
+                name: AccentColorStore.didChangeNotification,
                 object: nil
             )
         }

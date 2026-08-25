@@ -269,6 +269,9 @@ struct ChatView: View {
             return
         }
         transcriptVisibilityEmitted = true
+        // The local `sessionID`, not `model.selectedSessionID`: this records
+        // the chat whose paint was validated, and the selection may have moved.
+        model.noteTranscriptDisplayed(sessionID: sessionID)
     }
     private func largestRenderedRowCharacterCount(
         makeMessages: () -> [ChatMessage]

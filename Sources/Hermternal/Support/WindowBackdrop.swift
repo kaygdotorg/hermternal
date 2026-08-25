@@ -528,21 +528,24 @@ final class WindowBackdropView: NSView {
 
     private var titlebarBaseline: TitlebarBaseline?
 
-    /// Ghostty's titlebar handling for glass, ported to a view rather than an
+    /// Ghostty's titlebar handling, ported to a view rather than an
     /// `NSWindow` subclass: clear the titlebar's own layer, and hide
     /// `NSTitlebarBackgroundView` outright because, in Ghostty's words, "this
     /// has multiple subviews that force a background color".
     ///
-    /// Without it the glass stops at the titlebar. The toolbar's own backing is
-    /// already hidden in SwiftUI, but the titlebar behind it still paints, so
-    /// the top of the window reads as an opaque band and the glass layer's top
-    /// edge shows as a line across it.
+    /// Without it the treatment stops at the titlebar. The toolbar's own
+    /// backing is already hidden in SwiftUI, but the titlebar behind it still
+    /// paints, so the top of the window reads as an opaque band with an edge
+    /// line across it.
     ///
-    /// Scoped to glass deliberately. The blur is the window's own background
-    /// and already reaches the titlebar, so reaching into these private views
-    /// there would only put a treatment that is correct today at risk.
+    /// The blur already reaches the titlebar, but that does not clear the
+    /// native backing painted above the transcript. The same private traversal
+    /// therefore applies to both translucent treatments.
     private func syncTitlebar(_ plan: WindowBackdropPlan) {
-        guard case .glass = plan.treatment else {
+        switch plan.treatment {
+        case .glass, .blur:
+            break
+        case .opaque:
             restoreTitlebar()
             return
         }
@@ -600,10 +603,10 @@ final class WindowBackdropView: NSView {
 
     /// The titlebar's container, found from the window's frame view.
     ///
-    /// Glass never applies in native fullscreen — the plan forces the opaque
-    /// path there — so unlike Ghostty this never has to go looking for the
-    /// separate `NSToolbarFullScreenWindow` that owns the titlebar while a
-    /// window is fullscreen.
+    /// Neither translucent treatment applies in native fullscreen — the plan
+    /// forces the opaque path there — so unlike Ghostty this never has to go
+    /// looking for the separate `NSToolbarFullScreenWindow` that owns the
+    /// titlebar while a window is fullscreen.
     private var titlebarContainer: NSView? {
         window?.contentView?.superview?
             .firstDescendant(withClassName: "NSTitlebarContainerView")

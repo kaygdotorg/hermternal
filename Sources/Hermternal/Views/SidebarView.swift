@@ -4,37 +4,74 @@ import AppKit
 import HermternalCore
 
 /// SwiftUI's `List(selection:)` reports only the resulting Set. The local
-/// monitor captures the initiating event synchronously, so a modified click
-/// cannot be mistaken for an ordinary singleton selection later.
+/// monitor classifies the initiating event, so modified or context clicks
+/// cannot be mistaken for ordinary singleton selection later.
+///
+/// The adapter is a classifier, not a consumable event queue. Selection
+/// observation and row gestures can inspect the same physical click.
 @MainActor
 enum SidebarSelectionEventAdapter {
     private struct Event {
         let isContextClick: Bool
         let isModified: Bool
+        let isDrag: Bool
     }
 
     private static var monitor: Any?
     private static var pending: Event?
+    private static var serial = 0
+    private static var expiryTask: Task<Void, Never>?
 
     static func start() {
-        guard monitor == nil else { return }
+        guard monitor == nil else {
+            HermternalSwitchTrace.selectionGuard(
+                "eventAdapter.start",
+                reason: "monitorAlreadyInstalled"
+            )
+            return
+        }
         monitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.leftMouseDown, .rightMouseDown, .keyDown]
+            matching: [
+                .leftMouseDown,
+                .leftMouseDragged,
+                .leftMouseUp,
+                .rightMouseDown,
+                .rightMouseDragged,
+                .rightMouseUp,
+                .keyDown
+            ]
         ) { event in
             switch event.type {
             case .leftMouseDown:
                 let modifiers = event.modifierFlags.intersection([.command, .shift, .control])
                 let isControlClick = modifiers.contains(.control)
-                // Every mouse-down owns a complete click turn. Replacing the
-                // prior record here means a click with no List selection
-                // delta cannot leak its flags into the next click.
+                // A new mouse-down starts a new classification turn.
                 pending = Event(
                     isContextClick: isControlClick,
-                    isModified: !modifiers.isEmpty
+                    isModified: !modifiers.isEmpty,
+                    isDrag: false
                 )
+                serial &+= 1
+                scheduleExpiry(for: serial)
+            case .leftMouseDragged:
+                if let pending {
+                    self.pending = Event(
+                        isContextClick: pending.isContextClick,
+                        isModified: pending.isModified,
+                        isDrag: true
+                    )
+                }
             case .rightMouseDown:
-                pending = Event(isContextClick: true, isModified: true)
+                pending = Event(isContextClick: true, isModified: true, isDrag: false)
+                serial &+= 1
+                scheduleExpiry(for: serial)
+            case .rightMouseDragged:
+                pending = Event(isContextClick: true, isModified: true, isDrag: true)
+            case .leftMouseUp, .rightMouseUp:
+                scheduleExpiry(for: serial)
             case .keyDown:
+                expiryTask?.cancel()
+                expiryTask = nil
                 pending = nil
             default:
                 break
@@ -43,22 +80,43 @@ enum SidebarSelectionEventAdapter {
         }
     }
 
-    static func current() -> (isContextClick: Bool, isModified: Bool)? {
-        guard let pending else { return nil }
-        return (pending.isContextClick, pending.isModified)
-    }
-    static func consume() -> (isContextClick: Bool, isModified: Bool)? {
-        defer { pending = nil }
-        return current()
+    private static func scheduleExpiry(for eventSerial: Int) {
+        expiryTask?.cancel()
+        expiryTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !Task.isCancelled, serial == eventSerial else { return }
+            pending = nil
+            expiryTask = nil
+        }
     }
 
+    static func current() -> (
+        isContextClick: Bool,
+        isModified: Bool,
+        isDrag: Bool
+    )? {
+        guard let pending else {
+            HermternalSwitchTrace.selectionGuard(
+                "eventAdapter.current",
+                reason: "pendingEventMissing"
+            )
+            return nil
+        }
+        return (pending.isContextClick, pending.isModified, pending.isDrag)
+    }
 
     static func allowsPrimaryActivation() -> Bool {
-        // A tap gesture is already proof of a primary click. A missing monitor
-        // record must not turn that completed click into a silent no-op.
-        defer { pending = nil }
-        guard let pending else { return true }
-        return !pending.isContextClick && !pending.isModified
+        // Missing evidence means the user click may still be deliberate.
+        // Default to activation instead of turning a missed monitor event
+        // into a silent no-op.
+        guard let event = current() else {
+            HermternalSwitchTrace.selectionGuard(
+                "eventAdapter.allowsPrimaryActivation",
+                reason: "pendingEventMissing;defaultAllowed"
+            )
+            return true
+        }
+        return !event.isContextClick && !event.isModified && !event.isDrag
     }
 
     static func stop() {
@@ -66,6 +124,8 @@ enum SidebarSelectionEventAdapter {
             NSEvent.removeMonitor(monitor)
             self.monitor = nil
         }
+        expiryTask?.cancel()
+        expiryTask = nil
         pending = nil
     }
 }
@@ -273,6 +333,10 @@ struct SidebarView: View {
             messages: model.messages.count
         )
         let bodyStart = HermternalSelectionOccupancyTrace.sidebarBodyBegan()
+        let selectionBodySignpost = SelectionLatencySignposts.beginSidebarBody(
+            sessionID: model.selectedSessionID,
+            generation: model.openGeneration
+        )
         let orderingStart = HermternalSelectionOccupancyTrace.orderingResolveBegan()
         let derived = sidebarDerivationCache.resolve(
             sessions: model.sessions,
@@ -310,6 +374,7 @@ struct SidebarView: View {
                 }
             }
         )
+        SelectionLatencySignposts.endSidebarBody(selectionBodySignpost)
         let _ = HermternalSelectionOccupancyTrace.sidebarBodyEnded(bodyStart)
         return content
     }
@@ -719,6 +784,7 @@ struct SidebarView: View {
                 SidebarSelectionEventAdapter.stop()
                 pendingOpenTask?.cancel()
                 pendingOpenTask = nil
+                model.cancelOpenPreparation()
                 purgePreparationTask?.cancel()
                 archivedPointerActivatedID = nil
                 purgePreparationTask = nil
@@ -737,12 +803,18 @@ struct SidebarView: View {
         synchronizeArchivedRouteSelection()
     }
     private func handleArchivedSelectionChange(_ selection: Set<String>) {
-        let event = SidebarSelectionEventAdapter.consume()
+        let event = SidebarSelectionEventAdapter.current()
         guard contentMode == .archived,
               selection.count == 1,
               let id = selection.first,
               let session = model.archivedSessions.first(where: { $0.id == id })
         else {
+            HermternalSwitchTrace.selectionGuard(
+                "archivedSelection.validation",
+                id: selection.first,
+                messages: model.messages.count,
+                reason: "mode=\(contentMode.rawValue) count=\(selection.count) rowMissing"
+            )
             pendingOpenTask?.cancel()
             pendingOpenTask = nil
             pointerActivatedID = nil
@@ -751,6 +823,12 @@ struct SidebarView: View {
             return
         }
         if programmaticArchivedSelectionID == id {
+            HermternalSwitchTrace.selectionGuard(
+                "archivedSelection.programmatic",
+                id: id,
+                messages: model.messages.count,
+                reason: "programmaticSelection"
+            )
             programmaticArchivedSelectionID = nil
             if archivedPointerActivatedID != id {
                 archivedPointerActivatedID = nil
@@ -758,23 +836,32 @@ struct SidebarView: View {
             return
         }
         if archivedPointerActivatedID == id {
+            HermternalSwitchTrace.selectionGuard(
+                "archivedSelection.pointerDeduplication",
+                id: id,
+                messages: model.messages.count,
+                reason: "pointerAlreadyActivated"
+            )
             archivedPointerActivatedID = nil
             return
         }
-        guard let event else {
-            openArchivedImmediately(session)
-            return
-        }
-        guard !event.isContextClick, !event.isModified else {
+        if let event, event.isContextClick || event.isModified || event.isDrag {
+            HermternalSwitchTrace.selectionGuard(
+                "archivedSelection.pointerGate",
+                id: id,
+                messages: model.messages.count,
+                reason: "contextOrModifiedClickOrDrag"
+            )
             pendingOpenTask?.cancel()
             pendingOpenTask = nil
             pointerActivatedID = nil
             archivedPointerActivatedID = nil
             return
         }
-        pendingOpenTask?.cancel()
-        pendingOpenTask = nil
-        archivedPointerActivatedID = nil
+        // A missing event is an unclassified selection, not proof that it
+        // was programmatic. The explicit programmatic id check above owns
+        // that distinction, so every remaining selection opens.
+        openArchivedImmediately(session)
     }
     private func setSidebarSelection(
         _ selection: Set<SidebarSelectionID>,
@@ -825,6 +912,12 @@ struct SidebarView: View {
                 programmaticArchivedSelectionID = selection.first
                 archivedSelection = Set(selection)
             }
+            HermternalSwitchTrace.selectionGuard(
+                "modelSynchronization.archivedRoute",
+                id: archivedID,
+                messages: model.messages.count,
+                reason: "archivedRouteOwnsSelection"
+            )
             return
         }
 
@@ -841,8 +934,12 @@ struct SidebarView: View {
         guard let liveID = model.selectedSessionID,
               model.sessions.contains(where: { $0.id == liveID })
         else {
-            // A manually selected Archived mode has no live row to highlight
-            // while its archived list is loading.
+            HermternalSwitchTrace.selectionGuard(
+                "modelSynchronization.liveID",
+                id: model.selectedSessionID,
+                messages: model.messages.count,
+                reason: "selectedSessionMissingFromLiveRows"
+            )
             clearSidebarSelection("sidebarSelection.modelSynchronization.empty")
             programmaticSelectionID = nil
             pointerActivatedID = nil
@@ -850,6 +947,12 @@ struct SidebarView: View {
         }
 
         guard contentMode == .chats else {
+            HermternalSwitchTrace.selectionGuard(
+                "modelSynchronization.contentMode",
+                id: liveID,
+                messages: model.messages.count,
+                reason: "contentMode=\(contentMode.rawValue)"
+            )
             clearSidebarSelection("sidebarSelection.modelSynchronization.mode")
             programmaticSelectionID = nil
             pointerActivatedID = nil
@@ -857,11 +960,21 @@ struct SidebarView: View {
         }
 
         let selection: Set<SidebarSelectionID> = [.chat(liveID)]
-        guard sidebarSelection != selection else { return }
+        guard sidebarSelection != selection else {
+            HermternalSwitchTrace.selectionGuard(
+                "modelSynchronization.alreadySelected",
+                selection: selection,
+                id: liveID,
+                messages: model.messages.count,
+                reason: "sidebarSelectionAlreadyMatchesModel"
+            )
+            return
+        }
         programmaticSelectionID = liveID
         setSidebarSelection(selection, event: "sidebarSelection.modelSynchronization.live")
         pointerActivatedID = nil
     }
+
     private func handleSidebarSelectionChange(
         _ selection: Set<SidebarSelectionID>
     ) {
@@ -874,12 +987,18 @@ struct SidebarView: View {
             selection: selection,
             messages: model.messages.count
         )
-        let event = SidebarSelectionEventAdapter.consume()
+        let event = SidebarSelectionEventAdapter.current()
         guard selection.count == 1,
               let item = selection.first,
               case let .chat(id) = item,
-              model.sessions.contains(where: { $0.id == id })
+              let session = model.sessions.first(where: { $0.id == id })
         else {
+            HermternalSwitchTrace.selectionGuard(
+                "sidebarSelection.validation",
+                selection: selection,
+                messages: model.messages.count,
+                reason: "count=\(selection.count) nonChatOrMissingRow"
+            )
             pendingOpenTask?.cancel()
             pendingOpenTask = nil
             pointerActivatedID = nil
@@ -887,47 +1006,90 @@ struct SidebarView: View {
             return
         }
         if programmaticSelectionID == id {
+            HermternalSwitchTrace.selectionGuard(
+                "sidebarSelection.programmatic",
+                selection: selection,
+                id: id,
+                messages: model.messages.count,
+                reason: "programmaticSelection"
+            )
             programmaticSelectionID = nil
             pointerActivatedID = nil
             return
         }
         if pointerActivatedID == id {
+            HermternalSwitchTrace.selectionGuard(
+                "sidebarSelection.pointerDeduplication",
+                selection: selection,
+                id: id,
+                messages: model.messages.count,
+                reason: "pointerAlreadyActivated"
+            )
             pointerActivatedID = nil
             return
         }
-        if let event {
-            guard !event.isContextClick, !event.isModified,
-                  let session = model.sessions.first(where: { $0.id == id })
-            else {
-                pendingOpenTask?.cancel()
-                pendingOpenTask = nil
-                pointerActivatedID = nil
-                programmaticSelectionID = nil
-                return
-            }
-            activateSession(session, event: "open.requested.pointer")
+        if let event, event.isContextClick || event.isModified || event.isDrag {
+            HermternalSwitchTrace.selectionGuard(
+                "sidebarSelection.pointerGate",
+                selection: selection,
+                id: id,
+                messages: model.messages.count,
+                reason: "contextOrModifiedClickOrDrag"
+            )
+            pendingOpenTask?.cancel()
+            pendingOpenTask = nil
+            pointerActivatedID = nil
+            programmaticSelectionID = nil
             return
         }
-        // With no mouse-down record, this is keyboard navigation.
-        // It uses the same opener as a plain pointer selection.
-        scheduleOpen(for: id)
+        // A missing event is an unclassified selection, not proof that it
+        // was programmatic. The explicit programmatic id check above owns
+        // that distinction, so every remaining selection opens.
+        HermternalSwitchTrace.selection(
+            "sidebarSelection.activation",
+            selection: selection,
+            messages: model.messages.count,
+            detail: "id=\(id)"
+        )
+        activateSession(session, event: "open.requested.selection")
     }
 
     /// Archived rows can arrive after the read-only route. Restore only that
     /// route's row here; live-chat selection remains untouched for ordinary
     /// archive list refreshes.
     private func synchronizeArchivedRouteSelection() {
-        guard let archivedID = model.viewingArchivedSessionID else { return }
+        guard let archivedID = model.viewingArchivedSessionID else {
+            HermternalSwitchTrace.selectionGuard(
+                "archivedRouteSynchronization.route",
+                messages: model.messages.count,
+                reason: "noArchivedRoute"
+            )
+            return
+        }
         contentMode = .archived
         clearSidebarSelection("sidebarSelection.archivedRouteSynchronization")
         programmaticSelectionID = nil
         guard model.archivedSessions.contains(where: { $0.id == archivedID }) else {
+            HermternalSwitchTrace.selectionGuard(
+                "archivedRouteSynchronization.row",
+                id: archivedID,
+                messages: model.messages.count,
+                reason: "archivedRowMissing"
+            )
             return
         }
         if archivedPointerActivatedID != archivedID {
             archivedPointerActivatedID = nil
         }
-        guard archivedSelection != Set([archivedID]) else { return }
+        guard archivedSelection != Set([archivedID]) else {
+            HermternalSwitchTrace.selectionGuard(
+                "archivedRouteSynchronization.alreadySelected",
+                id: archivedID,
+                messages: model.messages.count,
+                reason: "archivedSelectionAlreadyMatchesRoute"
+            )
+            return
+        }
         programmaticArchivedSelectionID = archivedID
         archivedSelection = [archivedID]
     }
@@ -937,12 +1099,10 @@ struct SidebarView: View {
     /// compositing groups over the same rows, so one gradient holds both
     /// ramps.
     ///
-    /// The two ramps are no longer the same length. The titlebar is glass
-    /// and 44pt of the top ramp lies behind it, where the material washes
-    /// out whatever the mask is doing; the floating layer is opaque and
-    /// sits ON the list, so the whole bottom ramp is in open air. The top
-    /// ramp is therefore the longer of the two, and only its last 16pt do
-    /// work the eye can actually resolve.
+    /// Both ramps are the same length. The top one is the interesting one:
+    /// 44pt of it lies behind the glass titlebar, so only its last few
+    /// points fall in open air, and its job is to hint that rows continue
+    /// under the chrome rather than to wash the first row out.
     ///
     /// The code measures both ramps in points from the edge that they
     /// belong to, then converts the points to fractions. Each ramp keeps
@@ -1182,10 +1342,16 @@ struct SidebarView: View {
         case .failed: true
         default: false
         }
-        if model.selectedSessionID == session.id,
+        if model.displayedTranscriptSessionID == session.id,
            model.viewingArchivedSessionID == nil,
-           !model.messages.isEmpty,
+           !model.isPreparingTranscriptOpen,
            !isFailed {
+            HermternalSwitchTrace.selectionGuard(
+                "activateSession.alreadyDisplayed",
+                id: session.id,
+                messages: model.messages.count,
+                reason: "displayedRouteMatches;notPreparing;notFailed"
+            )
             return
         }
         model.userNavigationDidBegin()
@@ -1204,6 +1370,12 @@ struct SidebarView: View {
     /// selection, while the list remains the owner of its row surface.
     private func openArchivedImmediately(_ session: ChatSession) {
         guard model.viewingArchivedSessionID != session.id else {
+            HermternalSwitchTrace.selectionGuard(
+                "openArchived.alreadyDisplayed",
+                id: session.id,
+                messages: model.messages.count,
+                reason: "archivedRouteAlreadyDisplayed"
+            )
             archivedPointerActivatedID = nil
             return
         }
@@ -1212,7 +1384,15 @@ struct SidebarView: View {
         pendingOpenTask?.cancel()
         pendingOpenTask = nil
         pendingOpenTask = Task {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else {
+                HermternalSwitchTrace.selectionGuard(
+                    "openArchived.taskCancellation",
+                    id: session.id,
+                    messages: model.messages.count,
+                    reason: "taskCancelledBeforeOpen"
+                )
+                return
+            }
             await model.openArchived(session)
             if !Task.isCancelled, archivedPointerActivatedID == session.id {
                 archivedPointerActivatedID = nil
@@ -1225,7 +1405,15 @@ struct SidebarView: View {
     private func scheduleOpen(for id: String?) {
         guard let id,
               let session = model.sessions.first(where: { $0.id == id })
-        else { return }
+        else {
+            HermternalSwitchTrace.selectionGuard(
+                "scheduleOpen.sessionLookup",
+                id: id,
+                messages: model.messages.count,
+                reason: "missingIDOrLiveRow"
+            )
+            return
+        }
         activateSession(session, event: "open.requested.keyboard")
     }
 
@@ -1508,31 +1696,25 @@ private struct SidebarFolderDeletionTarget: Identifiable {
 /// one under the floating layer at the bottom.
 ///
 /// Both ramps borrow their SHAPE from what the app already ships, and
-/// neither borrows its distance. Every fade here is the same S: flat where
-/// it meets the chrome, steepest in the middle, soft where it meets opaque
-/// content. `SearchPanel` runs that S over 96pt. `ChatView` runs its top
-/// fade over 130pt, derived from its floating pill's frame rather than
-/// hardcoded. Both of those are full-width surfaces with nothing resting
-/// against the edge, so length costs them nothing.
+/// neither borrows its distance. `SearchPanel` runs clear through 30pt,
+/// 0.12 at 48pt, 0.55 at 72pt and opaque at 96pt: proportions of
+/// 0.31 / 0.5 / 0.75 / 1. `ChatView` runs its own top fade front-loaded,
+/// so content returns to full opacity quickly, over a reach derived from
+/// its floating pill's frame. Those distances were measured in a
+/// full-width results panel and a full-width reading column, where 96pt is
+/// a fraction of one card. This column is about 250pt wide with 32pt rows,
+/// so 96pt would be three whole rows fading at once: a hazy band, which is
+/// the thing rule 3 of the progressive-edge skill exists to prevent.
 ///
-/// This column has two constraints neither of them has, and between them
-/// they fix the top ramp's length.
+/// So the code keeps the proportions and takes the distances from this
+/// column. `reach` is 48pt, which is one and a half rows. A row is fully
+/// opaque at 48pt from the chrome. A row is fully transparent at `gone`,
+/// which is 15pt from the chrome. Only the row that passes under the
+/// chrome fades.
 ///
-/// First, the window's traffic lights sit OVER this column, spanning 14pt
-/// to 26pt down the window. Row ink has to be invisible behind them, so
-/// the ramp starts flat and holds under 0.05 for its first 18pt. Taking
-/// `ChatView`'s proportions directly would put 0.13 to 0.25 of ink there,
-/// which reads as a dirty titlebar and not as a fade.
-///
-/// Second, the first section header RESTS 46pt below the mask's top edge,
-/// so every point of extra length dims it. A 130pt reach would hold it at
-/// 0.25 permanently, and would fade two whole rows at once: the hazy band
-/// that rule 3 of the progressive-edge skill exists to prevent.
-///
-/// So the top ramp is as long as the resting header will bear and no
-/// longer: `topReach` is 60pt, up from the 48pt it shared with the bottom.
-///
-/// The geometry it works in, measured on the Mac at true 2x. The list
+/// Both edges use the same four distances, in mirror, because both edges
+/// are the same event: a row arrives at fixed chrome. Measurement on the
+/// Mac at true 2x shows that the top edge has the space for it. The list
 /// frame starts 8pt down the window. It extends 44pt up, under the
 /// titlebar. The bottom edge of the titlebar is 52pt down the window. The
 /// first section header rests at 54pt.
@@ -1540,33 +1722,44 @@ private struct SidebarFolderDeletionTarget: Identifiable {
 /// That 52pt is the window's top safe-area inset, and it is conditional: a
 /// probe on macOS 26.6.2 measures 52pt while the window has toolbar items
 /// and 32pt when it has none. This column's own ellipsis item is what
-/// holds it at 52. Remove that item and every distance below moves 20pt,
+/// holds it at 52. Remove that item and every distance here moves 20pt,
 /// silently, with nothing failing to say so.
 ///
 /// The top ramp is therefore transparent for its first 15pt, which end at
 /// 23pt down the window, and it keeps ink away from the window buttons.
-/// It reaches 0.55 at 38pt, still inside the overlap band where the glass
-/// titlebar draws no background of its own. It is 0.74 at the titlebar's
-/// bottom edge and only opaque at 60pt, which is 68pt down the window.
+/// The ramp fades the rows across the overlap band, where the glass
+/// titlebar draws no background of its own. The ramp is fully opaque at
+/// 48pt, which is 56pt down the window. That point is 2pt inside the
+/// ascenders of the resting header, and above the body of its text.
 ///
-/// That last figure is the whole point of the length. The 48pt ramp this
-/// replaced was opaque at 56pt, 4pt below the titlebar: the dissolve
-/// finished while the row was still behind glass, so the row emerged
-/// already solid and the fade read as almost nothing. This one is still
-/// running for 16pt of open air, so a row visibly dissolves on its way
-/// out rather than only under the chrome.
+/// This 48pt was measured, then challenged, then kept, and the reason it
+/// was kept is worth recording because it will be challenged again. The
+/// fade is subtle, and lengthening it is the obvious way to make it less
+/// so. Lengthening does not work here. Only one currency buys extra
+/// length — the opacity of whatever rests at the top of the list —
+/// because the ramp cannot start any higher without putting ink behind
+/// the window buttons, and the first section header rests only 46pt below
+/// the mask's top edge. A 60pt reach holds that header at 0.79 instead of
+/// 0.98; a 130pt reach holds it at 0.25. Washing out the first row is the
+/// one thing this edge must not do, so the currency is worth nothing and
+/// the length cannot be bought. The traffic lights close the other
+/// escape: any curve short enough AND steep enough to reach full opacity
+/// early leaves 0.12 to 0.25 of row ink behind the buttons, which reads
+/// as a dirty titlebar rather than as a fade.
 ///
-/// It is paid for by the resting header, which sits at 0.79 across its
-/// ascenders and 0.96 by its baseline instead of 0.93 and 1. That is a
-/// gradient across one line of bold text, in the resting state only: any
-/// scroll carries the header out of the ramp. Of the three things in
-/// tension — clean window buttons, a long enough dissolve, a fully opaque
-/// resting header — the header is the one that degrades gracefully, so it
-/// is the one that gives.
+/// What was wrong at 48pt was never the length. It was the SHAPE. Three
+/// ink stops made the ramp a polyline that changed slope by 2.7x in a
+/// single join — 0.0133 alpha/pt, then 0.0358 — and that join sat at 0.12
+/// to 0.55, the mid-alpha range where the eye resolves a facet best. That
+/// is a visible crease at any reach. Seven stops on a smoothstep remove
+/// it: the slope leaves zero and returns to zero, and no join in the
+/// perceptible band changes by more than 1.33x.
 ///
-/// The bottom ramp keeps all four of its original distances. Its chrome is
-/// opaque, so it never had the top ramp's problem, and `reach` also sets
-/// the list's bottom content inset: changing it would move rows.
+/// The new curve is also strictly kinder at both ends than the three-stop
+/// one it replaces. Ink behind the window buttons falls from 0.040 to
+/// 0.036, and the resting header's ascenders rise from 0.925 to 0.980, so
+/// the first row is LESS washed out than before, not more. Nothing about
+/// the reach, the row geometry or the bottom inset moves.
 ///
 /// The 6pt ramp that an earlier pass replaced came from an incorrect
 /// measurement. That measurement put the top of the list frame at the
@@ -1593,20 +1786,17 @@ private enum SidebarDissolve {
     static let isEnabled =
         ProcessInfo.processInfo.environment["HERMTERNAL_NO_SIDEBAR_MASK"] != "1"
 
-    /// The BOTTOM ramp's four distances, measured up from the floating
-    /// layer's top edge. `reach` is also the list's bottom content inset,
-    /// so the last row can travel the whole ramp; it is the one distance
-    /// here with a second dependent.
+    /// Distances from the chrome edge each ramp belongs to: up from the
+    /// floating layer's top edge at the bottom, down from the list's own
+    /// frame edge at the top. `reach` is also the list's bottom content
+    /// inset, so the last row can travel the whole ramp; it is the one
+    /// distance here with a second dependent, and moving it moves rows.
     static let reach: CGFloat = 48
     static let strong: CGFloat = 36
     static let soft: CGFloat = 24
-    /// Fully gone, short of the edge, so no ink ever touches it. Shared
-    /// with the top ramp, where it is what keeps the window buttons clean.
+    /// Fully gone, short of the edge, so no ink ever touches it. At the top
+    /// edge this is also what keeps the window buttons clean.
     static let gone: CGFloat = 15
-
-    /// The TOP ramp's own reach, measured down from the list frame's top
-    /// edge. Longer than the bottom's, for the reasons on the type.
-    static let topReach: CGFloat = 60
 
     /// One continuous gradient. Stacked opacity bands would step and seam,
     /// and a second mask would be a second compositing group.
@@ -1619,29 +1809,31 @@ private enum SidebarDissolve {
         // meet, but they never cross and invert. The unlimited values
         // increase in order, so the limited values stay in order.
         func up(_ above: CGFloat) -> CGFloat {
-            min(max(boundary - above, topReach), height) / height
+            min(max(boundary - above, reach), height) / height
         }
         func down(_ below: CGFloat) -> CGFloat {
             min(below, height) / height
         }
         return LinearGradient(
             stops: [
-                // The top ramp gets six ink stops, not the bottom's three.
-                // A gradient stop list is a polyline, and three stops over
-                // 60pt would facet: the old ramp changed slope by 2.7x in
-                // one join, at 0.12 to 0.55, which is exactly where a
-                // facet is visible. These six track the S to within 0.024
-                // and no join changes slope by more than 1.7x. The
-                // distances have one consumer each, so they sit beside the
-                // opacity they carry rather than becoming six more names.
+                // The top ramp spends seven ink stops on the same 48pt the
+                // bottom crosses in three, because a gradient stop list is
+                // a polyline and this edge is the one the eye studies.
+                // Evenly spaced every 4pt, they track a smoothstep to
+                // within 0.014 alpha, and no join in the perceptible band
+                // changes slope by more than 1.33x. The distances have one
+                // consumer each, so they sit beside the opacity they carry
+                // rather than becoming seven more names.
                 .init(color: .clear, location: 0),
                 .init(color: .clear, location: down(gone)),
-                .init(color: .black.opacity(0.11), location: down(22)),
-                .init(color: .black.opacity(0.32), location: down(30)),
-                .init(color: .black.opacity(0.55), location: down(38)),
-                .init(color: .black.opacity(0.77), location: down(45)),
-                .init(color: .black.opacity(0.94), location: down(52)),
-                .init(color: .black, location: down(topReach)),
+                .init(color: .black.opacity(0.06), location: down(20)),
+                .init(color: .black.opacity(0.18), location: down(24)),
+                .init(color: .black.opacity(0.34), location: down(28)),
+                .init(color: .black.opacity(0.52), location: down(32)),
+                .init(color: .black.opacity(0.70), location: down(36)),
+                .init(color: .black.opacity(0.85), location: down(40)),
+                .init(color: .black.opacity(0.96), location: down(44)),
+                .init(color: .black, location: down(reach)),
                 // The bottom ramp, in mirror. Its chrome is opaque and
                 // sits on the list, so the ramp is short and entirely in
                 // open air, and three stops carry it without faceting.

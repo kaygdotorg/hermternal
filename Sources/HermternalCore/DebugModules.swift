@@ -226,6 +226,9 @@ public struct DebugFrameDeliveryMetrics: Equatable, Sendable {
     public let clickLatencyP99Nanoseconds: UInt64?
     public let clickLatencyMaximumNanoseconds: UInt64?
     public let clickSampleCount: Int
+    /// Chronological click samples retained for QA distribution reporting.
+    /// This array is materialized only when a snapshot is requested.
+    public let clickLatencySamplesNanoseconds: [UInt64]
     public let gestureLatencyP90Nanoseconds: UInt64?
     public let gestureLatencyP99Nanoseconds: UInt64?
     public let gestureLatencyMaximumNanoseconds: UInt64?
@@ -250,6 +253,7 @@ public struct DebugFrameDeliveryMetrics: Equatable, Sendable {
             gestureLatencyP90Nanoseconds = nil
             clickLatencyMedianNanoseconds = nil
             clickLatencyP90Nanoseconds = nil
+            clickLatencySamplesNanoseconds = []
             clickLatencyP99Nanoseconds = nil
             clickLatencyMaximumNanoseconds = nil
             clickSampleCount = 0
@@ -299,7 +303,9 @@ public struct DebugFrameDeliveryMetrics: Equatable, Sendable {
         gestureLatencyP90Nanoseconds = latencies.isEmpty ? nil : Self.nearestRank(latencies, numerator: 9, denominator: 10)
         gestureLatencyP99Nanoseconds = latencies.isEmpty ? nil : Self.nearestRank(latencies, numerator: 99, denominator: 100)
         gestureLatencyMaximumNanoseconds = latencies.last
-        let clickLatencies = samples.compactMap(\.clickLatencyNanoseconds).sorted()
+        let clickSamples = samples.compactMap(\.clickLatencyNanoseconds)
+        clickLatencySamplesNanoseconds = clickSamples
+        let clickLatencies = clickSamples.sorted()
         clickSampleCount = clickLatencies.count
         clickLatencyMedianNanoseconds = clickLatencies.isEmpty ? nil : Self.median(clickLatencies)
         clickLatencyP90Nanoseconds = clickLatencies.isEmpty ? nil : Self.nearestRank(clickLatencies, numerator: 9, denominator: 10)

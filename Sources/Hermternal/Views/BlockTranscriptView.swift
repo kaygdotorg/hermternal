@@ -1108,7 +1108,30 @@ struct BlockTranscriptView: NSViewRepresentable {
     @MainActor
     func updateNSView(_ nsView: BlockTranscriptContainerView, context: Context) {
         let start = HermternalSwitchTrace.transcriptPhaseClock()
+        // Two intervals, because they answer different questions: the update
+        // bracket is our own work, and the commit bracket ends when Core
+        // Animation actually presents. The gap between them is the ~60-85 ms
+        // that no counter of ours could see, and the reason the sidebar's
+        // selection plate may not appear until the transcript is done.
+        let transcriptSignpost = SelectionLatencySignposts.beginTranscriptUpdate(
+            sessionID: input.routeIdentity,
+            generation: 0
+        )
+        let commitSignpost = SelectionLatencySignposts.beginCommit(
+            sessionID: input.routeIdentity,
+            generation: 0
+        )
+        if commitSignpost != nil {
+            // Chain rather than replace: another completion block on this
+            // transaction belongs to somebody else's work.
+            let existing = CATransaction.completionBlock()
+            CATransaction.setCompletionBlock {
+                existing?()
+                SelectionLatencySignposts.endCommit(commitSignpost)
+            }
+        }
         context.coordinator.update(container: nsView, input: input)
+        SelectionLatencySignposts.endTranscriptUpdate(transcriptSignpost)
         guard let start else { return }
         let end = DispatchTime.now().uptimeNanoseconds
         HermternalSwitchTrace.transcriptPhaseUpdateNSView(start: start, end: end)
@@ -1220,9 +1243,11 @@ struct BlockTranscriptView: NSViewRepresentable {
                 self.requestOlderIfNeeded()
             }
             observers.append((NotificationCenter.default, scrollToken))
-            // The accent colour and Increase Contrast both change the palette
-            // without changing the effective appearance, so they have to
-            // invalidate prepared colours the way a light-to-dark switch does.
+            // Three signals change the palette without changing the effective
+            // appearance, and all of them have to invalidate prepared colours
+            // the way a light-to-dark switch does.
+            //
+            // The system's own colours changing, which macOS posts:
             let colorToken = NotificationCenter.default.addObserver(
                 forName: NSColor.systemColorsDidChangeNotification,
                 object: nil,
@@ -1231,6 +1256,17 @@ struct BlockTranscriptView: NSViewRepresentable {
                 self?.appearanceDidChange()
             }
             observers.append((NotificationCenter.default, colorToken))
+            // The app's own palette inputs — the accent override, and which
+            // fill a user bubble takes — which only this app knows about:
+            let paletteToken = NotificationCenter.default.addObserver(
+                forName: AccentColorStore.didChangeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.appearanceDidChange()
+            }
+            observers.append((NotificationCenter.default, paletteToken))
+            // And Increase Contrast, which flips the bubble's text colour:
             let workspaceCenter = NSWorkspace.shared.notificationCenter
             let accessibilityToken = workspaceCenter.addObserver(
                 forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,

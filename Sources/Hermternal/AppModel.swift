@@ -422,6 +422,29 @@ enum HermternalSwitchTrace {
             timestampNanoseconds: DispatchTime.now().uptimeNanoseconds
         )
     }
+    /// Records a rejected selection path without doing work when the
+    /// sidebar-selection debug module is disabled.
+    static func selectionGuard(
+        _ guardName: String,
+        selection selectedItems: @autoclosure () -> Set<SidebarSelectionID> = [],
+        id: String? = nil,
+        generation: Int? = nil,
+        messages: @autoclosure () -> Int = 0,
+        reason: @autoclosure () -> String = ""
+    ) {
+        guard gate.isEnabled(.sidebarAndFolderSelection) else { return }
+        let suppliedReason = reason()
+        let detail = "guard=\(guardName)"
+            + (id.map { " id=\($0)" } ?? "")
+            + (generation.map { " gen=\($0)" } ?? "")
+            + (suppliedReason.isEmpty ? "" : " reason=\(suppliedReason)")
+        selection(
+            "selection.guard",
+            selection: selectedItems(),
+            messages: messages(),
+            detail: detail
+        )
+    }
     private static func resetCountersIfMetricsCleared() {
         guard hasRecordedMetricSample,
               gate.isEnabled(.visiblePaint),
@@ -535,12 +558,40 @@ final class AppModel {
         return matches
     }
     var selectedSessionID: String?
+    /// The chat whose transcript has actually been painted, as distinct from
+    /// the one that is selected.
+    ///
+    /// These diverge, and the difference is load-bearing. An open that fails,
+    /// is superseded, or is cancelled can leave `selectedSessionID` pointing at
+    /// a chat the user never saw. Any decision to skip work because a chat is
+    /// "already open" must consult this, not the selection: comparing
+    /// identifiers alone made a row that lost its transcript permanently
+    /// inert, because clicking it changed no selection and the opener then
+    /// declined to reopen what it believed was already loaded.
+    private(set) var displayedTranscriptSessionID: String?
+
+    /// Called when the transcript reports that a route's content reached the
+    /// screen. Ignores a stale report for a route the user has already left.
+    func noteTranscriptDisplayed(sessionID: String) {
+        guard selectedSessionID == sessionID else {
+            HermternalSwitchTrace.selectionGuard(
+                "transcriptDisplayed.route",
+                id: sessionID,
+                messages: messages.count,
+                reason: "staleVisibilityForCurrentSelection"
+            )
+            return
+        }
+        displayedTranscriptSessionID = sessionID
+    }
     /// A routed message target that ChatView reads during the transcript's
     /// initial layout. It is single-use and owned by its open generation.
     var pendingMessageLocation: MessageLocation? { pendingMessageRoute?.location }
     var openGeneration: Int { openGenerations.current() }
 
     var isAwaitingReply = false
+    /// True while an explicit open is preparing a replacement transcript.
+    var isPreparingTranscriptOpen: Bool { isPreparingOpen }
     /// Reserved for the read-only archived transcript route. It remains nil
     /// until the transcript host can gate the composer and send actions.
     var viewingArchivedSessionID: String?
@@ -652,6 +703,9 @@ final class AppModel {
     /// the first actor yield; without this guard an event arriving in that
     /// gap could reduce into the newly selected chat's empty reducer.
     private var isPreparingOpen = false
+    /// Identifies the request that owns `isPreparingOpen`, so a superseded
+    /// request cannot clear a newer request's preparation state.
+    private var preparingOpenGeneration: Int?
 
     private static let serverKey = "serverURL"
     private static let defaultServer = "https://hermes-dashboard.kayg.org"
@@ -2127,6 +2181,13 @@ final class AppModel {
             generation: generation,
             messages: messages.count
         )
+        // Leaving a route invalidates the painted-transcript signal. It is
+        // cleared here rather than at each call site so no future selection
+        // path can forget to, which is how a stale "already open" belief
+        // strands a row.
+        if value != selectedSessionID {
+            displayedTranscriptSessionID = nil
+        }
         selectedSessionID = value
         HermternalSwitchTrace.session(
             "\(event).after",
@@ -2185,7 +2246,15 @@ final class AppModel {
         serverTotal: Int?
     ) -> (any TranscriptSource)? {
         if let injectedTranscriptSource { return injectedTranscriptSource }
-        guard let gateway, let rest else { return nil }
+        guard let gateway, let rest else {
+            HermternalSwitchTrace.selectionGuard(
+                "transcriptSource.gateway",
+                id: sessionID,
+                messages: messages.count,
+                reason: "gatewayOrRESTUnavailable"
+            )
+            return nil
+        }
         var totals: [String: Int] = [:]
         if let sessionID, let serverTotal { totals[sessionID] = serverTotal }
 
@@ -2202,7 +2271,15 @@ final class AppModel {
             phase: pendingRoutePhase,
             sessionsLoadedCompletely: sessionsLoadedCompletely
         )
-        guard case let .open(destination, routeGeneration) = decision else { return }
+        guard case let .open(destination, routeGeneration) = decision else {
+            HermternalSwitchTrace.selectionGuard(
+                "externalRoute.routeDecision",
+                generation: generation,
+                messages: messages.count,
+                reason: "routeQueuedOrRejected"
+            )
+            return
+        }
         dispatchExternalRoute(
             destination,
             routeGeneration: routeGeneration,
@@ -2232,7 +2309,14 @@ final class AppModel {
         guard phase == .ready,
               let decision = pendingExternalRoute.sessionsLoadedCompletely(phase: pendingRoutePhase),
               case let .open(destination, routeGeneration) = decision
-        else { return }
+        else {
+            HermternalSwitchTrace.selectionGuard(
+                "externalRoute.ready",
+                messages: messages.count,
+                reason: "notReadyOrNoOpenDecision"
+            )
+            return
+        }
         let generation = openGenerations.begin()
         dispatchExternalRoute(
             destination,
@@ -2250,7 +2334,15 @@ final class AppModel {
             guard let self,
                   self.pendingExternalRoute.isCurrent(routeGeneration),
                   self.openGenerations.isCurrent(generation)
-            else { return }
+            else {
+                HermternalSwitchTrace.selectionGuard(
+                    "externalRoute.dispatch",
+                    generation: generation,
+                    messages: self?.messages.count ?? 0,
+                    reason: "routeOrOpenGenerationSuperseded"
+                )
+                return
+            }
             await self.openExternalDestination(
                 destination,
                 routeGeneration: routeGeneration,
@@ -2270,7 +2362,15 @@ final class AppModel {
         activeOpenTask = nil
         guard pendingExternalRoute.isCurrent(routeGeneration),
               openGenerations.isCurrent(generation)
-        else { return }
+        else {
+            HermternalSwitchTrace.selectionGuard(
+                "externalRoute.open",
+                generation: generation,
+                messages: messages.count,
+                reason: "routeOrOpenGenerationSuperseded"
+            )
+            return
+        }
         switch destination {
         case .chat(let sessionID):
             await openChat(sessionID: sessionID, generation: generation)
@@ -2286,6 +2386,54 @@ final class AppModel {
         activeOpenHandle = nil
         activeOpenTask = nil
         isPreparingOpen = false
+        preparingOpenGeneration = nil
+    }
+    /// Cancels a pending sidebar open when its hosting view disappears.
+    func cancelOpenPreparation() {
+        guard isPreparingOpen
+            || activeOpenTask != nil
+            || activeOpenHandle != nil
+            || externalRouteTask != nil
+        else {
+            HermternalSwitchTrace.selectionGuard(
+                "cancelOpenPreparation.noActiveOpen",
+                messages: messages.count,
+                reason: "idempotentNoOp"
+            )
+            return
+        }
+        isPreparingOpen = false
+        preparingOpenGeneration = nil
+        _ = openGenerations.begin()
+        externalRouteTask?.cancel()
+        externalRouteTask = nil
+        activeOpenHandle?.cancel()
+        activeOpenTask?.cancel()
+        activeOpenHandle = nil
+        activeOpenTask = nil
+    }
+    private func finishOpenPreparation(generation: Int, sessionID: String) {
+        guard preparingOpenGeneration == generation else {
+            HermternalSwitchTrace.selectionGuard(
+                "requestOpen.preparingOpen.clear",
+                id: sessionID,
+                generation: generation,
+                messages: messages.count,
+                reason: "ownerSuperseded;newPreparationOwnsFlag"
+            )
+            return
+        }
+        isPreparingOpen = false
+        preparingOpenGeneration = nil
+        activeOpenTask = nil
+        activeOpenHandle = nil
+        HermternalSwitchTrace.selectionGuard(
+            "requestOpen.preparingOpen.clear",
+            id: sessionID,
+            generation: generation,
+            messages: messages.count,
+            reason: "taskFinishedOrCancelledOrSuperseded"
+        )
     }
 
     /// Publishes the durable selection identity synchronously. Warm-cache
@@ -2297,12 +2445,17 @@ final class AppModel {
         cancelActiveOpen()
         pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
+        SelectionLatencySignposts.beginClick(
+            sessionID: session.id,
+            generation: generation
+        )
         let handle = TranscriptOpenHandle()
         activeOpenHandle = handle
         pendingMessageRoute = nil
         viewingArchivedSessionID = nil
         liveSessionID = nil
         isPreparingOpen = true
+        preparingOpenGeneration = generation
         // Invalidate the previous stream before yielding. Event handling is
         // also gated below until this open has installed its transcript.
         streamingReducer.reset()
@@ -2313,11 +2466,16 @@ final class AppModel {
             generation: generation,
             messages: messages.count
         )
+        let selectionMutation = SelectionLatencySignposts.beginSelectionMutation(
+            sessionID: session.id,
+            generation: generation
+        )
         setSelectedSessionID(
             session.id,
             event: "selectedSessionID.mutation",
             generation: generation
         )
+        SelectionLatencySignposts.endSelectionMutation(selectionMutation)
         HermternalSwitchTrace.session(
             "selection.publish",
             id: session.id,
@@ -2327,15 +2485,30 @@ final class AppModel {
         )
         let warmStoreForOpen = warmStore
         let cacheEnabledForOpen = cacheEnabled
-
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            // Let the List's selection transaction reach AppKit before any
-            // transcript state is published. The cache read itself is
-            // detached because warm-store locking and projection copying
-            // must not occupy the main actor's click turn.
+            defer {
+                self.finishOpenPreparation(
+                    generation: generation,
+                    sessionID: session.id
+                )
+            }
+            // The first yield is deliberate. Starting the detached lookup
+            // before it can complete and resume onto the main actor while
+            // AppKit is committing the List highlight, recreating this bug.
             await Task.yield()
-            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                HermternalSwitchTrace.selectionGuard(
+                    "requestOpen.afterFirstYield",
+                    id: session.id,
+                    generation: generation,
+                    messages: self.messages.count,
+                    reason: self.openGenerations.isCurrent(generation)
+                        ? "taskCancelled"
+                        : "generationSuperseded"
+                )
+                return
+            }
             let warm = await Task.detached(priority: .userInitiated) {
                 () -> WarmTranscriptProjection? in
                 guard cacheEnabledForOpen else { return nil }
@@ -2344,7 +2517,23 @@ final class AppModel {
                     minimumServerTotal: session.messageCount
                 )
             }.value
-            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                HermternalSwitchTrace.selectionGuard(
+                    "requestOpen.afterWarmLookup",
+                    id: session.id,
+                    generation: generation,
+                    messages: self.messages.count,
+                    reason: self.openGenerations.isCurrent(generation)
+                        ? "taskCancelled"
+                        : "generationSuperseded"
+                )
+                return
+            }
+            SelectionLatencySignposts.markWarmProjection(
+                warm != nil,
+                sessionID: session.id,
+                generation: generation
+            )
             let initialMessages = warm.map {
                 Array($0.messages.suffix(TranscriptWindowPolicy.initialWindowSize))
             } ?? []
@@ -2374,9 +2563,6 @@ final class AppModel {
                 selectionAlreadyPublished: true,
                 handle: handle
             )
-            if self.openGenerations.isCurrent(generation) {
-                self.isPreparingOpen = false
-            }
         }
         activeOpenTask = task
         return task
@@ -2416,6 +2602,13 @@ final class AppModel {
             liveSessionID = nil
         }
         guard let source = transcriptSource(for: session) else {
+            HermternalSwitchTrace.selectionGuard(
+                "open.transcriptSource",
+                id: session.id,
+                generation: generation,
+                messages: messages.count,
+                reason: "gatewayUnavailable;emptyColdRoute"
+            )
             postError("Could not open chat \(session.id)", detail: "The gateway is unavailable.")
             return false
         }
@@ -2441,7 +2634,18 @@ final class AppModel {
             sessionTitle: session.title,
             handle: handle
         ) {
-            guard openGenerations.isCurrent(generation), !Task.isCancelled else { return false }
+            guard openGenerations.isCurrent(generation), !Task.isCancelled else {
+                HermternalSwitchTrace.selectionGuard(
+                    "open.phase",
+                    id: session.id,
+                    generation: generation,
+                    messages: messages.count,
+                    reason: openGenerations.isCurrent(generation)
+                        ? "taskCancelled"
+                        : "generationSuperseded"
+                )
+                return false
+            }
             if !result.isCachedPhase {
                 liveSessionID = result.liveSessionID
             }
@@ -2803,12 +3007,26 @@ final class AppModel {
     // MARK: - Events
 
     private func handle(_ event: GatewayEvent) async {
-        guard !isViewingArchivedTranscript else { return }
+        guard !isViewingArchivedTranscript else {
+            HermternalSwitchTrace.selectionGuard(
+                "gatewayEvent.archivedTranscript",
+                id: selectedSessionID,
+                messages: messages.count,
+                reason: "readOnlyTranscript"
+            )
+            return
+        }
         if event.type == "transport.closed" {
             phase = .failed(event.text ?? "The gateway connection closed.")
             let reduction = streamingReducer.cancel()
             messages = reduction.messages
             isAwaitingReply = reduction.isAwaitingReply
+            HermternalSwitchTrace.selectionGuard(
+                "gatewayEvent.transportClosed",
+                id: selectedSessionID,
+                messages: messages.count,
+                reason: "transportClosed;cancelledReducer"
+            )
             return
         }
         if event.type == "transport.malformed" {
@@ -2816,10 +3034,24 @@ final class AppModel {
                 "Malformed gateway response",
                 detail: event.text ?? "The gateway sent an invalid frame."
             )
+            HermternalSwitchTrace.selectionGuard(
+                "gatewayEvent.transportMalformed",
+                id: selectedSessionID,
+                messages: messages.count,
+                reason: "malformedFrame"
+            )
             return
         }
 
-        guard !isPreparingOpen else { return }
+        guard !isPreparingOpen else {
+            HermternalSwitchTrace.selectionGuard(
+                "gatewayEvent.preparingOpen",
+                id: selectedSessionID,
+                messages: messages.count,
+                reason: "preparingOpenSuppressesReducer"
+            )
+            return
+        }
         let reduction = streamingReducer.reduce(event)
         messages = reduction.messages
         isAwaitingReply = reduction.isAwaitingReply

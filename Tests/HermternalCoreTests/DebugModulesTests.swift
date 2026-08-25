@@ -72,6 +72,7 @@ func frameDeliveryStatisticsMatchKnownSeries() {
     #expect(metrics?.clickLatencyMedianNanoseconds == 5)
     #expect(metrics?.clickLatencyP90Nanoseconds == 6)
     #expect(metrics?.clickLatencyP99Nanoseconds == 6)
+    #expect(metrics?.clickLatencySamplesNanoseconds == [4, 5, 6])
     #expect(metrics?.clickLatencyMaximumNanoseconds == 6)
     #expect(metrics?.clickSampleCount == 3)
     #expect(metrics?.sidebarFrameCount == 3)

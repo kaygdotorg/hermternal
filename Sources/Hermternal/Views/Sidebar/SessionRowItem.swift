@@ -90,7 +90,15 @@ extension SessionRowItem {
             .simultaneousGesture(
                 TapGesture(count: 1)
                     .onEnded {
-                        guard isSelected else { return }
+                        guard isSelected else {
+                            HermternalSwitchTrace.selectionGuard(
+                                "sessionRow.tapSelection",
+                                id: session.id,
+                                messages: session.messageCount,
+                                reason: "rowNotSelected;ListOwnsSelection"
+                            )
+                            return
+                        }
                         let allowed = SidebarSelectionEventAdapter.allowsPrimaryActivation()
                         HermternalSwitchTrace.session(
                             "selection.tapGate",
@@ -99,6 +107,12 @@ extension SessionRowItem {
                             detail: allowed ? "allowed" : "blocked"
                         )
                         guard allowed else {
+                            HermternalSwitchTrace.selectionGuard(
+                                "sessionRow.tapGate",
+                                id: session.id,
+                                messages: session.messageCount,
+                                reason: "eventAdapterRejectedPrimaryActivation"
+                            )
                             return
                         }
                         HermternalSwitchTrace.session(
