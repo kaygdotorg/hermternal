@@ -54,11 +54,6 @@ struct ChatView: View {
     /// follows it. Composer consumes this through SwiftUI focus state
     /// rather than taking first responder during every launch.
     @State private var composerFocusRequest = 0
-    /// Route and generation used by the representable. Selection changes
-    /// update these values on the next run-loop turn, after the selection
-    /// transaction commits.
-    @State private var renderedTranscriptIdentity: String?
-    @State private var renderedTranscriptGeneration: Int?
     /// Segmentation is retained only for the current route/window/revision.
     /// A route change or stream revision uses placeholder blocks until the
     /// replacement arrives from the background task.
@@ -156,7 +151,6 @@ struct ChatView: View {
                 return
             }
             resetTranscriptVisibility(for: sessionID)
-            scheduleTranscriptRendererRoute()
         }
         .onAppear {
             // Do not reset on a temporary disappearance/reappearance. The
@@ -189,29 +183,11 @@ struct ChatView: View {
     }
 
     private var renderedRouteIdentity: String {
-        renderedTranscriptIdentity ?? transcriptIdentity
+        model.transcriptRouteIdentity
     }
 
     private var renderedRouteGeneration: Int {
-        renderedTranscriptGeneration ?? model.openGeneration
-    }
-    @MainActor
-    private func scheduleTranscriptRendererRoute() {
-        let identity = transcriptIdentity
-        let generation = model.openGeneration
-        DispatchQueue.main.async {
-            guard self.transcriptIdentity == identity,
-                  self.model.openGeneration == generation,
-                  (
-                      self.renderedTranscriptIdentity != identity
-                        || self.renderedTranscriptGeneration != generation
-                  )
-            else { return }
-            self.renderedTranscriptIdentity = identity
-            self.renderedTranscriptGeneration = generation
-            self.isPrimingTranscriptWindow = true
-            self.transcriptWindowState = nil
-        }
+        model.transcriptRouteGeneration
     }
 
 
@@ -257,10 +233,6 @@ struct ChatView: View {
             requestedWindowSize: Self.transcriptWindowSize,
             currentState: transcriptWindowState
         ).state
-    }
-    @MainActor
-    private func resetTranscriptRendererRoute() {
-        scheduleTranscriptRendererRoute()
     }
     @MainActor
     private func resetTranscriptVisibility(for sessionID: String?) {
@@ -410,9 +382,8 @@ struct ChatView: View {
     @ViewBuilder
     private var transcript: some View {
         // `selectedSessionID` invalidates this body and SidebarView together.
-        // The route identity and generation used by the representable stay
-        // on their previous values until the next run-loop turn, so this
-        // transaction cannot include transcript content or route updates.
+        // The model installs route identity and messages together after the
+        // selection transaction. This body cannot render a mixed route.
         let messages = model.messages
         let query = isFindPresented ? findQuery : ""
         let matches = model.transcriptMatches(for: query)
@@ -520,7 +491,6 @@ struct ChatView: View {
                 includeActiveFindTarget(matches: matches)
             }
             .onChange(of: model.selectedSessionID) { _, _ in
-                resetTranscriptRendererRoute()
                 if model.pendingMessageLocation != nil {
                     _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                 } else {
@@ -528,7 +498,6 @@ struct ChatView: View {
                 }
             }
             .onChange(of: model.viewingArchivedSessionID) { _, _ in
-                resetTranscriptRendererRoute()
                 if model.pendingMessageLocation != nil {
                     _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                 } else {
@@ -549,10 +518,6 @@ struct ChatView: View {
                 }
             }
             .onAppear {
-                if renderedTranscriptIdentity == nil {
-                    renderedTranscriptIdentity = transcriptIdentity
-                    renderedTranscriptGeneration = model.openGeneration
-                }
                 if model.pendingMessageLocation != nil {
                     _ = capturePendingMessageTarget(targetIndex: pendingTargetIndex)
                 } else {

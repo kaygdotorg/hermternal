@@ -558,16 +558,14 @@ final class AppModel {
         return matches
     }
     var selectedSessionID: String?
+    /// Route identity installed with the transcript snapshot.
+    ///
+    /// Selection changes publish first. The opener changes this identity
+    /// together with `messages` after the selection transaction commits.
+    var transcriptRouteIdentity = "live:none"
+    private(set) var transcriptRouteGeneration = 0
     /// The chat whose transcript has actually been painted, as distinct from
     /// the one that is selected.
-    ///
-    /// These diverge, and the difference is load-bearing. An open that fails,
-    /// is superseded, or is cancelled can leave `selectedSessionID` pointing at
-    /// a chat the user never saw. Any decision to skip work because a chat is
-    /// "already open" must consult this, not the selection: comparing
-    /// identifiers alone made a row that lost its transcript permanently
-    /// inert, because clicking it changed no selection and the opener then
-    /// declined to reopen what it believed was already loaded.
     private(set) var displayedTranscriptSessionID: String?
 
     /// Called when the transcript reports that a route's content reached the
@@ -2215,6 +2213,8 @@ final class AppModel {
             let result = try await gateway.call("session.create")
             liveSessionID = result["session_id"]?.stringValue
             streamingReducer.reset()
+            transcriptRouteIdentity = "live:none"
+            transcriptRouteGeneration = openGenerations.current()
             messages = []
             isAwaitingReply = streamingReducer.isAwaitingReply
             // `session.create` does not persist a row until the first
@@ -2464,6 +2464,8 @@ final class AppModel {
                     continuation.resume(returning: false)
                     return
                 }
+                self.transcriptRouteIdentity = "live:\(session.id)"
+                self.transcriptRouteGeneration = generation
                 self.streamingReducer.reset(messages: initialMessages)
                 self.messages = initialMessages
                 self.isAwaitingReply = self.streamingReducer.isAwaitingReply
@@ -2750,6 +2752,8 @@ final class AppModel {
             if !rejectsCacheDerivedDowngrade
                 && (!sameWarmProjection || warmTailNeedsExpansion) {
                 streamingReducer.reset(messages: result.messages)
+                transcriptRouteIdentity = "live:\(session.id)"
+                transcriptRouteGeneration = generation
                 messages = result.messages
                 isAwaitingReply = streamingReducer.isAwaitingReply
             }
@@ -2832,6 +2836,8 @@ final class AppModel {
         }
         guard openGenerations.isCurrent(generation), !Task.isCancelled else { return false }
         streamingReducer.reset(messages: cached?.messages ?? [])
+        transcriptRouteIdentity = "archived:\(session.id)"
+        transcriptRouteGeneration = generation
         messages = cached?.messages ?? []
         isAwaitingReply = streamingReducer.isAwaitingReply
         HermternalSwitchTrace.session(
@@ -2893,6 +2899,8 @@ final class AppModel {
             guard openGenerations.isCurrent(generation), !Task.isCancelled else { return false }
         }
         streamingReducer.reset(messages: projected)
+        transcriptRouteIdentity = "archived:\(session.id)"
+        transcriptRouteGeneration = generation
         messages = projected
         isAwaitingReply = streamingReducer.isAwaitingReply
         HermternalSwitchTrace.session(
