@@ -12,14 +12,46 @@ public struct SearchDocument: Sendable {
     public let body: String
     public let role: Role
     public let timestamp: Date?
+    public let displayKind: String?
+    public let isTool: Bool
 
-    public init(messageID: ServerMessageID, body: String, role: Role, timestamp: Date? = nil) {
+    public init(
+        messageID: ServerMessageID,
+        body: String,
+        role: Role,
+        timestamp: Date? = nil,
+        displayKind: String? = nil,
+        isTool: Bool = false
+    ) {
         self.messageID = messageID
         self.body = body
         self.role = role
         self.timestamp = timestamp
+        self.displayKind = displayKind
+        self.isTool = isTool
+    }
+
+    /// Metadata and tool rows never enter FTS, even when a caller forgets to filter.
+    public var isSearchable: Bool {
+        guard displayKind != "model_switch", displayKind != "hidden" else { return false }
+        guard !isTool else { return false }
+        if let displayKind {
+            return !(displayKind == "tool" || displayKind.hasPrefix("tool_") || displayKind.hasPrefix("tool."))
+        }
+        return true
     }
 }
+/// A bounded page supplied to the search index during transcript ingestion.
+///
+/// Callers must keep pages small. The index never retains more than one page.
+public struct SearchDocumentPage: Sendable {
+    public let documents: [SearchDocument]
+
+    public init(documents: [SearchDocument]) {
+        self.documents = documents
+    }
+}
+
 
 /// A single message match in the persisted transcript corpus.
 public struct SearchHit: Sendable {
@@ -105,6 +137,9 @@ public actor SearchIndex: SearchQuerying {
     /// A chat contributes at most three rows per query. Round-robin diversity
     /// makes a large transcript useful without letting it exhaust the panel.
     public static let perSessionHitCap = 3
+    public static let sqlitePageCacheBytes = 16 * 1024 * 1024
+    public static let maxSearchWorkspaceBytes = 32 * 1024 * 1024
+    public static let maxDiversitySessions = 512
 
     public nonisolated let url: URL
     private var database: SQLiteConnection?
@@ -131,29 +166,125 @@ public actor SearchIndex: SearchQuerying {
     // mutating path therefore bumps generation and synchronously joins the
     // exact query lease before taking the connection's exclusive lifecycle lock.
     public func replace(_ snapshot: SearchSessionSnapshot) async throws {
+        let pages = AsyncThrowingStream<SearchDocumentPage, Error> { continuation in
+            continuation.yield(SearchDocumentPage(documents: snapshot.documents))
+            continuation.finish()
+        }
+        try await replacePaged(
+            sessionID: snapshot.sessionID,
+            title: snapshot.title,
+            truncated: snapshot.truncated,
+            pages: pages
+        )
+    }
+
+    /// Replaces one session from bounded pages.
+    ///
+    /// Each page is committed independently. A digest is updated as pages
+    /// arrive, so the index never builds a corpus-sized document array.
+    public func replacePaged(
+        sessionID: String,
+        title: String,
+        truncated: Bool,
+        pages: AsyncThrowingStream<SearchDocumentPage, Error>
+    ) async throws {
         generation &+= 1
         stopRunningQuery()
         guard !disabled, let database else { throw SearchIndexError.disabled }
-        let documents = snapshot.documents.sorted(by: Self.canonicalOrder)
-        let digest = SearchDigest.session(snapshot: snapshot, documents: documents)
+        let requestGeneration = generation
+        var digest = SearchDigest.Incremental(sessionID: sessionID, title: title, truncated: truncated)
+
         try database.withExclusive {
-            if try database.sessionDigest(snapshot.sessionID) == digest { return }
             try database.begin()
             do {
-                try database.deleteSession(snapshot.sessionID)
+                try database.deleteSession(sessionID)
+                try database.deleteSessionMetadata(sessionID)
+                try database.commit()
+            } catch {
+                database.rollback()
+                throw error
+            }
+        }
+
+        do {
+            for try await page in pages {
+                guard requestGeneration == generation, !Task.isCancelled else {
+                    throw CancellationError()
+                }
+                let documents = page.documents.filter(\.isSearchable).sorted(by: Self.canonicalOrder)
+                guard !documents.isEmpty else { continue }
+                try database.withExclusive {
+                    try database.begin()
+                    do {
+                        for document in documents {
+                            try database.insert(
+                                title: title,
+                                body: document.body,
+                                sessionID: sessionID,
+                                messageID: document.messageID.rawValue,
+                                role: document.role.rawValue,
+                                timestamp: document.timestamp
+                            )
+                        }
+                        try database.commit()
+                    } catch {
+                        database.rollback()
+                        throw error
+                    }
+                }
+            }
+            guard requestGeneration == generation, !Task.isCancelled else {
+                throw CancellationError()
+            }
+            let value = digest.finalize()
+            try database.withExclusive {
+                try database.begin()
+                do {
+                    try database.upsertSessionMetadata(sessionID: sessionID, digest: value, incomplete: truncated)
+                    try database.commit()
+                } catch {
+                    database.rollback()
+                    throw error
+                }
+            }
+        } catch {
+            if requestGeneration == generation {
+                try? database.withExclusive {
+                    try database.begin()
+                    do {
+                        try database.deleteSession(sessionID)
+                        try database.deleteSessionMetadata(sessionID)
+                        try database.commit()
+                    } catch { database.rollback() }
+                }
+            }
+            throw error
+        }
+    }
+
+    /// Appends one bounded page to an existing indexed session.
+    public func append(
+        _ page: SearchDocumentPage,
+        sessionID: String,
+        title: String,
+        truncated: Bool = false
+    ) async throws {
+        guard !disabled, let database else { throw SearchIndexError.disabled }
+        let documents = page.documents.filter(\.isSearchable).sorted(by: Self.canonicalOrder)
+        try database.withExclusive {
+            try database.begin()
+            do {
                 for document in documents {
-                    // The snapshot title is authoritative for every row. This also
-                    // makes a title-only session update invalidate old FTS rows.
                     try database.insert(
-                        title: snapshot.title,
+                        title: title,
                         body: document.body,
-                        sessionID: snapshot.sessionID,
+                        sessionID: sessionID,
                         messageID: document.messageID.rawValue,
                         role: document.role.rawValue,
                         timestamp: document.timestamp
                     )
                 }
-                try database.upsertSessionMetadata(sessionID: snapshot.sessionID, digest: digest, incomplete: snapshot.truncated)
+                try database.upsertSessionMetadata(sessionID: sessionID, digest: "", incomplete: truncated)
                 try database.commit()
             } catch {
                 database.rollback()
@@ -161,6 +292,7 @@ public actor SearchIndex: SearchQuerying {
             }
         }
     }
+
 
     public func remove(sessionID: String) async throws {
         generation &+= 1
@@ -352,6 +484,13 @@ private final class SQLiteConnection: @unchecked Sendable {
             _ = api.close(db)
             throw SearchIndexError.sqlite(code: timeoutResult, message: api.errorMessage(db))
         }
+        let cacheResult = "PRAGMA cache_size = -\(SearchIndex.sqlitePageCacheBytes / 1024)".withCString {
+            api.exec(db, $0, nil, nil, nil)
+        }
+        guard cacheResult == SQLiteAPI.ok else {
+            _ = api.close(db)
+            throw SearchIndexError.sqlite(code: cacheResult, message: api.errorMessage(db))
+        }
         handle = db
     }
 
@@ -487,21 +626,73 @@ private final class SQLiteConnection: @unchecked Sendable {
                 truncatedSessions: counts.truncated
             )
         }
-        // Fetch all matching rows before applying diversity. Limiting in SQL
-        // would let a single large chat hide better hits from other chats.
-        let rows = try queryRows("SELECT session_id, message_id, title, body, role, timestamp, snippet(hermternal_search_messages, -1, '⟦', '⟧', '…', 32), bm25(hermternal_search_messages, ?, ?) FROM hermternal_search_messages WHERE hermternal_search_messages MATCH ? ORDER BY bm25(hermternal_search_messages, ?, ?)", bindings: [.double(10), .double(1), .text(ftsQuery), .double(10), .double(1)])
-        let grouped = Dictionary(grouping: rows, by: { $0.text(0) ?? "" }).mapValues { Array($0.prefix(SearchIndex.perSessionHitCap)) }
+
+        // The query reads only identity, metadata, rank, and SQLite's bounded
+        // snippet. It never selects message bodies or materializes all rows.
+        let sql = """
+            SELECT session_id, message_id, title, role, timestamp,
+                   snippet(hermternal_search_messages, -1, '⟦', '⟧', '…', 32),
+                   bm25(hermternal_search_messages, ?, ?)
+            FROM hermternal_search_messages
+            WHERE hermternal_search_messages MATCH ?
+            ORDER BY bm25(hermternal_search_messages, ?, ?)
+            LIMIT ?
+            """
+        guard let handle else { throw SearchIndexError.disabled }
+        var statement: OpaquePointer?
+        let result = sql.withCString { api.prepare(handle, $0, -1, &statement, nil) }
+        guard result == SQLiteAPI.ok, let statement else { throw makeError(result) }
+        defer { _ = api.finalize(statement) }
+        try bind(
+            [.double(10), .double(1), .text(ftsQuery), .double(10), .double(1),
+             .int(SearchIndex.maxDiversitySessions * SearchIndex.perSessionHitCap)],
+            to: statement
+        )
+
+        var candidates: [String: [SearchCandidate]] = [:]
+        var candidateBytes = 0
+        var retainedCandidates = 0
+        let maxWorkspace = SearchIndex.maxSearchWorkspaceBytes
+        let maxSessions = SearchIndex.maxDiversitySessions
+        while true {
+            let step = api.step(statement)
+            if step == SQLiteAPI.done { break }
+            guard step == SQLiteAPI.row else { throw makeError(step) }
+            let sessionID = columnText(statement, 0) ?? ""
+            let candidate = SearchCandidate(
+                sessionID: sessionID,
+                messageID: api.columnInt64(statement, 1),
+                title: columnText(statement, 2) ?? "",
+                role: columnText(statement, 3) ?? "",
+                timestamp: api.columnType(statement, 4) == SQLiteAPI.nullType ? nil : api.columnDouble(statement, 4),
+                snippet: columnText(statement, 5) ?? "",
+                rank: api.columnDouble(statement, 6),
+                estimatedBytes: (sessionID.utf8.count + 64)
+                    + (columnText(statement, 2)?.utf8.count ?? 0)
+                    + (columnText(statement, 5)?.utf8.count ?? 0)
+            )
+            guard candidateBytes + candidate.estimatedBytes <= maxWorkspace else { continue }
+            if candidates[sessionID] == nil {
+                guard candidates.count < maxSessions else { continue }
+                candidates[sessionID] = []
+            }
+            guard candidates[sessionID]!.count < SearchIndex.perSessionHitCap else { continue }
+            candidates[sessionID]!.append(candidate)
+            candidateBytes += candidate.estimatedBytes
+            retainedCandidates += 1
+            if retainedCandidates >= limit { break }
+        }
         var hits: [SearchHit] = []
-        hits.reserveCapacity(min(limit, rows.count))
+        hits.reserveCapacity(min(limit, SearchIndex.defaultLimit))
         var round = 0
         while hits.count < limit {
-            let rankedSessions = grouped.keys.compactMap { key -> (String, Row)? in
-                guard let row = grouped[key], row.indices.contains(round) else { return nil }
-                return (key, row[round])
-            }.sorted { ($0.1.double(7) ?? 0, $0.0) < ($1.1.double(7) ?? 0, $1.0) }
-            if rankedSessions.isEmpty { break }
-            for (_, row) in rankedSessions where hits.count < limit {
-                hits.append(Self.makeHit(row))
+            let rankedSessions = candidates.compactMap { sessionID, rows -> (String, SearchCandidate)? in
+                guard rows.indices.contains(round) else { return nil }
+                return (sessionID, rows[round])
+            }.sorted { ($0.1.rank, $0.0) < ($1.1.rank, $1.0) }
+            guard !rankedSessions.isEmpty else { break }
+            for (_, candidate) in rankedSessions where hits.count < limit {
+                hits.append(makeHit(candidate))
             }
             round += 1
         }
@@ -512,19 +703,20 @@ private final class SQLiteConnection: @unchecked Sendable {
         )
     }
 
-    private static func makeHit(_ row: Row) -> SearchHit {
-        let title = row.text(2) ?? ""
-        let body = row.text(3) ?? ""
-        let snippet = row.text(6) ?? ""
-        let excerpt = SearchExcerpt.attributed(snippet: snippet, fallbackTitle: title, body: body)
-        return SearchHit(
-            location: MessageLocation(sessionID: row.text(0) ?? "", messageID: ServerMessageID(rawValue: row.int64(1))),
-            sessionTitle: title,
-            excerpt: excerpt,
-            role: Role(rawValue: row.text(4) ?? "") ?? .user,
-            timestamp: row.double(5).map(Date.init(timeIntervalSince1970:))
+    private func columnText(_ statement: OpaquePointer, _ index: Int32) -> String? {
+        api.columnText(statement, index).map { String(cString: $0) }
+    }
+
+    private func makeHit(_ candidate: SearchCandidate) -> SearchHit {
+        SearchHit(
+            location: MessageLocation(sessionID: candidate.sessionID, messageID: ServerMessageID(rawValue: candidate.messageID)),
+            sessionTitle: candidate.title,
+            excerpt: SearchExcerpt.attributed(snippet: candidate.snippet, fallbackTitle: candidate.title, body: ""),
+            role: Role(rawValue: candidate.role) ?? .user,
+            timestamp: candidate.timestamp.map(Date.init(timeIntervalSince1970:))
         )
     }
+
 
     private func rebuildSchema() throws {
         try execute("DROP TABLE IF EXISTS hermternal_search_messages")
@@ -543,6 +735,16 @@ private final class SQLiteConnection: @unchecked Sendable {
         func text(_ n: Int) -> String? { values[n].text }
         func int64(_ n: Int) -> Int64 { values[n].int64 ?? 0 }
         func double(_ n: Int) -> Double? { values[n].double }
+    }
+    private struct SearchCandidate {
+        let sessionID: String
+        let messageID: Int64
+        let title: String
+        let role: String
+        let timestamp: Double?
+        let snippet: String
+        let rank: Double
+        let estimatedBytes: Int
     }
 
     private func scalarString(_ sql: String, bindings: [Binding] = []) throws -> String? { try queryRows(sql, bindings: bindings).first?.text(0) }
@@ -691,12 +893,34 @@ private final class SQLiteAPI: @unchecked Sendable {
 }
 
 private enum SearchDigest {
-    static func session(snapshot: SearchSessionSnapshot, documents: [SearchDocument]) -> String {
-        var data = Data(); append(snapshot.sessionID, &data); append(snapshot.title, &data); append(snapshot.truncated ? "1" : "0", &data)
-        for document in documents { append(String(document.messageID.rawValue), &data); append(document.body, &data); append(document.role.rawValue, &data); append(document.timestamp.map { String($0.timeIntervalSince1970) } ?? "", &data) }
-        return SHA256.hash(data).map { String(format: "%02x", $0) }.joined()
+    struct Incremental: Sendable {
+        private var sha = SHA256.Incremental()
+
+        init(sessionID: String, title: String, truncated: Bool) {
+            append(sessionID)
+            append(title)
+            append(truncated ? "1" : "0")
+        }
+
+        mutating func append(_ document: SearchDocument) {
+            append(String(document.messageID.rawValue))
+            append(document.body)
+            append(document.role.rawValue)
+            append(document.timestamp.map { String($0.timeIntervalSince1970) } ?? "")
+        }
+
+        mutating func append(_ value: String) {
+            var count = UInt64(value.utf8.count).bigEndian
+            let bytes = withUnsafeBytes(of: &count) { Array($0) }
+            for byte in bytes { sha.update(byte) }
+            for byte in value.utf8 { sha.update(byte) }
+        }
+
+        func finalize() -> String {
+            var copy = sha
+            return copy.finalize().map { String(format: "%02x", $0) }.joined()
+        }
     }
-    private static func append(_ value: String, _ data: inout Data) { let bytes = Data(value.utf8); var count = UInt64(bytes.count).bigEndian; withUnsafeBytes(of: &count) { data.append(contentsOf: $0) }; data.append(bytes) }
 }
 
 private enum SHA256 {
@@ -710,6 +934,73 @@ private enum SHA256 {
         0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
         0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
     ]
+    struct Incremental: Sendable {
+        private var h: [UInt32] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+        ]
+        private var buffer: [UInt8] = []
+        private var byteCount: UInt64 = 0
+
+        mutating func update(_ byte: UInt8) {
+            buffer.append(byte)
+            byteCount &+= 1
+            if buffer.count == 64 {
+                let block = buffer
+                process(block)
+                buffer.removeAll(keepingCapacity: true)
+            }
+        }
+
+        mutating func finalize() -> [UInt8] {
+            var tail = buffer
+            tail.append(0x80)
+            while tail.count % 64 != 56 { tail.append(0) }
+            var bitLength = (byteCount * 8).bigEndian
+            withUnsafeBytes(of: &bitLength) { tail.append(contentsOf: $0) }
+            for base in stride(from: 0, to: tail.count, by: 64) {
+                process(Array(tail[base..<(base + 64)]))
+            }
+            return h.flatMap {
+                [
+                    UInt8(truncatingIfNeeded: $0 >> 24),
+                    UInt8(truncatingIfNeeded: $0 >> 16),
+                    UInt8(truncatingIfNeeded: $0 >> 8),
+                    UInt8(truncatingIfNeeded: $0)
+                ]
+            }
+        }
+
+        private mutating func process(_ bytes: [UInt8]) {
+            var w = Array(repeating: UInt32(0), count: 64)
+            for i in 0..<16 {
+                let p = i * 4
+                w[i] = UInt32(bytes[p]) << 24 | UInt32(bytes[p + 1]) << 16
+                    | UInt32(bytes[p + 2]) << 8 | UInt32(bytes[p + 3])
+            }
+            for i in 16..<64 {
+                let a = w[i - 15], b = w[i - 2]
+                let s0 = a.rotateRight(7) ^ a.rotateRight(18) ^ (a >> 3)
+                let s1 = b.rotateRight(17) ^ b.rotateRight(19) ^ (b >> 10)
+                w[i] = w[i - 16] &+ s0 &+ w[i - 7] &+ s1
+            }
+            var a = h[0], b = h[1], c = h[2], d = h[3]
+            var e = h[4], f = h[5], g = h[6], x = h[7]
+            for i in 0..<64 {
+                let s1 = e.rotateRight(6) ^ e.rotateRight(11) ^ e.rotateRight(25)
+                let choose = (e & f) ^ (~e & g)
+                let t1 = x &+ s1 &+ choose &+ k[i] &+ w[i]
+                let s0 = a.rotateRight(2) ^ a.rotateRight(13) ^ a.rotateRight(22)
+                let majority = (a & b) ^ (a & c) ^ (b & c)
+                let t2 = s0 &+ majority
+                x = g; g = f; f = e; e = d &+ t1
+                d = c; c = b; b = a; a = t1 &+ t2
+            }
+            h[0] &+= a; h[1] &+= b; h[2] &+= c; h[3] &+= d
+            h[4] &+= e; h[5] &+= f; h[6] &+= g; h[7] &+= x
+        }
+    }
+
 
     static func hash(_ input: Data) -> [UInt8] {
         var bytes = [UInt8](input)
@@ -747,6 +1038,9 @@ private enum SHA256 {
             [UInt8(truncatingIfNeeded: value >> 24), UInt8(truncatingIfNeeded: value >> 16), UInt8(truncatingIfNeeded: value >> 8), UInt8(truncatingIfNeeded: value)]
         }
     }
+}
+private extension UInt64 {
+    func rotateLeft(_ count: UInt64) -> UInt64 { (self << count) | (self >> (64 - count)) }
 }
 
 private extension UInt32 {

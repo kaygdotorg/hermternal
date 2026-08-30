@@ -612,7 +612,7 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
         includeSegments: Bool = true,
         includeSourceSpans: Bool = false,
         owner: TraceOwner = .unattributed
-    ) -> MarkdownParseResult {
+    ) -> LegacyMarkdownParseResult {
 
         var segments: [MarkdownSegment] = []
         var sourceSpans: [(source: Range<Int>, language: Range<Int>?)] = []
@@ -794,7 +794,7 @@ public enum MarkdownSegment: Identifiable, Sendable, Equatable {
         } else {
             flushProse(at: proseEnd ?? textLength)
         }
-        return MarkdownParseResult(segments: segments, sourceSpans: sourceSpans)
+        return LegacyMarkdownParseResult(segments: segments, sourceSpans: sourceSpans)
     }
 
     private static func heading(
@@ -1010,7 +1010,7 @@ public final class ByteBoundedCache<Key: Hashable, Value>: @unchecked Sendable {
         }
     }
 }
-fileprivate struct MarkdownParseResult {
+fileprivate struct LegacyMarkdownParseResult {
     let segments: [MarkdownSegment]
     let sourceSpans: [(source: Range<Int>, language: Range<Int>?)]
 }
@@ -1038,7 +1038,7 @@ private final class MarkdownParseCache: @unchecked Sendable {
     func value(
         for key: String,
         owner: TraceOwner
-    ) -> MarkdownParseResult {
+    ) -> LegacyMarkdownParseResult {
         lookupOrParse(
             key,
             includeSourceSpans: false,
@@ -1073,7 +1073,7 @@ private final class MarkdownParseCache: @unchecked Sendable {
         includeSourceSpans: Bool,
         measureWait: Bool,
         owner: TraceOwner
-    ) -> MarkdownParseResult {
+    ) -> LegacyMarkdownParseResult {
         let textToken = includeSourceSpans
             ? nil
             : TextWorkTrace.begin(owner: owner)
@@ -1098,7 +1098,7 @@ private final class MarkdownParseCache: @unchecked Sendable {
                 characters: 0
             )
             if includeSourceSpans {
-                return MarkdownParseResult(
+                return LegacyMarkdownParseResult(
                     segments: cached,
                     sourceSpans: MarkdownSegment.parseUncached(
                         key,
@@ -1108,7 +1108,7 @@ private final class MarkdownParseCache: @unchecked Sendable {
                     ).sourceSpans
                 )
             }
-            return MarkdownParseResult(segments: cached, sourceSpans: [])
+            return LegacyMarkdownParseResult(segments: cached, sourceSpans: [])
         }
 
         // Parsing is deliberately outside the lock so a slow Markdown decode
@@ -1147,7 +1147,7 @@ private final class MarkdownParseCache: @unchecked Sendable {
             text: key
         )
         if let raced {
-            return MarkdownParseResult(
+            return LegacyMarkdownParseResult(
                 segments: raced,
                 sourceSpans: includeSourceSpans ? parsed.sourceSpans : []
             )

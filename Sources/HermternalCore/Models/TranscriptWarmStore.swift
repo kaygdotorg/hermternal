@@ -1,13 +1,22 @@
 import Foundation
 
-/// A complete transcript that can be applied synchronously while a chat opens.
-///
-/// The message array is a value type backed by copy-on-write storage. Reading a
-/// projection does not deep-copy message bodies or the array's elements.
+/// Metadata retained synchronously for a transcript whose records are held by
+/// `PagedTranscriptStore`. No message bodies are retained by this value.
+public struct WarmTranscriptMetadata: Sendable {
+    public let snapshot: AuthoritativeTranscriptSnapshot
+    public let summary: TranscriptSummary
+
+    public init(snapshot: AuthoritativeTranscriptSnapshot, summary: TranscriptSummary) {
+        self.snapshot = snapshot
+        self.summary = summary
+    }
+}
+
+/// Compatibility projection for older callers. New code should retain only
+/// `WarmTranscriptMetadata` and read bounded pages from the paged store.
 public struct WarmTranscriptProjection: Sendable {
     public let messages: [ChatMessage]
     public let snapshot: AuthoritativeTranscriptSnapshot
-    /// Bytes charged against the store budget for this projection.
     public let retainedBytes: Int
 
     internal init(
@@ -21,16 +30,11 @@ public struct WarmTranscriptProjection: Sendable {
     }
 }
 
-/// A bounded, synchronous cache of complete transcript projections.
-///
-/// The store is deliberately lock-backed rather than actor-backed: callers on
-/// the main actor need a warm projection in the same turn as selection changes.
-/// Every operation is thread-safe, and lock critical sections contain only
-/// dictionary/accounting work. The default budget is a conservative 128 MiB
-/// charge for decoded transcript values, message text, metadata, and the LRU
-/// entry structures.
+/// A bounded, synchronous metadata/projection cache. Complete projections are
+/// retained only for the legacy compatibility API; paged callers should use
+/// `publish(metadata:for:)`.
 public final class TranscriptWarmStore: @unchecked Sendable {
-    public static let defaultBudgetBytes = 128 * 1024 * 1024
+    public static let defaultBudgetBytes = 16 * 1024 * 1024
 
     public struct Metrics: Sendable, Equatable {
         public let projectionCount: Int
@@ -51,14 +55,31 @@ public final class TranscriptWarmStore: @unchecked Sendable {
     private let lock = NSLock()
     public let budgetBytes: Int
     private var entries: [String: Entry] = [:]
+    private var metadataEntries: [String: WarmTranscriptMetadata] = [:]
     private var retainedBytes = 0
     private var lruHead: String?
     private var lruTail: String?
 
-
     public init(budgetBytes: Int = TranscriptWarmStore.defaultBudgetBytes) {
         precondition(budgetBytes > 0, "Transcript warm-store budget must be positive")
         self.budgetBytes = budgetBytes
+    }
+
+    /// Publishes only metadata for a paged transcript. This is O(1) in
+    /// transcript size and is safe to call from the main actor.
+    public func publish(metadata: WarmTranscriptMetadata, for sessionID: String) {
+        lock.lock()
+        if let old = removeEntry(for: sessionID) {
+            retainedBytes -= old.projection.retainedBytes
+        }
+        metadataEntries[sessionID] = metadata
+        lock.unlock()
+    }
+
+    public func metadata(for sessionID: String) -> WarmTranscriptMetadata? {
+        lock.lock()
+        defer { lock.unlock() }
+        return metadataEntries[sessionID]
     }
 
     /// Publishes a projection only when its snapshot proves a complete
@@ -83,6 +104,9 @@ public final class TranscriptWarmStore: @unchecked Sendable {
         else {
             return false
         }
+        // Compatibility projections are retained in full only when the
+        // explicit byte budget admits them. Oversized transcripts are served
+        // by the metadata/paged path and do not displace an existing entry.
         let cost = Self.retainedBytes(
             messages: messages,
             snapshot: snapshot,
@@ -113,6 +137,7 @@ public final class TranscriptWarmStore: @unchecked Sendable {
         }
 
         // Replace in place, then append the new entry as most recently used.
+        metadataEntries.removeValue(forKey: sessionID)
         if let old = removeEntry(for: sessionID) {
             retainedBytes -= old.projection.retainedBytes
         }
@@ -189,6 +214,7 @@ public final class TranscriptWarmStore: @unchecked Sendable {
             ContentionTrace.finishInteractive(&contentionRequest)
         }
         for sessionID in sessionIDs {
+            metadataEntries.removeValue(forKey: sessionID)
             if let entry = removeEntry(for: sessionID) {
                 retainedBytes -= entry.projection.retainedBytes
             }
@@ -210,9 +236,10 @@ public final class TranscriptWarmStore: @unchecked Sendable {
             lock.unlock()
             ContentionTrace.finishInteractive(&contentionRequest)
         }
-        guard !entries.isEmpty else { return }
-        let staleSessionIDs = entries.keys.filter { !sessionIDs.contains($0) }
+        guard !entries.isEmpty || !metadataEntries.isEmpty else { return }
+        let staleSessionIDs = Set(entries.keys).union(metadataEntries.keys).filter { !sessionIDs.contains($0) }
         for sessionID in staleSessionIDs {
+            metadataEntries.removeValue(forKey: sessionID)
             if let entry = removeEntry(for: sessionID) {
                 retainedBytes -= entry.projection.retainedBytes
             }
@@ -231,6 +258,7 @@ public final class TranscriptWarmStore: @unchecked Sendable {
         lock.lock()
         ContentionTrace.recordLockWait(&contentionRequest, startedAt: lockStartedAt)
         entries.removeAll(keepingCapacity: true)
+        metadataEntries.removeAll(keepingCapacity: true)
         retainedBytes = 0
         lruHead = nil
         lruTail = nil

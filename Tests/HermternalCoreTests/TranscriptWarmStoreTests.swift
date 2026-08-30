@@ -15,6 +15,17 @@ func completeWarmProjectionIsImmediate() throws {
     #expect(projection.snapshot.fetchedRows == 3)
 }
 
+@Test("paged warm metadata does not retain a message projection")
+func pagedWarmMetadataIsOOne() throws {
+    let store = TranscriptWarmStore()
+    let snapshot = warmSnapshot(sessionID: "paged", fetchedRows: 10_000, serverTotal: 10_000)
+    let summary = TranscriptSummary(rowCount: 10_000, messageCount: 10_000)
+    store.publish(metadata: WarmTranscriptMetadata(snapshot: snapshot, summary: summary), for: "paged")
+    #expect(store.metadata(for: "paged")?.summary.messageCount == 10_000)
+    #expect(store.projection(for: "paged") == nil)
+    #expect(store.metrics.projectionCount == 0)
+}
+
 @Test("incomplete, mismatched, and under-total snapshots are rejected")
 func invalidWarmProjectionsAreRejected() {
     let store = TranscriptWarmStore()

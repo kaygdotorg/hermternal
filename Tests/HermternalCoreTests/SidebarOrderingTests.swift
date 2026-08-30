@@ -538,6 +538,72 @@ func sidebarOrderingMemoInvalidation() {
     #expect(memo.rebuildCount == 9)
 }
 
+@Test("Ordering memo estimates once, preserves admission, and caches rejection")
+func sidebarOrderingMemoAdmissionAndEstimateCounters() {
+    let calendar = Calendar(identifier: .gregorian)
+    let baseInput = SidebarOrderingInputs(
+        sessions: [testSession(id: "base", title: "Base", startedAt: 1, lastActive: 2)],
+        folders: [],
+        membership: [:],
+        sortMode: .lastActivity,
+        groupByDate: false,
+        calendar: calendar,
+        now: Date(timeIntervalSince1970: 10)
+    )
+    let baseProjection = SidebarOrderingProjection(
+        sections: sidebarRows(
+            sessions: baseInput.sessions,
+            folders: baseInput.folders,
+            membership: baseInput.membership,
+            sortMode: baseInput.sortMode,
+            groupByDate: baseInput.groupByDate,
+            calendar: baseInput.calendar,
+            now: baseInput.now
+        )
+    )
+    let budget = baseInput.estimatedByteCount + baseProjection.estimatedByteCount
+    var memo = SidebarOrderingMemo(maxRetainedBytes: budget)
+
+    let admitted = memo.resolve(baseInput)
+    #expect(admitted == baseProjection)
+    #expect(memo.rebuildCount == 1)
+    #expect(memo.estimateCount == 1)
+    #expect(memo.retainedByteCount <= budget)
+
+    _ = memo.resolve(baseInput)
+    #expect(memo.rebuildCount == 1)
+    #expect(memo.estimateCount == 1)
+
+    let oversizedInput = SidebarOrderingInputs(
+        sessions: [
+            testSession(
+                id: "base",
+                title: String(repeating: "x", count: budget + 1),
+                startedAt: 1,
+                lastActive: 2
+            )
+        ],
+        folders: baseInput.folders,
+        membership: baseInput.membership,
+        sortMode: baseInput.sortMode,
+        groupByDate: baseInput.groupByDate,
+        calendar: baseInput.calendar,
+        now: baseInput.now
+    )
+    let retainedBeforeRejection = memo.retainedByteCount
+    let fallback = memo.resolve(oversizedInput)
+    #expect(fallback == admitted)
+    #expect(memo.rebuildCount == 2)
+    #expect(memo.estimateCount == 2)
+    #expect(memo.retainedByteCount == retainedBeforeRejection)
+
+    let repeatedFallback = memo.resolve(oversizedInput)
+    #expect(repeatedFallback == admitted)
+    #expect(memo.rebuildCount == 2)
+    #expect(memo.estimateCount == 2)
+    #expect(memo.retainedByteCount == retainedBeforeRejection)
+}
+
 private func rowID(_ section: SidebarSectionKind, _ sessionID: String) -> SidebarRowID {
     SidebarRowID(section: section, sessionID: sessionID)
 }

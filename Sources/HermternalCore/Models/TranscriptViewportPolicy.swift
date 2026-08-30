@@ -47,4 +47,17 @@ public enum TranscriptViewportPolicy {
         }
         return currentTarget ?? .bottom
     }
+
+    /// Keeps the visible anchor fixed when a provisional row is replaced by
+    /// its measured height. The caller supplies the anchor row's old and new
+    /// document coordinates; no AppKit scroll state is needed here.
+    public static func preservedScrollOrigin(
+        currentOrigin: Double,
+        oldAnchorOrigin: Double,
+        newAnchorOrigin: Double
+    ) -> Double {
+        let correction = newAnchorOrigin - oldAnchorOrigin
+        guard correction.isFinite else { return currentOrigin }
+        return max(0, currentOrigin + correction)
+    }
 }

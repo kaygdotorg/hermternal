@@ -89,6 +89,53 @@ public struct SidebarOrderingProjection: Equatable, Sendable {
             return nil
         }
     }
+
+    /// Conservative resident cost for this projection and its row strings.
+    public var estimatedByteCount: Int {
+        sections.reduce(0) { total, section in
+            let sectionBytes = section.rows.reduce(section.kind.estimatedByteCount) { subtotal, row in
+                saturatingAdd(subtotal, row.estimatedByteCount)
+            }
+            return saturatingAdd(total, sectionBytes)
+        }
+    }
+}
+
+private extension SidebarSectionKind {
+    var estimatedByteCount: Int {
+        switch self {
+        case .schedules, .pinned, .ungrouped:
+            return MemoryLayout<Self>.stride
+        case let .folder(id, name):
+            return saturatingAdd(
+                MemoryLayout<Self>.stride,
+                saturatingAdd(id.utf8.count, name.utf8.count)
+            )
+        case .bucket:
+            return MemoryLayout<Self>.stride
+        }
+    }
+}
+
+private extension SidebarRow {
+    var estimatedByteCount: Int {
+        let session = self.session
+        let strings = session.id.utf8.count
+            + session.title.utf8.count
+            + session.preview.utf8.count
+            + session.source.utf8.count
+            + (session.profile?.utf8.count ?? 0)
+            + session.displayTitle.utf8.count
+        return saturatingAdd(
+            MemoryLayout<Self>.stride + MemoryLayout<ChatSession>.stride,
+            strings
+        )
+    }
+}
+
+private func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+    let result = lhs.addingReportingOverflow(rhs)
+    return result.overflow ? Int.max : result.partialValue
 }
 
 /// Inputs that can change sidebar ordering.
@@ -109,12 +156,7 @@ public struct SidebarOrderingInputs: Equatable {
     /// A repeated body pass copies the same storage. The memo retains the
     /// previous input strongly, so its storage cannot be deallocated while
     /// this token is compared. Allocator reuse therefore cannot make a new
-    /// collection appear unchanged. A representation change only causes the
-    /// equality fallback and cannot return stale data.
-    ///
-    /// A mutation must copy storage while the memo retains the previous input,
-    /// so this check cannot return a stale projection. The equality fallback
-    /// handles equal values that use separate storage.
+    /// collection appear unchanged.
     fileprivate let storageValidity: SidebarOrderingStorageValidity
 
     public init(
@@ -141,6 +183,35 @@ public struct SidebarOrderingInputs: Equatable {
             groupByDate: groupByDate,
             calendar: calendar,
             now: now
+        )
+    }
+
+    /// Conservative resident cost for the retained input collections.
+    public var estimatedByteCount: Int {
+        let sessionBytes = sessions.reduce(0) { total, session in
+            let strings = session.id.utf8.count
+                + session.title.utf8.count
+                + session.preview.utf8.count
+                + session.source.utf8.count
+                + (session.profile?.utf8.count ?? 0)
+                + session.displayTitle.utf8.count
+            return saturatingAdd(total, MemoryLayout<ChatSession>.stride + strings)
+        }
+        let folderBytes = folders.reduce(0) { total, folder in
+            saturatingAdd(
+                total,
+                MemoryLayout<Folder>.stride + folder.id.utf8.count + folder.name.utf8.count
+            )
+        }
+        let membershipBytes = membership.reduce(0) { total, pair in
+            saturatingAdd(
+                total,
+                pair.key.utf8.count + pair.value.utf8.count + MemoryLayout<String>.stride
+            )
+        }
+        return saturatingAdd(
+            saturatingAdd(sessionBytes, folderBytes),
+            saturatingAdd(membershipBytes, MemoryLayout<Self>.stride)
         )
     }
 
@@ -218,22 +289,44 @@ public struct SidebarOrderingMemo {
     // Retain the collections while their storage tokens are resident.
     private var input: SidebarOrderingInputs?
     private var projection: SidebarOrderingProjection?
+    private var rejectedValidity: SidebarOrderingStorageValidity?
+    private var retainedBytes = 0
+    public let maxRetainedBytes: Int
     public private(set) var rebuildCount = 0
+    public private(set) var estimateCount = 0
+    public private(set) var lastResolveWasRejected = false
+    /// Bytes charged to this memo's bounded resident projection.
+    public var retainedByteCount: Int { retainedBytes }
 
-    public init() {}
+    public init(
+        maxRetainedBytes: Int = AppMemoryProfile.mac440MiB.limit(for: .sidebar)
+    ) {
+        precondition(maxRetainedBytes > 0)
+        self.maxRetainedBytes = maxRetainedBytes
+    }
 
     public mutating func resolve(_ input: SidebarOrderingInputs) -> SidebarOrderingProjection {
         if let cachedInput = self.input, let projection {
             if cachedInput.storageValidity == input.storageValidity {
+                lastResolveWasRejected = false
                 return projection
             }
             // Different storage can still contain equal values. Keep this
             // fallback because storage identity is only a fast-path proof.
             if cachedInput == input {
                 self.input = input
+                lastResolveWasRejected = false
                 return projection
             }
         }
+        // An oversized input is rejected without displacing the last admitted
+        // projection. Avoid rebuilding the same rejected storage on each body
+        // pass while the caller still has a stable fallback to display.
+        if rejectedValidity == input.storageValidity, let projection {
+            lastResolveWasRejected = true
+            return projection
+        }
+
         let next = SidebarOrderingProjection(
             sections: sidebarRows(
                 sessions: input.sessions,
@@ -245,9 +338,24 @@ public struct SidebarOrderingMemo {
                 now: input.now
             )
         )
+        let retained = input.estimatedByteCount.addingReportingOverflow(next.estimatedByteCount)
+        estimateCount += 1
+        rebuildCount += 1
+        guard !retained.overflow, retained.partialValue <= maxRetainedBytes else {
+            rejectedValidity = input.storageValidity
+            lastResolveWasRejected = true
+            // Keep the old admission. The returned value serves this call only
+            // when no previous admission exists.
+            return projection ?? next
+        }
+
+        // Admit the replacement before releasing the old one. This preserves
+        // a valid resident projection if the replacement is later rejected.
         self.input = input
         projection = next
-        rebuildCount += 1
+        retainedBytes = retained.partialValue
+        rejectedValidity = nil
+        lastResolveWasRejected = false
         return next
     }
 }

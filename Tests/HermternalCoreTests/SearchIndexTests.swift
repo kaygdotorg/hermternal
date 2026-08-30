@@ -193,6 +193,26 @@ func warmBenchmarkReport() async throws {
     print("SearchIndex warm benchmark: \(elapsed)")
 }
 
+@Test("paged replacement ingests incrementally and preserves digest")
+func pagedReplacementIngestsPages() async throws {
+    let index = try makeIndex()
+    defer { removeIndex(index.url) }
+    let pages = AsyncThrowingStream<SearchDocumentPage, Error> { continuation in
+        continuation.yield(SearchDocumentPage(documents: [document(1, "first needle")]))
+        continuation.yield(SearchDocumentPage(documents: [document(2, "second needle")]))
+        continuation.finish()
+    }
+    try await index.replacePaged(sessionID: "paged", title: "Paged", truncated: false, pages: pages)
+    #expect(try await index.indexedMessageCount(sessionID: "paged") == 2)
+    #expect(try await index.search("needle", limit: 10).hits.count == 2)
+    let firstDigest = try await index.storedDigest(for: "paged")
+    try await index.replacePaged(sessionID: "paged", title: "Paged", truncated: false, pages: AsyncThrowingStream { continuation in
+        continuation.yield(SearchDocumentPage(documents: [document(1, "first needle"), document(2, "second needle")]))
+        continuation.finish()
+    })
+    #expect(try await index.storedDigest(for: "paged") == firstDigest)
+}
+
 private func document(_ id: Int64, _ body: String, role: Role = .user) -> SearchDocument {
     SearchDocument(messageID: ServerMessageID(rawValue: id), body: body, role: role)
 }

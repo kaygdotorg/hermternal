@@ -220,3 +220,162 @@ func markdownSharedByteCacheEvictsDeterministically() {
     #expect(newValue == "new")
     #expect(cache.retainedByteCount == 8)
 }
+
+@Test("rich Markdown round trips Core constructs and Unicode")
+func richMarkdownRoundTripsCoreConstructs() {
+    let source = """
+    # Títle
+
+    A **bold** and *italic* [link](https://example.com "Example") with `code` and \\*literal\\*.
+
+    - parent
+      * child
+    12) numbered
+
+    > quoted line
+
+    ```swift
+    let value = "é"
+    ```
+    """
+    let result = MarkdownDocument.parse(source)
+
+    #expect(result.isValid)
+    #expect(result.error == nil)
+    #expect(MarkdownDocument.serialize(result.document) == source)
+    #expect(result.document.serializedSource == source)
+    #expect(result.document.blocks.count == 5)
+    guard case .heading(_, _, let level, _) = result.document.blocks[0],
+          case .paragraph(_, _, let inlines) = result.document.blocks[1],
+          case .list(_, _, let items) = result.document.blocks[2],
+          case .quote(_, _, _) = result.document.blocks[3],
+          case .code(_, _, let language, let body) = result.document.blocks[4] else {
+        Issue.record("Expected heading, paragraph, list, quote, and code blocks")
+        return
+    }
+    #expect(level == 1)
+    #expect(items.count == 3)
+    #expect(items[1].depth == 1)
+    #expect(language == "swift")
+    #expect(body.contains("é"))
+    #expect(inlines.contains {
+        if case .link(let destination, let title, _) = $0.kind {
+            return destination == "https://example.com" && title == "Example"
+        }
+        return false
+    })
+    #expect(inlines.contains {
+        if case .text(let text) = $0.kind { return text.contains("*literal*") }
+        return false
+    })
+}
+
+@Test("rich Markdown exposes output-only tables tasks footnotes and strike")
+func richMarkdownExposesOutputExtensions() {
+    let source = """
+    | Name | Value |
+    | --- | --- |
+    | one | **1** |
+
+    - [x] done
+      - [ ] nested
+
+    [^note]: Supporting text with ~~removed~~ words.
+    """
+    let result = MarkdownDocument.parse(source)
+
+    #expect(result.isValid)
+    #expect(MarkdownDocument.serialize(result.document) == source)
+    guard case .table(_, _, let headers, let rows) = result.document.blocks[0],
+          case .taskList(_, _, let items) = result.document.blocks[1],
+          case .footnote(_, _, let label, let footnoteInlines) = result.document.blocks[2] else {
+        Issue.record("Expected table, task list, and footnote blocks")
+        return
+    }
+    #expect(headers.count == 2)
+    #expect(rows.count == 1)
+    #expect(items.count == 2)
+    #expect(items[0].depth == 0)
+    #expect(items[1].depth == 1)
+    #expect(label == "note")
+    #expect(footnoteInlines.contains {
+        if case .strikethrough = $0.kind { return true }
+        return false
+    })
+    #expect(items[0].taskState == .checked)
+    #expect(items[1].taskState == .unchecked)
+}
+
+@Test("rich Markdown preserves source ranges and inline selection")
+func richMarkdownPreservesSourceRanges() {
+    let source = "é **bold**\n\n[open](https://example.com)"
+    let result = MarkdownDocument.parse(source)
+
+    #expect(result.isValid)
+    guard case .paragraph(_, let paragraphRange, let inlines) = result.document.blocks[0],
+          let bold = inlines.first(where: {
+              if case .strong = $0.kind { return true }
+              return false
+          }),
+          case .paragraph(_, let linkRange, let linkInlines) = result.document.blocks[1],
+          let link = linkInlines.first else {
+        Issue.record("Expected source-addressable paragraph inlines")
+        return
+    }
+    #expect(paragraphRange.range == 0..<10)
+    #expect(bold.sourceRange.range == 2..<10)
+    #expect(linkRange.range == 12..<39)
+    #expect(link.sourceRange.range == 12..<39)
+}
+
+@Test("invalid rich Markdown keeps original Source and precise error")
+func invalidRichMarkdownKeepsSource() {
+    let source = "before\n\n```swift\nmissing closer"
+    let result = MarkdownDocument.parse(source)
+
+    #expect(!result.isValid)
+    #expect(result.error?.message == "Unterminated fenced code block")
+    #expect(result.error?.sourceRange.location == 8)
+    #expect(result.document.source == source)
+    guard let first = result.document.blocks.first,
+          case .source(_, let range) = first else {
+        Issue.record("Invalid input must remain a Source block")
+        return
+    }
+    #expect(range.range == 0..<source.utf16.count)
+    #expect(MarkdownDocument.serialize(result.document) == source)
+}
+
+@Test("rich Markdown bounds source and inline work")
+func richMarkdownBoundsWork() {
+    let tooLarge = MarkdownDocument.parse(
+        "123456789",
+        limits: .init(maxSourceBytes: 8, maxBlocks: 2, maxInlines: 2)
+    )
+    #expect(!tooLarge.isValid)
+    #expect(tooLarge.document.source == "123456789")
+
+    let tooMany = MarkdownDocument.parse(
+        "one **two** and *three*",
+        limits: .init(maxSourceBytes: 100, maxBlocks: 4, maxInlines: 1)
+    )
+    #expect(!tooMany.isValid)
+    #expect(tooMany.document.source == "one **two** and *three*")
+}
+
+@Test("rich Markdown maps selection ranges back to exact source")
+func richMarkdownMapsRangesToSource() {
+    let source = "A **bold** value"
+    let result = MarkdownDocument.parse(source)
+    guard case .paragraph(_, _, let inlines) = result.document.blocks.first,
+          let bold = inlines.first(where: {
+              if case .strong = $0.kind { return true }
+              return false
+          }) else {
+        Issue.record("Expected a strong inline")
+        return
+    }
+
+    #expect(result.document.sourceText(in: bold.sourceRange) == "**bold**")
+    #expect(result.document.sourceText(for: result.document.blocks[0]) == source)
+}

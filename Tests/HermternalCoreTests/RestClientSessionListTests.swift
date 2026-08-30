@@ -67,7 +67,7 @@ func restSessionListEnforcesPageBound() async throws {
         switch error {
         case .sessionPageLimitExceeded:
             break
-        case .badStatus, .messagePageLimitExceeded, .noMutableFields, .sessionNotFound,
+        case .badStatus, .messagePageLimitExceeded, .messagePageTooLarge, .noMutableFields, .sessionNotFound,
              .purgeEmptyIDs, .purgeBatchTooLarge, .purgeInvalidConfirmation,
              .purgeUnsupportedEndpoint, .purgeHTTPError, .purgeMalformedResponse:
             Issue.record("unexpected REST error: \(error)")
@@ -95,7 +95,7 @@ func restSessionListFailureDoesNotReturnPartialRows() async throws {
         switch error {
         case .badStatus(let status, _):
             #expect(status == 503)
-        case .messagePageLimitExceeded, .sessionPageLimitExceeded,
+        case .messagePageLimitExceeded, .messagePageTooLarge, .sessionPageLimitExceeded,
              .noMutableFields, .sessionNotFound, .purgeEmptyIDs,
              .purgeBatchTooLarge, .purgeInvalidConfirmation,
              .purgeUnsupportedEndpoint, .purgeHTTPError, .purgeMalformedResponse:

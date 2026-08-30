@@ -169,15 +169,37 @@ public struct CachedTranscript: Codable, Sendable {
     public let version: Int
     public let messages: [ChatMessage]
     public let snapshot: AuthoritativeTranscriptSnapshot?
+    /// Optional wire metadata retained for offline turn projection.
+    public let records: [WireMessageRecord]?
 
     public init(
         version: Int,
         messages: [ChatMessage],
-        snapshot: AuthoritativeTranscriptSnapshot?
+        snapshot: AuthoritativeTranscriptSnapshot?,
+        records: [WireMessageRecord]? = nil
     ) {
         self.version = version
         self.messages = messages
         self.snapshot = snapshot
+        self.records = records
+    }
+
+    public var turns: [TranscriptTurn] {
+        let values = records ?? messages.map { message in
+            let id: String
+            switch message.id {
+            case .server(let value): id = String(value.rawValue)
+            case .provisional(let value): id = value.uuidString
+            }
+            return WireMessageRecord(
+                messageID: id,
+                role: message.role.rawValue,
+                text: message.text,
+                reasoning: message.reasoning,
+                timestamp: message.timestamp
+            )
+        }
+        return TranscriptTurnProjector.project(records: values)
     }
 
     /// The decoded residency charged to the bounded in-memory cache.
@@ -207,6 +229,15 @@ public struct CachedTranscript: Codable, Sendable {
         if let snapshot {
             total = Self.add(total, MemoryLayout<AuthoritativeTranscriptSnapshot>.stride + 32)
             total = Self.add(total, snapshot.sessionID.utf8.count)
+        }
+        if let records {
+            total = Self.add(total, Self.multiply(MemoryLayout<WireMessageRecord>.stride, by: records.count))
+            for record in records {
+                total = Self.add(total, record.messageID.utf8.count)
+                total = Self.add(total, record.displayKind?.utf8.count ?? 0)
+                total = Self.add(total, record.toolCallID?.utf8.count ?? 0)
+                total = Self.add(total, record.toolName?.utf8.count ?? 0)
+            }
         }
         return total
     }
@@ -257,6 +288,11 @@ public actor HistoryCache: TranscriptPersisting {
     /// Version 3 invalidates files containing the retired content-hash IDs.
     public static let version = 3
 
+    public enum PagedError: Error, Equatable, Sendable {
+        case unavailable
+        case invalidRecord
+    }
+
     private let directory: URL?
     private let fileSystem: any CacheFileSystem
     private let codec: any CacheCodec
@@ -268,13 +304,14 @@ public actor HistoryCache: TranscriptPersisting {
     private var memory: [String: CachedTranscript] = [:]
     private var memoryOrder: [String] = []
     private var memoryBytes: Int64 = 0
-    // Disk reads run outside the actor while this table coalesces callers.
-    // A flight commits decoded residency exactly once when a waiter resumes.
     private var inFlightReads: [String: ReadFlight] = [:]
+    private var epoch: UInt64 = 0
+    /// Paged stores are disk-backed actors. The dictionary only retains the
+    /// small actor handles and never a transcript corpus.
+    private var pagedStores: [String: PagedTranscriptStore] = [:]
     // A write is valid only if no clear happened after the read it derives
     // from. The epoch is actor-local so checking it and touching disk are
     // one atomic operation relative to clear().
-    private var epoch: UInt64 = 0
 
     private struct CacheReadResult: Sendable {
         let transcript: CachedTranscript?
@@ -397,6 +434,105 @@ public actor HistoryCache: TranscriptPersisting {
         if let directory = self.directory {
             try? fileSystem.createDirectory(at: directory)
         }
+    }
+
+    private struct PagedFileSystemAdapter: TranscriptFileSystem {
+        let base: any CacheFileSystem
+
+        func data(at url: URL) throws -> Data { try base.data(at: url) }
+        func write(_ data: Data, to url: URL) throws { try base.write(data, to: url) }
+        func remove(_ url: URL) throws { try base.removeItem(at: url) }
+        func move(_ source: URL, to destination: URL) throws {
+            let data = try base.data(at: source)
+            try base.write(data, to: destination)
+            try base.removeItem(at: source)
+        }
+        func exists(_ url: URL) -> Bool { base.fileExists(at: url) }
+        func createDirectory(_ url: URL) throws { try base.createDirectory(at: url) }
+    }
+
+    private func pagedDirectory(for id: String) -> URL? {
+        guard let directory else { return nil }
+        return directory.appendingPathComponent("paged-\(Self.encodedFilename(for: id))", isDirectory: true)
+    }
+
+    /// Returns the disk-backed store for a session. A v3 flat cache entry is
+    /// migrated one record at a time on first access, then the old file is
+    /// removed only after the paged manifest and records are durable.
+    public func pagedStore(for id: String) async throws -> PagedTranscriptStore {
+        guard !id.isEmpty, let pagedDirectory = pagedDirectory(for: id) else {
+            throw PagedError.unavailable
+        }
+        if let existing = pagedStores[id] { return existing }
+        let store = PagedTranscriptStore(
+            route: TranscriptRoute(sessionID: id, epoch: epoch),
+            directory: pagedDirectory,
+            fileSystem: PagedFileSystemAdapter(base: fileSystem)
+        )
+        try await store.load()
+
+        let summary = try await store.summary()
+        if summary.messageCount == 0,
+           let legacy = readIsolated(for: id, request: nil).transcript,
+           !legacy.messages.isEmpty
+        {
+            for message in legacy.messages {
+                try Task.checkCancellation()
+                try await store.append(Self.wireRecord(from: message))
+            }
+            if let old = url(for: id) {
+                try? fileSystem.removeItem(at: old)
+            }
+            forget(id)
+        }
+        pagedStores[id] = store
+        return store
+    }
+
+    /// Applies one bounded REST page with back-pressure. Only the page is
+    /// materialized; all records are persisted individually by the paged store.
+    public func appendTranscriptPage(
+        _ page: TranscriptMessagePage,
+        for id: String,
+        expectedEpoch: UInt64? = nil
+    ) async throws -> TranscriptSummary {
+        let authorized = expectedEpoch ?? epoch
+        guard authorized == epoch, !Task.isCancelled else {
+            throw TranscriptStoreError.staleEpoch(expected: authorized, actual: epoch)
+        }
+        let store = try await pagedStore(for: id)
+        let records = page.messages.compactMap(WireMessageRecord.init(row:))
+        for record in records {
+            try Task.checkCancellation()
+            _ = try await store.append(record)
+        }
+        return try await store.summary()
+    }
+
+    public func transcriptPage(
+        for id: String,
+        request: TranscriptPageRequest
+    ) async throws -> TranscriptPage {
+        try await pagedStore(for: id).page(request)
+    }
+
+    public func pagedSummary(for id: String) async throws -> TranscriptSummary {
+        try await pagedStore(for: id).summary()
+    }
+
+    private static func wireRecord(from message: ChatMessage) -> WireMessageRecord {
+        let id: String
+        switch message.id {
+        case .server(let value): id = String(value.rawValue)
+        case .provisional(let value): id = value.uuidString
+        }
+        return WireMessageRecord(
+            messageID: id,
+            role: message.role.rawValue,
+            text: message.text,
+            reasoning: message.reasoning,
+            timestamp: message.timestamp
+        )
     }
 
     private struct ReconciliationIndex {
@@ -990,7 +1126,8 @@ public actor HistoryCache: TranscriptPersisting {
     @discardableResult
     public func remove(sessionID: String) -> SessionLocalCleanupResult {
         forget(sessionID)
-        let targets = [url(for: sessionID), legacyURL(for: sessionID)]
+        pagedStores.removeValue(forKey: sessionID)
+        let targets = [url(for: sessionID), legacyURL(for: sessionID), pagedDirectory(for: sessionID)]
             .compactMap { $0 }
             .reduce(into: [String: URL]()) { result, target in
                 result[target.path] = target
@@ -1010,7 +1147,6 @@ public actor HistoryCache: TranscriptPersisting {
             index: .notRequired
         )
     }
-
     public func transcript(for id: String) -> CachedTranscript? {
         readIsolated(for: id, request: nil).transcript
     }
@@ -1032,7 +1168,6 @@ public actor HistoryCache: TranscriptPersisting {
         let payload = CachedTranscript(version: Self.version, messages: messages, snapshot: snapshot)
         return storePayload(payload, for: id, expectedEpoch: expectedEpoch, retainMemory: true)
     }
-
     public func isCached(_ id: String) -> Bool { transcript(for: id) != nil }
 
     public func reconcile(validIDs: [String]) -> CacheStatistics {
@@ -1067,8 +1202,6 @@ public actor HistoryCache: TranscriptPersisting {
                     continue
                 }
             case .legacyCollision:
-                // A legacy collision cannot be assigned safely. Keep it for
-                // a direct read rather than deleting a user's only copy.
                 continue
             case .orphan:
                 try? fileSystem.removeItem(at: file)
@@ -1103,6 +1236,7 @@ public actor HistoryCache: TranscriptPersisting {
         guard !Task.isCancelled, let directory else { return false }
         do {
             if fileSystem.fileExists(at: directory) { try fileSystem.removeItem(at: directory) }
+            pagedStores.removeAll(keepingCapacity: true)
             memory.removeAll()
             memoryOrder.removeAll()
             memoryBytes = 0

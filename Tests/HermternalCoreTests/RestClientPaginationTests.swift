@@ -15,6 +15,25 @@ func restPagingPreservesOrder() async throws {
     #expect(fixture.offsets == [0, 500])
 }
 
+@Test("REST paging delivers bounded pages to an awaited consumer")
+func restPagingStreamsPagesWithBackpressure() async throws {
+    let rows = (0..<556).map { pagingRow(id: Int64($0)) }
+    let pages = [
+        PagingPage(rows: Array(rows.prefix(500)), returned: 500),
+        PagingPage(rows: Array(rows.dropFirst(500)), returned: 56)
+    ]
+    let (client, fixture, cleanup) = try makePagingClient(pages: pages)
+    defer { cleanup() }
+    let collector = StreamPageCollector()
+    let summary = try await client.streamSessionMessages(durableID: fixture.id) { page in
+        await collector.append(page)
+    }
+    #expect(await collector.ids == pagingIDs(rows))
+    #expect(await collector.maximumPageRows <= 500)
+    #expect(summary.messageCount == 556)
+    #expect(fixture.offsets == [0, 500])
+}
+
 @Test("REST paging fetches the measured 896-row session in order")
 func restPagingFetchesEightHundredNinetySixRows() async throws {
     let rows = (0..<896).map { pagingRow(id: Int64($0)) }
@@ -97,7 +116,8 @@ func restPagingEnforcesPageBound() async throws {
         switch error {
         case .messagePageLimitExceeded:
             break
-        case .badStatus, .sessionPageLimitExceeded, .noMutableFields, .sessionNotFound,
+        case .badStatus, .messagePageTooLarge, .sessionPageLimitExceeded, .noMutableFields,
+             .sessionNotFound,
              .purgeEmptyIDs, .purgeBatchTooLarge, .purgeInvalidConfirmation,
              .purgeUnsupportedEndpoint, .purgeHTTPError, .purgeMalformedResponse:
             Issue.record("unexpected REST error: \(error)")
@@ -107,6 +127,16 @@ func restPagingEnforcesPageBound() async throws {
     }
     #expect(fixture.offsets.count == RestClient.maximumMessagePages)
     #expect(fixture.offsets.last == (RestClient.maximumMessagePages - 1) * 500)
+}
+
+private actor StreamPageCollector {
+    private(set) var ids: [Int64?] = []
+    private(set) var maximumPageRows = 0
+
+    func append(_ page: TranscriptMessagePage) {
+        ids.append(contentsOf: pagingIDs(page.messages))
+        maximumPageRows = max(maximumPageRows, page.messages.count)
+    }
 }
 
 private struct PagingPage: Sendable {

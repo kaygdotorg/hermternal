@@ -71,3 +71,12 @@ func unroutableWebSocketReplyIsNotSilent() throws {
         Issue.record("unexpected error: \(error)")
     }
 }
+
+@Test("gateway cancellation distinguishes pre-send from unknown post-send")
+func gatewayCancellationOutcomesAreDistinct() {
+    #expect(GatewayError.cancelledBeforeSend != GatewayError.outcomeUnknownAfterSend)
+    #expect(GatewayError.cancelledBeforeSend.localizedDescription
+        == "Gateway request cancelled before it was sent.")
+    #expect(GatewayError.outcomeUnknownAfterSend.localizedDescription
+        == "Gateway request cancelled after sending; its outcome is unknown.")
+}

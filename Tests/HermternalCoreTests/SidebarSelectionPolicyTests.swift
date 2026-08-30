@@ -45,6 +45,37 @@ func supersededSelectionCancelsExpensiveWork() {
     #expect(generations.isCurrent(second))
 }
 
+@Test("Pending repeat opens coalesce only before first publication")
+func pendingRepeatOpenCoalescingStopsAfterFirstPublication() {
+    #expect(
+        TranscriptSwitchWorkPolicy.shouldCoalescePendingOpen(
+            sessionID: "chat-1",
+            activeSessionID: "chat-1",
+            hasPublishedFirstFrame: false
+        )
+    )
+    #expect(
+        !TranscriptSwitchWorkPolicy.shouldCoalescePendingOpen(
+            sessionID: "chat-1",
+            activeSessionID: "chat-1",
+            hasPublishedFirstFrame: true
+        )
+    )
+    #expect(
+        !TranscriptSwitchWorkPolicy.shouldCoalescePendingOpen(
+            sessionID: "chat-2",
+            activeSessionID: "chat-1",
+            hasPublishedFirstFrame: false
+        )
+    )
+}
+
+@Test("Only repeated arrow events defer expensive opening")
+func repeatedArrowEventsDeferOpening() {
+    #expect(TranscriptSwitchWorkPolicy.shouldDeferNavigationOpen(isNavigationRepeat: true))
+    #expect(!TranscriptSwitchWorkPolicy.shouldDeferNavigationOpen(isNavigationRepeat: false))
+}
+
 @Test("Context targets preserve a mixed selected chat and folder set")
 func contextTargetsSupportMixedSelection() {
     let selected: Set<SidebarSelectionID> = [.chat("chat-1"), .folder("work")]

@@ -1,5 +1,70 @@
 import Foundation
 
+private final class SyncTailAccumulator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rows: [JSONValue] = []
+
+    func append(_ page: [JSONValue]) {
+        lock.lock()
+        rows.append(contentsOf: page)
+        let overflow = rows.count - TranscriptPublicationPolicy.initialMessageCount
+        if overflow > 0 { rows.removeFirst(overflow) }
+        lock.unlock()
+    }
+
+    var value: [JSONValue] {
+        lock.lock()
+        defer { lock.unlock() }
+        return rows
+    }
+}
+private final class SyncCompatibilityAccumulator: @unchecked Sendable {
+    static let maximumBytes = 16 * 1024 * 1024
+    private let lock = NSLock()
+    private var rows: [JSONValue] = []
+    private var bytes = 0
+    private var oversized = false
+
+    func append(_ page: TranscriptMessagePage) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !oversized else { return }
+        let estimated = page.messages.reduce(into: 0) { total, value in
+            total += Self.estimatedBytes(value)
+        }
+        let amount = max(page.byteCount, estimated)
+        guard amount <= Self.maximumBytes - min(bytes, Self.maximumBytes) else {
+            rows.removeAll(keepingCapacity: false)
+            oversized = true
+            return
+        }
+        bytes += amount
+        rows.append(contentsOf: page.messages)
+    }
+
+    var value: [JSONValue] {
+        lock.lock()
+        defer { lock.unlock() }
+        return rows
+    }
+
+    var isOversized: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return oversized
+    }
+    private static func estimatedBytes(_ value: JSONValue) -> Int {
+        switch value {
+        case .string(let value): return value.utf8.count
+        case .array(let values): return values.reduce(0) { $0 + estimatedBytes($1) }
+        case .object(let fields):
+            return fields.reduce(0) { $0 + $1.key.utf8.count + estimatedBytes($1.value) }
+        default: return 16
+        }
+    }
+}
+
+
 /// A durable transcript that should be reconciled with the upstream history.
 ///
 /// Requests intentionally carry only immutable session metadata. Selection is
@@ -56,8 +121,8 @@ public struct TranscriptSyncResult: Sendable {
 /// Segments only the rows that the first transcript frame will render. This
 /// function is called from the coordinator's non-main-actor worker closure,
 /// before AppModel publishes the projection into the warm store.
-private func presegmentInitialWindow(_ messages: [ChatMessage]) -> Int? {
-    let start = max(0, messages.count - TranscriptWindowPolicy.initialWindowSize)
+private func presegmentInitialPublication(_ messages: [ChatMessage]) -> Int? {
+    let start = max(0, messages.count - TranscriptPublicationPolicy.initialMessageCount)
     var segmentedRows = 0
     for message in messages[start...] {
         guard !Task.isCancelled else { return nil }
@@ -130,43 +195,69 @@ public struct TranscriptSyncCoordinator: Sendable {
                    let snapshot = cached.snapshot,
                    snapshot.sessionID == request.id,
                    snapshot.projectedMessages == cached.messages.count {
-                    guard let presegmentedRows = presegmentInitialWindow(cached.messages) else {
+                    let tail = Array(cached.messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
+                    guard let presegmentedRows = presegmentInitialPublication(tail) else {
                         return nil
                     }
                     return TranscriptSyncResult(
                         id: request.id,
                         title: request.title,
-                        messages: cached.messages,
+                        messages: tail,
                         snapshot: snapshot,
                         cacheStore: nil,
                         presegmentedRows: presegmentedRows
                     )
                 }
+                let compatibility = SyncCompatibilityAccumulator()
 
-                guard let authoritative = try? await source.fetchAuthoritative(sessionID: request.id),
-                      !Task.isCancelled
+                let tail = SyncTailAccumulator()
+                let metadata: AuthoritativeTranscriptMetadata
+                do {
+                    metadata = try await source.streamAuthoritative(sessionID: request.id) { page in
+                        try Task.checkCancellation()
+                        if let pagedCache = cache as? HistoryCache {
+                            _ = try await pagedCache.appendTranscriptPage(
+                                page,
+                                for: request.id,
+                                expectedEpoch: expectedEpoch
+                            )
+                        }
+                        compatibility.append(page)
+                        tail.append(page.messages)
+                    }
+                } catch {
+                    return nil
+                }
+                guard !Task.isCancelled,
+                      await cache.currentEpoch() == expectedEpoch
                 else { return nil }
-                let projected = ChatMessage.projectREST(historyRows: authoritative.rows)
-                let snapshot = CacheFirstOpenPolicy.snapshot(
+                let compatibilityRows = compatibility.value
+                let projectedRows = compatibility.isOversized ? tail.value : compatibilityRows
+                let projected = ChatMessage.projectREST(historyRows: projectedRows)
+                let snapshot = AuthoritativeTranscriptSnapshot(
                     sessionID: request.id,
-                    rows: authoritative.rows,
+                    serverTotal: metadata.serverTotal ?? request.serverTotal,
+                    fetchedRows: metadata.messageCount,
                     projectedMessages: projected.count,
-                    serverTotal: authoritative.serverTotal ?? request.serverTotal
+                    truncated: false,
+                    fetchedAt: Date()
                 )
+                let stored: CacheStoreResult?
+                if !compatibility.isOversized {
+                    stored = try? await cache.storeForWarming(
+                        projected,
+                        snapshot: snapshot,
+                        title: request.title,
+                        for: request.id,
+                        expectedEpoch: expectedEpoch
+                    )
+                } else {
+                    stored = nil
+                }
                 guard !Task.isCancelled,
                       await cache.currentEpoch() == expectedEpoch
                 else { return nil }
-                let stored = try? await cache.storeForWarming(
-                    projected,
-                    snapshot: snapshot,
-                    title: request.title,
-                    for: request.id,
-                    expectedEpoch: expectedEpoch
-                )
-                guard !Task.isCancelled,
-                      await cache.currentEpoch() == expectedEpoch
-                else { return nil }
-                guard let presegmentedRows = presegmentInitialWindow(projected) else {
+                guard let presegmentedRows = presegmentInitialPublication(projected) else {
                     return nil
                 }
                 return TranscriptSyncResult(

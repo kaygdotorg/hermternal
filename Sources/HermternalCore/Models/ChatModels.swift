@@ -382,6 +382,16 @@ public struct ChatMessage: Identifiable, Codable, Sendable {
             )
         }
     }
+    /// Projects authoritative rows into the platform-neutral turn document.
+    public static func projectTurns(
+        historyRows rows: [JSONValue],
+        sessionModel: String? = nil
+    ) -> [TranscriptTurn] {
+        TranscriptTurnProjector.project(
+            records: rows.compactMap(WireMessageRecord.init(row:)),
+            sessionModel: sessionModel
+        )
+    }
 
     /// Compatibility name for callers that provide REST rows.
     public static func project(historyRows rows: [JSONValue], sessionID _: String) -> [ChatMessage] {

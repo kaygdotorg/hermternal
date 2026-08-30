@@ -99,6 +99,84 @@ public final class TranscriptOpenHandle: @unchecked Sendable {
     }
 }
 
+private final class TranscriptInitialPageState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didPublish = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !didPublish else { return false }
+        didPublish = true
+        return true
+    }
+}
+
+private final class TranscriptTailAccumulator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [JSONValue] = []
+
+    func append(_ page: [JSONValue]) {
+        lock.lock()
+        values.append(contentsOf: page)
+        let overflow = values.count - TranscriptPublicationPolicy.initialMessageCount
+        if overflow > 0 { values.removeFirst(overflow) }
+        lock.unlock()
+    }
+
+    var rows: [JSONValue] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
+}
+private final class TranscriptCompatibilityAccumulator: @unchecked Sendable {
+    static let maximumBytes = 16 * 1024 * 1024
+    private let lock = NSLock()
+    private var values: [JSONValue] = []
+    private var bytes = 0
+    private var didOverflow = false
+
+    func append(_ page: TranscriptMessagePage) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !didOverflow else { return }
+        let estimated = page.messages.reduce(into: 0) { total, value in
+            total += Self.estimatedBytes(value)
+        }
+        let pageBytes = max(page.byteCount, estimated)
+        guard pageBytes <= Self.maximumBytes - min(bytes, Self.maximumBytes) else {
+            values.removeAll(keepingCapacity: false)
+            didOverflow = true
+            return
+        }
+        bytes += pageBytes
+        values.append(contentsOf: page.messages)
+    }
+
+    var rows: [JSONValue] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
+
+    var isOversized: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didOverflow
+    }
+
+    private static func estimatedBytes(_ value: JSONValue) -> Int {
+        switch value {
+        case .string(let value): return value.utf8.count
+        case .array(let values): return values.reduce(0) { $0 + estimatedBytes($1) }
+        case .object(let fields):
+            return fields.reduce(0) { $0 + $1.key.utf8.count + estimatedBytes($1.value) }
+        default: return 16
+        }
+    }
+}
+
 private final class TranscriptOpenState: @unchecked Sendable {
     private let lock = NSLock()
     private var cachedValue: CachedTranscript?
@@ -259,14 +337,18 @@ private final class TranscriptOpenTaskRef: @unchecked Sendable {
 
 public struct TranscriptOpenResult: Sendable {
     public let liveSessionID: String?
+    /// Only the bounded tail needed for the first frame. Full history lives
+    /// in PagedTranscriptStore and is requested by ordinal pages.
     public let messages: [ChatMessage]
     public let cacheStore: CacheStoreResult?
     public let notice: String?
     public let didFetchREST: Bool
-    /// True only for the immediate cache-first paint; later phases are
-    /// authoritative and may intentionally carry a nil live id on failure.
     public let isCachedPhase: Bool
+    /// True when this result publishes the first REST page before the
+    /// authoritative stream has finished.
+    public let isInitialPage: Bool
     public let snapshot: AuthoritativeTranscriptSnapshot?
+    public let summary: TranscriptSummary?
 
     public init(
         liveSessionID: String?,
@@ -275,7 +357,9 @@ public struct TranscriptOpenResult: Sendable {
         notice: String? = nil,
         didFetchREST: Bool = false,
         isCachedPhase: Bool = false,
-        snapshot: AuthoritativeTranscriptSnapshot? = nil
+        isInitialPage: Bool = false,
+        snapshot: AuthoritativeTranscriptSnapshot? = nil,
+        summary: TranscriptSummary? = nil
     ) {
         self.liveSessionID = liveSessionID
         self.messages = messages
@@ -283,7 +367,9 @@ public struct TranscriptOpenResult: Sendable {
         self.notice = notice
         self.didFetchREST = didFetchREST
         self.isCachedPhase = isCachedPhase
+        self.isInitialPage = isInitialPage
         self.snapshot = snapshot
+        self.summary = summary
     }
 }
 
@@ -399,7 +485,7 @@ public struct TranscriptOpener: Sendable {
     ) -> AsyncStream<TranscriptOpenResult> {
         let state = TranscriptOpenState()
         let ownedHandle = handle ?? TranscriptOpenHandle()
-        return AsyncStream { continuation in
+        return AsyncStream(bufferingPolicy: .bufferingNewest(2)) { continuation in
             let taskRef = TranscriptOpenTaskRef()
             let terminate: @Sendable (String) -> Void = { detail in
                 state.clear()
@@ -425,15 +511,18 @@ public struct TranscriptOpener: Sendable {
                 if cacheEnabled {
                     guard !Task.isCancelled else {
                         terminate("cancelled")
+                        continuation.finish()
                         return
                     }
                     let read = await cache.read(for: sessionID)
                     guard !Task.isCancelled else {
                         terminate("cancelled")
+                        continuation.finish()
                         return
                     }
                     state.setCached(read.transcript, epoch: read.epoch)
-                    ownedHandle.setRetainedMessageCount(read.transcript?.messages.count ?? 0)
+                    let cachedMessages = Self.boundedTail(read.transcript?.messages ?? [])
+                    ownedHandle.setRetainedMessageCount(cachedMessages.count)
                 }
                 guard isCurrent(generation) else {
                     continuation.finish()
@@ -442,7 +531,7 @@ public struct TranscriptOpener: Sendable {
                 continuation.yield(
                     TranscriptOpenResult(
                         liveSessionID: nil,
-                        messages: state.cached?.messages ?? [],
+                        messages: Self.boundedTail(state.cached?.messages ?? []),
                         isCachedPhase: true,
                         snapshot: state.cached?.snapshot
                     )
@@ -457,9 +546,12 @@ public struct TranscriptOpener: Sendable {
                         let resumed = try await source.resume(sessionID: sessionID)
                         guard !Task.isCancelled else {
                             terminate("cancelled")
+                            continuation.finish()
                             return
                         }
-                        ownedHandle.setRetainedMessageCount(resumed.rows.count)
+                        ownedHandle.setRetainedMessageCount(
+                            min(resumed.rows.count, TranscriptPublicationPolicy.initialMessageCount)
+                        )
                         state.setResumed(resumed)
                         TranscriptSwitchTrace.resume(
                             sessionID: sessionID,
@@ -474,6 +566,7 @@ public struct TranscriptOpener: Sendable {
                     } catch {
                         guard !Task.isCancelled else {
                             terminate("cancelled")
+                            continuation.finish()
                             return
                         }
                         TranscriptSwitchTrace.resume(
@@ -514,27 +607,80 @@ public struct TranscriptOpener: Sendable {
                     continuation.finish()
                     return
                 }
-
                 do {
-                    let authoritative = try await source.fetchAuthoritative(sessionID: sessionID)
-                    guard !Task.isCancelled else {
+                    // Keep only the bounded tail for the first frame. A
+                    // concrete HistoryCache persists every incoming page in
+                    // PagedTranscriptStore before the next page is fetched.
+                    let tail = TranscriptTailAccumulator()
+                    let compatibility = TranscriptCompatibilityAccumulator()
+                    var metadata: AuthoritativeTranscriptMetadata?
+                    let initialPageState = TranscriptInitialPageState()
+                    metadata = try await source.streamAuthoritative(
+                        sessionID: sessionID
+                    ) { page in
+                        guard self.isCurrent(generation) else {
+                            throw CancellationError()
+                        }
+                        if cacheEnabled,
+                           let pagedCache = cache as? any PagedTranscriptPersisting {
+                            _ = try await pagedCache.appendTranscriptPage(
+                                page,
+                                title: sessionTitle,
+                                for: sessionID,
+                                expectedEpoch: state.cacheEpoch
+                            )
+                        } else if cacheEnabled,
+                                  let pagedCache = cache as? HistoryCache {
+                            _ = try await pagedCache.appendTranscriptPage(
+                                page,
+                                for: sessionID,
+                                expectedEpoch: state.cacheEpoch
+                            )
+                        }
+                        guard self.isCurrent(generation) else {
+                            throw CancellationError()
+                        }
+                        compatibility.append(page)
+                        tail.append(page.messages)
+                        let initialMessages = Self.boundedTail(
+                            ChatMessage.projectREST(historyRows: page.messages)
+                        )
+                        guard !initialMessages.isEmpty,
+                              initialPageState.claim()
+                        else { return }
+                        ownedHandle.setRetainedMessageCount(initialMessages.count)
+                        continuation.yield(
+                            TranscriptOpenResult(
+                                liveSessionID: state.resumed?.liveSessionID,
+                                messages: initialMessages,
+                                didFetchREST: true,
+                                isInitialPage: true
+                            )
+                        )
+                    }
+                    guard let metadata, !Task.isCancelled else {
                         terminate("cancelled")
+                        continuation.finish()
                         return
                     }
-                    ownedHandle.setRetainedMessageCount(authoritative.rows.count)
-                    state.setAuthoritative(authoritative)
-                    let total = authoritative.serverTotal ?? serverTotal
-                    let projected = ChatMessage.projectREST(historyRows: authoritative.rows)
-                    ownedHandle.setRetainedMessageCount(projected.count)
-                    state.setProjected(projected)
-                    let snapshot = CacheFirstOpenPolicy.snapshot(
+                    let compatibilityRows = compatibility.rows
+                    let projectedRows = compatibility.isOversized ? tail.rows : compatibilityRows
+                    let projected = ChatMessage.projectREST(historyRows: projectedRows)
+                    let published = Self.boundedTail(projected)
+                    ownedHandle.setRetainedMessageCount(published.count)
+                    let total = metadata.serverTotal ?? serverTotal
+                    let snapshot = AuthoritativeTranscriptSnapshot(
                         sessionID: sessionID,
-                        rows: authoritative.rows,
+                        serverTotal: total,
+                        fetchedRows: metadata.messageCount,
                         projectedMessages: projected.count,
-                        serverTotal: total
+                        truncated: false,
+                        fetchedAt: Date()
                     )
                     var cacheStore: CacheStoreResult?
-                    if cacheEnabled {
+                    // Non-paged third-party caches retain compatibility only
+                    // for a single bounded page.
+                    if cacheEnabled, !compatibility.isOversized {
                         guard isCurrent(generation) else {
                             continuation.finish()
                             return
@@ -546,30 +692,36 @@ public struct TranscriptOpener: Sendable {
                             for: sessionID,
                             expectedEpoch: state.cacheEpoch
                         )
-                        guard isCurrent(generation) else {
-                            continuation.finish()
-                            return
-                        }
                     }
-                    continuation.yield(
-                        TranscriptOpenResult(
-                            liveSessionID: state.resumed?.liveSessionID,
-                            messages: projected,
-                            cacheStore: cacheStore,
-                            notice: resumeNotice,
-                            didFetchREST: true,
-                            snapshot: snapshot
-                        )
-                    )
-                } catch {
-                    guard !Task.isCancelled, isCurrent(generation) else {
-                        terminate("cancelled")
+                    guard isCurrent(generation) else {
+                        continuation.finish()
                         return
                     }
                     continuation.yield(
                         TranscriptOpenResult(
                             liveSessionID: state.resumed?.liveSessionID,
-                            messages: state.cached?.messages ?? [],
+                            messages: published,
+                            cacheStore: cacheStore,
+                            notice: resumeNotice,
+                            didFetchREST: true,
+                            snapshot: snapshot,
+                            summary: TranscriptSummary(
+                                rowCount: metadata.messageCount,
+                                messageCount: metadata.messageCount,
+                                countKind: .exact
+                            )
+                        )
+                    )
+                } catch {
+                    guard !Task.isCancelled, isCurrent(generation) else {
+                        terminate("cancelled")
+                        continuation.finish()
+                        return
+                    }
+                    continuation.yield(
+                        TranscriptOpenResult(
+                            liveSessionID: state.resumed?.liveSessionID,
+                            messages: Self.boundedTail(state.cached?.messages ?? []),
                             notice: error.localizedDescription,
                             didFetchREST: true,
                             snapshot: state.cached?.snapshot
@@ -644,19 +796,49 @@ public struct TranscriptOpener: Sendable {
         }
         let cacheEpoch = cacheEnabled ? await cache.currentEpoch() : nil
         do {
-            let authoritative = try await source.fetchAuthoritative(sessionID: sessionID)
+            let tail = TranscriptTailAccumulator()
+            let compatibility = TranscriptCompatibilityAccumulator()
+            let metadata = try await source.streamAuthoritative(sessionID: sessionID) { page in
+                try Task.checkCancellation()
+                guard self.isCurrent(generation) else { throw CancellationError() }
+                if cacheEnabled,
+                   let pagedCache = cache as? any PagedTranscriptPersisting {
+                    _ = try await pagedCache.appendTranscriptPage(
+                        page,
+                        title: sessionTitle,
+                        for: sessionID,
+                        expectedEpoch: cacheEpoch
+                    )
+                } else if cacheEnabled,
+                          let pagedCache = cache as? HistoryCache {
+                    _ = try await pagedCache.appendTranscriptPage(
+                        page,
+                        for: sessionID,
+                        expectedEpoch: cacheEpoch
+                    )
+                }
+                guard self.isCurrent(generation) else {
+                    throw CancellationError()
+                }
+                compatibility.append(page)
+                tail.append(page.messages)
+            }
             guard isCurrent(generation) else { return nil }
-            let total = authoritative.serverTotal ?? serverTotal
-            let projected = ChatMessage.projectREST(historyRows: authoritative.rows)
-            let snapshot = CacheFirstOpenPolicy.snapshot(
+            let compatibilityRows = compatibility.rows
+            let projectedRows = compatibility.isOversized ? tail.rows : compatibilityRows
+            let projected = ChatMessage.projectREST(historyRows: projectedRows)
+            let published = Self.boundedTail(projected)
+            let total = metadata.serverTotal ?? serverTotal
+            let snapshot = AuthoritativeTranscriptSnapshot(
                 sessionID: sessionID,
-                rows: authoritative.rows,
+                serverTotal: total,
+                fetchedRows: metadata.messageCount,
                 projectedMessages: projected.count,
-                serverTotal: total
+                truncated: false,
+                fetchedAt: Date()
             )
             var cacheStore: CacheStoreResult?
-            if cacheEnabled {
-                guard isCurrent(generation) else { return nil }
+            if cacheEnabled, !compatibility.isOversized {
                 cacheStore = try await cache.store(
                     projected,
                     snapshot: snapshot,
@@ -664,10 +846,10 @@ public struct TranscriptOpener: Sendable {
                     for: sessionID,
                     expectedEpoch: cacheEpoch
                 )
-                guard isCurrent(generation) else { return nil }
             }
+            guard isCurrent(generation) else { return nil }
             return TranscriptReconciliationResult(
-                messages: projected,
+                messages: published,
                 cacheStore: cacheStore,
                 snapshot: snapshot
             )
@@ -676,10 +858,14 @@ public struct TranscriptOpener: Sendable {
             // A failed REST reconciliation retains the already displayed
             // transcript and leaves its prior cache snapshot untouched.
             return TranscriptReconciliationResult(
-                messages: currentMessages,
+                messages: Self.boundedTail(currentMessages),
                 notice: error.localizedDescription
             )
         }
+    }
+
+    private static func boundedTail(_ messages: [ChatMessage]) -> [ChatMessage] {
+        Array(messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
     }
 
     private func isCurrent(_ generation: Int) -> Bool {

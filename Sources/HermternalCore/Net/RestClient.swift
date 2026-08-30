@@ -1,10 +1,57 @@
 import Foundation
+
+private final class TranscriptRowAccumulator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rows: [JSONValue] = []
+
+    func append(_ values: [JSONValue]) {
+        lock.lock()
+        rows.append(contentsOf: values)
+        lock.unlock()
+    }
+
+    var value: [JSONValue] {
+        lock.lock()
+        defer { lock.unlock() }
+        return rows
+    }
+}
 /// Controls which archived durable sessions a session-list request returns.
 public enum SessionArchiveFilter: String, Sendable {
     case exclude
     case include
     case only
 }
+
+/// One bounded page of durable transcript messages.
+public struct TranscriptMessagePage: Sendable {
+    public let messages: [JSONValue]
+    public let returned: Int
+    public let offset: Int
+    public let serverTotal: Int?
+    public let byteCount: Int
+    public let hasMore: Bool
+
+    public init(
+        messages: [JSONValue],
+        returned: Int? = nil,
+        offset: Int,
+        serverTotal: Int? = nil,
+        byteCount: Int = 0,
+        hasMore: Bool = false
+    ) {
+        self.messages = messages
+        self.returned = returned ?? messages.count
+        self.offset = offset
+        self.serverTotal = serverTotal
+        self.byteCount = byteCount
+        self.hasMore = hasMore
+    }
+}
+
+/// A bounded page callback. The callback is awaited before the next network
+/// page is requested, providing back-pressure to a paged transcript store.
+public typealias TranscriptMessagePageConsumer = @Sendable (TranscriptMessagePage) async throws -> Void
 
 /// One page of durable dashboard sessions returned by the REST API.
 public struct SessionListPage: Sendable {
@@ -107,71 +154,96 @@ public actor RestClient {
         self.urlSession = urlSession
     }
 
-    /// All persisted transcript rows for a durable session id, in server order.
-    ///
-    /// The endpoint hard-clamps `limit` to 500. Pages are requested oldest
-    /// first and concatenated without sorting so the database's stable order
-    /// is preserved.
-    public func sessionMessages(durableID: String, limit: Int = 500) async throws -> [JSONValue] {
+    /// Delivers durable transcript pages oldest-first. The consumer is awaited
+    /// before the next page is requested, so callers can apply explicit
+    /// memory admission and persist records without an accumulating stream.
+    public func streamSessionMessages(
+        durableID: String,
+        limit: Int = 500,
+        maximumPageBytes: Int = TranscriptPageRequest.hardMaximumBytes,
+        onPage: @escaping TranscriptMessagePageConsumer
+    ) async throws -> TranscriptSummary {
+        let pageLimit = min(max(limit, 1), 500)
+        let byteLimit = max(1, min(maximumPageBytes, TranscriptPageRequest.hardMaximumBytes))
         var credentials = try await auth.validCredentials()
         var hasRefreshedAfterUnauthorized = false
-        let pageLimit = min(max(limit, 1), 500)
-        var rows: [JSONValue] = []
-        rows.reserveCapacity(pageLimit)
         var offset = 0
+        var messageCount = 0
 
-        // A full page is not proof of completion: the API exposes no total or
-        // has-more flag, so an exact multiple of 500 pays one empty probe.
-        // TranscriptOpener's AsyncStream onTermination cancels this task, so
-        // these checks stop paging when navigation supersedes an open.
         for _ in 0..<Self.maximumMessagePages {
             try Task.checkCancellation()
             let page: MessagesResponse
+            let bytes: Int
             do {
-                page = try await fetchMessagePage(
+                let fetched = try await fetchMessagePage(
                     durableID: durableID,
                     limit: pageLimit,
                     offset: offset,
-                    credentials: credentials
+                    credentials: credentials,
+                    maximumBytes: byteLimit
                 )
+                page = fetched.response
+                bytes = fetched.byteCount
             } catch {
                 guard case RestError.badStatus(let status, _) = error,
                       status == 401,
-                      hasRefreshedAfterUnauthorized == false
-                else {
-                    throw error
-                }
+                      !hasRefreshedAfterUnauthorized
+                else { throw error }
                 hasRefreshedAfterUnauthorized = true
-                // The local expiry can lag server-side revocation. Refresh
-                // once, then retry this page with the new bearer; a refresh
-                // failure is sessionExpired and escapes without a loop.
                 credentials = try await auth.refreshCredentials()
-                page = try await fetchMessagePage(
+                let fetched = try await fetchMessagePage(
                     durableID: durableID,
                     limit: pageLimit,
                     offset: offset,
-                    credentials: credentials
+                    credentials: credentials,
+                    maximumBytes: byteLimit
                 )
+                page = fetched.response
+                bytes = fetched.byteCount
             }
             try Task.checkCancellation()
-            rows.append(contentsOf: page.messages)
-
             let returned = page.pagination?.returned ?? page.messages.count
-            if returned < pageLimit {
-                return rows
+            let total = page.pagination?.total
+            let hasMore = returned >= pageLimit
+            try await onPage(TranscriptMessagePage(
+                messages: page.messages,
+                returned: returned,
+                offset: offset,
+                serverTotal: total,
+                byteCount: bytes,
+                hasMore: hasMore
+            ))
+            messageCount += page.messages.count
+            if !hasMore {
+                return TranscriptSummary(
+                    rowCount: messageCount,
+                    messageCount: messageCount,
+                    countKind: .exact,
+                    generation: 0,
+                    epoch: 0
+                )
             }
             offset += pageLimit
         }
-
         throw RestError.messagePageLimitExceeded
+    }
+
+    public func sessionMessages(durableID: String, limit: Int = 500) async throws -> [JSONValue] {
+        let accumulator = TranscriptRowAccumulator()
+        _ = try await streamSessionMessages(durableID: durableID, limit: limit) { page in
+            try Task.checkCancellation()
+            accumulator.append(page.messages)
+        }
+        return accumulator.value
     }
 
     private func fetchMessagePage(
         durableID: String,
         limit: Int,
         offset: Int,
-        credentials: Credentials
-    ) async throws -> MessagesResponse {
+        credentials: Credentials,
+        maximumBytes: Int
+    ) async throws -> (response: MessagesResponse, byteCount: Int) {
         var components = URLComponents(
             url: server.appending(path: "api/sessions/\(durableID)/messages"),
             resolvingAgainstBaseURL: false
@@ -197,7 +269,19 @@ public actor RestClient {
                 String(decoding: data.prefix(512), as: UTF8.self)
             )
         }
-        return try responseDecoder.decode(MessagesResponse.self, from: data)
+        // A single provider token can exceed the in-memory page admission.
+        // Spool that response before decoding rather than rejecting valid
+        // history; the callback still applies back-pressure one page at a time.
+        if data.count > maximumBytes {
+            let spool = FileManager.default.temporaryDirectory
+                .appendingPathComponent("hermternal-transcript-\(UUID().uuidString).json")
+            try data.write(to: spool, options: [.atomic])
+            defer { try? FileManager.default.removeItem(at: spool) }
+            try Task.checkCancellation()
+            let spooled = try Data(contentsOf: spool)
+            return (try responseDecoder.decode(MessagesResponse.self, from: spooled), spooled.count)
+        }
+        return (try responseDecoder.decode(MessagesResponse.self, from: data), data.count)
     }
 
     private struct MessagesResponse: Decodable {
@@ -207,6 +291,7 @@ public actor RestClient {
 
     private struct Pagination: Decodable {
         let returned: Int?
+        let total: Int?
     }
 
     /// Lists durable dashboard sessions without opening or resuming live sessions.
@@ -537,6 +622,7 @@ public actor RestClient {
 public enum RestError: LocalizedError, Sendable {
     case badStatus(Int, String)
     case messagePageLimitExceeded
+    case messagePageTooLarge(maxBytes: Int)
     case sessionPageLimitExceeded
     case noMutableFields
     case sessionNotFound
@@ -553,6 +639,8 @@ public enum RestError: LocalizedError, Sendable {
             "Request failed (HTTP \(status)): \(body)"
         case .messagePageLimitExceeded:
             "The transcript exceeded the maximum number of REST pages."
+        case .messagePageTooLarge(let maxBytes):
+            "The transcript page exceeded the \(maxBytes)-byte admission limit."
         case .sessionPageLimitExceeded:
             "The session list exceeded the maximum number of REST pages."
         case .noMutableFields:

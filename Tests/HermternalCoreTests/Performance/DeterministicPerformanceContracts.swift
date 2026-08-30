@@ -200,8 +200,8 @@ func performanceWarmSwitchPureWorkContract() {
     let rowHeightCache = CountingSwitchLookupCache<RowHeightCacheKey, Double>()
     let preparedContentCache = CountingSwitchLookupCache<MessageIdentity, String>()
     var rowHeightKeys: [RowHeightCacheKey] = []
-    rowHeightKeys.reserveCapacity(plan.window.range.count)
-    for index in plan.window.range {
+    rowHeightKeys.reserveCapacity(plan.messageRange.count)
+    for index in plan.messageRange {
         let message = messages[index]
         let key = performanceRowHeightKey(for: message)
         rowHeightKeys.append(key)
@@ -212,25 +212,25 @@ func performanceWarmSwitchPureWorkContract() {
     var warmProjectionLookups = 0
     let projection = store.projection(for: sessionID)
     warmProjectionLookups += 1
-    let resolvedWindow = plan.window
-    let windowPolicyResolutions = 1
+    let resolvedMessageRange = plan.messageRange
+    let initialPublicationRangeResolutions = 1
     let heights = rowHeightKeys.compactMap { rowHeightCache.lookup($0) }
-    let prepared = plan.window.range.map { index in
+    let prepared = resolvedMessageRange.map { index in
         preparedContentCache.lookup(messages[index].id)
     }
     let pureWorkUnits = warmProjectionLookups
-        + windowPolicyResolutions
+        + initialPublicationRangeResolutions
         + rowHeightCache.lookupCount
         + preparedContentCache.lookupCount
 
     #expect(projection?.messages.count == messages.count)
-    #expect(resolvedWindow.range.count == TranscriptWindowPolicy.initialWindowSize)
-    #expect(heights.count == plan.window.range.count)
+    #expect(resolvedMessageRange.count == TranscriptPublicationPolicy.initialMessageCount)
+    #expect(heights.count == plan.messageRange.count)
     #expect(prepared.allSatisfy { $0 != nil })
     #expect(warmProjectionLookups == 1)
-    #expect(windowPolicyResolutions == 1)
-    #expect(rowHeightCache.lookupCount == plan.window.range.count)
-    #expect(preparedContentCache.lookupCount == plan.window.range.count)
+    #expect(initialPublicationRangeResolutions == 1)
+    #expect(rowHeightCache.lookupCount == plan.messageRange.count)
+    #expect(preparedContentCache.lookupCount == plan.messageRange.count)
     #expect(plan.workUnits == pureWorkUnits)
     #expect(plan.workUnits <= TranscriptSwitchWorkPolicy.maximumPureWorkUnits)
     print(
@@ -241,7 +241,7 @@ func performanceWarmSwitchPureWorkContract() {
             + "workUnits=\(pureWorkUnits) "
             + "gate<=\(TranscriptSwitchWorkPolicy.maximumPureWorkUnits) "
             + "warmProjectionLookups=\(warmProjectionLookups) "
-            + "windowPolicyResolutions=\(windowPolicyResolutions) "
+            + "initialPublicationRangeResolutions=\(initialPublicationRangeResolutions) "
             + "rowHeightHits=\(rowHeightCache.lookupCount) "
             + "preparedContentHits=\(preparedContentCache.lookupCount)"
     )
@@ -405,6 +405,42 @@ func performanceResourceReport() async throws {
         "PERF|disk bytes per 1000 messages|"
         + "index=\(indexBytesPerThousand) cache=\(cacheBytesPerThousand) "
         + "gate<=\(diskFootprintCeiling)"
+    )
+}
+
+@Test("performance contract: worst-v1 app memory envelope")
+func performanceWorstTranscriptMemoryContract() {
+    let report = WorstTranscriptFixture.run(profile: .mac440MiB)
+    #expect(report.fixtureVersion == WorstTranscriptFixture.version)
+    #expect(report.sessionCount == 10_000)
+    #expect(report.folderCount == 1_000)
+    #expect(report.attachmentCount == 8)
+    #expect(report.residentAttachmentDataCount == 0)
+    #expect(report.switchCount == 20)
+    #expect(report.headVisits == 1)
+    #expect(report.tailVisits == 1)
+    #expect(report.searchQueries == 1)
+    #expect(report.findQueries == 1)
+    #expect(report.streamChunks == 20)
+    #expect(report.stalePublications == 0)
+    #expect(report.everyCategoryWithinEnvelope)
+    #expect(report.withinProfileEnvelope)
+    #expect(report.settledResidentBytes == 0)
+    #expect(report.settledGrowthBytes <= 32 * 1_048_576)
+    print(
+        "PERF|worst-v1 memory signpost|"
+            + "sessions=\(report.sessionCount) folders=\(report.folderCount) "
+            + "switches=\(report.switchCount) streamChunks=\(report.streamChunks)"
+    )
+    print(
+        "PERF|worst-v1 app-owned bytes|"
+            + "peak=\(report.metrics.peakBytes) limit=\(report.profile.totalBytes) "
+            + "settled=\(report.settledResidentBytes)"
+    )
+    print(
+        "PERF|worst-v1 physical RSS report-only|"
+            + "measure on each target device with Instruments or Activity Monitor; "
+            + "do not use RSS as a deterministic test gate"
     )
 }
 

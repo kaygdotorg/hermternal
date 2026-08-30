@@ -1,5 +1,16 @@
 import Foundation
 
+/// Extended persistence seam for bounded transcript ingestion.
+public protocol PagedTranscriptPersisting: TranscriptPersisting {
+    func appendTranscriptPage(
+        _ page: TranscriptMessagePage,
+        title: String,
+        for sessionID: String,
+        expectedEpoch: UInt64?
+    ) async throws -> TranscriptSummary
+    func pagedSummary(for sessionID: String) async throws -> TranscriptSummary
+}
+
 
 /// Core-owned policy boundary between HistoryCache and SearchIndex.
 ///
@@ -10,7 +21,7 @@ import Foundation
 /// coordinator is deliberately an actor: cache epoch checks and the resulting
 /// index mutation are serialized here, so a clear cannot be followed by an
 /// index write derived from an older read.
-public actor SearchIndexReconciliation: TranscriptPersisting {
+public actor SearchIndexReconciliation: PagedTranscriptPersisting {
     private let cache: HistoryCache
     private let index: SearchIndex
     private var degraded = false
@@ -80,7 +91,8 @@ public actor SearchIndexReconciliation: TranscriptPersisting {
             messages: messages,
             snapshot: snapshot,
             sessionID: sessionID,
-            title: title
+            title: title,
+            expectedEpoch: expectedEpoch
         )
         return result
     }
@@ -89,31 +101,122 @@ public actor SearchIndexReconciliation: TranscriptPersisting {
         messages: [ChatMessage],
         snapshot: AuthoritativeTranscriptSnapshot?,
         sessionID: String,
-        title: String
+        title: String,
+        expectedEpoch: UInt64? = nil
     ) async -> Bool {
         guard !Task.isCancelled else { return false }
+        if let expectedEpoch, await cache.currentEpoch() != expectedEpoch { return false }
         guard let snapshot, snapshot.sessionID == sessionID else {
             do { try await index.remove(sessionID: sessionID) }
             catch { recordIndexFailure(error, operation: "remove") }
             return false
         }
 
-        let documents = messages.compactMap { message -> SearchDocument? in
-            guard case .server(let messageID) = message.id else { return nil }
-            return SearchDocument(messageID: messageID, body: message.text, role: message.role, timestamp: message.timestamp)
-        }
         do {
-            try await index.replace(SearchSessionSnapshot(
-                sessionID: sessionID,
-                title: title,
-                documents: documents,
-                truncated: snapshot.truncated
-            ))
+            // HistoryCache exposes a disk-backed paged store. Prefer it after
+            // persistence so indexing never retains the full transcript.
+            if let paged = try? await cache.pagedStore(for: sessionID),
+               let pagedSummary = try? await paged.summary(),
+               (pagedSummary.messageCount > 0 || messages.isEmpty) {
+                let stream = AsyncThrowingStream<SearchDocumentPage, Error> { continuation in
+                    let producer = Task {
+                        do {
+                            var ordinal = 0
+                            while !Task.isCancelled {
+                                let page = try await paged.page(TranscriptPageRequest(
+                                    startOrdinal: ordinal,
+                                    maximumBytes: TranscriptPageRequest.hardMaximumBytes,
+                                    maximumRows: TranscriptPageRequest.hardMaximumRows,
+                                    expectedEpoch: expectedEpoch
+                                ))
+                                let documents = page.rows.compactMap { row -> SearchDocument? in
+                                    guard row.message.isSearchable,
+                                          let messageID = Int64(row.message.messageID),
+                                          let role = Role(rawValue: row.message.role)
+                                    else { return nil }
+                                    return SearchDocument(
+                                        messageID: ServerMessageID(rawValue: messageID),
+                                        body: row.text,
+                                        role: role,
+                                        timestamp: row.message.timestamp,
+                                        displayKind: row.message.displayKind,
+                                        isTool: row.message.isToolEvent
+                                    )
+                                }
+                                continuation.yield(SearchDocumentPage(documents: documents))
+                                if !page.hasMore { break }
+                                ordinal = page.nextOrdinal
+                            }
+                            continuation.finish()
+                        } catch {
+                            continuation.finish(throwing: error)
+                        }
+                    }
+                    continuation.onTermination = { _ in producer.cancel() }
+                }
+                try await index.replacePaged(
+                    sessionID: sessionID,
+                    title: title,
+                    truncated: snapshot.truncated,
+                    pages: stream
+                )
+            } else {
+                let documents = messages.compactMap { message -> SearchDocument? in
+                    guard case .server(let messageID) = message.id else { return nil }
+                    return SearchDocument(messageID: messageID, body: message.text, role: message.role, timestamp: message.timestamp)
+                }
+                try await index.replace(SearchSessionSnapshot(
+                    sessionID: sessionID,
+                    title: title,
+                    documents: documents,
+                    truncated: snapshot.truncated
+                ))
+            }
             return true
         } catch {
             recordIndexFailure(error, operation: "replace")
             return false
         }
+    }
+
+    /// Forwards a bounded transcript page through the decorator.
+    @discardableResult
+    public func appendTranscriptPage(
+        _ page: TranscriptMessagePage,
+        title: String,
+        for sessionID: String,
+        expectedEpoch: UInt64? = nil
+    ) async throws -> TranscriptSummary {
+        let summary = try await cache.appendTranscriptPage(page, for: sessionID, expectedEpoch: expectedEpoch)
+        let documents = page.messages.compactMap { value -> SearchDocument? in
+            guard let record = WireMessageRecord(row: value),
+                  record.isSearchable,
+                  let messageID = Int64(record.messageID),
+                  let role = Role(rawValue: record.role)
+            else { return nil }
+            return SearchDocument(
+                messageID: ServerMessageID(rawValue: messageID),
+                body: record.text,
+                role: role,
+                timestamp: record.timestamp,
+                displayKind: record.displayKind,
+                isTool: record.isToolEvent
+            )
+        }
+        do {
+            try await index.append(
+                SearchDocumentPage(documents: documents),
+                sessionID: sessionID,
+                title: title
+            )
+        } catch {
+            recordIndexFailure(error, operation: "append")
+        }
+        return summary
+    }
+
+    public func pagedSummary(for sessionID: String) async throws -> TranscriptSummary {
+        try await cache.pagedSummary(for: sessionID)
     }
 
     /// Reconciles a cache entry that was already stored. A read from a
@@ -130,7 +233,8 @@ public actor SearchIndexReconciliation: TranscriptPersisting {
             messages: read.transcript?.messages ?? [],
             snapshot: read.transcript?.snapshot,
             sessionID: sessionID,
-            title: title
+            title: title,
+            expectedEpoch: expectedEpoch
         )
     }
 

@@ -133,20 +133,28 @@ public struct GatewayEvent: Sendable {
     }
 }
 
-public enum GatewayError: LocalizedError {
+public enum GatewayError: LocalizedError, Equatable {
     case notConnected
     case rpc(code: Int, message: String)
     case connectionClosed(String)
     case malformedFrame(String)
     case unroutableFrame(String)
+    /// The caller cancelled before this request was put on the wire.
+    case cancelledBeforeSend
+    /// The caller cancelled after the request was handed to URLSession. The
+    /// gateway may still have applied it, so callers must not retry blindly.
+    case outcomeUnknownAfterSend
 
     public var errorDescription: String? {
         switch self {
         case .notConnected: "Not connected to the Hermes gateway."
-        case .rpc(let code, let message): "Gateway error \(code): \(message)"
+        case .rpc(code: let code, message: let message): "Gateway error \(code): \(message)"
         case .connectionClosed(let reason): "Gateway connection closed: \(reason)"
         case .malformedFrame(let detail): "Malformed gateway frame: \(detail)"
         case .unroutableFrame(let detail): "Unroutable gateway frame: \(detail)"
+        case .cancelledBeforeSend: "Gateway request cancelled before it was sent."
+        case .outcomeUnknownAfterSend:
+            "Gateway request cancelled after sending; its outcome is unknown."
         }
     }
 }
@@ -163,7 +171,14 @@ public actor GatewayClient {
 
     private var task: URLSessionWebSocketTask?
     private var nextID = 1
-    private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
+    private struct PendingCall {
+        let continuation: CheckedContinuation<JSONValue, Error>
+        var didSend: Bool
+    }
+    private var pending: [Int: PendingCall] = [:]
+    /// Responses for cancelled calls that were already handed to URLSession
+    /// are expected late responses, not malformed/unroutable frames.
+    private var ignoredResponseIDs: Set<Int> = []
     private var receiveLoop: Task<Void, Never>?
     private let frameDecoder = JSONDecoder()
 
@@ -198,14 +213,20 @@ public actor GatewayClient {
         receiveLoop = nil
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
+        ignoredResponseIDs.removeAll()
         failAllPending(with: GatewayError.connectionClosed("disconnected"))
     }
 
     // MARK: - Calls
 
     /// Issue a JSON-RPC call and await its result.
+    ///
+    /// Cancellation is deliberately not treated as a safe retry signal:
+    /// once `send` has been invoked, the gateway may have accepted the
+    /// operation even if no response arrives.
     public func call(_ method: String, params: [String: Any] = [:]) async throws -> JSONValue {
         guard let task else { throw GatewayError.notConnected }
+        guard !Task.isCancelled else { throw GatewayError.cancelledBeforeSend }
 
         let id = nextID
         nextID += 1
@@ -214,28 +235,64 @@ public actor GatewayClient {
         if !params.isEmpty { frame["params"] = params }
         let data = try JSONSerialization.data(withJSONObject: frame)
 
-        return try await withCheckedThrowingContinuation { continuation in
-            pending[id] = continuation
-            // The wire is newline-delimited, so terminate every frame even
-            // though WebSocket already provides framing.
-            let payload = String(decoding: data, as: UTF8.self) + "\n"
-            task.send(.string(payload)) { error in
-                guard let error else { return }
-                Task { await self.fail(id: id, with: error) }
+        return try await withTaskCancellationHandler(operation: {
+            guard !Task.isCancelled else { throw GatewayError.cancelledBeforeSend }
+            return try await withCheckedThrowingContinuation { continuation in
+                // This closure runs on the actor, so insertion and the
+                // didSend transition cannot be interleaved by cancel(id:).
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: GatewayError.cancelledBeforeSend)
+                    return
+                }
+                pending[id] = PendingCall(continuation: continuation, didSend: false)
+                guard !Task.isCancelled else {
+                    cancelPending(id: id)
+                    return
+                }
+                pending[id]?.didSend = true
+                // The wire is newline-delimited, so terminate every frame
+                // even though WebSocket already provides framing.
+                let payload = String(decoding: data, as: UTF8.self) + "\n"
+                task.send(.string(payload)) { error in
+                    guard let error else { return }
+                    Task { await self.fail(id: id, with: error) }
+                }
             }
+        }, onCancel: {
+            Task { await self.cancelPending(id: id) }
+        })
+    }
+
+    private func cancelPending(id: Int) {
+        guard let pendingCall = pending.removeValue(forKey: id) else { return }
+        if pendingCall.didSend {
+            ignoredResponseIDs.insert(id)
+            pendingCall.continuation.resume(throwing: GatewayError.outcomeUnknownAfterSend)
+        } else {
+            pendingCall.continuation.resume(throwing: GatewayError.cancelledBeforeSend)
         }
     }
 
     private func fail(id: Int, with error: Error) {
-        pending.removeValue(forKey: id)?.resume(throwing: error)
+        if let pendingCall = pending.removeValue(forKey: id) {
+            let failure: Error = pendingCall.didSend
+                ? GatewayError.outcomeUnknownAfterSend
+                : error
+            pendingCall.continuation.resume(throwing: failure)
+        } else {
+            ignoredResponseIDs.remove(id)
+        }
     }
 
     /// Resume every suspended caller so a dead socket can't strand them.
     private func failAllPending(with error: Error) {
         let stranded = pending
         pending.removeAll()
-        for continuation in stranded.values {
-            continuation.resume(throwing: error)
+        for pendingCall in stranded.values {
+            let failure: Error = pendingCall.didSend
+                ? GatewayError.outcomeUnknownAfterSend
+                : error
+            pendingCall.continuation.resume(throwing: failure)
         }
     }
 
@@ -269,10 +326,7 @@ public actor GatewayClient {
                 let frame = try frameDecoder.decode(Frame.self, from: data)
                 route(frame)
             } catch {
-                let detail = String(decoding: data.prefix(512), as: UTF8.self)
-                let decodeError = GatewayError.malformedFrame(
-                    "\(error.localizedDescription): \(detail)"
-                )
+                let decodeError = GatewayError.malformedFrame("invalid JSON frame")
                 Log.error("gateway frame decode failed: \(decodeError)")
                 failAllPending(with: decodeError)
                 emit("transport.malformed", text: decodeError.localizedDescription)
@@ -288,9 +342,9 @@ public actor GatewayClient {
             .compactMap { $0.data(using: .utf8) }
     }
 
-    /// Validates complete WebSocket frames without hiding malformed input.
-    /// Production receive handling emits a transport event with the same
-    /// detail so the app can surface it through its toast path.
+    /// Validates complete WebSocket frames without exposing raw input.
+    /// Production receive handling emits a transport event without echoing
+    /// untrusted frame bytes into logs or user-facing errors.
     public static func validateWebSocketFrames(from text: String) throws -> [Data] {
         let frames = webSocketFrames(from: text)
         let decoder = JSONDecoder()
@@ -299,8 +353,7 @@ public actor GatewayClient {
             do {
                 frame = try decoder.decode(Frame.self, from: data)
             } catch {
-                let detail = String(decoding: data.prefix(512), as: UTF8.self)
-                throw GatewayError.malformedFrame("\(error.localizedDescription): \(detail)")
+                throw GatewayError.malformedFrame("invalid JSON frame")
             }
             try validateRoutingShape(of: frame)
         }
@@ -310,8 +363,7 @@ public actor GatewayClient {
     private static func validateRoutingShape(of frame: Frame) throws {
         if let id = frame.id, id.intValue == nil {
             throw GatewayError.unroutableFrame(
-                "response id has type \(String(describing: id)); "
-                + "decoded shape: \(shape(of: frame))"
+                "response id has unsupported type; decoded shape: \(shape(of: frame))"
             )
         }
         if frame.id == nil, frame.result != nil || frame.error != nil {
@@ -322,27 +374,44 @@ public actor GatewayClient {
     }
 
     private static func shape(of frame: Frame) -> String {
-        "id=\(String(describing: frame.id)), method=\(frame.method ?? "nil"), "
+        let idType: String
+        if let id = frame.id {
+            switch id {
+            case .integer: idType = "integer"
+            case .number: idType = "number"
+            case .string: idType = "string"
+            case .null: idType = "null"
+            case .bool: idType = "boolean"
+            case .array: idType = "array"
+            case .object: idType = "object"
+            }
+        } else {
+            idType = "missing"
+        }
+        return "idType=\(idType), methodPresent=\(frame.method != nil), "
             + "hasResult=\(frame.result != nil), hasParams=\(frame.params != nil), "
             + "hasError=\(frame.error != nil)"
     }
-
     private func route(_ frame: Frame) {
         if let rawID = frame.id {
             guard let id = rawID.intValue else {
                 rejectUnroutable(frame, reason: "response id is not an integer")
                 return
             }
-            guard let continuation = pending.removeValue(forKey: id) else {
+            guard let pendingCall = pending.removeValue(forKey: id) else {
+                // A cancellation after send has no continuation left to
+                // resume. Consume exactly its eventual response so it does
+                // not turn a known race into a misleading protocol error.
+                if ignoredResponseIDs.remove(id) != nil { return }
                 rejectUnroutable(frame, reason: "no pending call matches response id \(id)")
                 return
             }
             if let error = frame.error {
-                continuation.resume(
+                pendingCall.continuation.resume(
                     throwing: GatewayError.rpc(code: error.code, message: error.message)
                 )
             } else {
-                continuation.resume(returning: frame.result ?? .null)
+                pendingCall.continuation.resume(returning: frame.result ?? .null)
             }
             return
         }

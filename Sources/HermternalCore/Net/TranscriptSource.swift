@@ -1,11 +1,49 @@
 import Foundation
 
+private final class TranscriptTotalCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var valueStorage: Int?
+
+    func set(_ value: Int?) {
+        guard let value else { return }
+        lock.lock()
+        valueStorage = value
+        lock.unlock()
+    }
+
+    var value: Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        return valueStorage
+    }
+}
+
 public struct AuthoritativeTranscript: Sendable {
+    /// Compatibility projection. Incremental callers should use
+    /// `streamAuthoritative` so this corpus is never accumulated.
     public let rows: [JSONValue]
     public let serverTotal: Int?
 
     public init(rows: [JSONValue], serverTotal: Int?) {
         self.rows = rows
+        self.serverTotal = serverTotal
+    }
+    public func turnDocuments(sessionModel: String? = nil) -> [TranscriptTurn] {
+        TranscriptTurnProjector.project(
+            records: rows.compactMap(WireMessageRecord.init(row:)),
+            sessionModel: sessionModel
+        )
+    }
+}
+
+/// Incremental authoritative history metadata. Records are delivered in
+/// database order through the source callback.
+public struct AuthoritativeTranscriptMetadata: Sendable, Equatable {
+    public let messageCount: Int
+    public let serverTotal: Int?
+
+    public init(messageCount: Int, serverTotal: Int?) {
+        self.messageCount = messageCount
         self.serverTotal = serverTotal
     }
 }
@@ -27,12 +65,44 @@ public struct ResumedTranscript: Sendable {
         self.rows = rows
         self.messageCount = messageCount
     }
+    public func turnDocuments(sessionModel: String? = nil) -> [TranscriptTurn] {
+        TranscriptTurnProjector.project(
+            records: rows.compactMap(WireMessageRecord.init(row:)),
+            sessionModel: sessionModel
+        )
+    }
 }
 
 /// The seam between opening a chat and its two server transports.
 public protocol TranscriptSource: Sendable {
     func fetchAuthoritative(sessionID: String) async throws -> AuthoritativeTranscript
     func resume(sessionID: String) async throws -> ResumedTranscript
+    func streamAuthoritative(
+        sessionID: String,
+        onPage: @escaping TranscriptMessagePageConsumer
+    ) async throws -> AuthoritativeTranscriptMetadata
+}
+
+public extension TranscriptSource {
+    /// Compatibility default for test and third-party sources. Gateway
+    /// production sources override this with REST page delivery.
+    func streamAuthoritative(
+        sessionID: String,
+        onPage: @escaping TranscriptMessagePageConsumer
+    ) async throws -> AuthoritativeTranscriptMetadata {
+        let result = try await fetchAuthoritative(sessionID: sessionID)
+        try await onPage(TranscriptMessagePage(
+            messages: result.rows,
+            returned: result.rows.count,
+            offset: 0,
+            serverTotal: result.serverTotal,
+            byteCount: 0
+        ))
+        return AuthoritativeTranscriptMetadata(
+            messageCount: result.rows.count,
+            serverTotal: result.serverTotal
+        )
+    }
 }
 
 public struct GatewayTranscriptSource: TranscriptSource, Sendable {
@@ -49,6 +119,23 @@ public struct GatewayTranscriptSource: TranscriptSource, Sendable {
     public func fetchAuthoritative(sessionID: String) async throws -> AuthoritativeTranscript {
         let rows = try await rest.sessionMessages(durableID: sessionID)
         return AuthoritativeTranscript(rows: rows, serverTotal: serverTotals[sessionID])
+    }
+    public func streamAuthoritative(
+        sessionID: String,
+        onPage: @escaping TranscriptMessagePageConsumer
+    ) async throws -> AuthoritativeTranscriptMetadata {
+        let totalCapture = TranscriptTotalCapture()
+        let summary = try await rest.streamSessionMessages(
+            durableID: sessionID,
+            onPage: { page in
+                totalCapture.set(page.serverTotal)
+                try await onPage(page)
+            }
+        )
+        return AuthoritativeTranscriptMetadata(
+            messageCount: summary.messageCount,
+            serverTotal: totalCapture.value ?? serverTotals[sessionID]
+        )
     }
 
     public func resume(sessionID: String) async throws -> ResumedTranscript {
@@ -182,35 +269,38 @@ public struct StreamingReduction: Sendable {
     public let notice: String?
     /// Event type names that this client does not know yet.
     public let unknownEventTypes: [String]
+    /// The same reduction projected through the platform-neutral turn seam.
+    public let turns: [TranscriptTurn]
 
     public init(
         messages: [ChatMessage],
         isAwaitingReply: Bool,
         terminal: StreamingTerminal? = nil,
         notice: String? = nil,
-        unknownEventTypes: [String] = []
+        unknownEventTypes: [String] = [],
+        turns: [TranscriptTurn] = []
     ) {
         self.messages = messages
         self.isAwaitingReply = isAwaitingReply
         self.terminal = terminal
         self.notice = notice
         self.unknownEventTypes = unknownEventTypes
+        self.turns = turns
     }
 }
 
 /// Production reducer for the event shapes emitted by GatewayClient.
 ///
 /// The reducer consumes events in gateway arrival order. It does not assume
-/// that reasoning ends before answer text starts, or that either stream is
-/// contiguous.
-/// Live rows remain provisional unless the gateway explicitly supplies a
-/// durable id in a future event shape.
 public struct StreamingEventReducer: Sendable {
     public private(set) var messages: [ChatMessage]
     public private(set) var isAwaitingReply: Bool
     /// Unknown events remain observable for forward compatibility and support
     /// diagnostics instead of disappearing in the default branch.
     public private(set) var unknownEventTypes: [String]
+    private var toolRecords: [WireMessageRecord]
+    private var modelMarkers: [WireMessageRecord]
+    private var reasoningEffort: String?
 
     public init(
         messages: [ChatMessage] = [],
@@ -220,6 +310,14 @@ public struct StreamingEventReducer: Sendable {
         self.messages = messages
         self.isAwaitingReply = isAwaitingReply
         self.unknownEventTypes = unknownEventTypes
+        self.toolRecords = []
+        self.modelMarkers = []
+        self.reasoningEffort = nil
+    }
+
+    public var turns: [TranscriptTurn] {
+        let values = modelMarkers + messages.map { Self.wireRecord(from: $0, reasoningEffort: reasoningEffort) } + toolRecords
+        return TranscriptTurnProjector.project(records: values)
     }
 
     public mutating func reset(
@@ -228,6 +326,9 @@ public struct StreamingEventReducer: Sendable {
     ) {
         self.messages = messages
         self.isAwaitingReply = isAwaitingReply
+        self.toolRecords.removeAll(keepingCapacity: true)
+        self.modelMarkers.removeAll(keepingCapacity: true)
+        self.reasoningEffort = nil
         unknownEventTypes.removeAll(keepingCapacity: true)
     }
 
@@ -247,6 +348,20 @@ public struct StreamingEventReducer: Sendable {
     }
 
     public mutating func reduce(_ event: GatewayEvent) -> StreamingReduction {
+        if event.payload?["display_kind"]?.stringValue == "model_switch" {
+            modelMarkers.append(WireMessageRecord(
+                messageID: markerID(for: event),
+                role: "system",
+                text: "",
+                displayKind: "model_switch",
+                displayMetadata: Self.objectFields(event.payload?["display_metadata"])
+            ))
+            return reduction()
+        }
+        if event.type.hasPrefix("tool.") && event.kind == .unknown(event.type) {
+            toolRecords.append(toolRecord(for: event))
+            return reduction()
+        }
         switch event.kind {
         case .messageStart:
             messages.append(ChatMessage(
@@ -267,6 +382,7 @@ public struct StreamingEventReducer: Sendable {
         // Anthropic thinking blocks, and Codex reasoning deltas to one
         // logical reasoning channel. Arrival order remains authoritative.
         case .thinkingDelta, .reasoningDelta, .reasoningAvailable:
+            if let effort = Self.effort(from: event.payload) { reasoningEffort = effort }
             guard let delta = event.text, !delta.isEmpty else { return reduction() }
             appendReasoning(delta, identity: identity(for: event))
             return reduction()
@@ -285,6 +401,10 @@ public struct StreamingEventReducer: Sendable {
             complete(event)
             return reduction(terminal: .complete)
 
+        case .toolStart, .toolProgress, .toolGenerating, .toolComplete:
+            toolRecords.append(toolRecord(for: event))
+            return reduction()
+
         case .error, .messageError:
             finishStreaming()
             return reduction(terminal: .error, notice: event.text ?? "The agent reported an error.")
@@ -294,9 +414,8 @@ public struct StreamingEventReducer: Sendable {
             return reduction()
 
         default:
-            // Known lifecycle, tool, MoA, subagent, notification, approval,
-            // voice, and status events remain classified even when this
-            // transcript reducer has no message projection for them yet.
+            // Known lifecycle, notification, approval, and status events remain
+            // observable through the reducer without becoming message rows.
             return reduction()
         }
     }
@@ -323,6 +442,71 @@ public struct StreamingEventReducer: Sendable {
         }
         isAwaitingReply = true
     }
+    private func markerID(for event: GatewayEvent) -> String {
+        event.serverMessageID.map { String($0.rawValue) }
+            ?? event.payload?["marker_id"]?.stringValue
+            ?? "model-switch-\(modelMarkers.count)"
+    }
+
+    private func toolRecord(for event: GatewayEvent) -> WireMessageRecord {
+        let payload = event.payload
+        let status: String
+        switch event.kind {
+        case .toolStart: status = "running"
+        case .toolComplete: status = payload?["error"] != nil ? "error" : "completed"
+        default: status = "running"
+        }
+        return WireMessageRecord(
+            messageID: payload?["id"]?.stringValue
+                ?? payload?["tool_call_id"]?.stringValue
+                ?? payload?["call_id"]?.stringValue
+                ?? "tool-event-\(toolRecords.count)",
+            role: "tool",
+            text: event.text ?? "",
+            displayKind: "tool_event",
+            displayMetadata: Self.objectFields(payload),
+            toolCallID: payload?["tool_call_id"]?.stringValue ?? payload?["call_id"]?.stringValue,
+            toolName: payload?["tool_name"]?.stringValue ?? payload?["name"]?.stringValue,
+            toolInput: payload?["input"]?.stringValue,
+            toolOutput: payload?["output"]?.stringValue ?? payload?["result"]?.stringValue,
+            toolStatus: status,
+            turnID: payload?["turn_id"]?.stringValue
+        )
+    }
+
+    private static func wireRecord(
+        from message: ChatMessage,
+        reasoningEffort: String? = nil
+    ) -> WireMessageRecord {
+        let id: String
+        switch message.id {
+        case .server(let value): id = String(value.rawValue)
+        case .provisional(let value): id = value.uuidString
+        }
+        let metadata: [String: JSONValue]? = reasoningEffort.map {
+            ["reasoning_effort": .string($0)]
+        }
+        return WireMessageRecord(
+            messageID: id,
+            role: message.role.rawValue,
+            text: message.text,
+            reasoning: message.reasoning,
+            timestamp: message.timestamp,
+            displayMetadata: metadata
+        )
+    }
+    private static func objectFields(_ value: JSONValue?) -> [String: JSONValue]? {
+        guard case .object(let fields) = value else { return nil }
+        return fields
+    }
+    private static func effort(from value: JSONValue?) -> String? {
+        let fields = objectFields(value)
+        for key in ["reasoning_effort", "reasoningEffort", "effort"] {
+            if let value = fields?[key]?.stringValue, !value.isEmpty { return value }
+        }
+        return nil
+    }
+
 
     private mutating func appendReasoning(_ delta: String, identity: MessageIdentity) {
         if let index = streamingIndex {
@@ -375,7 +559,8 @@ public struct StreamingEventReducer: Sendable {
             isAwaitingReply: isAwaitingReply,
             terminal: terminal,
             notice: notice,
-            unknownEventTypes: unknownEventTypes
+            unknownEventTypes: unknownEventTypes,
+            turns: turns
         )
     }
 }

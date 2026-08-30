@@ -283,7 +283,7 @@ func delayedRESTCannotRestoreAfterCacheDisable() async throws {
             sessionTitle: ""
         )
     }
-    while await source.authoritativeCalls == 0 {
+    while await source.authoritativeWaiterCount == 0 {
         await Task.yield()
     }
 
@@ -320,15 +320,14 @@ func delayedRESTStoreAfterCacheClearIsRejected() async throws {
             sessionTitle: ""
         )
     }
-    while await source.authoritativeCalls == 0 {
+    while await source.authoritativeWaiterCount == 0 {
         await Task.yield()
     }
 
     #expect(await cache.clear())
     await source.finishAuthoritative()
     let result = await task.value
-    #expect(result != nil)
-    #expect(result?.cacheStore?.addedEntry == false)
+    #expect(result?.cacheStore?.addedEntry != true)
     #expect(try FileManager.default.contentsOfDirectory(
         at: directory,
         includingPropertiesForKeys: nil
@@ -414,9 +413,14 @@ func staleTerminalReconciliationIsDiscarded() async throws {
             sessionTitle: ""
         )
     }
+    while await source.authoritativeWaiterCount == 0 {
+        await Task.yield()
+    }
     _ = generations.begin()
     await source.finishAuthoritative()
-    #expect(await task.value == nil)
+    let result = await task.value
+    #expect(result == nil)
+    #expect(await source.authoritativeWaiterCount == 0)
 }
 
 @Test("superseded open handles terminate one-for-one")
@@ -442,7 +446,7 @@ func supersededOpenHandlesTerminateOneForOne() async throws {
             handle: handle
         ).makeAsyncIterator()
         _ = await phases.next()
-        while !(await source.resumeStarted) {
+        while await source.resumeCalls < index + 1 {
             await Task.yield()
         }
         if let previous = handles.last {
@@ -451,6 +455,13 @@ func supersededOpenHandlesTerminateOneForOne() async throws {
         handles.append(handle)
     }
     handles.last?.cancel()
+    let resumeCalls = await source.resumeCalls
+    #expect(resumeCalls == handles.count)
+    await source.finishResume(.init(liveSessionID: "live", rows: []))
+    while await source.resumeCompletedCount < resumeCalls {
+        await Task.yield()
+    }
+    #expect(await source.resumeWaiterCount == 0)
     #expect(handles.count == handles.filter(\.isTerminated).count)
 }
 
@@ -495,21 +506,413 @@ func cancellingOpenClearsCapturedTranscriptState() async throws {
     handle.cancel()
     #expect(handle.isTerminated)
     #expect(handle.retainedMessageCount == 0)
+    await source.finishResume(.init(liveSessionID: "live", rows: []))
+    while await source.resumeCompletedCount < 1 {
+        await Task.yield()
+    }
+    #expect(await source.resumeWaiterCount == 0)
     #expect(await phases.next() == nil)
+}
+
+@Test("REST publishes its first page before reconciliation completes")
+func restPublishesInitialPageBeforeReconciliation() async throws {
+    let directory = try openStateTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let source = IncrementalOpenSource(
+        pages: [
+            TranscriptMessagePage(
+                messages: [openStateRow(id: 1)],
+                returned: 1,
+                offset: 0,
+                serverTotal: 2,
+                byteCount: 32
+            ),
+            TranscriptMessagePage(
+                messages: [openStateRow(id: 2)],
+                returned: 1,
+                offset: 1,
+                serverTotal: 2,
+                byteCount: 32
+            )
+        ],
+        pausesAfterFirstPage: true
+    )
+    let cache = HistoryCache(directory: directory)
+    let generations = OpenGenerationController()
+    let opener = TranscriptOpener(
+        source: source,
+        cache: cache,
+        cacheEnabled: true,
+        generations: generations
+    )
+    let generation = generations.begin()
+    var phases = opener.openPhases(
+        sessionID: "session",
+        serverTotal: 2,
+        generation: generation,
+        sessionTitle: ""
+    ).makeAsyncIterator()
+    _ = try #require(await phases.next())
+    defer {
+        Task { await source.releaseFirstPage() }
+    }
+    let initial = try #require(await phases.next())
+    #expect(initial.isInitialPage)
+    #expect(initial.messages.map(\.text) == ["row 1"])
+    let deliveredSecondPage = await source.secondPageDelivered
+    #expect(!deliveredSecondPage)
+
+    let route = try await cache.pagedStore(for: "session").currentRoute()
+    let firstPage = try await cache.transcriptPage(
+        for: "session",
+        request: TranscriptPageRequest(
+            maximumBytes: 512,
+            maximumRows: 64,
+            expectedGeneration: route.generation,
+            expectedEpoch: route.epoch
+        )
+    )
+    #expect(firstPage.rows.map(\.text) == ["row 1"])
+
+    await source.releaseFirstPage()
+    let final = try #require(await phases.next())
+    #expect(!final.isInitialPage)
+    #expect(final.messages.map(\.text) == ["row 1", "row 2"])
+    #expect(await phases.next() == nil)
+}
+
+@Test("a superseded REST route cannot publish its initial page")
+func supersededRESTRouteCannotPublishInitialPage() async throws {
+    let directory = try openStateTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let source = IncrementalOpenSource(
+        pages: [
+            TranscriptMessagePage(
+                messages: [openStateRow(id: 1)],
+                returned: 1,
+                offset: 0,
+                serverTotal: 1,
+                byteCount: 32
+            )
+        ],
+        pausesBeforeFirstPage: true
+    )
+    let generations = OpenGenerationController()
+    let opener = TranscriptOpener(
+        source: source,
+        cache: HistoryCache(directory: directory),
+        cacheEnabled: true,
+        generations: generations
+    )
+    let generation = generations.begin()
+    defer {
+        Task { await source.releaseFirstPage() }
+    }
+    let task = Task {
+        var phases: [TranscriptOpenResult] = []
+        for await phase in opener.openPhases(
+            sessionID: "session",
+            serverTotal: 1,
+            generation: generation,
+            sessionTitle: "",
+        ) {
+            phases.append(phase)
+        }
+        return phases
+    }
+    while !(await source.streamStarted) {
+        await Task.yield()
+    }
+    _ = generations.begin()
+    await source.releaseFirstPage()
+    await Task.yield()
+    let phases = await task.value
+    #expect(phases.allSatisfy { !$0.isInitialPage })
+}
+
+@Test("100 rapid selections keep one open active and publish only the latest route")
+func rapidSelectionBurstIsLatestWins() async throws {
+    let directory = try openStateTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let source = LatestWinsGatedSource()
+    let cache = HistoryCache(directory: directory)
+    let generations = OpenGenerationController()
+    let opener = TranscriptOpener(
+        source: source,
+        cache: cache,
+        cacheEnabled: true,
+        generations: generations
+    )
+
+    var selections: [String] = []
+    var handles: [TranscriptOpenHandle] = []
+    var tasks: [Task<[TranscriptOpenResult], Never>] = []
+
+    selections.append("chat-1")
+    let firstGeneration = generations.begin()
+    let firstHandle = TranscriptOpenHandle()
+    let firstTask = Task {
+        var phases: [TranscriptOpenResult] = []
+        for await phase in opener.openPhases(
+            sessionID: "chat-1",
+            serverTotal: 1,
+            generation: firstGeneration,
+            sessionTitle: "chat-1",
+            handle: firstHandle
+        ) {
+            phases.append(phase)
+        }
+        return phases
+    }
+    handles.append(firstHandle)
+    tasks.append(firstTask)
+    while await source.streamCalls < 1 {
+        await Task.yield()
+    }
+
+    var pendingReplacements = 0
+    for index in 2...100 {
+        selections.append("chat-\(index)")
+        pendingReplacements += 1
+    }
+
+    _ = generations.begin()
+    firstHandle.cancel()
+    _ = await firstTask.value
+    while await source.activeStreams != 0 {
+        await Task.yield()
+    }
+
+    let finalGeneration = generations.begin()
+    let finalHandle = TranscriptOpenHandle()
+    let finalTask = Task {
+        var phases: [TranscriptOpenResult] = []
+        for await phase in opener.openPhases(
+            sessionID: "chat-100",
+            serverTotal: 1,
+            generation: finalGeneration,
+            sessionTitle: "chat-100",
+            handle: finalHandle
+        ) {
+            phases.append(phase)
+        }
+        return phases
+    }
+    handles.append(finalHandle)
+    tasks.append(finalTask)
+    while await source.streamCalls < 2 {
+        await Task.yield()
+    }
+
+    await source.releaseLatest()
+    var finalPhases: [TranscriptOpenResult] = []
+    var nonCachedPublications: [String] = []
+    for (index, task) in tasks.enumerated() {
+        let phases = await task.value
+        if index == tasks.index(before: tasks.endIndex) {
+            finalPhases = phases
+        }
+        nonCachedPublications.append(
+            contentsOf: phases
+                .filter { !$0.isCachedPhase }
+                .map { _ in index == 0 ? "chat-1" : "chat-100" }
+        )
+    }
+    let finalCache = await cache.transcript(for: "chat-100")
+
+    #expect(selections.count == 100)
+    #expect(selections.first == "chat-1")
+    #expect(selections.last == "chat-100")
+    #expect(finalPhases.contains { $0.didFetchREST })
+    #expect(await source.streamCalls == 2)
+    #expect(pendingReplacements == 99)
+    for index in 1..<100 {
+        #expect(await cache.transcript(for: "chat-\(index)") == nil)
+    }
+    #expect(await source.terminatedStreams == 2)
+    #expect(nonCachedPublications == ["chat-100", "chat-100"])
+    #expect(finalCache?.messages.map(\.text) == ["row 100"])
+    #expect(await source.maxActiveStreams == 1)
+    #expect(await source.activeStreams == 0)
+    #expect(handles.filter(\.isTerminated).count == 2)
+    print(
+        "OPEN_BURST|selections=\(selections.count) "
+            + "leadingStarts=1 "
+            + "pendingReplacements=\(pendingReplacements) "
+            + "trailingStarts=1 "
+            + "streamCalls=\(await source.streamCalls) "
+            + "maxActive=\(await source.maxActiveStreams) "
+            + "active=\(await source.activeStreams) "
+            + "producerTerminated=\(await source.terminatedStreams) "
+            + "nonCachedPublications=\(nonCachedPublications.count) "
+            + "finalStored=\(finalCache != nil)"
+    )
+}
+private actor LatestWinsGatedSource: TranscriptSource {
+    private var continuations: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private(set) var streamCalls = 0
+    private(set) var activeStreams = 0
+    private(set) var maxActiveStreams = 0
+    private(set) var terminatedStreams = 0
+
+    func resume(sessionID _: String) async throws -> ResumedTranscript {
+        ResumedTranscript(liveSessionID: "live", rows: [])
+    }
+
+    func fetchAuthoritative(sessionID _: String) async throws -> AuthoritativeTranscript {
+        AuthoritativeTranscript(rows: [openStateRow(id: 100)], serverTotal: 1)
+    }
+
+    func streamAuthoritative(
+        sessionID _: String,
+        onPage: @escaping TranscriptMessagePageConsumer
+    ) async throws -> AuthoritativeTranscriptMetadata {
+        streamCalls += 1
+        activeStreams += 1
+        maxActiveStreams = max(maxActiveStreams, activeStreams)
+        let token = UUID()
+        defer {
+            activeStreams -= 1
+            terminatedStreams += 1
+        }
+        await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                continuations[token] = continuation
+            }
+        }, onCancel: {
+            Task { await self.cancel(token) }
+        })
+        try await onPage(
+            TranscriptMessagePage(
+                messages: [openStateRow(id: 100)],
+                returned: 1,
+                offset: 0,
+                serverTotal: 1,
+                byteCount: 32
+            )
+        )
+        return AuthoritativeTranscriptMetadata(messageCount: 1, serverTotal: 1)
+    }
+
+    func releaseLatest() {
+        let pending = continuations.values
+        continuations.removeAll()
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+
+    private func cancel(_ token: UUID) {
+        continuations.removeValue(forKey: token)?.resume()
+    }
+}
+
+
+private actor IncrementalOpenSource: TranscriptSource {
+    let pages: [TranscriptMessagePage]
+    let pausesAfterFirstPage: Bool
+    let pausesBeforeFirstPage: Bool
+    private var firstPageContinuation: CheckedContinuation<Void, Never>?
+    private var firstPageReleased = false
+    private(set) var streamStarted = false
+    private(set) var firstPageDelivered = false
+    private(set) var secondPageDelivered = false
+
+    init(
+        pages: [TranscriptMessagePage],
+        pausesAfterFirstPage: Bool = false,
+        pausesBeforeFirstPage: Bool = false
+    ) {
+        self.pages = pages
+        self.pausesAfterFirstPage = pausesAfterFirstPage
+        self.pausesBeforeFirstPage = pausesBeforeFirstPage
+    }
+
+    func fetchAuthoritative(sessionID _: String) async throws -> AuthoritativeTranscript {
+        AuthoritativeTranscript(
+            rows: pages.flatMap(\.messages),
+            serverTotal: pages.last?.serverTotal
+        )
+    }
+
+    func resume(sessionID _: String) async throws -> ResumedTranscript {
+        ResumedTranscript(liveSessionID: "live", rows: [])
+    }
+
+    func streamAuthoritative(
+        sessionID _: String,
+        onPage: @escaping TranscriptMessagePageConsumer
+    ) async throws -> AuthoritativeTranscriptMetadata {
+        streamStarted = true
+        if pausesBeforeFirstPage {
+            await waitForFirstPageRelease()
+        }
+        for (index, page) in pages.enumerated() {
+            if index == 0 { firstPageDelivered = true }
+            try await onPage(page)
+            if index == 0, pausesAfterFirstPage {
+                await waitForFirstPageRelease()
+            }
+            if index == 1 { secondPageDelivered = true }
+        }
+        return AuthoritativeTranscriptMetadata(
+            messageCount: pages.reduce(0) { $0 + $1.messages.count },
+            serverTotal: pages.last?.serverTotal
+        )
+    }
+
+    func releaseFirstPage() {
+        if let continuation = firstPageContinuation {
+            firstPageContinuation = nil
+            continuation.resume()
+        } else {
+            firstPageReleased = true
+        }
+    }
+
+    private func waitForFirstPageRelease() async {
+        guard !firstPageReleased else {
+            firstPageReleased = false
+            return
+        }
+        await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                firstPageContinuation = continuation
+            }
+        }, onCancel: {
+            Task { await self.releaseFirstPage() }
+        })
+    }
 }
 
 private actor OpenStateGate {
     private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
     private(set) var started = false
 
     func wait() async {
         started = true
-        await withCheckedContinuation { continuation = $0 }
+        guard !released else {
+            released = false
+            return
+        }
+        await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                self.continuation = continuation
+            }
+        }, onCancel: {
+            Task { await self.release() }
+        })
     }
 
     func release() {
-        continuation?.resume()
-        continuation = nil
+        if let continuation {
+            self.continuation = nil
+            continuation.resume()
+        } else {
+            released = true
+        }
     }
 }
 
@@ -517,14 +920,16 @@ private actor OpenStateSuspendedSource: TranscriptSource {
     private let resumed: ResumedTranscript
     private let authoritative: AuthoritativeTranscript
     private let suspendResume: Bool
-    private var resumeContinuation: CheckedContinuation<ResumedTranscript, Error>?
-    private var authoritativeContinuation: CheckedContinuation<AuthoritativeTranscript, Error>?
+    private var resumeContinuations: [UUID: CheckedContinuation<ResumedTranscript, Error>] = [:]
+    private var authoritativeContinuations: [UUID: CheckedContinuation<AuthoritativeTranscript, Error>] = [:]
+    var authoritativeWaiterCount: Int { authoritativeContinuations.count }
+    var resumeWaiterCount: Int { resumeContinuations.count }
     private(set) var resumeStarted = false
     private(set) var resumeCalls = 0
     private(set) var authoritativeCalls = 0
+    private(set) var resumeCompletedCount = 0
 
     init(
-
         resumed: ResumedTranscript = .init(liveSessionID: "live", rows: []),
         authoritative: AuthoritativeTranscript = .init(rows: [], serverTotal: 0),
         suspendResume: Bool = true
@@ -537,45 +942,100 @@ private actor OpenStateSuspendedSource: TranscriptSource {
     func resume(sessionID _: String) async throws -> ResumedTranscript {
         resumeCalls += 1
         resumeStarted = true
-        guard suspendResume else { return resumed }
-        return try await withCheckedThrowingContinuation { continuation in
-            resumeContinuation = continuation
+        guard suspendResume else {
+            resumeCompletedCount += 1
+            return resumed
+        }
+        let token = UUID()
+        do {
+            let value = try await withTaskCancellationHandler(operation: {
+                try await withCheckedThrowingContinuation { continuation in
+                    resumeContinuations[token] = continuation
+                }
+            }, onCancel: {
+                Task { await self.cancelResume(token) }
+            })
+            resumeCompletedCount += 1
+            return value
+        } catch {
+            resumeCompletedCount += 1
+            throw error
         }
     }
 
     func fetchAuthoritative(sessionID _: String) async throws -> AuthoritativeTranscript {
         authoritativeCalls += 1
-        return try await withCheckedThrowingContinuation { continuation in
-            authoritativeContinuation = continuation
-        }
+        let token = UUID()
+        return try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                authoritativeContinuations[token] = continuation
+            }
+        }, onCancel: {
+            Task { await self.cancelAuthoritative(token) }
+        })
+    }
+
+    private func cancelResume(_ token: UUID) {
+        resumeContinuations.removeValue(forKey: token)?.resume(throwing: CancellationError())
+    }
+
+    private func cancelAuthoritative(_ token: UUID) {
+        authoritativeContinuations.removeValue(forKey: token)?.resume(throwing: CancellationError())
     }
 
     func finishResume(_ value: ResumedTranscript) {
-        resumeContinuation?.resume(returning: value)
-        resumeContinuation = nil
+        let continuations = resumeContinuations.values
+        resumeContinuations.removeAll()
+        for continuation in continuations {
+            continuation.resume(returning: value)
+        }
     }
 
     func finishAuthoritative() {
-        authoritativeContinuation?.resume(returning: authoritative)
-        authoritativeContinuation = nil
+        let continuations = authoritativeContinuations.values
+        authoritativeContinuations.removeAll()
+        for continuation in continuations {
+            continuation.resume(returning: authoritative)
+        }
     }
 }
 private final class BlockingOpenStateCodec: CacheCodec, @unchecked Sendable {
     private let gate = DispatchSemaphore(value: 0)
-    private(set) var started = false
+    private let lock = NSLock()
+    private var startedValue = false
+    private var releasePermits = 0
+
+    var started: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return startedValue
+    }
 
     func encode(_ transcript: CachedTranscript) throws -> Data {
         try JSONCacheCodec().encode(transcript)
     }
 
     func decode(_ data: Data) throws -> CachedTranscript {
-        started = true
-        gate.wait()
+        lock.lock()
+        startedValue = true
+        let consumePermit = releasePermits > 0
+        if consumePermit { releasePermits -= 1 }
+        lock.unlock()
+        if !consumePermit {
+            gate.wait()
+        }
         return try JSONCacheCodec().decode(data)
     }
 
     func release() {
-        gate.signal()
+        lock.lock()
+        if startedValue {
+            lock.unlock()
+            gate.signal()
+        } else {
+            releasePermits += 1
+            lock.unlock()
+        }
     }
 }
 
