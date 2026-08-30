@@ -292,6 +292,8 @@ public struct ChatMessage: Identifiable, Codable, Sendable {
     /// projections render the same content.
     public var reasoning: String?
     public var timestamp: Date?
+    /// Gateway and REST use this durable turn correlation key for terminal reconciliation.
+    public var turnID: String?
     public var isStreaming: Bool
     /// Ordinary Codex message items may be cached. Codex reasoning items are
     /// excluded when opaque/encrypted, with only their availability marker
@@ -306,6 +308,7 @@ public struct ChatMessage: Identifiable, Codable, Sendable {
         case text
         case reasoning
         case timestamp
+        case turnID
         case isStreaming
         case codexMessageItems
         case codexReasoningItems
@@ -318,6 +321,7 @@ public struct ChatMessage: Identifiable, Codable, Sendable {
         text: String,
         reasoning: String? = nil,
         timestamp: Date? = nil,
+        turnID: String? = nil,
         isStreaming: Bool = false,
         codexMessageItems: CodexSerializedPayload? = nil,
         codexReasoningItems: CodexSerializedPayload? = nil
@@ -327,6 +331,7 @@ public struct ChatMessage: Identifiable, Codable, Sendable {
         self.text = text
         self.reasoning = reasoning
         self.timestamp = timestamp
+        self.turnID = turnID
         self.isStreaming = isStreaming
         self.codexMessageItems = codexMessageItems
         self.codexReasoningItems = codexReasoningItems
@@ -339,6 +344,7 @@ public struct ChatMessage: Identifiable, Codable, Sendable {
         text = try container.decode(String.self, forKey: .text)
         reasoning = try container.decodeIfPresent(String.self, forKey: .reasoning)
         timestamp = try container.decodeIfPresent(Date.self, forKey: .timestamp)
+        turnID = try container.decodeIfPresent(String.self, forKey: .turnID)
         isStreaming = try container.decodeIfPresent(Bool.self, forKey: .isStreaming) ?? false
         codexMessageItems = try container.decodeIfPresent(CodexSerializedPayload.self, forKey: .codexMessageItems)
         codexReasoningItems = try container.decodeIfPresent(CodexSerializedPayload.self, forKey: .codexReasoningItems)
@@ -354,6 +360,7 @@ public struct ChatMessage: Identifiable, Codable, Sendable {
         try container.encode(text, forKey: .text)
         try container.encodeIfPresent(reasoning, forKey: .reasoning)
         try container.encodeIfPresent(timestamp, forKey: .timestamp)
+        try container.encodeIfPresent(turnID, forKey: .turnID)
         try container.encode(isStreaming, forKey: .isStreaming)
         try container.encodeIfPresent(codexMessageItems, forKey: .codexMessageItems)
         if codexReasoningAvailability == .presentAndDisplayable {
@@ -377,6 +384,7 @@ public struct ChatMessage: Identifiable, Codable, Sendable {
                 text: text,
                 reasoning: mergedReasoning(from: row),
                 timestamp: DateParser.date(from: row["timestamp"]),
+                turnID: row["turn_id"]?.stringValue,
                 codexMessageItems: codexPayload(from: row["codex_message_items"]),
                 codexReasoningItems: codexPayload(from: row["codex_reasoning_items"])
             )

@@ -368,6 +368,7 @@ public struct StreamingEventReducer: Sendable {
                 id: identity(for: event),
                 role: .assistant,
                 text: "",
+                turnID: turnID(for: event),
                 isStreaming: true
             ))
             isAwaitingReply = true
@@ -375,7 +376,7 @@ public struct StreamingEventReducer: Sendable {
 
         case .messageDelta:
             guard let delta = event.text, !delta.isEmpty else { return reduction() }
-            appendAnswer(delta, identity: identity(for: event))
+            appendAnswer(delta, identity: identity(for: event), turnID: turnID(for: event))
             return reduction()
 
         // The wire names differ, but upstream routes provider reasoning,
@@ -384,16 +385,20 @@ public struct StreamingEventReducer: Sendable {
         case .thinkingDelta, .reasoningDelta, .reasoningAvailable:
             if let effort = Self.effort(from: event.payload) { reasoningEffort = effort }
             guard let delta = event.text, !delta.isEmpty else { return reduction() }
-            appendReasoning(delta, identity: identity(for: event))
+            appendReasoning(delta, identity: identity(for: event), turnID: turnID(for: event))
             return reduction()
 
         case .messageInterim:
             guard let interim = event.text, !interim.isEmpty else { return reduction() }
             if event.payload?["already_streamed"]?.boolValue == true {
-                if let index = streamingIndex { messages[index].text = interim }
-                else { appendAnswer(interim, identity: identity(for: event)) }
+                if let index = streamingIndex {
+                    messages[index].text = interim
+                    if messages[index].turnID == nil { messages[index].turnID = turnID(for: event) }
+                } else {
+                    appendAnswer(interim, identity: identity(for: event), turnID: turnID(for: event))
+                }
             } else {
-                appendAnswer(interim, identity: identity(for: event))
+                appendAnswer(interim, identity: identity(for: event), turnID: turnID(for: event))
             }
             return reduction()
 
@@ -429,19 +434,25 @@ public struct StreamingEventReducer: Sendable {
         return .provisional(UUID())
     }
 
-    private mutating func appendAnswer(_ delta: String, identity: MessageIdentity) {
+    private mutating func appendAnswer(_ delta: String, identity: MessageIdentity, turnID: String?) {
         if let index = streamingIndex {
             messages[index].text += delta
+            if messages[index].turnID == nil { messages[index].turnID = turnID }
         } else {
             messages.append(ChatMessage(
                 id: identity,
                 role: .assistant,
                 text: delta,
+                turnID: turnID,
                 isStreaming: true
             ))
         }
         isAwaitingReply = true
     }
+    private func turnID(for event: GatewayEvent) -> String? {
+        event.payload?["turn_id"]?.stringValue
+    }
+
     private func markerID(for event: GatewayEvent) -> String {
         event.serverMessageID.map { String($0.rawValue) }
             ?? event.payload?["marker_id"]?.stringValue
@@ -492,7 +503,8 @@ public struct StreamingEventReducer: Sendable {
             text: message.text,
             reasoning: message.reasoning,
             timestamp: message.timestamp,
-            displayMetadata: metadata
+            displayMetadata: metadata,
+            turnID: message.turnID
         )
     }
     private static func objectFields(_ value: JSONValue?) -> [String: JSONValue]? {
@@ -508,15 +520,17 @@ public struct StreamingEventReducer: Sendable {
     }
 
 
-    private mutating func appendReasoning(_ delta: String, identity: MessageIdentity) {
+    private mutating func appendReasoning(_ delta: String, identity: MessageIdentity, turnID: String?) {
         if let index = streamingIndex {
             messages[index].reasoning = (messages[index].reasoning ?? "") + delta
+            if messages[index].turnID == nil { messages[index].turnID = turnID }
         } else {
             messages.append(ChatMessage(
                 id: identity,
                 role: .assistant,
                 text: "",
                 reasoning: delta,
+                turnID: turnID,
                 isStreaming: true
             ))
         }
@@ -525,6 +539,7 @@ public struct StreamingEventReducer: Sendable {
 
     private mutating func complete(_ event: GatewayEvent) {
         if let index = streamingIndex {
+            if messages[index].turnID == nil { messages[index].turnID = turnID(for: event) }
             if let full = event.text, !full.isEmpty {
                 messages[index].text = full
             }
@@ -539,7 +554,8 @@ public struct StreamingEventReducer: Sendable {
                 id: identity(for: event),
                 role: .assistant,
                 text: full,
-                reasoning: event.payload?["reasoning"]?.stringValue
+                reasoning: event.payload?["reasoning"]?.stringValue,
+                turnID: turnID(for: event)
             ))
         }
         finishStreaming()

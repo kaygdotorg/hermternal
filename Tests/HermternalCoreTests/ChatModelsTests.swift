@@ -266,3 +266,50 @@ private func chatSession(title: String, preview: String) -> ChatSession {
         "preview": .string(preview)
     ]))
 }
+
+
+@Test("Gateway and REST messages retain the durable turn identity")
+func chatMessagesRetainTurnID() {
+    var reducer = StreamingEventReducer()
+    let live = reducer.reduce(GatewayEvent(
+        type: "message.delta",
+        sessionID: "chat",
+        payload: .object([
+            "text": .string("Streaming"),
+            "turn_id": .string("turn-42")
+        ])
+    ))
+    let durable = ChatMessage.projectREST(historyRows: [
+        .object([
+            "id": .integer(42),
+            "role": .string("assistant"),
+            "text": .string("Durable"),
+            "turn_id": .string("turn-42")
+        ])
+    ])
+
+    #expect(live.messages.first?.turnID == "turn-42")
+    #expect(durable.first?.turnID == "turn-42")
+}
+
+
+@Test("Already-streamed interim events fill a missing turn identity")
+func alreadyStreamedInterimCapturesTurnID() {
+    var reducer = StreamingEventReducer()
+    _ = reducer.reduce(GatewayEvent(
+        type: "message.start",
+        sessionID: "chat",
+        payload: .object([:])
+    ))
+    let reduction = reducer.reduce(GatewayEvent(
+        type: "message.interim",
+        sessionID: "chat",
+        payload: .object([
+            "text": .string("Complete"),
+            "already_streamed": .bool(true),
+            "turn_id": .string("turn-interim")
+        ])
+    ))
+
+    #expect(reduction.messages.first?.turnID == "turn-interim")
+}

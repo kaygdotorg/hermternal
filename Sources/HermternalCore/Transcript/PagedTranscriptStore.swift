@@ -137,6 +137,7 @@ public enum TranscriptMutation: Sendable {
     case replace(WireMessageRecord)
     case replaceText(messageID: String, text: String, revision: UInt64)
     case remove(messageID: String)
+    case removeMany(messageIDs: [String])
     case clear
 }
 
@@ -470,6 +471,17 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
             guard entries.removeValue(forKey: messageID) != nil else { return result(applied: false) }
             order.removeAll { $0 == messageID }
             try? fileSystem.remove(recordURL(messageID: messageID))
+            try rebuildDescriptors()
+        case .removeMany(let messageIDs):
+            var removed = false
+            for messageID in messageIDs {
+                if entries.removeValue(forKey: messageID) != nil {
+                    try? fileSystem.remove(recordURL(messageID: messageID))
+                    removed = true
+                }
+            }
+            guard removed else { return result(applied: false) }
+            order.removeAll { entries[$0] == nil }
             try rebuildDescriptors()
         case .clear:
             for id in order { try? fileSystem.remove(recordURL(messageID: id)) }

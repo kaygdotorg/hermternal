@@ -2471,18 +2471,21 @@ final class AppModel: ComposerTurnRouting {
             role: message.role.rawValue,
             text: message.text,
             reasoning: message.reasoning,
-            timestamp: message.timestamp
+            timestamp: message.timestamp,
+            turnID: message.turnID
         )
     }
 
     /// Persists only the currently published tail. The complete transcript is
     /// already represented by the paged store's disk records.
-    private func persistTranscriptTail(_ values: [ChatMessage]) async {
+    func persistTranscriptTail(_ values: [ChatMessage]) async {
         guard let store = activeTranscriptStore,
               let route = activeTranscriptRoute,
               let value = values.last,
               selectedSessionID == route.sessionID
         else { return }
+        // Live rows without a turn id remain durable provisional rows until
+        // an authoritative terminal transcript can replace them.
         do {
             let result = try await store.append(
                 Self.wireRecord(from: value),
@@ -3621,7 +3624,26 @@ final class AppModel: ComposerTurnRouting {
             return
         }
         let targetIdentity = MessageIdentity.server(location.messageID)
-        guard messages.contains(where: { $0.id == targetIdentity }) else {
+        let isPublished = messages.contains { $0.id == targetIdentity }
+        let store = activeTranscriptStore
+        let targetExistsInStore: Bool
+        if let store,
+           activeStoreAppGeneration == generation,
+           activeTranscriptRoute?.sessionID == location.sessionID {
+            targetExistsInStore = (try? await store.locate(
+                messageID: String(location.messageID.rawValue)
+            )) != nil
+            guard activeTranscriptStore === store,
+                  activeStoreAppGeneration == generation,
+                  selectedSessionID == location.sessionID,
+                  pendingMessageRoute?.generation == generation,
+                  openGenerations.isCurrent(generation),
+                  Task.isCancelled == false
+            else { return }
+        } else {
+            targetExistsInStore = false
+        }
+        guard isPublished || targetExistsInStore else {
             pendingMessageRoute = nil
             postError("Could not open that message", detail: "It is no longer available.")
             return
@@ -3798,7 +3820,77 @@ final class AppModel: ComposerTurnRouting {
         await reconcileTerminal(reduction.terminal)
     }
 
-    private func reconcileTerminal(_ terminal: StreamingTerminal?) async {
+    /// Removes only provisional rows with the same gateway turn identity and role
+    /// as an authoritative durable row. Text and timestamps never establish identity.
+    private func reconcileProvisionalTranscriptRows(
+        with authoritativeMessages: [ChatMessage],
+        expectedGeneration: Int
+    ) async {
+        guard let store = activeTranscriptStore,
+              let activeRoute = activeTranscriptRoute,
+              activeStoreAppGeneration == expectedGeneration,
+              openGenerations.isCurrent(expectedGeneration),
+              Task.isCancelled == false
+        else { return }
+        let currentRoute: TranscriptRoute
+        do {
+            currentRoute = try await store.currentRoute()
+        } catch {
+            Log.error("transcript provisional route lookup failed: \(error)")
+            return
+        }
+        guard currentRoute.sessionID == activeRoute.sessionID,
+              activeTranscriptStore === store,
+              activeStoreAppGeneration == expectedGeneration,
+              openGenerations.isCurrent(expectedGeneration),
+              Task.isCancelled == false
+        else { return }
+        var route = currentRoute
+
+        let provisionalIDs = messages.compactMap { message -> String? in
+            guard case .provisional(let id) = message.id,
+                  let turnID = message.turnID,
+                  authoritativeMessages.contains(where: { candidate in
+                      guard case .server = candidate.id else { return false }
+                      return candidate.role == message.role && candidate.turnID == turnID
+                  })
+            else { return nil }
+            return id.uuidString
+        }
+        guard !provisionalIDs.isEmpty else { return }
+
+        do {
+            let result = try await store.apply(
+                .removeMany(messageIDs: provisionalIDs),
+                expectedGeneration: route.generation,
+                expectedEpoch: route.epoch
+            )
+            guard activeTranscriptStore === store,
+                  activeStoreAppGeneration == expectedGeneration,
+                  selectedSessionID == route.sessionID,
+                  openGenerations.isCurrent(expectedGeneration),
+                  Task.isCancelled == false
+            else { return }
+            route = TranscriptRoute(
+                sessionID: route.sessionID,
+                generation: result.generation,
+                epoch: result.epoch
+            )
+            transcriptSummary = result.summary
+            guard activeTranscriptStore === store,
+                  activeStoreAppGeneration == expectedGeneration,
+                  selectedSessionID == route.sessionID,
+                  openGenerations.isCurrent(expectedGeneration),
+                  Task.isCancelled == false
+            else { return }
+            activeTranscriptRoute = route
+            transcriptRevision &+= 1
+        } catch {
+            Log.error("transcript provisional reconciliation failed: \(error)")
+        }
+    }
+
+    func reconcileTerminal(_ terminal: StreamingTerminal?) async {
         guard !isViewingArchivedTranscript, terminal != nil else { return }
         let generation = openGenerations.current()
         let sessionID = selectedSessionID
@@ -3830,10 +3922,16 @@ final class AppModel: ComposerTurnRouting {
             sessionTitle: sessionTitle
         ) else { return }
         guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
-        streamingReducer.reset(
-            messages: Array(result.messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
+        await reconcileProvisionalTranscriptRows(
+            with: result.messages,
+            expectedGeneration: generation
         )
-        messages = result.messages
+        guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
+        let reconciledMessages = result.messages.isEmpty ? messages : result.messages
+        streamingReducer.reset(
+            messages: Array(reconciledMessages.suffix(TranscriptPublicationPolicy.initialMessageCount))
+        )
+        messages = reconciledMessages
         updateComposerRoute()
         await refreshActiveTranscriptMetadata(nil, expectedGeneration: generation)
         if let snapshot = result.snapshot,

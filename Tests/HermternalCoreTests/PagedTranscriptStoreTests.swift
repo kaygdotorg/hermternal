@@ -79,4 +79,29 @@ final class PagedTranscriptStoreTests: XCTestCase {
         } catch is CancellationError {
         }
     }
+
+
+    func testBatchRemovalRemovesOnlySelectedRowsInOneMutation() async throws {
+        let store = makeStore()
+        try await store.append(WireMessageRecord(messageID: "one", text: "one"))
+        try await store.append(WireMessageRecord(messageID: "two", text: "two"))
+        try await store.append(WireMessageRecord(messageID: "three", text: "three"))
+        let route = try await store.currentRoute()
+
+        let result = try await store.apply(
+            .removeMany(messageIDs: ["one", "three"]),
+            expectedGeneration: route.generation,
+            expectedEpoch: route.epoch
+        )
+
+        let first = try await store.locate(messageID: "one")
+        let second = try await store.locate(messageID: "two")
+        let third = try await store.locate(messageID: "three")
+        XCTAssertTrue(result.applied)
+        XCTAssertEqual(result.epoch, route.epoch + 1)
+        XCTAssertNil(first)
+        XCTAssertNotNil(second)
+        XCTAssertNil(third)
+    }
+
 }
