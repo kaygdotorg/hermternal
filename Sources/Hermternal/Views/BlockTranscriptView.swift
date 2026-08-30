@@ -56,6 +56,7 @@ struct BlockTranscriptView: NSViewRepresentable {
         private var isStreaming = false
         private var findQuery = ""
         private var pendingMessageID: String?
+        private var consumedPendingMessageID: String?
         private var findMessageID: String?
         private var targetOrdinal: Int?
         private var viewportTarget: TranscriptRendererTestSeam.ViewportTarget?
@@ -135,6 +136,7 @@ struct BlockTranscriptView: NSViewRepresentable {
                 totalTurnCount = nil
                 heightByOrdinal.removeAll(keepingCapacity: true)
                 targetOrdinal = nil
+                consumedPendingMessageID = nil
                 viewportTarget = nil
                 expandedReasoning.removeAll(keepingCapacity: true)
                 expandedTools.removeAll(keepingCapacity: true)
@@ -144,6 +146,9 @@ struct BlockTranscriptView: NSViewRepresentable {
             revision = input.revision
             if pendingMessageID != input.pendingMessageID || findTargetChanged {
                 targetOrdinal = nil
+            }
+            if pendingMessageID != input.pendingMessageID {
+                consumedPendingMessageID = nil
             }
             pendingMessageID = input.pendingMessageID
             if revisionChanged, !routeChanged {
@@ -409,7 +414,10 @@ struct BlockTranscriptView: NSViewRepresentable {
         private func position(routeChanged: Bool) {
             let current = generation
             let target = TranscriptRendererTestSeam.viewportTarget(
-                pendingMessageID: pendingMessageID,
+                pendingMessageID: TranscriptRendererTestSeam.activePendingMessageID(
+                    pendingMessageID: pendingMessageID,
+                    consumedPendingMessageID: consumedPendingMessageID
+                ),
                 findMessageID: findMessageID,
                 isStreaming: isStreaming,
                 isNearBottom: followsStreaming,
@@ -447,6 +455,11 @@ struct BlockTranscriptView: NSViewRepresentable {
                     else { return }
                     self.table.selectRowIndexes(IndexSet(integer: target), byExtendingSelection: false)
                     self.table.scrollRowToVisible(target)
+                    if self.pendingMessageID == messageID,
+                       self.consumedPendingMessageID != messageID {
+                        self.consumedPendingMessageID = messageID
+                        self.position(routeChanged: false)
+                    }
                 }
             case .bottom:
                 guard !isReadOnly, routeChanged || (isStreaming && followsStreaming) else { return }
@@ -506,7 +519,13 @@ enum TranscriptRendererTestSeam {
         currentTarget == .message(id: messageID)
     }
 
-    static func configuredTurnID(for turn: TranscriptTurn) -> String { turn.id }
+    static func activePendingMessageID(
+        pendingMessageID: String?,
+        consumedPendingMessageID: String?
+    ) -> String? {
+        pendingMessageID == consumedPendingMessageID ? nil : pendingMessageID
+    }
+
     static func attributedAnswer(_ document: MarkdownDocument) -> NSAttributedString { TranscriptTurnTextRenderer.attributedAnswer(document) }
 }
 
@@ -583,7 +602,7 @@ private final class BlockTranscriptTableView: NSTableView {
 }
 
 @MainActor
-private final class TranscriptTurnRowView: NSTableCellView {
+final class TranscriptTurnRowView: NSTableCellView {
     static let identifier = NSUserInterfaceItemIdentifier("TranscriptTurnRow")
 
     private let stack = NSStackView()
@@ -592,8 +611,10 @@ private final class TranscriptTurnRowView: NSTableCellView {
     private let roleLabel = NSTextField(labelWithString: "")
     private let answerView = NSTextView()
     private let reasoningButton = NSButton()
+    var reasoningButtonForTesting: NSButton { reasoningButton }
     private let reasoningView = NSTextView()
     private let toolsButton = NSButton()
+    var toolsButtonForTesting: NSButton { toolsButton }
     private let copyButton = NSButton()
     private let toolsView = NSTextView()
     private let metadataStack = NSStackView()
@@ -769,7 +790,10 @@ private final class TranscriptTurnRowView: NSTableCellView {
         onTools: @escaping (String) -> Void,
         onCopyCode: @escaping (String) -> Void
     ) {
-        turnID = TranscriptRendererTestSeam.configuredTurnID(for: turn)
+        turnID = turn.id
+        self.onReasoning = onReasoning
+        self.onTools = onTools
+        self.onCopyCode = onCopyCode
         let isHermes = turn.speaker == .hermes
         markView.isHidden = !isHermes
         if isHermes {
@@ -981,7 +1005,14 @@ private enum TranscriptTurnTextRenderer {
             var heading = attributes; heading[.font] = headingFont(level, bodyFont: font)
             output.append(attributedInline(inlines, attributes: heading))
         case .quote(_, _, let inlines):
-            output.append(NSAttributedString(string: "│ ", attributes: attributes)); output.append(attributedInline(inlines, attributes: attributes))
+            var quoteAttributes = attributes
+            quoteAttributes[.foregroundColor] = NSColor.secondaryLabelColor
+            let quoteParagraph = (paragraph.mutableCopy() as? NSMutableParagraphStyle) ?? NSMutableParagraphStyle()
+            quoteParagraph.headIndent = 10
+            quoteParagraph.firstLineHeadIndent = 10
+            quoteAttributes[.paragraphStyle] = quoteParagraph
+            output.append(NSAttributedString(string: "│ ", attributes: quoteAttributes))
+            output.append(attributedInline(inlines, attributes: quoteAttributes))
         case .list(_, _, let items), .taskList(_, _, let items):
             for (index, item) in items.enumerated() {
                 if index > 0 { output.append(NSAttributedString(string: "\n", attributes: attributes)) }
@@ -1010,7 +1041,10 @@ private enum TranscriptTurnTextRenderer {
                 }
             }
         case .footnote(_, _, let label, let inlines):
-            output.append(NSAttributedString(string: "[^\(label)]: ", attributes: attributes)); output.append(attributedInline(inlines, attributes: attributes))
+            var footnoteAttributes = attributes
+            footnoteAttributes[.font] = NSFont.preferredFont(forTextStyle: .footnote)
+            output.append(NSAttributedString(string: "[^\(label)]: ", attributes: footnoteAttributes))
+            output.append(attributedInline(inlines, attributes: footnoteAttributes))
         case .source(_, _): output.append(NSAttributedString(string: source.sourceText(for: block), attributes: attributes))
         }
     }
@@ -1038,7 +1072,14 @@ private enum TranscriptTurnTextRenderer {
 
     private static func fontTraits(_ traits: NSFontTraitMask, _ attributes: [NSAttributedString.Key: Any]) -> [NSAttributedString.Key: Any] {
         var result = attributes
-        result[.font] = NSFontManager.shared.convert((attributes[.font] as? NSFont) ?? NSFont.preferredFont(forTextStyle: .body), toHaveTrait: traits)
+        let font = (attributes[.font] as? NSFont) ?? NSFont.preferredFont(forTextStyle: .body)
+        let symbolicTraits = font.fontDescriptor.symbolicTraits.union(
+            NSFontDescriptor.SymbolicTraits(rawValue: UInt32(truncatingIfNeeded: traits.rawValue))
+        )
+        let descriptor = font.fontDescriptor.addingAttributes([
+            .traits: [NSFontDescriptor.TraitKey.symbolic: symbolicTraits.rawValue]
+        ])
+        result[.font] = NSFont(descriptor: descriptor, size: font.pointSize) ?? font
         return result
     }
     private static func headingFont(_ level: Int, bodyFont: NSFont) -> NSFont {
