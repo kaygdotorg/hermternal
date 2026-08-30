@@ -72,25 +72,7 @@ extension SessionRowItem {
 
     var body: some View {
         let _ = HermternalSelectionOccupancyTrace.sessionRowBodyEvaluated()
-        return rowContent
-            .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                pinButton
-            }
-            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                archiveButton
-            }
-            .contextMenu {
-                contextMenu
-            }
-    }
-
-    /// List owns primary clicks for rows that are not selected.
-    ///
-    /// Only the selected row needs a tap recognizer because List does not
-    /// publish a selection change when the user activates it again.
-    @ViewBuilder
-    private var rowContent: some View {
-        let content = SessionRow(session: session)
+        return SessionRow(session: session)
             .accessibilityLabel(session.displayTitle)
             .accessibilityValue(sessionRowDetail(session))
             .accessibilityIdentifier("session-row-\(session.id)")
@@ -102,16 +84,23 @@ extension SessionRowItem {
                 )
                 onOpen(session)
             }
-        if isSelected {
-            content.modifier(
+            // An unselected row must not attach a recognizer because it can consume the click before native List selection.
+            .modifier(
                 SessionRowTapModifier(
                     session: session,
+                    isSelected: isSelected,
                     onOpen: onOpen
                 )
             )
-        } else {
-            content
-        }
+            .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                pinButton
+            }
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                archiveButton
+            }
+            .contextMenu {
+                contextMenu
+            }
     }
 
 
@@ -235,40 +224,47 @@ extension SessionRowItem {
 
 }
 
-/// Reopens the selected row without intercepting native selection.
+/// Adds the only pointer recognizer a session row needs. `List` owns clicks
+/// that change selection; this seam is intentionally absent on unselected rows
+/// so their click cannot be consumed before `List` sees it.
 private struct SessionRowTapModifier: ViewModifier {
     let session: ChatSession
+    let isSelected: Bool
     let onOpen: (ChatSession) -> Void
 
+    @ViewBuilder
     func body(content: Content) -> some View {
-        content.simultaneousGesture(
-            TapGesture(count: 1)
-                .onEnded {
-                    let allowed =
-                        SidebarSelectionEventAdapter.allowsCompletedTapActivation()
-                    HermternalSwitchTrace.session(
-                        "selection.tapGate",
-                        id: session.id,
-                        messages: session.messageCount,
-                        detail: allowed ? "allowed" : "blocked"
-                    )
-                    guard allowed else {
-                        HermternalSwitchTrace.selectionGuard(
-                            "sessionRow.tapGate",
+        if isSelected {
+            content.simultaneousGesture(
+                TapGesture(count: 1)
+                    .onEnded {
+                        let allowed = SidebarSelectionEventAdapter.allowsPrimaryActivation()
+                        HermternalSwitchTrace.session(
+                            "selection.tapGate",
                             id: session.id,
                             messages: session.messageCount,
-                            reason: "contextOrModifiedClick"
+                            detail: allowed ? "allowed" : "blocked"
                         )
-                        return
+                        guard allowed else {
+                            HermternalSwitchTrace.selectionGuard(
+                                "sessionRow.tapGate",
+                                id: session.id,
+                                messages: session.messageCount,
+                                reason: "eventAdapterRejectedPrimaryActivation"
+                            )
+                            return
+                        }
+                        HermternalSwitchTrace.session(
+                            "selection.observed.pointer",
+                            id: session.id,
+                            messages: session.messageCount
+                        )
+                        onOpen(session)
                     }
-                    HermternalSwitchTrace.session(
-                        "selection.observed.pointer",
-                        id: session.id,
-                        messages: session.messageCount
-                    )
-                    onOpen(session)
-                }
-        )
+            )
+        } else {
+            content
+        }
     }
 }
 
