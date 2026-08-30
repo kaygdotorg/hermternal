@@ -1,0 +1,13 @@
+Act as the librarian agent. Research only official Apple primary sources.
+You are already a delegated subagent. Perform this slice yourself. Do not delegate further.
+Cover bottom anchoring, scroll-position preservation, keyboard and composer insets, memory bounds for long chats, paging, prefetching, coalescing, accessibility, and anti-patterns causing scroll jumps or excessive work.
+Use Apple documentation, Apple sample code, HIG, and WWDC sessions only.
+Do not use secondary sources.
+Write findings to Research/.native-chat-scroll-slice.md.
+Use exactly one finding per physical line.
+Prefix each line with "- FACT:" or "- RECOMMENDATION:".
+Add one or more exact direct Apple URLs on the same line.
+Mark derived guidance as a recommendation.
+Preserve every source link.
+Do not edit other files.
+Use Simplified Technical English.
