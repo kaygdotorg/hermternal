@@ -93,13 +93,19 @@ cp "$ROOT/Resources/Info.plist" "$STAGE_APP/Contents/Info.plist"
 # .icns has no appearance axis, so there is no fallback worth shipping. A failure
 # here is fatal rather than silently producing a bundle with a generic icon.
 ICON_BUILD="$ROOT/build/icon"
+MACOS_ICON_CATALOG="$ROOT/Resources/AppIcon.icon"
 rm -rf "$ICON_BUILD"
 mkdir -p "$ICON_BUILD"
+# Compile only the macOS icon catalog. Do not pass a parent Resources directory
+# to actool: that would make unrelated platform asset catalogs eligible for
+# Assets.car and could leak an iOS AccentColor into this macOS bundle.
+[[ -d "$MACOS_ICON_CATALOG" ]] ||
+	{ echo "error: macOS icon catalog is missing: $MACOS_ICON_CATALOG" >&2; exit 1; }
 # Match the deployment floor the bundle itself advertises instead of repeating it.
 MIN_MACOS="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' \
 	"$ROOT/Resources/Info.plist" 2>/dev/null)" ||
 	{ echo "error: Resources/Info.plist has no LSMinimumSystemVersion" >&2; exit 1; }
-if ! ICON_LOG="$(xcrun actool "$ROOT/Resources/AppIcon.icon" \
+if ! ICON_LOG="$(xcrun actool "$MACOS_ICON_CATALOG" \
 	--compile "$ICON_BUILD" \
 	--app-icon AppIcon \
 	--output-partial-info-plist "$ICON_BUILD/partial.plist" \

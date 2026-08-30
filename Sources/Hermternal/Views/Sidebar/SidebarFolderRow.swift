@@ -164,6 +164,8 @@ struct SidebarFolderRow: View {
 
     @State private var isTargeted = false
     @State private var isHovered = false
+    @Environment(\.hermternalAccentColor) private var accentColor
+
 
 
     var body: some View {
@@ -298,11 +300,11 @@ struct SidebarFolderRow: View {
         Label {
             Text(target.name)
                 .lineLimit(1)
-                .foregroundStyle(isTargeted ? Color.accentColor : Color.primary)
+                .foregroundStyle(isTargeted ? accentColor : Color.primary)
         } icon: {
             Image(systemName: "folder")
                 .symbolVariant(isTargeted ? .fill : SymbolVariants.none)
-                .foregroundStyle(isTargeted ? Color.accentColor : Color.secondary)
+                .foregroundStyle(isTargeted ? accentColor : Color.secondary)
         }
         .font(.body)
         .help(target.name)

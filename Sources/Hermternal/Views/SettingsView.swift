@@ -22,11 +22,14 @@ struct SettingsView: View {
     }
 
     var body: some View {
+
+        let accentColor = Color(nsColor: appearance.effectiveAccentColor)
         SettingsSplitView(
             appearance: appearance,
             model: model,
             registry: registry,
             debugModules: debugModules,
+            accentColor: accentColor,
             selection: $selection
         )
         .frame(
@@ -41,7 +44,9 @@ struct SettingsView: View {
 
 enum SettingsSection: String, CaseIterable, Hashable, Identifiable {
     case appearance
+    case chat
     case gateway
+    case models
     case cache
     case modules
 
@@ -50,7 +55,9 @@ enum SettingsSection: String, CaseIterable, Hashable, Identifiable {
     var title: String {
         switch self {
         case .appearance: "Appearance"
+        case .chat: "Chat"
         case .gateway: "Gateway"
+        case .models: "Models"
         case .cache: "Cache"
         case .modules: "Modules"
         }
@@ -59,7 +66,9 @@ enum SettingsSection: String, CaseIterable, Hashable, Identifiable {
     var systemImage: String {
         switch self {
         case .appearance: "paintbrush"
+        case .chat: "text.bubble"
         case .gateway: "network"
+        case .models: "slider.horizontal.3"
         case .cache: "internaldrive"
         case .modules: "puzzlepiece.extension"
         }
@@ -68,6 +77,8 @@ enum SettingsSection: String, CaseIterable, Hashable, Identifiable {
 
 struct SettingsSourceList: View {
     @Binding var selection: SettingsSection?
+    let accentColor: Color
+
 
     var body: some View {
         List(selection: $selection) {
@@ -83,12 +94,16 @@ struct SettingsSourceList: View {
         // Clear the traffic lights; the hosting controller drops the titlebar
         // safe area, so this is the only top inset the list gets.
         .padding(.top, 46)
+        .environment(\.hermternalAccentColor, accentColor)
+        .tint(accentColor)
     }
 }
 
 struct SettingsDetailView: View {
     let section: SettingsSection
     @Bindable var appearance: AppearanceSettings
+    let accentColor: Color
+
     @Bindable var model: AppModel
     let registry: CapabilityRegistry
     let debugModules: any DebugModuleCapability
@@ -104,8 +119,11 @@ struct SettingsDetailView: View {
             detailContent
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
+        .environment(\.hermternalAccentColor, accentColor)
+        .tint(accentColor)
         // Top inset comes from the heading's own padding; the hosting
         // controller already drops the titlebar safe area.
+
     }
 
     @ViewBuilder
@@ -113,11 +131,15 @@ struct SettingsDetailView: View {
         switch section {
         case .appearance:
             AppearanceSettingsView(appearance: appearance)
+        case .chat:
+            ChatSettingsView(appearance: appearance)
         case .gateway:
             GatewaySettingsView(
                 status: model.gatewayStatus,
                 onSelectMethod: model.setAuthenticationMethod
             )
+        case .models:
+            ModelsSettingsView(model: model)
         case .cache:
             CacheSettingsView(model: model)
         case .modules:
@@ -175,15 +197,6 @@ private struct AppearanceSettingsView: View {
                     Button("Use macOS System Accent") {
                         appearance.useSystemAccent()
                     }
-                }
-
-                Toggle(isOn: $appearance.userBubbleUsesAccent) {
-                    Text("Tint your own messages with the accent")
-                    Text(
-                        "Your messages fill a blue bubble, the way Messages "
-                            + "draws one you sent. Turn this on to fill them "
-                            + "with the accent colour instead."
-                    )
                 }
             } header: {
                 Text("Accent")
@@ -245,8 +258,94 @@ private struct AppearanceSettingsView: View {
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
+}
+}
+
+private struct ChatSettingsView: View {
+    @Bindable var appearance: AppearanceSettings
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle(isOn: $appearance.alwaysShowsChatMetadata) {
+                    Text("Always show model and reasoning")
+                    Text(
+                        "Every answer keeps a footer with the model and the "
+                            + "reasoning effort. Turn this off to show the "
+                            + "footer only while the pointer is over the turn."
+                    )
+                }
+            } header: {
+                Text("Metadata")
+            }
+        }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
     }
 }
+
+private struct ModelsSettingsView: View {
+    @Bindable var model: AppModel
+    @State private var defaultModel = ""
+    @State private var defaultProvider = ""
+    @State private var defaultReasoning = "none"
+    @State private var isSaving = false
+
+    var body: some View {
+        Form {
+            if let reason = model.composerDefaultsUnavailableReason {
+                Section {
+                    Label(reason, systemImage: "info.circle")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Section {
+                TextField("Model", text: $defaultModel)
+                TextField("Provider (optional)", text: $defaultProvider)
+                Picker("Reasoning", selection: $defaultReasoning) {
+                    Text("Off").tag("none")
+                    ForEach(ReasoningEffort.allCases, id: \.rawValue) { effort in
+                        Text(effort.rawValue.capitalized).tag(effort.rawValue)
+                    }
+                }
+            } header: {
+                Text("New chat defaults")
+            } footer: {
+                Text("These settings apply to new chats. Changing them does not change the current chat.")
+            }
+            .disabled(!model.composerDefaultsAvailable)
+
+            Section {
+                Button(isSaving ? "Saving…" : "Save Defaults") {
+                    isSaving = true
+                    let modelValue = defaultModel.isEmpty ? nil : defaultModel
+                    let providerValue = defaultProvider.isEmpty ? nil : defaultProvider
+                    let reasoning: ReasoningSetting? = defaultReasoning == "none"
+                        ? .off
+                        : ReasoningEffort(rawValue: defaultReasoning).map(ReasoningSetting.effort)
+                    Task { @MainActor in
+                        await model.setComposerDefaults(
+                            model: modelValue,
+                            provider: providerValue,
+                            reasoning: reasoning
+                        )
+                        isSaving = false
+                    }
+                }
+                .disabled(isSaving || model.phase != .ready || !model.composerDefaultsAvailable)
+            }
+        }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+        .task {
+            await model.loadComposerDefaults()
+            defaultModel = model.composerDefaultModel ?? ""
+            defaultProvider = model.composerDefaultProvider ?? ""
+            defaultReasoning = model.composerDefaultReasoning?.wireValue ?? "none"
+        }
+    }
+}
+
 
 
 private struct CacheSettingsView: View {

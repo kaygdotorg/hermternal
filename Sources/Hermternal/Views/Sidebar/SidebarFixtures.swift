@@ -8,6 +8,15 @@ import HermternalCore
 /// Release builds do not compile the environment-controlled fixture path.
 enum SidebarFixtures {
     static let isEnabled = ProcessInfo.processInfo.environment["HERMTERNAL_FIXTURES"] == "1"
+    /// Memory stress fixtures need both explicit debug fixture switches.
+    static let worstMemoryIsEnabled = isEnabled
+        && ProcessInfo.processInfo.environment["HERMTERNAL_WORST_MEMORY"] == "1"
+
+    static func worstMemoryState(root: URL) -> WorstTranscriptFixture.State {
+        precondition(worstMemoryIsEnabled)
+        return WorstTranscriptFixture.State(root: root)
+    }
+
     /// Fixture authority is deliberately non-production so labels and copied
     /// links never claim the real gateway.
     static let gatewayURL = URL(string: "https://fixtures.hermternal.invalid")!

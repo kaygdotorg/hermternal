@@ -39,5 +39,7 @@
 	<true/>
 	<key>NSSupportsSuddenTermination</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Hermternal uses the microphone for on-device dictation and audio recordings that you choose to create.</string>
 </dict>
 </plist>

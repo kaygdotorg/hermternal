@@ -494,14 +494,9 @@ enum HermternalSwitchTrace {
 }
 
 
-private struct TranscriptMatchCache {
-    let query: String
-    let revision: Int
-    let matches: [TranscriptMatch]
-}
 @MainActor
 @Observable
-final class AppModel {
+final class AppModel: ComposerTurnRouting {
     /// The process capability injected by the composition root. The trace
     /// owner retains this same reference so a paint can record without global
     /// capability lookup or a second registry.
@@ -520,42 +515,60 @@ final class AppModel {
     var sessions: [ChatSession] = []
     var sortMode: SortMode = .lastActivity
     var groupByDate = true
+    /// Which of the sidebar's two lists the column shows. The window's
+    /// toolbar menu and the column itself both act on this, so neither of
+    /// them can own it.
+    var sidebarContentMode: SidebarContentMode = .chats
+    /// Raised by the New Folder command. The sidebar column owns the prompt,
+    /// because the prompt belongs beside the list it adds a folder to.
+    var isCreatingFolder = false
     var archivedSessions: [ChatSession] = []
     var archivedSessionsLoading = false
     var archivedSessionsError: String?
     var folders: [Folder] = []
     var membership: [String: String] = [:]
+    /// A bounded presentation of the active transcript. Full history lives in
+    /// the disk-backed PagedTranscriptStore and is never retained here.
     var messages: [ChatMessage] = [] {
         didSet {
+            let bounded = Array(messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
+            if bounded.count != messages.count {
+                messages = bounded
+                return
+            }
             messagesRevision &+= 1
-            transcriptMatchCache = nil
+            transcriptRevision &+= 1
         }
     }
-    /// Monotonic revision for transcript content. Find memoization keys on
-    /// this value rather than repeatedly comparing all message text.
+    /// Monotonic revision for the bounded transcript presentation.
     private(set) var messagesRevision = 0
-    private var transcriptMatchCache: TranscriptMatchCache?
 
-    /// Returns the memoized Find result for the current transcript revision.
-    ///
-    /// The revision increments from `messages`' didSet, including element
-    /// replacement and streaming text updates. The single-entry cache avoids
-    /// retaining match arrays for old transcripts or queries.
+    /// The active disk-backed transcript and the route used to read it.
+    /// Renderer and Find consumers use these values instead of a corpus array.
+    private(set) var activeTranscriptStore: PagedTranscriptStore?
+    private(set) var activeTranscriptRoute: TranscriptRoute?
+    private(set) var transcriptSummary: TranscriptSummary?
+    private(set) var transcriptRevision: UInt64 = 0
+    private var activeStoreAppGeneration: Int?
+    private(set) var activeTranscriptFindCursor: TranscriptFindCursor?
+
+    /// Compatibility projection for legacy callers. This scans only the
+    /// bounded visible tail; the full Find path uses `makeTranscriptFindCursor`.
     func transcriptMatches(for query: String) -> [TranscriptMatch] {
-        let revision = messagesRevision
-        if let cache = transcriptMatchCache,
-           cache.revision == revision,
-           cache.query == query {
-            return cache.matches
-        }
-        // ChatView previously caused five full scans per body pass.
-        let matches = TranscriptFindPass.matches(in: messages, query: query)
-        transcriptMatchCache = TranscriptMatchCache(
-            query: query,
-            revision: revision,
-            matches: matches
+        TranscriptFindPass.matches(in: messages, query: query)
+    }
+
+    func makeTranscriptFindCursor(
+        query: String,
+        caseSensitive: Bool = false,
+        role: String? = nil
+    ) async -> TranscriptFindCursor? {
+        guard let store = activeTranscriptStore else { return nil }
+        let cursor = try? await store.find(
+            FindQuery(text: query, caseSensitive: caseSensitive, role: role)
         )
-        return matches
+        activeTranscriptFindCursor = cursor
+        return cursor
     }
     var selectedSessionID: String?
     /// Route identity installed with the transcript snapshot.
@@ -590,6 +603,16 @@ final class AppModel {
     var isAwaitingReply = false
     /// True while an explicit open is preparing a replacement transcript.
     var isPreparingTranscriptOpen: Bool { isPreparingOpen }
+    func isPreparingTranscriptOpen(for sessionID: String) -> Bool {
+        isPreparingOpen
+            && TranscriptSwitchWorkPolicy.shouldCoalescePendingOpen(
+                sessionID: sessionID,
+                activeSessionID: activeOpenSessionID,
+                hasPublishedFirstFrame: activeOpenDidPublish
+            )
+            && activeOpenTask?.isCancelled == false
+            && activeOpenHandle?.isTerminated == false
+    }
     /// Reserved for the read-only archived transcript route. It remains nil
     /// until the transcript host can gate the composer and send actions.
     var viewingArchivedSessionID: String?
@@ -618,7 +641,7 @@ final class AppModel {
             gatewayAdvertisedMethods: gatewayAdvertisedMethods
         )
     }
-    /// Capability state is composed once by the connected gateway module.
+    /// Capability state is composed by the connected gateway module.
     var sessionPurgeCapability: SessionPurgeCapability?
     var sessionPurgeUnavailableReason: String = "Complete deletion is unavailable on this gateway."
     var canPurgeSessions: Bool { sessionPurgeCapability != nil }
@@ -630,10 +653,50 @@ final class AppModel {
             gateway: gatewayStatus.url
         )
     }
+    /// Composer state is created at the connected-gateway composition root.
+    /// Composer state is always present; before connection its real gateway
+    /// adapter reports transport unavailability rather than disappearing.
+    @ObservationIgnored
+    private(set) lazy var composerModel: ComposerModel = {
+        let gateway = GatewayClient()
+        let runtime = GatewayRuntimeAdapter(gateway: gateway)
+        return ComposerModel(
+            route: composerRoute,
+            runtime: runtime,
+            attachmentStaging: runtime,
+            turn: self,
+            dictation: SpeechDictationAdapter(),
+            recorder: AudioCaptureAdapter()
+        )
+    }()
+    private(set) var composerRuntimeSnapshot = SessionRuntimeSnapshot(
+        model: nil,
+        provider: nil,
+        reasoning: nil,
+        isRunning: false
+    )
+    private(set) var composerDefaultModel: String?
+    private(set) var composerDefaultProvider: String?
+    private(set) var composerDefaultReasoning: ReasoningSetting?
+    private(set) var composerDefaultsUnavailableReason: String?
+    var composerDefaultsAvailable: Bool { composerDefaultsUnavailableReason == nil }
+    var composerInventory: ModelInventory? {
+        if case let .loaded(value) = composerModel.inventory { return value }
+        return nil
+    }
+    var currentSessionModel: String? { composerRuntimeSnapshot.model }
+    var currentSessionReasoning: ReasoningSetting? { composerRuntimeSnapshot.reasoning }
 
     /// The command-K surface is owned by the app model so the command menu
     /// and the window overlay share one source of truth.
     var isSearchPresented = false
+    /// Incremented by the application Find command. ChatView observes this
+    /// explicit seam because focused values do not cross an AppKit host.
+    var findRequestGeneration = 0
+    /// Incremented by AppKit commands that need to focus the composer. This
+    /// remains a generation rather than a Boolean so a request is observable
+    /// even when the current selection is already nil.
+    var composerFocusRequestGeneration = 0
 
     let toastPresenter: ToastPresenter
     private(set) var searchQuerying: (any SearchQuerying)?
@@ -659,6 +722,7 @@ final class AppModel {
     private var gateway: GatewayClient?
     private var rest: RestClient?
     private var capabilityModule: GatewayCapabilityModule?
+    private var composerRuntime: GatewayRuntimeAdapter?
     private let organizationStore: SessionOrganizationStore
     private var organizationSnapshot: SessionOrganization?
     private var organizationLoaded = false
@@ -670,6 +734,9 @@ final class AppModel {
     private let injectedTranscriptSource: (any TranscriptSource)?
     private var eventTask: Task<Void, Never>?
     private let cache: any TranscriptPersisting
+    /// Kept separately because the search decorator intentionally hides the
+    /// paged-store seam; both layers still share the same on-disk directory.
+    private let historyCache: HistoryCache
     private let warmStore: TranscriptWarmStore
     private var accountIdentity: AccountIdentity?
     private var discoveredProvider: AuthProvider?
@@ -693,6 +760,9 @@ final class AppModel {
     /// starts. Its handle clears producer-owned transcript state synchronously.
     private var activeOpenTask: Task<Void, Never>?
     private var activeOpenHandle: TranscriptOpenHandle?
+    private var activeOpenSessionID: String?
+    private var activeOpenDidPublish = false
+    private var pendingNavigationSession: ChatSession?
     private var externalRouteTask: Task<Void, Never>?
     private let openGenerations = OpenGenerationController()
     private var streamingReducer = StreamingEventReducer()
@@ -731,6 +801,7 @@ final class AppModel {
         self.injectedTranscriptSource = transcriptSource
         self.toastPresenter = toastPresenter
         self.organizationStore = organizationStore
+        self.historyCache = cache
         self.warmStore = warmStore
         HermternalSwitchTrace.configure(capability: debugModules)
         guard let historyDirectory = HistoryCache.defaultDirectory() else {
@@ -870,8 +941,6 @@ final class AppModel {
         // Clear all account-owned rows before the first suspension point.
         sessions = []
         archivedSessions = []
-        archivedSessionsLoading = false
-        archivedSessionsError = nil
         setSelectedSessionID(nil, event: "selectedSessionID.signOut")
         viewingArchivedSessionID = nil
         phase = .signedOut
@@ -881,6 +950,9 @@ final class AppModel {
         cacheControlTask?.cancel()
         cacheControlTask = nil
         cacheControlGeneration += 1
+        composerModel.shutdown()
+        composerRuntime = nil
+        clearActiveTranscriptStore()
         await gateway?.disconnect()
         gateway = nil
         rest = nil
@@ -901,6 +973,16 @@ final class AppModel {
         isSearchPresented = false
         toastPresenter.setSuppressed(false)
         capabilityModule = nil
+        composerRuntimeSnapshot = SessionRuntimeSnapshot(
+            model: nil,
+            provider: nil,
+            reasoning: nil,
+            isRunning: false
+        )
+        composerDefaultModel = nil
+        composerDefaultProvider = nil
+        composerDefaultReasoning = nil
+        composerDefaultsUnavailableReason = nil
         sessionPurgeCapability = nil
         sessionPurgeUnavailableReason = "Complete deletion is unavailable on this gateway."
     }
@@ -932,6 +1014,98 @@ final class AppModel {
         AuthMethodStore.save(method, gateway: status.url)
     }
 
+    private func isUnsupportedComposerDefaultsError(_ error: Error) -> Bool {
+        guard let gatewayError = error as? GatewayError else { return false }
+        guard case let .rpc(code, message) = gatewayError else { return false }
+        let normalized = message.lowercased()
+        return (code == 4002 || code == 40002)
+            && normalized.contains("unknown config key")
+    }
+    /// Reads gateway-wide composer defaults. This intentionally omits
+    /// `session_id`: these values apply to future chats, not the open turn.
+    func loadComposerDefaults() async {
+        guard composerDefaultsUnavailableReason == nil, let gateway else { return }
+        do {
+            let response = try await gateway.call("config.get")
+            let values: [String: JSONValue]
+            if case let .object(root) = response,
+               case let .object(config)? = root["config"] {
+                values = config
+            } else if case let .object(root) = response {
+                values = root
+            } else {
+                values = [:]
+            }
+            composerDefaultModel = values["model"]?.stringValue
+            composerDefaultProvider = values["provider"]?.stringValue
+            if let raw = values["reasoning"]?.stringValue
+                ?? values["reasoning_effort"]?.stringValue {
+                let normalized = raw.lowercased()
+                composerDefaultReasoning = normalized == "none"
+                    ? .off
+                    : ReasoningEffort(rawValue: normalized).map(ReasoningSetting.effort)
+            }
+        } catch {
+            if isUnsupportedComposerDefaultsError(error) {
+                composerDefaultsUnavailableReason = "This gateway does not support global model defaults."
+            } else {
+                postError("Could not load model defaults", detail: error.localizedDescription)
+            }
+        }
+    }
+
+    func setComposerDefaults(
+        model: String?,
+        provider: String?,
+        reasoning: ReasoningSetting?
+    ) async {
+        guard composerDefaultsUnavailableReason == nil, let gateway else {
+            if composerDefaultsUnavailableReason == nil {
+                postError("Could not save model defaults", detail: "The gateway connection is unavailable.")
+            }
+            return
+        }
+        do {
+            if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let normalizedProvider = provider?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let wireValue: String
+                if let normalizedProvider, !normalizedProvider.isEmpty {
+                    wireValue = "\(model) --provider \(normalizedProvider)"
+                } else {
+                    wireValue = model
+                }
+                _ = try await gateway.call(
+                    "config.set",
+                    params: ["key": "model", "value": wireValue]
+                )
+            }
+            if let reasoning {
+                _ = try await gateway.call(
+                    "config.set",
+                    params: ["key": "reasoning", "value": reasoning.wireValue]
+                )
+            }
+            composerDefaultModel = model
+            composerDefaultProvider = provider
+            composerDefaultReasoning = reasoning
+        } catch {
+            if isUnsupportedComposerDefaultsError(error) {
+                composerDefaultsUnavailableReason = "This gateway does not support global model defaults."
+            } else {
+                postError("Could not save model defaults", detail: error.localizedDescription)
+            }
+        }
+    }
+
+    func requestFind() {
+        guard case .ready = phase else { return }
+        findRequestGeneration &+= 1
+    }
+
+    func requestComposerFocus() {
+        composerFocusRequestGeneration &+= 1
+    }
+
     func toggleSearch() {
         guard searchQuerying != nil else {
             toastPresenter.error(
@@ -955,6 +1129,7 @@ final class AppModel {
             let gateway = GatewayClient()
             self.gateway = gateway
             try await gateway.connect(server: url, ticket: ticket.ticket)
+            installComposer(gateway: gateway)
             Log.info("connect: websocket dialed")
             rest = RestClient(server: url, auth: auth)
             let capabilities = GatewayCapabilityModule(server: url, auth: auth)
@@ -965,6 +1140,7 @@ final class AppModel {
                 ?? "Complete deletion is unavailable on this gateway."
             observeEvents(on: gateway)
             phase = .ready
+            await loadComposerDefaults()
             await loadSessions()
         } catch is CancellationError {
             return
@@ -1125,14 +1301,14 @@ final class AppModel {
     /// There is deliberately no success toast: the pasteboard is the result.
     func copyDeepLinks(for sessions: [ChatSession]) {
         guard let host = configuredGatewayHost else {
-            postError("Could not copy deep links", detail: "The gateway address is unavailable.")
+            postError("Could not copy links", detail: "The gateway address is unavailable.")
             return
         }
         let links = sessions.compactMap {
             MessageDeepLink(gatewayHost: host, sessionID: $0.id)?.url.absoluteString
         }
         guard !links.isEmpty else {
-            postError("Could not copy deep links", detail: "No valid chat links were available.")
+            postError("Could not copy links", detail: "No valid chat links were available.")
             return
         }
         NSPasteboard.general.clearContents()
@@ -1370,8 +1546,10 @@ final class AppModel {
             viewingArchivedSessionID = nil
             liveSessionID = nil
             messages = []
+            clearActiveTranscriptStore()
             streamingReducer.reset()
             isAwaitingReply = streamingReducer.isAwaitingReply
+            updateComposerRoute()
         }
 
         let reconciliation = SessionPurgePolicy.reconcile(
@@ -1440,6 +1618,7 @@ final class AppModel {
         liveSessionID = nil
         pendingMessageRoute = nil
         messages = []
+        clearActiveTranscriptStore()
         streamingReducer.reset()
         isAwaitingReply = streamingReducer.isAwaitingReply
     }
@@ -1454,11 +1633,32 @@ final class AppModel {
         setSelectedSessionID(nil, event: "selectedSessionID.leaveArchived")
         liveSessionID = nil
         messages = []
+        clearActiveTranscriptStore()
         composerText = ""
         streamingReducer.reset()
         isAwaitingReply = streamingReducer.isAwaitingReply
     }
 
+    /// Shows the live chat list. An archived preview is read-only, so leaving
+    /// it is part of the same command.
+    func showChatsList() {
+        if viewingArchivedSessionID != nil {
+            leaveArchivedView()
+        }
+        sidebarContentMode = .chats
+    }
+
+    /// Shows the archived chat list. The list is fetched on demand, because
+    /// the archive is not part of the sidebar's normal load.
+    func showArchivedList() async {
+        sidebarContentMode = .archived
+        await loadArchivedSessions()
+    }
+
+    /// Raises the New Folder prompt. The sidebar column presents it.
+    func beginFolderCreate() {
+        isCreatingFolder = true
+    }
     
 
     private func uniqueIDs(_ ids: [String]) -> [String] {
@@ -2187,6 +2387,7 @@ final class AppModel {
             displayedTranscriptSessionID = nil
         }
         selectedSessionID = value
+        updateComposerRoute()
         HermternalSwitchTrace.session(
             "\(event).after",
             id: value,
@@ -2203,20 +2404,324 @@ final class AppModel {
         }
         cacheBytes = max(0, cacheBytes + result.byteDelta)
     }
+    private func clearActiveTranscriptStore() {
+        activeTranscriptStore = nil
+        activeTranscriptRoute = nil
+        transcriptSummary = nil
+        activeTranscriptFindCursor = nil
+        activeStoreAppGeneration = nil
+        transcriptRevision &+= 1
+    }
+
+    /// Installs the disk-backed store before the first transcript frame. A
+    /// store generation is advanced for every route so stale page reads and
+    /// writes cannot publish into a replacement selection.
+    private func prepareActiveTranscriptStore(
+        sessionID: String,
+        appGeneration: Int
+    ) async {
+        guard !sessionID.isEmpty else {
+            clearActiveTranscriptStore()
+            return
+        }
+        guard openGenerations.isCurrent(appGeneration), !Task.isCancelled else {
+            return
+        }
+        if activeStoreAppGeneration == appGeneration,
+           activeTranscriptRoute?.sessionID == sessionID {
+            return
+        }
+        do {
+            let store = try await historyCache.pagedStore(for: sessionID)
+            guard openGenerations.isCurrent(appGeneration), !Task.isCancelled else {
+                return
+            }
+            let route = try await store.beginGeneration()
+            guard openGenerations.isCurrent(appGeneration), !Task.isCancelled else {
+                return
+            }
+            let summary = try await store.summary()
+            guard openGenerations.isCurrent(appGeneration), !Task.isCancelled else {
+                return
+            }
+            activeTranscriptStore = store
+            activeTranscriptRoute = route
+            transcriptSummary = summary
+            activeTranscriptFindCursor = nil
+            activeStoreAppGeneration = appGeneration
+            transcriptRevision &+= 1
+        } catch {
+            guard openGenerations.isCurrent(appGeneration), !Task.isCancelled else {
+                return
+            }
+            clearActiveTranscriptStore()
+            Log.error("transcript store unavailable for \(sessionID): \(error)")
+        }
+    }
+
+    private static func wireRecord(from message: ChatMessage) -> WireMessageRecord {
+        let messageID: String
+        switch message.id {
+        case .server(let id): messageID = String(id.rawValue)
+        case .provisional(let id): messageID = id.uuidString
+        }
+        return WireMessageRecord(
+            messageID: messageID,
+            role: message.role.rawValue,
+            text: message.text,
+            reasoning: message.reasoning,
+            timestamp: message.timestamp
+        )
+    }
+
+    /// Persists only the currently published tail. The complete transcript is
+    /// already represented by the paged store's disk records.
+    private func persistTranscriptTail(_ values: [ChatMessage]) async {
+        guard let store = activeTranscriptStore,
+              let route = activeTranscriptRoute,
+              let value = values.last,
+              selectedSessionID == route.sessionID
+        else { return }
+        do {
+            let result = try await store.append(
+                Self.wireRecord(from: value),
+                expectedGeneration: route.generation,
+                expectedEpoch: route.epoch
+            )
+            guard activeTranscriptStore === store,
+                  selectedSessionID == route.sessionID,
+                  activeTranscriptRoute?.generation == route.generation,
+                  activeTranscriptRoute?.epoch == route.epoch
+            else { return }
+            transcriptSummary = result.summary
+            activeTranscriptRoute = TranscriptRoute(
+                sessionID: route.sessionID,
+                generation: result.generation,
+                epoch: result.epoch
+            )
+            transcriptRevision &+= 1
+        } catch {
+            Log.error("transcript store stream write failed: \(error)")
+        }
+    }
+    private func refreshActiveTranscriptMetadata(
+        _ summaryHint: TranscriptSummary?,
+        expectedGeneration: Int? = nil
+    ) async {
+        guard let store = activeTranscriptStore,
+              let route = activeTranscriptRoute
+        else { return }
+        let appGeneration = expectedGeneration ?? activeStoreAppGeneration
+        guard appGeneration.map({ openGenerations.isCurrent($0) }) ?? true else { return }
+        do {
+            // The store knows descriptor row counts (including split rows);
+            // opener metadata counts server messages and must not overwrite it.
+            _ = summaryHint
+            let summary = try await store.summary()
+            let currentRoute = try await store.currentRoute()
+            guard activeTranscriptStore === store,
+                  selectedSessionID == route.sessionID,
+                  activeTranscriptRoute?.sessionID == route.sessionID,
+                  appGeneration.map({ openGenerations.isCurrent($0) }) ?? true
+            else { return }
+            transcriptSummary = summary
+            activeTranscriptRoute = currentRoute
+            transcriptRevision &+= 1
+        } catch {
+            Log.error("transcript store metadata refresh failed: \(error)")
+        }
+    }
+
+    private func hydratePagedTranscriptStore(
+        source: any TranscriptSource,
+        session: ChatSession,
+        generation: Int
+    ) async {
+        guard let pagedCache = cache as? any PagedTranscriptPersisting,
+              let summary = transcriptSummary,
+              summary.messageCount == 0,
+              let store = activeTranscriptStore,
+              openGenerations.isCurrent(generation)
+        else { return }
+        let expectedEpoch = await cache.currentEpoch()
+        guard openGenerations.isCurrent(generation),
+              activeTranscriptStore === store
+        else { return }
+        do {
+            let generations = openGenerations
+            _ = try await source.streamAuthoritative(sessionID: session.id) { page in
+                try Task.checkCancellation()
+                guard generations.isCurrent(generation) else {
+                    throw CancellationError()
+                }
+                _ = try await pagedCache.appendTranscriptPage(
+                    page,
+                    title: session.title,
+                    for: session.id,
+                    expectedEpoch: expectedEpoch
+                )
+            }
+            guard openGenerations.isCurrent(generation),
+                  activeTranscriptStore === store
+            else { return }
+            await refreshActiveTranscriptMetadata(nil, expectedGeneration: generation)
+        } catch {
+            Log.error("paged transcript hydration failed for \(session.id): \(error)")
+        }
+    }
+
+    private func persistTranscriptMessages(
+        _ values: [ChatMessage],
+        expectedGeneration: Int? = nil
+    ) async {
+        guard let store = activeTranscriptStore,
+              var route = activeTranscriptRoute
+        else { return }
+        let appGeneration = expectedGeneration ?? activeStoreAppGeneration
+        guard appGeneration.map({ openGenerations.isCurrent($0) }) ?? true else { return }
+        do {
+            for value in values {
+                let result = try await store.append(
+                    Self.wireRecord(from: value),
+                    expectedGeneration: route.generation,
+                    expectedEpoch: route.epoch
+                )
+                guard activeTranscriptStore === store,
+                      activeStoreAppGeneration == appGeneration,
+                      appGeneration.map({ openGenerations.isCurrent($0) }) ?? true
+                else { return }
+                route = TranscriptRoute(
+                    sessionID: route.sessionID,
+                    generation: result.generation,
+                    epoch: result.epoch
+                )
+            }
+            guard activeTranscriptStore === store,
+                  activeStoreAppGeneration == appGeneration,
+                  appGeneration.map({ openGenerations.isCurrent($0) }) ?? true
+            else { return }
+            activeTranscriptRoute = route
+            transcriptSummary = try await store.summary()
+            guard activeTranscriptStore === store,
+                  activeStoreAppGeneration == appGeneration,
+                  appGeneration.map({ openGenerations.isCurrent($0) }) ?? true
+            else { return }
+            transcriptRevision &+= 1
+        } catch {
+            Log.error("transcript store full reconciliation write failed: \(error)")
+        }
+    }
+
+    private var composerRoute: ComposerRoute {
+        ComposerRoute(
+            identity: selectedSessionID ?? "new",
+            generation: UInt64(max(0, transcriptRouteGeneration)),
+            liveSessionID: liveSessionID,
+            runtime: composerRuntimeSnapshot,
+            isAwaitingReply: isAwaitingReply,
+            isReadOnly: isViewingArchivedTranscript
+        )
+    }
+
+    private func updateComposerRoute() {
+        composerModel.update(route: composerRoute)
+    }
+
+    private func installComposer(gateway: GatewayClient) {
+        let runtime = GatewayRuntimeAdapter(gateway: gateway)
+        composerModel = ComposerModel(
+            route: composerRoute,
+            runtime: runtime,
+            attachmentStaging: runtime,
+            turn: self,
+            dictation: SpeechDictationAdapter(),
+            recorder: AudioCaptureAdapter()
+        )
+    }
+
+    func shutdownComposer() {
+        composerModel.shutdown()
+        composerRuntime = nil
+    }
+    func prepareSession(expectedRoute: ComposerRouteToken) async throws -> String {
+        guard composerRoute.token == expectedRoute,
+              !isViewingArchivedTranscript,
+              let gateway
+        else { throw GatewayError.unroutableFrame("Composer route changed.") }
+        if let liveSessionID {
+            return liveSessionID
+        }
+        let created: JSONValue
+        if selectedSessionID != nil {
+            guard await establishLiveSessionForInteraction(),
+                  composerRoute.token == expectedRoute,
+                  let liveSessionID
+            else { throw GatewayError.unroutableFrame("Composer route changed.") }
+            return liveSessionID
+        } else {
+            created = try await gateway.call("session.create")
+            guard composerRoute.token == expectedRoute else {
+                throw GatewayError.unroutableFrame("Composer route changed.")
+            }
+            guard let id = created["session_id"]?.stringValue, !id.isEmpty else {
+                throw GatewayError.malformedFrame("session.create returned no session id.")
+            }
+            liveSessionID = id
+            composerRuntimeSnapshot = GatewayRuntimeAdapter.decodeRuntimeSnapshot(from: created)
+            updateComposerRoute()
+            return id
+        }
+    }
+
+    func submit(text: String, sessionID: String) async throws {
+        guard !isViewingArchivedTranscript,
+              let gateway,
+              liveSessionID == sessionID,
+              composerRoute.liveSessionID == sessionID
+        else { throw GatewayError.unroutableFrame("Composer session is no longer active.") }
+        let expectedRoute = composerRoute.token
+        let generation = openGenerations.current()
+        try await gateway.call(
+            "prompt.submit",
+            params: ["session_id": sessionID, "text": text]
+        )
+        guard openGenerations.isCurrent(generation),
+              composerRoute.token == expectedRoute,
+              !Task.isCancelled
+        else { throw GatewayError.unroutableFrame("Composer route changed.") }
+        composerText = ""
+        streamingReducer.appendUser(text)
+        let reduction = StreamingReduction(
+            messages: streamingReducer.messages,
+            isAwaitingReply: streamingReducer.isAwaitingReply
+        )
+        messages = reduction.messages
+        isAwaitingReply = reduction.isAwaitingReply
+        await persistTranscriptTail(reduction.messages)
+        updateComposerRoute()
+    }
+
+    func stop() async {
+        await interrupt()
+    }
+
     func newChat() async {
         pendingExternalRoute.clearPending()
         _ = openGenerations.begin()
         pendingMessageRoute = nil
         viewingArchivedSessionID = nil
+        clearActiveTranscriptStore()
         guard let gateway else { return }
         do {
             let result = try await gateway.call("session.create")
             liveSessionID = result["session_id"]?.stringValue
+            composerRuntimeSnapshot = GatewayRuntimeAdapter.decodeRuntimeSnapshot(from: result)
             streamingReducer.reset()
             transcriptRouteIdentity = "live:none"
             transcriptRouteGeneration = openGenerations.current()
             messages = []
             isAwaitingReply = streamingReducer.isAwaitingReply
+            updateComposerRoute()
             // `session.create` does not persist a row until the first
             // prompt, so there is nothing to select in the sidebar yet.
             setSelectedSessionID(nil, event: "selectedSessionID.newChat")
@@ -2224,6 +2729,18 @@ final class AppModel {
         } catch {
             Log.error("session.create failed: \(error)")
             postError("Could not start a new chat", detail: error.localizedDescription)
+        }
+    }
+
+    /// New Chat as a user command. A route without a selection gives focus no
+    /// place to stay, so the caret moves to the composer. In all other cases
+    /// the focus does not move.
+    func newChatCommand() async {
+        guard phase == .ready else { return }
+        let shouldFocusComposer = selectedSessionID == nil
+        await newChat()
+        if shouldFocusComposer {
+            requestComposerFocus()
         }
     }
 
@@ -2263,6 +2780,7 @@ final class AppModel {
     /// Routes a validated external destination after session authority exists.
     /// A route received during restore replaces any older queued destination.
     func route(_ destination: MessageDeepLink.Destination) {
+        pendingNavigationSession = nil
         cancelActiveOpen()
         let generation = openGenerations.begin()
         pendingMessageRoute = nil
@@ -2290,6 +2808,7 @@ final class AppModel {
     /// Invalidates a queued external route when the user starts navigation.
     /// This runs before the delayed transcript open can begin.
     func userNavigationDidBegin() {
+        pendingNavigationSession = nil
         cancelActiveOpen()
         pendingExternalRoute.clearPending()
         _ = openGenerations.begin()
@@ -2317,6 +2836,8 @@ final class AppModel {
             )
             return
         }
+        pendingNavigationSession = nil
+        cancelActiveOpen()
         let generation = openGenerations.begin()
         dispatchExternalRoute(
             destination,
@@ -2360,6 +2881,8 @@ final class AppModel {
         activeOpenTask?.cancel()
         activeOpenHandle = nil
         activeOpenTask = nil
+        activeOpenSessionID = nil
+        activeOpenDidPublish = false
         guard pendingExternalRoute.isCurrent(routeGeneration),
               openGenerations.isCurrent(generation)
         else {
@@ -2378,6 +2901,12 @@ final class AppModel {
             await open(at: location, generation: generation)
         }
     }
+    /// Starts the trailing open after a held-arrow burst ends.
+    func flushPendingNavigationOpen() {
+        guard let session = pendingNavigationSession else { return }
+        pendingNavigationSession = nil
+        _ = requestOpen(session)
+    }
     private func cancelActiveOpen() {
         externalRouteTask?.cancel()
         externalRouteTask = nil
@@ -2385,11 +2914,14 @@ final class AppModel {
         activeOpenTask?.cancel()
         activeOpenHandle = nil
         activeOpenTask = nil
+        activeOpenSessionID = nil
+        activeOpenDidPublish = false
         isPreparingOpen = false
         preparingOpenGeneration = nil
     }
     /// Cancels a pending sidebar open when its hosting view disappears.
     func cancelOpenPreparation() {
+        pendingNavigationSession = nil
         guard isPreparingOpen
             || activeOpenTask != nil
             || activeOpenHandle != nil
@@ -2411,6 +2943,8 @@ final class AppModel {
         activeOpenTask?.cancel()
         activeOpenHandle = nil
         activeOpenTask = nil
+        activeOpenSessionID = nil
+        activeOpenDidPublish = false
     }
     private func finishOpenPreparation(generation: Int, sessionID: String) {
         guard preparingOpenGeneration == generation else {
@@ -2427,6 +2961,8 @@ final class AppModel {
         preparingOpenGeneration = nil
         activeOpenTask = nil
         activeOpenHandle = nil
+        activeOpenSessionID = nil
+        activeOpenDidPublish = false
         HermternalSwitchTrace.selectionGuard(
             "requestOpen.preparingOpen.clear",
             id: sessionID,
@@ -2463,6 +2999,7 @@ final class AppModel {
                     continuation.resume(returning: false)
                     return
                 }
+                self.activeOpenDidPublish = true
                 self.transcriptRouteIdentity = "live:\(session.id)"
                 self.transcriptRouteGeneration = generation
                 self.streamingReducer.reset(messages: initialMessages)
@@ -2498,7 +3035,53 @@ final class AppModel {
     /// Transcript publication therefore crosses a run-loop turn before it
     /// mutates `messages`. The generation guard remains on that assignment.
     @discardableResult
-    func requestOpen(_ session: ChatSession) -> Task<Void, Never> {
+    func requestOpen(
+        _ session: ChatSession,
+        deferStart: Bool = false
+    ) -> Task<Void, Never> {
+        if deferStart {
+            cancelActiveOpen()
+            pendingExternalRoute.clearPending()
+            let generation = openGenerations.begin()
+            pendingMessageRoute = nil
+            viewingArchivedSessionID = nil
+            liveSessionID = nil
+            clearActiveTranscriptStore()
+            streamingReducer.reset()
+            setSelectedSessionID(
+                session.id,
+                event: "selectedSessionID.mutation",
+                generation: generation
+            )
+            HermternalSwitchTrace.session(
+                "selection.publish",
+                id: session.id,
+                generation: generation,
+                messages: messages.count,
+                detail: "navigation.pending"
+            )
+            pendingNavigationSession = session
+            return Task {}
+        }
+        pendingNavigationSession = nil
+        if isPreparingOpen,
+           TranscriptSwitchWorkPolicy.shouldCoalescePendingOpen(
+               sessionID: session.id,
+               activeSessionID: activeOpenSessionID,
+               hasPublishedFirstFrame: activeOpenDidPublish
+           ),
+           let activeOpenTask,
+           !activeOpenTask.isCancelled,
+           activeOpenHandle?.isTerminated == false {
+            HermternalSwitchTrace.selectionGuard(
+                "requestOpen.coalesced",
+                id: session.id,
+                generation: preparingOpenGeneration,
+                messages: messages.count,
+                reason: "sameRouteStillPreparing"
+            )
+            return activeOpenTask
+        }
         cancelActiveOpen()
         pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
@@ -2506,8 +3089,10 @@ final class AppModel {
             sessionID: session.id,
             generation: generation
         )
+        activeOpenDidPublish = false
         let handle = TranscriptOpenHandle()
         activeOpenHandle = handle
+        activeOpenSessionID = session.id
         pendingMessageRoute = nil
         viewingArchivedSessionID = nil
         liveSessionID = nil
@@ -2515,6 +3100,7 @@ final class AppModel {
         preparingOpenGeneration = generation
         // Invalidate the previous stream before yielding. Event handling is
         // also gated below until this open has installed its transcript.
+        clearActiveTranscriptStore()
         streamingReducer.reset()
         ContentionTrace.reset()
         HermternalSwitchTrace.session(
@@ -2542,9 +3128,15 @@ final class AppModel {
         )
         let warmStoreForOpen = warmStore
         let cacheEnabledForOpen = cacheEnabled
+        let generationsForOpen = openGenerations
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
+                // Task cancellation can happen before the opener's
+                // AsyncStream consumer observes termination. Cancel the
+                // handle here so the source and its cache state terminate
+                // even when this task never reaches the opener call.
+                handle.cancel()
                 self.finishOpenPreparation(
                     generation: generation,
                     sessionID: session.id
@@ -2568,11 +3160,17 @@ final class AppModel {
             }
             let warm = await Task.detached(priority: .userInitiated) {
                 () -> WarmTranscriptProjection? in
-                guard cacheEnabledForOpen else { return nil }
-                return warmStoreForOpen.projection(
+                guard cacheEnabledForOpen,
+                      generationsForOpen.isCurrent(generation)
+                else { return nil }
+                let projection = warmStoreForOpen.projection(
                     for: session.id,
                     minimumServerTotal: session.messageCount
                 )
+                guard generationsForOpen.isCurrent(generation) else {
+                    return nil
+                }
+                return projection
             }.value
             guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
                 HermternalSwitchTrace.selectionGuard(
@@ -2591,8 +3189,15 @@ final class AppModel {
                 sessionID: session.id,
                 generation: generation
             )
+            await self.prepareActiveTranscriptStore(
+                sessionID: session.id,
+                appGeneration: generation
+            )
+            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                return
+            }
             let initialMessages = warm.map {
-                Array($0.messages.suffix(TranscriptWindowPolicy.initialWindowSize))
+                Array($0.messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
             } ?? []
             // The first-frame tail is bounded. Publish it after the
             // selection transaction has completed, not after a scheduler
@@ -2622,6 +3227,7 @@ final class AppModel {
         cancelActiveOpen()
         pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
+        clearActiveTranscriptStore()
         HermternalSwitchTrace.session(
             "open.generation.begins",
             id: session.id,
@@ -2661,6 +3267,14 @@ final class AppModel {
             postError("Could not open chat \(session.id)", detail: "The gateway is unavailable.")
             return false
         }
+        await prepareActiveTranscriptStore(
+            sessionID: session.id,
+            appGeneration: generation
+        )
+        guard openGenerations.isCurrent(generation), !Task.isCancelled else {
+            return false
+        }
+        updateComposerRoute()
 
         if !selectionAlreadyPublished {
             setSelectedSessionID(
@@ -2750,12 +3364,26 @@ final class AppModel {
             }
             if !rejectsCacheDerivedDowngrade
                 && (!sameWarmProjection || warmTailNeedsExpansion) {
-                streamingReducer.reset(messages: result.messages)
+                streamingReducer.reset(
+                    messages: Array(result.messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
+                )
                 transcriptRouteIdentity = "live:\(session.id)"
                 transcriptRouteGeneration = generation
                 messages = result.messages
                 isAwaitingReply = streamingReducer.isAwaitingReply
+                updateComposerRoute()
             }
+            if result.didFetchREST, !result.isInitialPage {
+                await hydratePagedTranscriptStore(
+                    source: source,
+                    session: session,
+                    generation: generation
+                )
+            }
+            await refreshActiveTranscriptMetadata(
+                result.summary,
+                expectedGeneration: generation
+            )
             let phase = result.isCachedPhase
                 ? "cache.publish"
                 : (result.didFetchREST ? "rest.publish" : "resume.complete")
@@ -2808,11 +3436,19 @@ final class AppModel {
             messages: messages.count
         )
         pendingMessageRoute = nil
+        clearActiveTranscriptStore()
         guard let source = transcriptSource(for: session) else {
             postError(
                 "Could not open archived chat \(session.id)",
                 detail: "The gateway is unavailable."
             )
+            return false
+        }
+        await prepareActiveTranscriptStore(
+            sessionID: session.id,
+            appGeneration: generation
+        )
+        guard openGenerations.isCurrent(generation), !Task.isCancelled else {
             return false
         }
 
@@ -2823,6 +3459,7 @@ final class AppModel {
             generation: generation
         )
         liveSessionID = nil
+        updateComposerRoute()
         let cached: CachedTranscript?
         let cacheEpoch: UInt64?
         if cacheEnabled {
@@ -2834,7 +3471,9 @@ final class AppModel {
             cacheEpoch = nil
         }
         guard openGenerations.isCurrent(generation), !Task.isCancelled else { return false }
-        streamingReducer.reset(messages: cached?.messages ?? [])
+        streamingReducer.reset(
+            messages: Array((cached?.messages ?? []).suffix(TranscriptPublicationPolicy.initialMessageCount))
+        )
         transcriptRouteIdentity = "archived:\(session.id)"
         transcriptRouteGeneration = generation
         messages = cached?.messages ?? []
@@ -2868,6 +3507,15 @@ final class AppModel {
             projectedMessages: projected.count,
             serverTotal: authoritative.serverTotal ?? session.messageCount
         )
+        if transcriptSummary?.messageCount == 0 {
+            await persistTranscriptMessages(
+                projected,
+                expectedGeneration: generation
+            )
+            guard openGenerations.isCurrent(generation), !Task.isCancelled else {
+                return false
+            }
+        }
         if cacheEnabled,
            projected.count == snapshot.projectedMessages {
             let resident = warmStore.projection(
@@ -2897,11 +3545,22 @@ final class AppModel {
             )
             guard openGenerations.isCurrent(generation), !Task.isCancelled else { return false }
         }
-        streamingReducer.reset(messages: projected)
+        streamingReducer.reset(
+            messages: Array(projected.suffix(TranscriptPublicationPolicy.initialMessageCount))
+        )
         transcriptRouteIdentity = "archived:\(session.id)"
         transcriptRouteGeneration = generation
         messages = projected
         isAwaitingReply = streamingReducer.isAwaitingReply
+        updateComposerRoute()
+        await refreshActiveTranscriptMetadata(
+            TranscriptSummary(
+                rowCount: projected.count,
+                messageCount: projected.count,
+                countKind: .exact
+            ),
+            expectedGeneration: generation
+        )
         HermternalSwitchTrace.session(
             "rest.publish.archived",
             id: session.id,
@@ -2999,6 +3658,13 @@ final class AppModel {
                 self.liveSessionID = liveSessionID
                 established = true
             }
+            if let summary = result.summary {
+                await refreshActiveTranscriptMetadata(
+                    summary,
+                    expectedGeneration: generation
+                )
+            }
+            updateComposerRoute()
             if let cacheStore = result.cacheStore {
                 applyCacheStore(cacheStore)
             }
@@ -3028,6 +3694,8 @@ final class AppModel {
         streamingReducer.appendUser(text)
         messages = streamingReducer.messages
         isAwaitingReply = streamingReducer.isAwaitingReply
+        await persistTranscriptTail(streamingReducer.messages)
+        updateComposerRoute()
 
         do {
             _ = try await gateway.call(
@@ -3056,6 +3724,8 @@ final class AppModel {
         let reduction = streamingReducer.interrupt()
         messages = reduction.messages
         isAwaitingReply = reduction.isAwaitingReply
+        await persistTranscriptTail(reduction.messages)
+        updateComposerRoute()
         await reconcileTerminal(reduction.terminal)
     }
 
@@ -3076,6 +3746,8 @@ final class AppModel {
             let reduction = streamingReducer.cancel()
             messages = reduction.messages
             isAwaitingReply = reduction.isAwaitingReply
+            await persistTranscriptTail(reduction.messages)
+            updateComposerRoute()
             HermternalSwitchTrace.selectionGuard(
                 "gatewayEvent.transportClosed",
                 id: selectedSessionID,
@@ -3098,6 +3770,13 @@ final class AppModel {
             return
         }
 
+        if event.type == "session.info",
+           event.sessionID == liveSessionID || event.sessionID == selectedSessionID {
+            composerRuntimeSnapshot = GatewayRuntimeAdapter.decodeRuntimeSnapshot(
+                from: event.payload
+            )
+            updateComposerRoute()
+        }
         guard !isPreparingOpen else {
             HermternalSwitchTrace.selectionGuard(
                 "gatewayEvent.preparingOpen",
@@ -3110,6 +3789,8 @@ final class AppModel {
         let reduction = streamingReducer.reduce(event)
         messages = reduction.messages
         isAwaitingReply = reduction.isAwaitingReply
+        await persistTranscriptTail(reduction.messages)
+        updateComposerRoute()
         if let notice = reduction.notice {
             postError("The gateway reported an error", detail: notice)
         }
@@ -3148,8 +3829,12 @@ final class AppModel {
             sessionTitle: sessionTitle
         ) else { return }
         guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
-        streamingReducer.reset(messages: result.messages)
+        streamingReducer.reset(
+            messages: Array(result.messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
+        )
         messages = result.messages
+        updateComposerRoute()
+        await refreshActiveTranscriptMetadata(nil, expectedGeneration: generation)
         if let snapshot = result.snapshot,
            let selectedSessionID,
            cacheEnabled,

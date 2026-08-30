@@ -10,7 +10,7 @@ struct FindBar: View {
     let previous: () -> Void
     let close: () -> Void
 
-    @State private var accentColor = Color(nsColor: AccentColorStore.resolvedColor())
+    @Environment(\.hermternalAccentColor) private var accentColor
     @FocusState private var fieldFocused: Bool
 
     var body: some View {
@@ -72,20 +72,6 @@ struct FindBar: View {
         .tint(accentColor)
         .background(.thickMaterial, in: .capsule)
         .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
-        .onReceive(
-            NotificationCenter.default.publisher(
-                for: AccentColorStore.didChangeNotification
-            )
-        ) { _ in
-            accentColor = Color(nsColor: AccentColorStore.resolvedColor())
-        }
-        .onReceive(
-            NotificationCenter.default.publisher(
-                for: NSColor.systemColorsDidChangeNotification
-            )
-        ) { _ in
-            accentColor = Color(nsColor: AccentColorStore.resolvedColor())
-        }
         .onAppear {
             // No entrance animation: ⌘F must be ready for the next keystroke.
             fieldFocused = true

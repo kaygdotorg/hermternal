@@ -63,39 +63,16 @@ struct SessionRowItem: View {
     let purgeAvailable: Bool
     let purgeUnavailableReason: String
     let onMove: ([ChatSession], String?) -> Void
+    @Environment(\.hermternalAccentColor) private var accentColor
 }
+
 
 extension SessionRowItem {
 
 
     var body: some View {
         let _ = HermternalSelectionOccupancyTrace.sessionRowBodyEvaluated()
-        return SessionRow(session: session)
-            .accessibilityLabel(session.displayTitle)
-            .accessibilityValue(sessionRowDetail(session))
-            .accessibilityIdentifier("session-row-\(session.id)")
-            // The row surface belongs to List, but VoiceOver still needs the
-            // same default activation that the old row Button provided.
-            .accessibilityAction {
-                HermternalSwitchTrace.session(
-                    "selection.observed.accessibility",
-                    id: session.id,
-                    messages: session.messageCount
-                )
-                onOpen(session)
-            }
-            // Unselected rows must leave the primary click entirely to List.
-            // Attaching this recognizer to every row lets it win the click
-            // before List can publish a new selection, which loses activation.
-            // The gesture exists only for the one case List cannot express:
-            // activating the row that is already selected.
-            .modifier(
-                SessionRowTapModifier(
-                    session: session,
-                    isSelected: isSelected,
-                    onOpen: onOpen
-                )
-            )
+        return rowContent
             .swipeActions(edge: .leading, allowsFullSwipe: false) {
                 pinButton
             }
@@ -105,6 +82,36 @@ extension SessionRowItem {
             .contextMenu {
                 contextMenu
             }
+    }
+
+    /// List owns primary clicks for rows that are not selected.
+    ///
+    /// Only the selected row needs a tap recognizer because List does not
+    /// publish a selection change when the user activates it again.
+    @ViewBuilder
+    private var rowContent: some View {
+        let content = SessionRow(session: session)
+            .accessibilityLabel(session.displayTitle)
+            .accessibilityValue(sessionRowDetail(session))
+            .accessibilityIdentifier("session-row-\(session.id)")
+            .accessibilityAction {
+                HermternalSwitchTrace.session(
+                    "selection.observed.accessibility",
+                    id: session.id,
+                    messages: session.messageCount
+                )
+                onOpen(session)
+            }
+        if isSelected {
+            content.modifier(
+                SessionRowTapModifier(
+                    session: session,
+                    onOpen: onOpen
+                )
+            )
+        } else {
+            content
+        }
     }
 
 
@@ -216,58 +223,52 @@ extension SessionRowItem {
         ) {
             onPin([session], !session.pinned)
         }
-        .tint(.accentColor)
+        .tint(accentColor)
     }
 
     private var archiveButton: some View {
         Button("Archive", systemImage: "archivebox") {
             onArchive([session])
         }
-        .tint(.accentColor)
+        .tint(accentColor)
     }
+
 }
 
-/// Adds the only pointer recognizer a session row needs. `List` owns clicks
-/// that change selection; this seam is intentionally absent on unselected rows
-/// so their click cannot be consumed before `List` sees it.
+/// Reopens the selected row without intercepting native selection.
 private struct SessionRowTapModifier: ViewModifier {
     let session: ChatSession
-    let isSelected: Bool
     let onOpen: (ChatSession) -> Void
 
-    @ViewBuilder
     func body(content: Content) -> some View {
-        if isSelected {
-            content.simultaneousGesture(
-                TapGesture(count: 1)
-                    .onEnded {
-                        let allowed = SidebarSelectionEventAdapter.allowsPrimaryActivation()
-                        HermternalSwitchTrace.session(
-                            "selection.tapGate",
+        content.simultaneousGesture(
+            TapGesture(count: 1)
+                .onEnded {
+                    let allowed =
+                        SidebarSelectionEventAdapter.allowsCompletedTapActivation()
+                    HermternalSwitchTrace.session(
+                        "selection.tapGate",
+                        id: session.id,
+                        messages: session.messageCount,
+                        detail: allowed ? "allowed" : "blocked"
+                    )
+                    guard allowed else {
+                        HermternalSwitchTrace.selectionGuard(
+                            "sessionRow.tapGate",
                             id: session.id,
                             messages: session.messageCount,
-                            detail: allowed ? "allowed" : "blocked"
+                            reason: "contextOrModifiedClick"
                         )
-                        guard allowed else {
-                            HermternalSwitchTrace.selectionGuard(
-                                "sessionRow.tapGate",
-                                id: session.id,
-                                messages: session.messageCount,
-                                reason: "eventAdapterRejectedPrimaryActivation"
-                            )
-                            return
-                        }
-                        HermternalSwitchTrace.session(
-                            "selection.observed.pointer",
-                            id: session.id,
-                            messages: session.messageCount
-                        )
-                        onOpen(session)
+                        return
                     }
-            )
-        } else {
-            content
-        }
+                    HermternalSwitchTrace.session(
+                        "selection.observed.pointer",
+                        id: session.id,
+                        messages: session.messageCount
+                    )
+                    onOpen(session)
+                }
+        )
     }
 }
 
@@ -301,6 +302,8 @@ private struct SessionRow: View {
             Image(systemName: sessionSourceGlyphs[session.source] ?? sessionFallbackGlyph)
                 .symbolRenderingMode(.monochrome)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(.rect)
         .font(.body)
         .help(title)
     }

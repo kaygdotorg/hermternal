@@ -1,6 +1,37 @@
 import AppKit
 import SwiftUI
 
+/// The accent selected in Hermternal's macOS Appearance settings.
+///
+/// SwiftUI's platform accent can resolve from an asset catalog instead of the
+/// in-app override. App-owned controls read this value instead, so the iOS
+/// AccentColor asset can never change their appearance.
+private struct HermternalAccentColorKey: EnvironmentKey {
+    static let defaultValue = Color(nsColor: NSColor.controlAccentColor)
+}
+
+/// Whether a chat turn always shows its model and reasoning pills.
+///
+/// The pills sit in a reserved footer band. The band appears on hover by
+/// default. This preference keeps the band visible at all times. `false` is
+/// also the value of an absent preference.
+private struct HermternalAlwaysShowsChatMetadataKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var hermternalAccentColor: Color {
+        get { self[HermternalAccentColorKey.self] }
+        set { self[HermternalAccentColorKey.self] = newValue }
+    }
+
+    var hermternalAlwaysShowsChatMetadata: Bool {
+        get { self[HermternalAlwaysShowsChatMetadataKey.self] }
+        set { self[HermternalAlwaysShowsChatMetadataKey.self] = newValue }
+    }
+}
+
+
 enum AppearanceMode: String, CaseIterable, Identifiable {
     case system
     case light
@@ -66,8 +97,7 @@ struct AccentColorValue: Hashable, Sendable {
 /// Stores the optional application accent without changing the system colour.
 enum AccentColorStore {
     static let key = "appearance.accentOverride"
-    /// Posted when any in-app palette input changes: the accent override, or
-    /// which fill the user's own message bubbles take.
+    /// Posted when the accent override changes.
     ///
     /// Deliberately ours. Broadcasting `NSColor.systemColorsDidChangeNotification`
     /// would be this process telling every observer in it, AppKit's included,
@@ -106,21 +136,6 @@ enum AccentColorStore {
     }
 }
 
-/// Which fill the user's own message bubbles take.
-///
-/// The transcript palette is resolved from an AppKit appearance with no view
-/// environment to read, so it reads this preference the same way it reads the
-/// accent: straight from `UserDefaults`.
-enum UserBubbleFillStore {
-    static let key = "appearance.userBubbleUsesAccent"
-
-    /// `false` — which is also what an absent key reads as — means the
-    /// platform's system blue, the colour Messages fills a sent bubble with.
-    static func usesAccent(from defaults: UserDefaults = .standard) -> Bool {
-        defaults.bool(forKey: key)
-    }
-}
-
 /// User-tunable appearance, persisted in `UserDefaults`.
 @MainActor
 @Observable
@@ -149,23 +164,6 @@ final class AppearanceSettings {
         }
     }
 
-    /// Fills the user's own message bubbles with the effective accent instead
-    /// of the system blue Messages uses. Written only when it changes, so
-    /// reading the appearance never touches `UserDefaults`.
-    var userBubbleUsesAccent: Bool {
-        didSet {
-            guard oldValue != userBubbleUsesAccent else { return }
-            defaults.set(userBubbleUsesAccent, forKey: UserBubbleFillStore.key)
-            // Prepared transcript rows carry concrete colours, including the
-            // bubble's text colour, so they have to be reshaped rather than
-            // merely repainted.
-            NotificationCenter.default.post(
-                name: AccentColorStore.didChangeNotification,
-                object: nil
-            )
-        }
-    }
-
     /// The current accent for views that need an AppKit colour.
     var effectiveAccentColor: NSColor {
         accentOverride?.nsColor ?? NSColor.controlAccentColor
@@ -186,6 +184,19 @@ final class AppearanceSettings {
         }
     }
 
+    /// Keeps the model and reasoning pills of every chat turn visible, instead
+    /// of showing them only while the pointer is over the turn. Written only
+    /// when it changes, so reading the appearance never touches `UserDefaults`.
+    var alwaysShowsChatMetadata: Bool {
+        didSet {
+            guard oldValue != alwaysShowsChatMetadata else { return }
+            defaults.set(
+                alwaysShowsChatMetadata,
+                forKey: Keys.alwaysShowsChatMetadata
+            )
+        }
+    }
+
     /// Solid enough to read against any desktop, translucent enough that the
     /// blur behind it is plainly the point.
     private static let defaultBackgroundOpacity = 0.85
@@ -202,6 +213,7 @@ final class AppearanceSettings {
         static let mode = "appearance.mode"
         static let backgroundOpacity = "appearance.backgroundOpacity"
         static let usesLiquidGlass = "appearance.usesLiquidGlass"
+        static let alwaysShowsChatMetadata = "appearance.alwaysShowsChatMetadata"
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -216,7 +228,9 @@ final class AppearanceSettings {
         // `didSet` does not fire for either of these, so loading the stored
         // appearance costs no write back.
         usesLiquidGlass = defaults.bool(forKey: Keys.usesLiquidGlass)
-        userBubbleUsesAccent = UserBubbleFillStore.usesAccent(from: defaults)
+        alwaysShowsChatMetadata = defaults.bool(
+            forKey: Keys.alwaysShowsChatMetadata
+        )
         applyAppKitAppearance()
     }
 
@@ -265,6 +279,5 @@ final class AppearanceSettings {
         backgroundOpacity = Self.defaultBackgroundOpacity
         persistBackgroundOpacity()
         usesLiquidGlass = false
-        userBubbleUsesAccent = false
     }
 }

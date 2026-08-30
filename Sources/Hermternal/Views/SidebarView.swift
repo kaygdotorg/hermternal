@@ -17,12 +17,17 @@ enum SidebarSelectionEventAdapter {
         let isDrag: Bool
     }
 
+    private static let dragThresholdSquared: CGFloat = 16
+    private static var mouseDownLocation: NSPoint?
+    private static var navigationRepeat = false
+    private static var navigationEndHandler: (@MainActor () -> Void)?
     private static var monitor: Any?
     private static var pending: Event?
     private static var serial = 0
     private static var expiryTask: Task<Void, Never>?
 
-    static func start() {
+    static func start(onNavigationEnd: (@MainActor () -> Void)? = nil) {
+        navigationEndHandler = onNavigationEnd
         guard monitor == nil else {
             HermternalSwitchTrace.selectionGuard(
                 "eventAdapter.start",
@@ -38,14 +43,16 @@ enum SidebarSelectionEventAdapter {
                 .rightMouseDown,
                 .rightMouseDragged,
                 .rightMouseUp,
-                .keyDown
+                .keyDown,
+                .keyUp
             ]
         ) { event in
             switch event.type {
             case .leftMouseDown:
                 let modifiers = event.modifierFlags.intersection([.command, .shift, .control])
                 let isControlClick = modifiers.contains(.control)
-                // A new mouse-down starts a new classification turn.
+                mouseDownLocation = event.locationInWindow
+                navigationRepeat = false
                 pending = Event(
                     isContextClick: isControlClick,
                     isModified: !modifiers.isEmpty,
@@ -54,14 +61,20 @@ enum SidebarSelectionEventAdapter {
                 serial &+= 1
                 scheduleExpiry(for: serial)
             case .leftMouseDragged:
-                if let pending {
-                    self.pending = Event(
-                        isContextClick: pending.isContextClick,
-                        isModified: pending.isModified,
-                        isDrag: true
-                    )
-                }
+                guard let pending,
+                      let start = mouseDownLocation
+                else { break }
+                let delta = event.locationInWindow
+                let dx = delta.x - start.x
+                let dy = delta.y - start.y
+                guard dx * dx + dy * dy >= dragThresholdSquared else { break }
+                self.pending = Event(
+                    isContextClick: pending.isContextClick,
+                    isModified: pending.isModified,
+                    isDrag: true
+                )
             case .rightMouseDown:
+                navigationRepeat = false
                 pending = Event(isContextClick: true, isModified: true, isDrag: false)
                 serial &+= 1
                 scheduleExpiry(for: serial)
@@ -73,6 +86,15 @@ enum SidebarSelectionEventAdapter {
                 expiryTask?.cancel()
                 expiryTask = nil
                 pending = nil
+                let isArrow = event.keyCode == 123 || event.keyCode == 124
+                    || event.keyCode == 125 || event.keyCode == 126
+                navigationRepeat = isArrow && event.isARepeat
+            case .keyUp:
+                let wasNavigation = navigationRepeat
+                navigationRepeat = false
+                if wasNavigation {
+                    navigationEndHandler?()
+                }
             default:
                 break
             }
@@ -104,6 +126,9 @@ enum SidebarSelectionEventAdapter {
         }
         return (pending.isContextClick, pending.isModified, pending.isDrag)
     }
+    static var isNavigationRepeat: Bool {
+        navigationRepeat
+    }
 
     static func allowsPrimaryActivation() -> Bool {
         // Missing evidence means the user click may still be deliberate.
@@ -119,6 +144,17 @@ enum SidebarSelectionEventAdapter {
         return !event.isContextClick && !event.isModified && !event.isDrag
     }
 
+    /// A SwiftUI `TapGesture` has already resolved the pointer sequence as a
+    /// tap. The local event monitor can still see a sub-pixel
+    /// `leftMouseDragged` while the press is over a draggable title and mark
+    /// the same sequence as a drag. Rejecting that bit here loses a gesture the
+    /// framework has already accepted, which is why title clicks missed while
+    /// surrounding whitespace worked. Context and modified clicks remain
+    /// non-primary; the drag bit is relevant only before gesture recognition.
+    static func allowsCompletedTapActivation() -> Bool {
+        guard let event = current() else { return true }
+        return !event.isContextClick && !event.isModified
+    }
     static func stop() {
         if let monitor {
             NSEvent.removeMonitor(monitor)
@@ -127,6 +163,9 @@ enum SidebarSelectionEventAdapter {
         expiryTask?.cancel()
         expiryTask = nil
         pending = nil
+        mouseDownLocation = nil
+        navigationRepeat = false
+        navigationEndHandler = nil
     }
 }
 /// Opt-in aggregate accounting for the synchronous work observed during one
@@ -278,10 +317,8 @@ struct SidebarView: View {
     @State private var pendingOpenTask: Task<Void, Never>?
     @State private var sidebarSelection: Set<SidebarSelectionID> = []
     @State private var pointerActivatedID: String?
-    @State private var archivedPointerActivatedID: String?
     @State private var programmaticSelectionID: String?
     @State private var programmaticArchivedSelectionID: String?
-    @State private var contentMode: SidebarContentMode = .chats
     @State private var archivedSelection: Set<String> = []
     /// The native List is the window's browsing focus target. Keeping this
     /// identity in SwiftUI lets defaultFocus and row taps use the same seam
@@ -289,7 +326,6 @@ struct SidebarView: View {
     @FocusState private var focusedList: SidebarFocusTarget?
     @State private var renameSession: ChatSession?
     @State private var renameTitle = ""
-    @State private var isCreatingFolder = false
     @State private var renameFolderTarget: SidebarFolderTarget?
     @State private var deleteFolderTarget: SidebarFolderDeletionTarget?
     @State private var purgePreparationTask: Task<Void, Never>?
@@ -356,7 +392,7 @@ struct SidebarView: View {
         let rowMenuDerivations = derived.rowMenuDerivations
         let content = columnChrome(
             Group {
-                if contentMode == .chats {
+                if model.sidebarContentMode == .chats {
                     ZStack(alignment: .bottom) {
                         chatList(
                             sections,
@@ -407,7 +443,7 @@ struct SidebarView: View {
             }
             .listStyle(.sidebar)
             .scrollContentBackground(.hidden)
-            .focusable()
+            // No `.focusable()`, for the reason recorded on `chatList`.
             .focused($focusedList, equals: .archived)
             // List remains the owner of selection. This observes the
             // completed primary click and also covers the row tap seam.
@@ -424,6 +460,7 @@ struct SidebarView: View {
             .padding(.horizontal, 14)
         }
     }
+
     private func chatList(
         _ sections: [SidebarSection],
         visibleOrder: [SidebarSelectionID],
@@ -474,10 +511,23 @@ struct SidebarView: View {
         // rather than flattening its gradient, because a mask whose ramps
         // are opaque still makes the compositing group under test.
         .modifier(SidebarDissolveMask(ramp: chatListDissolve))
-        // This is a SwiftUI focus identity rather than an AppKit responder
-        // lookup. The default is applied only when the window is choosing its
-        // initial focus; Composer requests focus explicitly after New Chat.
-        .focusable()
+        // A SwiftUI focus identity, not an AppKit responder lookup. The
+        // default is applied only when the window is choosing its initial
+        // focus; Composer requests focus explicitly after New Chat.
+        //
+        // There is deliberately no `.focusable()` here, and adding one is a
+        // regression on macOS 27. A `.sidebar` List is already focusable, so
+        // the modifier adds nothing on macOS 26 and two things on macOS 27,
+        // both measured with a probe on 27.0 build 26A5421a: SwiftUI inserts
+        // a `_FocusRingView` the full size of the column, which 27 paints in
+        // the accent colour as a rectangle around the WHOLE sidebar, and it
+        // makes `SwiftUI.KeyViewProxy` the window's first responder instead
+        // of `SwiftUIOutlineListView`, so Up and Down never reach the table
+        // and the selection stops moving. `.focusEffectDisabled()` removes
+        // the ring and leaves the dead arrow keys, so it is not the fix.
+        // Without the modifier the table is first responder on both 26 and
+        // 27, arrow keys move the selection, and the ring view is absent
+        // from the hierarchy entirely.
         .focused($focusedList, equals: .chats)
         .defaultFocus($focusedList, .chats)
         // List remains the owner of selection. This observes the completed
@@ -540,7 +590,7 @@ struct SidebarView: View {
                     affectedChatCount: affected
                 )
             },
-            onNewFolder: beginFolderCreate,
+            onNewFolder: { model.beginFolderCreate() },
             onPurge: requestPurge,
             purgeAvailable: model.canPurgeSessions,
             purgeUnavailableReason: model.sessionPurgeUnavailableReason,
@@ -614,45 +664,14 @@ struct SidebarView: View {
         )
     }
 
-    /// Everything the column carries rather than draws: its menu, the four
-    /// prompts its rows and its menu raise, and the open it schedules.
+    /// Everything the column carries rather than draws: the four prompts its
+    /// rows and the window's toolbar menu raise, and the open it schedules.
     /// Alerts attach anywhere in the column, so gathering them here costs
     /// no behaviour and keeps `body` readable.
     private func columnChrome(_ content: some View) -> some View {
         let folderCount = deleteFolderTarget?.folders.count ?? 0
         let folderDeleteTitle = "Delete \(folderCount) Folders?"
         let chrome = content
-            // Declared on the sidebar column, because everything in the
-            // menu is a property of the chat list rather than of the open
-            // chat.
-            .toolbar {
-                ToolbarItem {
-                    Menu {
-                        SidebarModeMenu(
-                            mode: $contentMode,
-                            onChatsSelected: {
-                                if model.viewingArchivedSessionID != nil {
-                                    model.leaveArchivedView()
-                                }
-                            },
-                            onArchivedSelected: {
-                                Task { await model.loadArchivedSessions() }
-                            }
-                        )
-                        if contentMode == .chats {
-                            Divider()
-                            SidebarOrganizeMenu(
-                                sortMode: sortModeBinding,
-                                groupByDate: groupByDateBinding,
-                                onNewFolder: beginFolderCreate
-                            )
-                        }
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
-                    }
-                    .help("Folders, sorting and grouping")
-                }
-            }
             .alert(
                 "Rename Chat",
                 isPresented: renamePresented,
@@ -669,14 +688,14 @@ struct SidebarView: View {
             } message: { _ in
                 Text("Enter a new title.")
             }
-            .alert("New Folder", isPresented: $isCreatingFolder) {
+            .alert("New Folder", isPresented: folderCreatePresented) {
                 TextField("Name", text: $folderNameField)
                     .onSubmit { commitFolderCreate() }
                 Button("Create") {
                     commitFolderCreate()
                 }
                 Button("Cancel", role: .cancel) {
-                    folderNameField = ""
+                    cancelFolderCreate()
                 }
             } message: {
                 Text("Enter a name for the folder.")
@@ -764,7 +783,7 @@ struct SidebarView: View {
             .onChange(of: model.viewingArchivedSessionID) { _, _ in
                 synchronizeModelSelection(forceChats: true)
             }
-            .onChange(of: contentMode) { _, mode in
+            .onChange(of: model.sidebarContentMode) { _, mode in
                 handleContentModeChange(mode)
             }
             .onChange(of: model.archivedSessions) { _, sessions in
@@ -777,7 +796,9 @@ struct SidebarView: View {
                 pruneSelection(validFolderIDs: Set(folders.map(\.id)))
             }
             .onAppear {
-                SidebarSelectionEventAdapter.start()
+                SidebarSelectionEventAdapter.start {
+                    model.flushPendingNavigationOpen()
+                }
                 synchronizeModelSelection()
             }
             .onDisappear {
@@ -786,7 +807,6 @@ struct SidebarView: View {
                 pendingOpenTask = nil
                 model.cancelOpenPreparation()
                 purgePreparationTask?.cancel()
-                archivedPointerActivatedID = nil
                 purgePreparationTask = nil
                 purgeRequestGeneration &+= 1
             }
@@ -804,7 +824,7 @@ struct SidebarView: View {
     }
     private func handleArchivedSelectionChange(_ selection: Set<String>) {
         let event = SidebarSelectionEventAdapter.current()
-        guard contentMode == .archived,
+        guard model.sidebarContentMode == .archived,
               selection.count == 1,
               let id = selection.first,
               let session = model.archivedSessions.first(where: { $0.id == id })
@@ -813,12 +833,11 @@ struct SidebarView: View {
                 "archivedSelection.validation",
                 id: selection.first,
                 messages: model.messages.count,
-                reason: "mode=\(contentMode.rawValue) count=\(selection.count) rowMissing"
+                reason: "mode=\(model.sidebarContentMode.rawValue) count=\(selection.count) rowMissing"
             )
             pendingOpenTask?.cancel()
             pendingOpenTask = nil
             pointerActivatedID = nil
-            archivedPointerActivatedID = nil
             programmaticArchivedSelectionID = nil
             return
         }
@@ -830,19 +849,6 @@ struct SidebarView: View {
                 reason: "programmaticSelection"
             )
             programmaticArchivedSelectionID = nil
-            if archivedPointerActivatedID != id {
-                archivedPointerActivatedID = nil
-            }
-            return
-        }
-        if archivedPointerActivatedID == id {
-            HermternalSwitchTrace.selectionGuard(
-                "archivedSelection.pointerDeduplication",
-                id: id,
-                messages: model.messages.count,
-                reason: "pointerAlreadyActivated"
-            )
-            archivedPointerActivatedID = nil
             return
         }
         if let event, event.isContextClick || event.isModified || event.isDrag {
@@ -855,7 +861,6 @@ struct SidebarView: View {
             pendingOpenTask?.cancel()
             pendingOpenTask = nil
             pointerActivatedID = nil
-            archivedPointerActivatedID = nil
             return
         }
         // A missing event is an unclassified selection, not proof that it
@@ -884,7 +889,6 @@ struct SidebarView: View {
             clearSidebarSelection("sidebarSelection.archiveMode")
             programmaticSelectionID = nil
         } else {
-            archivedPointerActivatedID = nil
             archivedSelection.removeAll()
             programmaticArchivedSelectionID = nil
             synchronizeModelSelection()
@@ -901,7 +905,7 @@ struct SidebarView: View {
     /// this), so selection must be cleared rather than left as an inert tag.
     private func synchronizeModelSelection(forceChats: Bool = false) {
         if let archivedID = model.viewingArchivedSessionID {
-            contentMode = .archived
+            model.sidebarContentMode = .archived
             clearSidebarSelection("sidebarSelection.modelSynchronization.archived")
             programmaticSelectionID = nil
             pointerActivatedID = nil
@@ -922,12 +926,11 @@ struct SidebarView: View {
         }
 
         if forceChats {
-            contentMode = .chats
+            model.sidebarContentMode = .chats
             archivedSelection.removeAll()
             programmaticArchivedSelectionID = nil
-            archivedPointerActivatedID = nil
         }
-        if contentMode == .archived {
+        if model.sidebarContentMode == .archived {
             archivedSelection.formIntersection(Set(model.archivedSessions.map(\.id)))
         }
 
@@ -946,12 +949,12 @@ struct SidebarView: View {
             return
         }
 
-        guard contentMode == .chats else {
+        guard model.sidebarContentMode == .chats else {
             HermternalSwitchTrace.selectionGuard(
-                "modelSynchronization.contentMode",
+                "modelSynchronization.sidebarContentMode",
                 id: liveID,
                 messages: model.messages.count,
-                reason: "contentMode=\(contentMode.rawValue)"
+                reason: "contentMode=\(model.sidebarContentMode.rawValue)"
             )
             clearSidebarSelection("sidebarSelection.modelSynchronization.mode")
             programmaticSelectionID = nil
@@ -991,7 +994,8 @@ struct SidebarView: View {
         guard selection.count == 1,
               let item = selection.first,
               case let .chat(id) = item,
-              let session = model.sessions.first(where: { $0.id == id })
+              let session = sidebarDerivationCache.session(for: id)
+                    ?? model.sessions.first(where: { $0.id == id })
         else {
             HermternalSwitchTrace.selectionGuard(
                 "sidebarSelection.validation",
@@ -1051,7 +1055,13 @@ struct SidebarView: View {
             messages: model.messages.count,
             detail: "id=\(id)"
         )
-        activateSession(session, event: "open.requested.selection")
+        activateSession(
+            session,
+            event: "open.requested.selection",
+            deferStart: TranscriptSwitchWorkPolicy.shouldDeferNavigationOpen(
+                isNavigationRepeat: SidebarSelectionEventAdapter.isNavigationRepeat
+            )
+        )
     }
 
     /// Archived rows can arrive after the read-only route. Restore only that
@@ -1066,7 +1076,7 @@ struct SidebarView: View {
             )
             return
         }
-        contentMode = .archived
+        model.sidebarContentMode = .archived
         clearSidebarSelection("sidebarSelection.archivedRouteSynchronization")
         programmaticSelectionID = nil
         guard model.archivedSessions.contains(where: { $0.id == archivedID }) else {
@@ -1077,9 +1087,6 @@ struct SidebarView: View {
                 reason: "archivedRowMissing"
             )
             return
-        }
-        if archivedPointerActivatedID != archivedID {
-            archivedPointerActivatedID = nil
         }
         guard archivedSelection != Set([archivedID]) else {
             HermternalSwitchTrace.selectionGuard(
@@ -1136,23 +1143,16 @@ struct SidebarView: View {
         }
     }
 
-    /// Both preferences write through the model, so both persist.
-    private var sortModeBinding: Binding<SortMode> {
+    /// The New Folder prompt is raised by the window's toolbar menu and by
+    /// the Folders section header, so the model carries the request and this
+    /// column presents it.
+    private var folderCreatePresented: Binding<Bool> {
         Binding(
-            get: { model.sortMode },
-            set: { mode in
-                guard mode != model.sortMode else { return }
-                Task { await model.setSortMode(mode) }
-            }
-        )
-    }
-
-    private var groupByDateBinding: Binding<Bool> {
-        Binding(
-            get: { model.groupByDate },
-            set: { isEnabled in
-                guard isEnabled != model.groupByDate else { return }
-                Task { await model.setGroupByDate(isEnabled) }
+            get: { model.isCreatingFolder },
+            set: { isPresented in
+                if !isPresented {
+                    cancelFolderCreate()
+                }
             }
         )
     }
@@ -1232,19 +1232,19 @@ struct SidebarView: View {
         renameTitle = ""
     }
 
-    private func beginFolderCreate() {
-        folderNameField = ""
-        isCreatingFolder = true
-    }
-
     private func commitFolderCreate() {
         let name = folderNameField.trimmingCharacters(in: .whitespacesAndNewlines)
         folderNameField = ""
-        isCreatingFolder = false
+        model.isCreatingFolder = false
         guard !name.isEmpty else { return }
         Task {
             await model.createFolder(named: name)
         }
+    }
+
+    private func cancelFolderCreate() {
+        folderNameField = ""
+        model.isCreatingFolder = false
     }
 
     private func requestPurge(
@@ -1331,33 +1331,27 @@ struct SidebarView: View {
     /// also calls it, so a lost row gesture cannot lose a deliberate click.
     private func activateSession(
         _ session: ChatSession,
-        event: String
+        event: String,
+        deferStart: Bool = false
     ) {
         HermternalSwitchTrace.session(
             event,
             id: session.id,
             messages: model.messages.count
         )
-        let isFailed = switch model.phase {
-        case .failed: true
-        default: false
-        }
-        if model.displayedTranscriptSessionID == session.id,
-           model.viewingArchivedSessionID == nil,
-           !model.isPreparingTranscriptOpen,
-           !isFailed {
+        let samePendingOpen = model.isPreparingTranscriptOpen(for: session.id)
+        if !samePendingOpen {
+            model.userNavigationDidBegin()
+        } else {
             HermternalSwitchTrace.selectionGuard(
-                "activateSession.alreadyDisplayed",
+                "activateSession.coalesced",
                 id: session.id,
                 messages: model.messages.count,
-                reason: "displayedRouteMatches;notPreparing;notFailed"
+                reason: "sameRouteStillPreparing"
             )
-            return
         }
-        model.userNavigationDidBegin()
         pointerActivatedID = session.id
-        pendingOpenTask?.cancel()
-        pendingOpenTask = model.requestOpen(session)
+        pendingOpenTask = model.requestOpen(session, deferStart: deferStart)
     }
 
     /// Explicit activation, including VoiceOver, uses the same opener as
@@ -1376,19 +1370,8 @@ struct SidebarView: View {
                 messages: model.messages.count,
                 reason: "archivedRouteAlreadyDisplayed"
             )
-            archivedPointerActivatedID = nil
             return
         }
-        guard archivedPointerActivatedID != session.id else {
-            HermternalSwitchTrace.selectionGuard(
-                "openArchived.pointerDeduplication",
-                id: session.id,
-                messages: model.messages.count,
-                reason: "pointerAlreadyActivated"
-            )
-            return
-        }
-        archivedPointerActivatedID = session.id
         model.userNavigationDidBegin()
         pendingOpenTask?.cancel()
         pendingOpenTask = nil
@@ -1403,9 +1386,6 @@ struct SidebarView: View {
                 return
             }
             await model.openArchived(session)
-            if !Task.isCancelled, archivedPointerActivatedID == session.id {
-                archivedPointerActivatedID = nil
-            }
         }
     }
 
@@ -1413,7 +1393,8 @@ struct SidebarView: View {
     /// pointer selections share the same cancellation and publication path.
     private func scheduleOpen(for id: String?) {
         guard let id,
-              let session = model.sessions.first(where: { $0.id == id })
+              let session = sidebarDerivationCache.session(for: id)
+                    ?? model.sessions.first(where: { $0.id == id })
         else {
             HermternalSwitchTrace.selectionGuard(
                 "scheduleOpen.sessionLookup",
@@ -1436,9 +1417,10 @@ struct SidebarRowMenuDerivations {
     let scheduledIDs: Set<String>
 }
 
-/// The body-level values derived from sidebar ordering and selection inputs.
-private struct SidebarDerivedData {
-    let selection: Set<SidebarSelectionID>
+/// Values shared by every selection-dependent sidebar projection.
+///
+/// This base is stable while only the native List selection changes.
+private struct SidebarStableBase {
     let orderedSessionIDs: [String]
     let sections: [SidebarSection]
     let scheduleRows: [SidebarRow]
@@ -1448,18 +1430,113 @@ private struct SidebarDerivedData {
     let sessionsByID: [String: ChatSession]
     let pinnedByID: [String: Bool]
     let foldersByID: [String: SidebarFolderTarget]
-    let expandedChats: [ChatSession]
     let expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
+}
+
+/// The small projection that changes when the native List selection changes.
+private struct SidebarSelectionProjection {
+    let selection: Set<SidebarSelectionID>
+    let expandedChats: [ChatSession]
     let rowMenuDerivations: SidebarRowMenuDerivations
 }
 
-/// Keeps ordering and selection expansion projections resident across SwiftUI
-/// body passes. Ordering inputs rebuild the per-item context projections;
-/// selection changes rebuild only the one aggregate expansion.
+/// The body-level values derived from stable ordering and current selection.
+private struct SidebarDerivedData {
+    let base: SidebarStableBase
+    let selectionProjection: SidebarSelectionProjection
+
+    var selection: Set<SidebarSelectionID> { selectionProjection.selection }
+    var orderedSessionIDs: [String] { base.orderedSessionIDs }
+    var sections: [SidebarSection] { base.sections }
+    var scheduleRows: [SidebarRow] { base.scheduleRows }
+    var scheduledIDs: Set<String> { base.scheduledIDs }
+    var visibleOrder: [SidebarSelectionID] { base.visibleOrder }
+    var folderVisibleOrder: [SidebarSelectionID] { base.folderVisibleOrder }
+    var sessionsByID: [String: ChatSession] { base.sessionsByID }
+    var pinnedByID: [String: Bool] { base.pinnedByID }
+    var foldersByID: [String: SidebarFolderTarget] { base.foldersByID }
+    var expandedChats: [ChatSession] { selectionProjection.expandedChats }
+    var expandedChatsByItem: [SidebarSelectionID: [ChatSession]] {
+        base.expandedChatsByItem
+    }
+    var rowMenuDerivations: SidebarRowMenuDerivations {
+        selectionProjection.rowMenuDerivations
+    }
+}
+
+private func sidebarAdd(_ lhs: Int, _ rhs: Int) -> Int {
+    let result = lhs.addingReportingOverflow(rhs)
+    return result.overflow ? Int.max : result.partialValue
+}
+
+private func sidebarSessionBytes(_ session: ChatSession) -> Int {
+    let strings = session.id.utf8.count
+        + session.title.utf8.count
+        + session.preview.utf8.count
+        + session.source.utf8.count
+        + (session.profile?.utf8.count ?? 0)
+        + session.displayTitle.utf8.count
+    return sidebarAdd(MemoryLayout<ChatSession>.stride, strings)
+}
+
+private func sidebarSessionsBytes(_ sessions: [ChatSession]) -> Int {
+    sessions.reduce(0) { sidebarAdd($0, sidebarSessionBytes($1)) }
+}
+
+private extension SidebarRowMenuDerivations {
+    var estimatedByteCount: Int {
+        let sessions = sessionByItem.values.reduce(0) {
+            sidebarAdd($0, sidebarAdd(sidebarSessionsBytes($1.chats), sidebarSessionsBytes($1.moveChats)))
+        }
+        let folders = folderByItem.values.reduce(0) { total, menu in
+            sidebarAdd(
+                total,
+                sidebarAdd(
+                    sidebarSessionsBytes(menu.chats),
+                    menu.targets.reduce(0) { subtotal, target in
+                        sidebarAdd(subtotal, target.id.utf8.count + target.name.utf8.count)
+                    }
+                )
+            )
+        }
+        let ids = scheduledIDs.reduce(0) { sidebarAdd($0, $1.utf8.count) }
+        return sidebarAdd(
+            MemoryLayout<Self>.stride,
+            sidebarAdd(sessions, sidebarAdd(folders, ids))
+        )
+    }
+}
+
+
+private extension SidebarSelectionProjection {
+    var estimatedByteCount: Int {
+        let selectionBytes = selection.reduce(0) { partial, _ in
+            sidebarAdd(partial, MemoryLayout<SidebarSelectionID>.stride)
+        }
+        return sidebarAdd(
+            MemoryLayout<Self>.stride,
+            sidebarAdd(
+                selectionBytes,
+                sidebarAdd(sidebarSessionsBytes(expandedChats), rowMenuDerivations.estimatedByteCount)
+            )
+        )
+    }
+}
+
+/// Keeps ordering and selection projections resident across SwiftUI body
+/// passes. Ordering inputs rebuild the stable base; selection changes rebuild
+/// only the aggregate and menu projection.
 private final class SidebarDerivationCache {
-    private var orderingMemo = SidebarOrderingMemo()
-    private var derived: SidebarDerivedData?
-    private var derivedRebuildCount = 0
+    private static let sidebarBudget = AppMemoryProfile.mac440MiB.limit(for: .sidebar)
+    // Ordering and selection each have a bounded half. Together they preserve
+    // the 16 MiB sidebar category envelope without evicting a live fallback.
+    private var orderingMemo = SidebarOrderingMemo(maxRetainedBytes: sidebarBudget / 2)
+    private var base: SidebarStableBase?
+    private var selectionProjection: SidebarSelectionProjection?
+    private var selectionAdmission: AppMemoryAdmission?
+    private let memoryRegistry = AppMemoryRegistry(profile: .mac440MiB)
+    private var baseRebuildCount = 0
+    private var selectionBaseRebuildCount = -1
 
     func resolve(
         sessions: [ChatSession],
@@ -1482,12 +1559,11 @@ private final class SidebarDerivationCache {
                 now: now
             )
         )
-        let orderingChanged = derivedRebuildCount != orderingMemo.rebuildCount || derived == nil
-        if !orderingChanged, let cached = derived, cached.selection == selection {
-            return cached
-        }
-
-        let base: SidebarDerivedData
+        let orderingChanged = base == nil
+            || (
+                baseRebuildCount != orderingMemo.rebuildCount
+                    && !orderingMemo.lastResolveWasRejected
+            )
         if orderingChanged {
             let scheduleRows = projection.sections.first { $0.kind == .schedules }?.rows ?? []
             let sessionsByID = Dictionary(
@@ -1516,8 +1592,7 @@ private final class SidebarDerivationCache {
                     return (item, ids.compactMap { sessionsByID[$0] })
                 }
             )
-            base = SidebarDerivedData(
-                selection: [],
+            base = SidebarStableBase(
                 orderedSessionIDs: orderedSessionIDs,
                 sections: projection.sections,
                 scheduleRows: scheduleRows,
@@ -1526,22 +1601,23 @@ private final class SidebarDerivationCache {
                 folderVisibleOrder: projection.folderVisibleOrder,
                 sessionsByID: sessionsByID,
                 pinnedByID: Dictionary(
-                    uniqueKeysWithValues: sessionsByID.map {
-                        ($0.key, $0.value.pinned)
-                    }
+                    uniqueKeysWithValues: sessionsByID.map { ($0.key, $0.value.pinned) }
                 ),
                 foldersByID: foldersByID,
-                expandedChats: [],
-                expandedChatsByItem: expandedChatsByItem,
-                rowMenuDerivations: SidebarRowMenuDerivations(
-                    sessionByItem: [:],
-                    folderByItem: [:],
-                    scheduledIDs: scheduledIDs
-                )
+                expandedChatsByItem: expandedChatsByItem
             )
-            derivedRebuildCount = orderingMemo.rebuildCount
-        } else {
-            base = derived!
+            baseRebuildCount = orderingMemo.rebuildCount
+        }
+
+        guard let base else {
+            // The first projection is always available for this body pass.
+            preconditionFailure("Sidebar ordering base was not created")
+        }
+        if !orderingChanged,
+           let cached = selectionProjection,
+           selectionBaseRebuildCount == baseRebuildCount,
+           cached.selection == selection {
+            return SidebarDerivedData(base: base, selectionProjection: cached)
         }
 
         let expandedIDs = SidebarSelectionPolicy.expandedChatIDs(
@@ -1551,19 +1627,9 @@ private final class SidebarDerivationCache {
             folderMembership: membership
         )
         let aggregateChats = expandedIDs.compactMap { base.sessionsByID[$0] }
-        let next = SidebarDerivedData(
+        let candidate = SidebarSelectionProjection(
             selection: selection,
-            orderedSessionIDs: base.orderedSessionIDs,
-            sections: base.sections,
-            scheduleRows: base.scheduleRows,
-            scheduledIDs: base.scheduledIDs,
-            visibleOrder: base.visibleOrder,
-            folderVisibleOrder: base.folderVisibleOrder,
-            sessionsByID: base.sessionsByID,
-            pinnedByID: base.pinnedByID,
-            foldersByID: base.foldersByID,
             expandedChats: aggregateChats,
-            expandedChatsByItem: base.expandedChatsByItem,
             rowMenuDerivations: menuDerivations(
                 base: base,
                 selection: selection,
@@ -1571,12 +1637,35 @@ private final class SidebarDerivationCache {
                 membership: membership
             )
         )
-        derived = next
-        return next
-
+        // Estimate once for this changed selection. The local also prevents
+        // admission from traversing every menu array a second time.
+        let candidateBytes = candidate.estimatedByteCount
+        if candidateBytes <= Self.sidebarBudget / 2,
+           let admission = memoryRegistry.admit(
+               category: .sidebar,
+               bytes: candidateBytes
+           ) {
+            // Admit first. A failed replacement must not evict the old menu.
+            if let previous = selectionAdmission {
+                memoryRegistry.evict(previous)
+            }
+            selectionProjection = candidate
+            selectionAdmission = admission
+            selectionBaseRebuildCount = baseRebuildCount
+        }
+        return SidebarDerivedData(
+            base: base,
+            selectionProjection: candidate
+        )
     }
+
+    /// Reuses the ordering map for selection callbacks that follow a body pass.
+    func session(for id: String) -> ChatSession? {
+        base?.sessionsByID[id]
+    }
+
     private func menuDerivations(
-        base: SidebarDerivedData,
+        base: SidebarStableBase,
         selection: Set<SidebarSelectionID>,
         aggregateChats: [ChatSession],
         membership: [String: String]
@@ -1662,36 +1751,6 @@ private struct SidebarPurgeTarget: Identifiable {
     var id: String {
         "\(plan.mode.rawValue):\(plan.chatIDs.joined(separator: ",")):"
             + "\(plan.folderIDs.joined(separator: ","))"
-    }
-}
-
-private struct SidebarModeMenu: View {
-    @Binding var mode: SidebarContentMode
-    let onChatsSelected: () -> Void
-    let onArchivedSelected: () -> Void
-
-    var body: some View {
-        Button {
-            onChatsSelected()
-            mode = .chats
-        } label: {
-            modeLabel("Chats", selected: mode == .chats)
-        }
-        Button {
-            mode = .archived
-            onArchivedSelected()
-        } label: {
-            modeLabel("Archived Chats", selected: mode == .archived)
-        }
-    }
-
-    private func modeLabel(_ title: String, selected: Bool) -> some View {
-        Label {
-            Text(title)
-        } icon: {
-            Image(systemName: "checkmark")
-                .opacity(selected ? 1 : 0)
-        }
     }
 }
 

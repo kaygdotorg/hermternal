@@ -1,7 +1,17 @@
+import HermternalCore
 import SwiftUI
 
 struct RootView: View {
     @Bindable var model: AppModel
+    let onModelStateChanged: @MainActor () -> Void
+
+    init(
+        model: AppModel,
+        onModelStateChanged: @escaping @MainActor () -> Void = {}
+    ) {
+        self._model = Bindable(model)
+        self.onModelStateChanged = onModelStateChanged
+    }
 
     var body: some View {
         ZStack {
@@ -11,27 +21,156 @@ struct RootView: View {
             case .connecting:
                 ConnectingView()
             case .ready:
-                ChatWindow(model: model)
+                ChatView(
+                    model: model,
+                    isReadOnly: model.isViewingArchivedTranscript
+                )
             case .failed(let message):
                 FailureView(message: message, model: model)
             }
         }
-        // The search panel is the front surface of the window. No toolbar item
-        // must show above it. The `automatic` placement removes the toolbar
-        // items only. The `.windowToolbar` placement removes the whole window
-        // toolbar, and it also removes the title and the traffic light
-        // controls. This window keeps those controls.
-        .toolbarVisibility(model.isSearchPresented ? .hidden : .automatic)
-        .overlay {
-            ToastLayer()
-                .environment(model.toastPresenter)
-                .zIndex(2)
+        .onChange(of: model.isSearchPresented) { _, presented in
+            model.toastPresenter.setSuppressed(presented)
+            onModelStateChanged()
+        }
+        .onChange(of: model.viewingArchivedSessionID) { _, _ in
+            onModelStateChanged()
+        }
+        .onChange(of: model.archivedSessions) { _, _ in
+            onModelStateChanged()
+        }
+        .onChange(of: model.sessionPurgeCapability) { _, _ in
+            onModelStateChanged()
+        }
+        .onChange(of: model.sessionPurgeUnavailableReason) { _, _ in
+            onModelStateChanged()
+        }
+        .task {
+            model.toastPresenter.setSuppressed(model.isSearchPresented)
+            onModelStateChanged()
+        }
+    }
+}
+
+/// The SwiftUI-owned split is hosted by the AppKit window shell. Keeping the
+/// visibility state here means a column change never changes the NSWindow's
+/// frame or asks AppKit to restore a divider position.
+struct MainSplitRoot: View {
+    @Bindable var model: AppModel
+    let appearance: AppearanceSettings
+    let onModelStateChanged: @MainActor () -> Void
+    let isActive: Bool
+    @State private var columnVisibility: NavigationSplitViewVisibility
+    @State private var readyVisibility: NavigationSplitViewVisibility
+    @State private var wasReady: Bool
+
+    init(
+        model: AppModel,
+        appearance: AppearanceSettings,
+        onModelStateChanged: @escaping @MainActor () -> Void = {},
+        isActive: Bool = true
+    ) {
+        self._model = Bindable(model)
+        self.appearance = appearance
+        self.onModelStateChanged = onModelStateChanged
+        self.isActive = isActive
+        let startsReady = model.phase == .ready
+        self._columnVisibility = State(initialValue: startsReady ? .all : .detailOnly)
+        self._readyVisibility = State(initialValue: .all)
+        self._wasReady = State(initialValue: startsReady)
+    }
+
+    var body: some View {
+        Group {
+            if !isActive {
+                Color.clear
+            } else if model.phase == .ready {
+                splitContent
+            } else {
+                RootView(model: model, onModelStateChanged: onModelStateChanged)
+                    // Keep the authentication surface below the titlebar.
+                    .ignoresSafeArea(.container, edges: .top)
+            }
+        }
+        .environment(
+            \.hermternalAccentColor,
+            Color(nsColor: appearance.effectiveAccentColor)
+        )
+        .environment(
+            \.hermternalAlwaysShowsChatMetadata,
+            appearance.alwaysShowsChatMetadata
+        )
+        .tint(Color(nsColor: appearance.effectiveAccentColor))
+
+        .onChange(of: model.phase) { _, phase in
+            synchronizeVisibility(for: phase)
+            onModelStateChanged()
+        }
+        .task {
+            synchronizeVisibility(for: model.phase)
+        }
+    }
+
+    private var splitContent: some View {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            SidebarView(
+                model: model,
+                accountName: model.accountPresentation.title,
+                accountDetail: model.accountPresentation.detail,
+                accountID: model.accountPresentation.accountID
+            )
+            .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 340)
+        } detail: {
+            RootView(model: model, onModelStateChanged: onModelStateChanged)
+                // Sidebar keeps the host's titlebar inset. The reading
+                // surface alone reaches the physical top for its fade.
+                .ignoresSafeArea(.container, edges: .top)
+        }
+        .background {
+            MainSplitVisibilityBridge {
+                toggleSidebar()
+            }
+            .frame(width: 0, height: 0)
         }
         .overlay(alignment: .topLeading) {
             FrameDeliveryProbe(capability: model.debugModules)
                 .frame(width: 1, height: 1)
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
+        }
+        .onChange(of: columnVisibility) { _, visibility in
+            guard model.phase == .ready else { return }
+            readyVisibility = visibility
+        }
+    }
+
+
+
+    private func toggleSidebar() {
+        guard model.phase == .ready else { return }
+        withAnimation(.snappy(duration: 0.24, extraBounce: 0)) {
+            columnVisibility = columnVisibility == .detailOnly
+                ? readyVisibility == .detailOnly ? .all : readyVisibility
+                : .detailOnly
+        }
+    }
+
+    private func synchronizeVisibility(for phase: AppModel.Phase) {
+        switch phase {
+        case .ready:
+            guard !wasReady else { return }
+            wasReady = true
+            withAnimation(.snappy(duration: 0.24, extraBounce: 0)) {
+                columnVisibility = readyVisibility == .detailOnly ? .all : readyVisibility
+            }
+        case .signedOut, .connecting, .failed:
+            if wasReady {
+                readyVisibility = columnVisibility
+                wasReady = false
+            }
+            withAnimation(.snappy(duration: 0.24, extraBounce: 0)) {
+                columnVisibility = .detailOnly
+            }
         }
     }
 }
@@ -59,8 +198,6 @@ private struct FailureView: View {
                 .foregroundStyle(.orange)
             Text("Could not connect")
                 .font(.title3.weight(.semibold))
-            // The gateway's own error text is the most useful thing we can
-            // show while iterating, so surface it verbatim and selectable.
             Text(message)
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -76,74 +213,5 @@ private struct FailureView: View {
         }
         .padding(40)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-struct ChatWindow: View {
-    @Bindable var model: AppModel
-    @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            SidebarView(
-                model: model,
-                accountName: model.accountPresentation.title,
-                accountDetail: model.accountPresentation.detail,
-                // The visible title is a truncated account id, so the full
-                // value has to reach the tooltip and VoiceOver label.
-                accountID: model.accountPresentation.accountID
-            )
-                .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 340)
-                // `NavigationSplitView` supplies the sidebar toggle item. A
-                // hidden toolbar visibility removes custom items only, so it
-                // does not remove this item. Apple documents
-                // `toolbar(removing:)` on the sidebar column for this purpose.
-                // The parameter is optional, so one state controls both
-                // modifiers.
-                .toolbar(
-                    removing: model.isSearchPresented ? .sidebarToggle : nil
-                )
-        } detail: {
-            ChatView(
-                model: model,
-                isReadOnly: model.isViewingArchivedTranscript
-            )
-        }
-        // The window keeps the native titlebar and the traffic light controls.
-        // `ChatView` and `SidebarView` declare the toolbar items
-        // unconditionally. Only the visibility modifiers above respond to the
-        // search panel, so the panel does not cause a toolbar rebuild.
-        .overlay {
-            ZStack {
-                if model.isSearchPresented, let querying = model.searchQuerying {
-                    SearchPanel(
-                        querying: querying,
-                        activate: { location in
-                            Task {
-                                await model.open(at: location)
-                                model.isSearchPresented = false
-                            }
-                        },
-                        dismiss: { model.isSearchPresented = false }
-                    )
-                    .transition(.opacity)
-                    .zIndex(1)
-                }
-            }
-            // The overlay and the panel share one animation so material,
-            // panel content, and dismissal remain a single interruptible
-            // gesture when ⌘K/Escape are pressed repeatedly.
-            .animation(
-                SearchPanel.panelAnimation(reduceMotion: reduceMotion),
-                value: model.isSearchPresented
-            )
-        }
-        .onChange(of: model.isSearchPresented) { _, presented in
-            model.toastPresenter.setSuppressed(presented)
-        }
-        .task {
-            model.toastPresenter.setSuppressed(model.isSearchPresented)
-        }
     }
 }

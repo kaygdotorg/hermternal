@@ -36,7 +36,7 @@ final class SearchPanelModel {
         resultLimit: Int = 100
     ) {
         self.querying = querying
-        self.resultLimit = resultLimit
+        self.resultLimit = min(max(resultLimit, 0), SearchIndex.defaultLimit)
         self.query = initialQuery
         self.state = initialState ?? (initialQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .empty : .loading(query: initialQuery))
         self.selectedIndex = nil

@@ -83,10 +83,13 @@ struct ArchivedSidebarContent: View {
             failureRow(errorMessage)
         }
         ForEach(sessions) { session in
-            ArchivedSidebarRow(session: session, onOpen: onOpen)
+            ArchivedSidebarRow(
+                session: session,
+                isSelected: selection.contains(session.id),
+                onOpen: onOpen
+            )
                 .tag(session.id)
                 .selectionDisabled(false)
-                // A per-row menu keeps the command tied to the clicked row
                 // without changing List selection.
                 .contextMenu {
                     commands(for: session)
@@ -216,38 +219,37 @@ struct ArchivedSidebarContent: View {
     }
 
     private func copyLabel(count: Int) -> String {
-        count == 1 ? "Copy 1 Deep Link" : "Copy \(count) Deep Links"
+        count == 1 ? "Copy 1 Link" : "Copy \(count) Links"
     }
 }
 
 /// One archived chat: its glyph, its title, and when it was last active.
-///
-/// The row surface is owned by the host `List`; accessibility activation is
-/// explicit because there is no row Button to consume native selection.
 private struct ArchivedSidebarRow: View {
     let session: ChatSession
+    let isSelected: Bool
     let onOpen: (ChatSession) -> Void
 
     var body: some View {
-        label
+        let content = label
             .accessibilityLabel(session.displayTitle)
             .accessibilityValue(archivedRowDetail(session))
             .accessibilityIdentifier("archived-row-\(session.id)")
             .accessibilityAction {
                 onOpen(session)
             }
-            // List remains the owner of selection. The simultaneous tap
-            // observes only the completed primary click and leaves native
-            // selection and the context menu untouched.
-            .simultaneousGesture(
+        if isSelected {
+            content.simultaneousGesture(
                 TapGesture(count: 1)
                     .onEnded {
-                        guard SidebarSelectionEventAdapter.allowsPrimaryActivation() else {
+                        guard SidebarSelectionEventAdapter.allowsCompletedTapActivation() else {
                             return
                         }
                         onOpen(session)
                     }
             )
+        } else {
+            content
+        }
     }
 
     @ViewBuilder
@@ -285,6 +287,8 @@ private struct ArchivedSidebarRow: View {
                     .fixedSize()
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(.rect)
         .font(.body)
         .help(title)
     }

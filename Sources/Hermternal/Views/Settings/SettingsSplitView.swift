@@ -9,6 +9,8 @@ struct SettingsSplitView: NSViewControllerRepresentable {
     let model: AppModel
     let registry: CapabilityRegistry
     let debugModules: any DebugModuleCapability
+    let accentColor: Color
+
     @Binding var selection: SettingsSection?
 
     func makeNSViewController(context: Context) -> SettingsSplitViewController {
@@ -17,6 +19,7 @@ struct SettingsSplitView: NSViewControllerRepresentable {
             model: model,
             registry: registry,
             debugModules: debugModules,
+            accentColor: accentColor,
             selection: $selection
         )
     }
@@ -30,6 +33,7 @@ struct SettingsSplitView: NSViewControllerRepresentable {
             model: model,
             registry: registry,
             debugModules: debugModules,
+            accentColor: accentColor,
             selection: $selection
         )
     }
@@ -49,15 +53,20 @@ final class SettingsSplitViewController: NSSplitViewController {
         model: AppModel,
         registry: CapabilityRegistry,
         debugModules: any DebugModuleCapability,
+        accentColor: Color,
         selection: Binding<SettingsSection?>
     ) {
         sidebarHosting = NSHostingController(
-            rootView: SettingsSourceList(selection: selection)
+            rootView: SettingsSourceList(
+                selection: selection,
+                accentColor: accentColor
+            )
         )
         detailHosting = NSHostingController(
             rootView: SettingsDetailView(
                 section: selection.wrappedValue ?? .appearance,
                 appearance: appearance,
+                accentColor: accentColor,
                 model: model,
                 registry: registry,
                 debugModules: debugModules
@@ -101,12 +110,17 @@ final class SettingsSplitViewController: NSSplitViewController {
         model: AppModel,
         registry: CapabilityRegistry,
         debugModules: any DebugModuleCapability,
+        accentColor: Color,
         selection: Binding<SettingsSection?>
     ) {
-        sidebarHosting.rootView = SettingsSourceList(selection: selection)
+        sidebarHosting.rootView = SettingsSourceList(
+            selection: selection,
+            accentColor: accentColor
+        )
         detailHosting.rootView = SettingsDetailView(
             section: selection.wrappedValue ?? .appearance,
             appearance: appearance,
+            accentColor: accentColor,
             model: model,
             registry: registry,
             debugModules: debugModules
@@ -187,6 +201,7 @@ final class SettingsWindowController: NSWindowController {
             model: lastContext.model,
             registry: lastContext.registry,
             debugModules: lastContext.debugModules,
+            accentColor: Color(nsColor: lastContext.appearance.effectiveAccentColor),
             selection: selectionBinding
         )
     }
@@ -209,6 +224,7 @@ final class SettingsWindowController: NSWindowController {
                 model: model,
                 registry: registry,
                 debugModules: debugModules,
+                accentColor: Color(nsColor: appearance.effectiveAccentColor),
                 selection: selectionBinding
             )
         } else {
@@ -217,6 +233,7 @@ final class SettingsWindowController: NSWindowController {
                 model: model,
                 registry: registry,
                 debugModules: debugModules,
+                accentColor: Color(nsColor: appearance.effectiveAccentColor),
                 selection: selectionBinding
             )
             self.splitController = splitController

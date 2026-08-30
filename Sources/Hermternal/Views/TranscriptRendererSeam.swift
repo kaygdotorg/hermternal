@@ -1,26 +1,33 @@
 import HermternalCore
 
-/// The narrow seam shared by transcript rendering adapters.
+/// The narrow, bounded seam shared by transcript rendering adapters.
 ///
-/// `blocks` are the stable render units. `messages` are the windowed source
-/// messages used to resolve each block's UTF-16 source range and preserve
-/// message-level chrome. `window` is resolved by `TranscriptWindowPolicy` in
-/// `ChatView`; adapters consume it rather than deriving their own window.
+/// A renderer never receives the transcript corpus. It receives the route that
+/// identifies the publication, its indexed summary, and the actor that owns
+/// page reads. Rows and prepared layouts are fetched only for the viewport.
 struct TranscriptRendererInput {
-    let blocks: [TranscriptBlock]
-    let messages: [ChatMessage]
-    let window: TranscriptWindow
-    let routeIdentity: String
-    /// Publication generation for signposts and stale-route attribution.
-    let generation: Int
+    let store: (any TranscriptTurnPageLocating)?
+    let route: TranscriptRoute?
+    let summary: TranscriptSummary?
+    let revision: UInt64
     let isReadOnly: Bool
     let isStreaming: Bool
     let findQuery: String
-    let findMatches: [TranscriptMatch]
-    let activeFindIndex: Int?
-    let pendingMessageID: MessageIdentity?
-    let onRequestOlder: () -> Void
+    let pendingMessageID: String?
+    let findMessageID: String?
+    let showsMetadata: Bool
     let onCopyCode: (String) -> Void
     let onPaint: (UInt64) -> Void
 }
 
+extension TranscriptRendererInput {
+    /// Compatibility projections for instrumentation. They are derived from
+    /// the immutable route rather than maintained as a second identity source.
+    var routeIdentity: String {
+        route?.sessionID ?? "none"
+    }
+
+    var generation: Int {
+        Int(route?.generation ?? 0)
+    }
+}

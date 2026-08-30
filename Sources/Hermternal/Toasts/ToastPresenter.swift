@@ -341,6 +341,11 @@ extension ToastSeverity {
 // is the decisive one: it needs a transient in-window surface that carries a
 // button which mutates app state.
 //
+/// The AppKit host uses this callback to pass pointer events through every
+/// transparent part of the overlay. The rectangle is in the ToastLayer's
+/// top-left SwiftUI coordinate space.
+typealias ToastLayerHitRegionReporter = @MainActor (CGRect?) -> Void
+
 // Only the stack arithmetic and the drag gesture are app-owned. The material,
 // the radius, the symbols, the action button, the context menu, the
 // presentation and the VoiceOver announcement are all system components.
@@ -350,6 +355,11 @@ struct ToastLayer: View {
     @Environment(ToastPresenter.self) private var presenter
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    private let reportHitRegion: ToastLayerHitRegionReporter?
+
+    init(reportHitRegion: ToastLayerHitRegionReporter? = nil) {
+        self.reportHitRegion = reportHitRegion
+    }
 
     /// The one measured-height store. It is pruned whenever the entries
     /// change, because toast ids are fresh UUIDs and an unpruned store grows
@@ -359,7 +369,9 @@ struct ToastLayer: View {
 
     var body: some View {
         if presenter.entries.isEmpty || presenter.isSuppressed {
-            EmptyView()
+            Color.clear
+                .onAppear { reportHitRegion?(nil) }
+                .onDisappear { reportHitRegion?(nil) }
         } else {
             GeometryReader { geometry in
                 stack(in: geometry.size)
@@ -378,6 +390,13 @@ struct ToastLayer: View {
             && expandedHeight <= Double(SearchSurfaceGeometry.maximumHeight(in: container.height))
         let region = ToastStackGeometry.regionHeight(of: measured, expanded: isExpanded)
         let width = CGFloat(ToastStackGeometry.width(in: Double(container.width)))
+        let topInset = SearchSurfaceGeometry.topInset(in: container.height)
+        let hitRegion = CGRect(
+            x: (container.width - width) / 2,
+            y: topInset,
+            width: width,
+            height: CGFloat(region)
+        )
         let frontHeight = measured.first ?? ToastStackGeometry.estimatedCardHeight
         let transition = AnyTransition.asymmetric(insertion: insertion, removal: removal)
 
@@ -425,13 +444,19 @@ struct ToastLayer: View {
         }
         .focusSection()
         .frame(maxWidth: .infinity, alignment: .top)
-        .padding(.top, SearchSurfaceGeometry.topInset(in: container.height))
+        .padding(.top, topInset)
+        .onAppear { reportHitRegion?(hitRegion) }
+        .onChange(of: hitRegion) { _, region in
+            reportHitRegion?(region)
+        }
+        .onDisappear { reportHitRegion?(nil) }
         .onChange(of: presenter.entries) { _, entries in
             let kept = ToastStackGeometry.pruned(heights, keeping: entries.lazy.map(\.id))
             guard kept.count != heights.count else { return }
             heights = kept
         }
     }
+
 
     private func measuredHeight(of id: ToastID) -> Double {
         guard let height = heights[id] else { return ToastStackGeometry.estimatedCardHeight }
@@ -489,6 +514,8 @@ private struct ToastCard: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.hermternalAccentColor) private var accentColor
+
     @State private var isHovering = false
     @FocusState private var isFocused: Bool
 
@@ -612,7 +639,7 @@ private struct ToastCard: View {
     /// `ShapeStyle` such as `.separator` forces the compiler to unify two
     /// unrelated types inside an already large expression.
     private var borderColor: Color {
-        isFocused ? .accentColor : Color(nsColor: .separatorColor)
+        isFocused ? accentColor : Color(nsColor: .separatorColor)
     }
 
     private var borderWidth: CGFloat {

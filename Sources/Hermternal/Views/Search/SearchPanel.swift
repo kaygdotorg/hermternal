@@ -489,7 +489,8 @@ private struct ResultsSearchState: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 2) {
-                ForEach(Array(results.hits.enumerated()), id: \.element.location) { index, hit in
+                ForEach(results.hits.indices, id: \.self) { index in
+                    let hit = results.hits[index]
                     SearchResultRow(
                         hit: hit,
                         index: index,
@@ -599,6 +600,8 @@ private struct SearchResultRow: View {
     let activate: () -> Void
 
     @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.hermternalAccentColor) private var accentColor
+
 
     var body: some View {
         Button(action: activate) {
@@ -617,14 +620,14 @@ private struct SearchResultRow: View {
             .padding(.vertical, 10)
             .background(
                 isSelected
-                    ? Color.accentColor.opacity(contrast == .increased ? 0.24 : 0.12)
+                    ? accentColor.opacity(contrast == .increased ? 0.24 : 0.12)
                     : Color.clear,
                 in: RoundedRectangle(cornerRadius: 12, style: .continuous)
             )
             .overlay {
                 if isSelected && contrast == .increased {
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(Color.accentColor, lineWidth: 1)
+                        .strokeBorder(accentColor, lineWidth: 1)
                 }
             }
             .contentShape(Rectangle())

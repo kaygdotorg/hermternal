@@ -89,30 +89,9 @@ struct FoldersSectionCommands: View {
     }
 }
 
-/// Sidebar toolbar menu: folder creation plus the two list preferences.
-///
-/// The bindings write through `AppModel`, so both preferences persist.
-struct SidebarOrganizeMenu: View {
-    @Binding var sortMode: SortMode
-    @Binding var groupByDate: Bool
-    let onNewFolder: () -> Void
-
-    var body: some View {
-        Button("New Folder…", systemImage: "folder.badge.plus", action: onNewFolder)
-        Divider()
-        Picker("Sort By", selection: $sortMode) {
-            ForEach(SortMode.allCases, id: \.self) { mode in
-                Text(mode.sidebarTitle).tag(mode)
-            }
-        }
-        Divider()
-        Toggle("Group by Date", isOn: $groupByDate)
-    }
-}
-
 extension SortMode {
-    /// Menu title. The exhaustive `switch` keeps a new case visible to the
-    /// compiler instead of falling back to a raw value.
+    /// Title in the window's toolbar menu. The exhaustive `switch` keeps a new
+    /// case visible to the compiler instead of falling back to a raw value.
     var sidebarTitle: String {
         switch self {
         case .lastActivity: "Last Activity"
