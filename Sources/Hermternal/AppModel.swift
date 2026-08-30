@@ -2380,8 +2380,10 @@ final class AppModel: ComposerTurnRouting {
             generation: generation,
             messages: messages.count
         )
-        // Leaving a route invalidates the painted-transcript signal unless a
-        // deferred navigation retains the visible transcript until it opens.
+        // Leaving a route invalidates the painted-transcript signal. It is
+        // cleared here rather than at each call site so no future selection
+        // path can forget to, which is how a stale "already open" belief
+        // strands a row.
         if !preserveDisplayedTranscript, value != selectedSessionID {
             displayedTranscriptSessionID = nil
         }

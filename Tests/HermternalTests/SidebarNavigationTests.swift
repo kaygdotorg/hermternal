@@ -1,71 +1,76 @@
-@testable import Hermternal
 import AppKit
+import Foundation
+import HermternalCore
 import Testing
+@testable import Hermternal
 
-@Test("An active repeat reset clears deferred navigation")
+@Test("Deferred sidebar navigation keeps the displayed transcript until it opens")
 @MainActor
-func activeRepeatResetClearsDeferredNavigation() {
-    var tracker = SidebarNavigationRepeatTracker()
-    tracker.recordKeyDown(keyCode: 126, isRepeat: true)
+func deferredSidebarNavigationPreservesDisplayedTranscript() {
+    let model = AppModel()
+    let current = chatSession(id: "current")
+    let next = chatSession(id: "next")
+    let transcript = [ChatMessage(role: .assistant, text: "Current transcript")]
 
-    #expect(tracker.reset())
+    model.messages = transcript
+    model.transcriptRouteIdentity = "live:current"
+    model.selectedSessionID = current.id
+    model.noteTranscriptDisplayed(sessionID: current.id)
+
+    _ = model.requestOpen(next, deferStart: true)
+
+    #expect(model.selectedSessionID == next.id)
+    #expect(model.messages.map(\.text) == transcript.map(\.text))
+    #expect(model.transcriptRouteIdentity == "live:current")
+    #expect(model.displayedTranscriptSessionID == current.id)
+}
+
+@Test("An unrelated key-up does not finish repeated sidebar navigation")
+func unrelatedKeyUpDoesNotFlushRepeatedArrowNavigation() {
+    var tracker = SidebarNavigationRepeatTracker()
+
+    tracker.recordKeyDown(keyCode: 124, isRepeat: true)
+
+    let didFinish = tracker.recordKeyUp(keyCode: 12)
+    #expect(!didFinish)
+    #expect(tracker.isNavigationRepeat)
+}
+
+@Test("The repeated arrow key-up finishes sidebar navigation once")
+func repeatedArrowKeyUpFlushesSidebarNavigationOnce() {
+    var tracker = SidebarNavigationRepeatTracker()
+
+    tracker.recordKeyDown(keyCode: 124, isRepeat: true)
+
+    let didFinish = tracker.recordKeyUp(keyCode: 124)
+    #expect(didFinish)
+    let didFinishAgain = tracker.recordKeyUp(keyCode: 124)
+    #expect(!didFinishAgain)
     #expect(!tracker.isNavigationRepeat)
 }
 
-@Test("A repeat reset reports active state once")
-@MainActor
-func repeatResetReportsActiveStateOnce() {
-    var tracker = SidebarNavigationRepeatTracker()
-    tracker.recordKeyDown(keyCode: 125, isRepeat: true)
-
-    #expect(tracker.reset())
-    #expect(!tracker.reset())
-    #expect(!tracker.isNavigationRepeat)
-}
-
-@Test("An inactive repeat reset does not report deferred navigation")
-@MainActor
-func inactiveRepeatResetDoesNotReportDeferredNavigation() {
-    var tracker = SidebarNavigationRepeatTracker()
-
-    #expect(!tracker.reset())
-    #expect(!tracker.isNavigationRepeat)
+private func chatSession(id: String) -> ChatSession {
+    ChatSession(from: .object(["id": .string(id)]))
 }
 
 @Test("Observer registration ends repeated sidebar navigation once and cleans up")
 @MainActor
-func observerRegistrationEndsRepeatedSidebarNavigationOnceAndCleansUp() async {
+func observerRegistrationEndsRepeatedSidebarNavigationOnceAndCleansUp() {
     SidebarSelectionEventAdapter.stop()
     defer { SidebarSelectionEventAdapter.stop() }
 
     var navigationEndCount = 0
-    SidebarSelectionEventAdapter.start {
-        navigationEndCount += 1
-    }
-    SidebarSelectionEventAdapter.recordKeyDown(keyCode: 126, isRepeat: false)
-    SidebarSelectionEventAdapter.recordKeyDown(keyCode: 126, isRepeat: true)
+    SidebarSelectionEventAdapter.start { navigationEndCount += 1 }
+    SidebarSelectionEventAdapter.recordKeyDown(keyCode: 124, isRepeat: false)
+    SidebarSelectionEventAdapter.recordKeyDown(keyCode: 124, isRepeat: true)
 
-    NotificationCenter.default.post(
-        name: NSApplication.didResignActiveNotification,
-        object: nil
-    )
-    await Task.yield()
+    NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: nil)
+    #expect(navigationEndCount == 1)
+    NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: nil)
     #expect(navigationEndCount == 1)
 
-    NotificationCenter.default.post(
-        name: NSApplication.didResignActiveNotification,
-        object: nil
-    )
-    await Task.yield()
-    #expect(navigationEndCount == 1)
-
-    SidebarSelectionEventAdapter.recordKeyDown(keyCode: 126, isRepeat: true)
+    SidebarSelectionEventAdapter.recordKeyDown(keyCode: 124, isRepeat: true)
     SidebarSelectionEventAdapter.stop()
-
-    NotificationCenter.default.post(
-        name: NSApplication.didResignActiveNotification,
-        object: nil
-    )
-    await Task.yield()
+    NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: nil)
     #expect(navigationEndCount == 1)
 }

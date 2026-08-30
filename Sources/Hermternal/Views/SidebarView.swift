@@ -3,36 +3,29 @@ import SwiftUI
 import AppKit
 import HermternalCore
 
-@MainActor
 struct SidebarNavigationRepeatTracker {
-    private(set) var isNavigationRepeat = false
-    private var repeatingArrowKeyCode: UInt16?
+    private var repeatedArrowKeyCode: UInt16?
+
+    var isNavigationRepeat: Bool { repeatedArrowKeyCode != nil }
 
     mutating func recordKeyDown(keyCode: UInt16, isRepeat: Bool) {
-        guard isRepeat, Self.isArrowKey(keyCode) else { return }
-        repeatingArrowKeyCode = keyCode
-        isNavigationRepeat = true
+        guard isRepeat,
+              keyCode == 123 || keyCode == 124
+                || keyCode == 125 || keyCode == 126
+        else { return }
+        repeatedArrowKeyCode = keyCode
     }
 
-    /// Returns true once, when the arrow key whose repeat deferred navigation
-    /// is released. Other key releases leave the pending repeat intact.
     mutating func recordKeyUp(keyCode: UInt16) -> Bool {
-        guard keyCode == repeatingArrowKeyCode else { return false }
-        repeatingArrowKeyCode = nil
-        isNavigationRepeat = false
+        guard repeatedArrowKeyCode == keyCode else { return false }
+        repeatedArrowKeyCode = nil
         return true
     }
 
-    /// Clears repeat state and reports whether deferred navigation was pending.
     mutating func reset() -> Bool {
         let wasNavigationRepeat = isNavigationRepeat
-        repeatingArrowKeyCode = nil
-        isNavigationRepeat = false
+        repeatedArrowKeyCode = nil
         return wasNavigationRepeat
-    }
-
-    private static func isArrowKey(_ keyCode: UInt16) -> Bool {
-        keyCode == 123 || keyCode == 124 || keyCode == 125 || keyCode == 126
     }
 }
 
@@ -117,10 +110,10 @@ enum SidebarSelectionEventAdapter {
             case .leftMouseUp, .rightMouseUp:
                 scheduleExpiry(for: serial)
             case .keyDown:
-                expiryTask?.cancel()
-                expiryTask = nil
-                pending = nil
-                Self.recordKeyDown(keyCode: event.keyCode, isRepeat: event.isARepeat)
+                Self.recordKeyDown(
+                    keyCode: event.keyCode,
+                    isRepeat: event.isARepeat
+                )
             case .keyUp:
                 if navigationRepeatTracker.recordKeyUp(keyCode: event.keyCode) {
                     navigationEndHandler?()
@@ -136,7 +129,7 @@ enum SidebarSelectionEventAdapter {
             object: nil,
             queue: .main
         ) { _ in
-            Task { @MainActor in
+            MainActor.assumeIsolated {
                 if Self.navigationRepeatTracker.reset() {
                     Self.navigationEndHandler?()
                 }
@@ -145,6 +138,9 @@ enum SidebarSelectionEventAdapter {
     }
 
     static func recordKeyDown(keyCode: UInt16, isRepeat: Bool) {
+        expiryTask?.cancel()
+        expiryTask = nil
+        pending = nil
         navigationRepeatTracker.recordKeyDown(keyCode: keyCode, isRepeat: isRepeat)
     }
 
