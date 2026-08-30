@@ -3,6 +3,39 @@ import SwiftUI
 import AppKit
 import HermternalCore
 
+@MainActor
+struct SidebarNavigationRepeatTracker {
+    private(set) var isNavigationRepeat = false
+    private var repeatingArrowKeyCode: UInt16?
+
+    mutating func recordKeyDown(keyCode: UInt16, isRepeat: Bool) {
+        guard isRepeat, Self.isArrowKey(keyCode) else { return }
+        repeatingArrowKeyCode = keyCode
+        isNavigationRepeat = true
+    }
+
+    /// Returns true once, when the arrow key whose repeat deferred navigation
+    /// is released. Other key releases leave the pending repeat intact.
+    mutating func recordKeyUp(keyCode: UInt16) -> Bool {
+        guard keyCode == repeatingArrowKeyCode else { return false }
+        repeatingArrowKeyCode = nil
+        isNavigationRepeat = false
+        return true
+    }
+
+    /// Clears repeat state and reports whether deferred navigation was pending.
+    mutating func reset() -> Bool {
+        let wasNavigationRepeat = isNavigationRepeat
+        repeatingArrowKeyCode = nil
+        isNavigationRepeat = false
+        return wasNavigationRepeat
+    }
+
+    private static func isArrowKey(_ keyCode: UInt16) -> Bool {
+        keyCode == 123 || keyCode == 124 || keyCode == 125 || keyCode == 126
+    }
+}
+
 /// SwiftUI's `List(selection:)` reports only the resulting Set. The local
 /// monitor classifies the initiating event, so modified or context clicks
 /// cannot be mistaken for ordinary singleton selection later.
@@ -19,9 +52,10 @@ enum SidebarSelectionEventAdapter {
 
     private static let dragThresholdSquared: CGFloat = 16
     private static var mouseDownLocation: NSPoint?
-    private static var navigationRepeat = false
+    private static var navigationRepeatTracker = SidebarNavigationRepeatTracker()
     private static var navigationEndHandler: (@MainActor () -> Void)?
     private static var monitor: Any?
+    private static var didResignActiveObserver: NSObjectProtocol?
     private static var pending: Event?
     private static var serial = 0
     private static var expiryTask: Task<Void, Never>?
@@ -52,7 +86,7 @@ enum SidebarSelectionEventAdapter {
                 let modifiers = event.modifierFlags.intersection([.command, .shift, .control])
                 let isControlClick = modifiers.contains(.control)
                 mouseDownLocation = event.locationInWindow
-                navigationRepeat = false
+                _ = navigationRepeatTracker.reset()
                 pending = Event(
                     isContextClick: isControlClick,
                     isModified: !modifiers.isEmpty,
@@ -74,7 +108,7 @@ enum SidebarSelectionEventAdapter {
                     isDrag: true
                 )
             case .rightMouseDown:
-                navigationRepeat = false
+                _ = navigationRepeatTracker.reset()
                 pending = Event(isContextClick: true, isModified: true, isDrag: false)
                 serial &+= 1
                 scheduleExpiry(for: serial)
@@ -86,13 +120,9 @@ enum SidebarSelectionEventAdapter {
                 expiryTask?.cancel()
                 expiryTask = nil
                 pending = nil
-                let isArrow = event.keyCode == 123 || event.keyCode == 124
-                    || event.keyCode == 125 || event.keyCode == 126
-                navigationRepeat = isArrow && event.isARepeat
+                Self.recordKeyDown(keyCode: event.keyCode, isRepeat: event.isARepeat)
             case .keyUp:
-                let wasNavigation = navigationRepeat
-                navigationRepeat = false
-                if wasNavigation {
+                if navigationRepeatTracker.recordKeyUp(keyCode: event.keyCode) {
                     navigationEndHandler?()
                 }
             default:
@@ -100,6 +130,22 @@ enum SidebarSelectionEventAdapter {
             }
             return event
         }
+
+        didResignActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task { @MainActor in
+                if Self.navigationRepeatTracker.reset() {
+                    Self.navigationEndHandler?()
+                }
+            }
+        }
+    }
+
+    static func recordKeyDown(keyCode: UInt16, isRepeat: Bool) {
+        navigationRepeatTracker.recordKeyDown(keyCode: keyCode, isRepeat: isRepeat)
     }
 
     private static func scheduleExpiry(for eventSerial: Int) {
@@ -127,7 +173,7 @@ enum SidebarSelectionEventAdapter {
         return (pending.isContextClick, pending.isModified, pending.isDrag)
     }
     static var isNavigationRepeat: Bool {
-        navigationRepeat
+        navigationRepeatTracker.isNavigationRepeat
     }
 
     static func allowsPrimaryActivation() -> Bool {
@@ -160,11 +206,15 @@ enum SidebarSelectionEventAdapter {
             NSEvent.removeMonitor(monitor)
             self.monitor = nil
         }
+        if let didResignActiveObserver {
+            NotificationCenter.default.removeObserver(didResignActiveObserver)
+            self.didResignActiveObserver = nil
+        }
         expiryTask?.cancel()
         expiryTask = nil
         pending = nil
         mouseDownLocation = nil
-        navigationRepeat = false
+        _ = navigationRepeatTracker.reset()
         navigationEndHandler = nil
     }
 }

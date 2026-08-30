@@ -2371,7 +2371,8 @@ final class AppModel: ComposerTurnRouting {
     private func setSelectedSessionID(
         _ value: String?,
         event: String,
-        generation: Int? = nil
+        generation: Int? = nil,
+        preserveDisplayedTranscript: Bool = false
     ) {
         HermternalSwitchTrace.session(
             "\(event).before",
@@ -2379,11 +2380,9 @@ final class AppModel: ComposerTurnRouting {
             generation: generation,
             messages: messages.count
         )
-        // Leaving a route invalidates the painted-transcript signal. It is
-        // cleared here rather than at each call site so no future selection
-        // path can forget to, which is how a stale "already open" belief
-        // strands a row.
-        if value != selectedSessionID {
+        // Leaving a route invalidates the painted-transcript signal unless a
+        // deferred navigation retains the visible transcript until it opens.
+        if !preserveDisplayedTranscript, value != selectedSessionID {
             displayedTranscriptSessionID = nil
         }
         selectedSessionID = value
@@ -3046,12 +3045,12 @@ final class AppModel: ComposerTurnRouting {
             pendingMessageRoute = nil
             viewingArchivedSessionID = nil
             liveSessionID = nil
-            clearActiveTranscriptStore()
             streamingReducer.reset()
             setSelectedSessionID(
                 session.id,
                 event: "selectedSessionID.mutation",
-                generation: generation
+                generation: generation,
+                preserveDisplayedTranscript: true
             )
             HermternalSwitchTrace.session(
                 "selection.publish",
