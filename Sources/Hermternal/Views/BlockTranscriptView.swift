@@ -48,6 +48,7 @@ struct BlockTranscriptView: NSViewRepresentable {
         private var totalTurnCount: Int?
         private var loadingStarts = Set<Int>()
         private var pageTasks: [Int: Task<Void, Never>] = [:]
+        private var locateTask: Task<Void, Never>?
         private var generation = 0
         private var routeKey = "none"
         private var revision: UInt64 = 0
@@ -55,7 +56,10 @@ struct BlockTranscriptView: NSViewRepresentable {
         private var isStreaming = false
         private var findQuery = ""
         private var pendingMessageID: String?
+        private var findMessageID: String?
         private var targetOrdinal: Int?
+        private var viewportTarget: TranscriptRendererTestSeam.ViewportTarget?
+        private var followsStreaming = false
         private var expandedReasoning = Set<String>()
         private var expandedTools = Set<String>()
         private var onCopyCode: (String) -> Void = { _ in }
@@ -86,8 +90,10 @@ struct BlockTranscriptView: NSViewRepresentable {
                 queue: .main
             ) { [weak self] _ in
                 Task { @MainActor [weak self] in
-                    self?.requestVisiblePages()
-                    self?.prepareVisibleTurns()
+                    guard let self else { return }
+                    self.followsStreaming = self.isStreaming && self.isNearBottom()
+                    self.requestVisiblePages()
+                    self.prepareVisibleTurns()
                 }
             }
             observers.append(boundsToken)
@@ -96,6 +102,8 @@ struct BlockTranscriptView: NSViewRepresentable {
 
         func update(container: BlockTranscriptContainerView, input: TranscriptRendererInput) {
             let findChanged = findQuery != input.findQuery
+            let findTargetChanged = findMessageID != input.findMessageID
+            let wasNearBottom = isNearBottom()
             container.onPaint = input.onPaint
             container.resetPaint()
             self.store = input.store
@@ -103,7 +111,9 @@ struct BlockTranscriptView: NSViewRepresentable {
             self.summary = input.summary
             self.isReadOnly = input.isReadOnly
             self.findQuery = input.findQuery
+            self.findMessageID = input.findMessageID
             self.isStreaming = input.isStreaming
+            self.followsStreaming = input.isStreaming && wasNearBottom
             self.onCopyCode = input.onCopyCode
             self.showsMetadata = input.showsMetadata
 
@@ -116,6 +126,8 @@ struct BlockTranscriptView: NSViewRepresentable {
                 generation &+= 1
                 pageTasks.values.forEach { $0.cancel() }
                 pageTasks.removeAll(keepingCapacity: true)
+                locateTask?.cancel()
+                locateTask = nil
                 loadingStarts.removeAll(keepingCapacity: true)
                 loadedTurns.removeAll(keepingCapacity: true)
                 loadedOrder.removeAll(keepingCapacity: true)
@@ -123,13 +135,14 @@ struct BlockTranscriptView: NSViewRepresentable {
                 totalTurnCount = nil
                 heightByOrdinal.removeAll(keepingCapacity: true)
                 targetOrdinal = nil
+                viewportTarget = nil
                 expandedReasoning.removeAll(keepingCapacity: true)
                 expandedTools.removeAll(keepingCapacity: true)
                 table.noteNumberOfRowsChanged()
             }
             routeKey = nextRouteKey
             revision = input.revision
-            if pendingMessageID != input.pendingMessageID {
+            if pendingMessageID != input.pendingMessageID || findTargetChanged {
                 targetOrdinal = nil
             }
             pendingMessageID = input.pendingMessageID
@@ -163,6 +176,8 @@ struct BlockTranscriptView: NSViewRepresentable {
             generation &+= 1
             pageTasks.values.forEach { $0.cancel() }
             pageTasks.removeAll()
+            locateTask?.cancel()
+            locateTask = nil
             for observer in observers { NotificationCenter.default.removeObserver(observer) }
             observers.removeAll()
             container.onPaint = nil
@@ -393,24 +408,59 @@ struct BlockTranscriptView: NSViewRepresentable {
 
         private func position(routeChanged: Bool) {
             let current = generation
-            if let pendingMessageID, targetOrdinal == nil, let store {
-                Task { [weak self, store] in
-                    guard let location = try? await store.locateTurn(messageID: pendingMessageID) else { return }
-                    await MainActor.run {
-                        guard let self, self.generation == current else { return }
-                        self.targetOrdinal = location.ordinal
-                        if let target = self.targetOrdinal { self.requestPage(containing: target) }
+            let target = TranscriptRendererTestSeam.viewportTarget(
+                pendingMessageID: pendingMessageID,
+                findMessageID: findMessageID,
+                isStreaming: isStreaming,
+                isNearBottom: followsStreaming,
+                routeChanged: routeChanged,
+                currentTarget: viewportTarget
+            )
+            let targetChanged = target != viewportTarget
+            viewportTarget = target
+            switch target {
+            case .message(let messageID):
+                if targetChanged {
+                    locateTask?.cancel()
+                    locateTask = nil
+                    targetOrdinal = nil
+                }
+                if targetOrdinal == nil, locateTask == nil, let store {
+                    locateTask = Task { [weak self, store] in
+                        let location = try? await store.locateTurn(messageID: messageID)
+                        await MainActor.run {
+                            guard let self, self.generation == current else { return }
+                            self.locateTask = nil
+                            guard TranscriptRendererTestSeam.acceptsLocatedMessage(
+                                messageID,
+                                currentTarget: self.viewportTarget
+                            ), let location else { return }
+                            self.targetOrdinal = location.ordinal
+                            self.requestPage(containing: location.ordinal)
+                            self.position(routeChanged: false)
+                        }
                     }
                 }
-            }
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.generation == current else { return }
-                if let target = self.targetOrdinal, target < self.rowCount {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.generation == current,
+                          let target = self.targetOrdinal, target < self.rowCount
+                    else { return }
+                    self.table.selectRowIndexes(IndexSet(integer: target), byExtendingSelection: false)
                     self.table.scrollRowToVisible(target)
-                } else if (routeChanged || self.isStreaming) && !self.isReadOnly {
+                }
+            case .bottom:
+                guard !isReadOnly, routeChanged || (isStreaming && followsStreaming) else { return }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.generation == current else { return }
                     self.scrollToBottom()
                 }
             }
+        }
+
+        private func isNearBottom() -> Bool {
+            guard let clip = table.enclosingScrollView?.contentView else { return true }
+            let distance = max(0, table.bounds.height - clip.bounds.maxY)
+            return distance <= max(48, clip.bounds.height * 0.15)
         }
 
         private func scrollToBottom() {
@@ -429,6 +479,35 @@ struct BlockTranscriptView: NSViewRepresentable {
         }
 
     }
+}
+
+enum TranscriptRendererTestSeam {
+    enum ViewportTarget: Equatable { case bottom; case message(id: String) }
+    private static let explicitMarker = MessageIdentity.server(ServerMessageID(rawValue: -1))
+    private static let findMarker = MessageIdentity.server(ServerMessageID(rawValue: -2))
+    private static let retainedMarker = MessageIdentity.server(ServerMessageID(rawValue: -3))
+
+    static func viewportTarget(pendingMessageID: String?, findMessageID: String?, isStreaming: Bool, isNearBottom: Bool, routeChanged: Bool, currentTarget: ViewportTarget?) -> ViewportTarget {
+        let current: TranscriptViewportTarget?
+        switch currentTarget {
+        case .bottom: current = .bottom
+        case .message: current = .message(id: retainedMarker)
+        case nil: current = nil
+        }
+        switch TranscriptViewportPolicy.resolveTarget(explicitMessageID: pendingMessageID == nil ? nil : explicitMarker, findMessageID: findMessageID == nil ? nil : findMarker, isStreaming: isStreaming, isNearBottom: isNearBottom, routeChanged: routeChanged, currentTarget: current) {
+        case .bottom: return .bottom
+        case .message(let marker) where marker == explicitMarker: return .message(id: pendingMessageID!)
+        case .message(let marker) where marker == findMarker: return .message(id: findMessageID!)
+        case .message: return currentTarget ?? .bottom
+        }
+    }
+
+    static func acceptsLocatedMessage(_ messageID: String, currentTarget: ViewportTarget?) -> Bool {
+        currentTarget == .message(id: messageID)
+    }
+
+    static func configuredTurnID(for turn: TranscriptTurn) -> String { turn.id }
+    static func attributedAnswer(_ document: MarkdownDocument) -> NSAttributedString { TranscriptTurnTextRenderer.attributedAnswer(document) }
 }
 
 @MainActor
@@ -690,6 +769,7 @@ private final class TranscriptTurnRowView: NSTableCellView {
         onTools: @escaping (String) -> Void,
         onCopyCode: @escaping (String) -> Void
     ) {
+        turnID = TranscriptRendererTestSeam.configuredTurnID(for: turn)
         let isHermes = turn.speaker == .hermes
         markView.isHidden = !isHermes
         if isHermes {
@@ -890,57 +970,76 @@ private enum TranscriptTurnTextRenderer {
     }
 
     private static func append(_ block: MarkdownBlock, source: MarkdownDocument, to output: NSMutableAttributedString) {
-        let body: String
-        let bodyFont = NSFont.preferredFont(forTextStyle: .body)
-        var paragraph = NSMutableParagraphStyle()
+        let font = NSFont.preferredFont(forTextStyle: .body)
+        let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = MessageTypography.bodyLineSpacing
         paragraph.paragraphSpacing = MessageTypography.paragraphGap
-        var attributes: [NSAttributedString.Key: Any] = [
-            .font: bodyFont,
-            .foregroundColor: NSColor.labelColor,
-            .paragraphStyle: paragraph
-        ]
+        let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph]
         switch block {
-        case .paragraph(_, _, let inlines):
-            body = inlineText(inlines)
+        case .paragraph(_, _, let inlines): output.append(attributedInline(inlines, attributes: attributes))
         case .heading(_, _, let level, let inlines):
-            body = inlineText(inlines)
-            attributes[.font] = headingFont(level, bodyFont: bodyFont)
+            var heading = attributes; heading[.font] = headingFont(level, bodyFont: font)
+            output.append(attributedInline(inlines, attributes: heading))
         case .quote(_, _, let inlines):
-            body = "│ " + inlineText(inlines)
-            attributes[.foregroundColor] = NSColor.secondaryLabelColor
-            paragraph.headIndent = 10
-            paragraph.firstLineHeadIndent = 10
-            attributes[.paragraphStyle] = paragraph
+            output.append(NSAttributedString(string: "│ ", attributes: attributes)); output.append(attributedInline(inlines, attributes: attributes))
         case .list(_, _, let items), .taskList(_, _, let items):
-            body = items.map { item in
-                let marker = item.taskState.map { $0 == .checked ? "☑" : "☐" }
-                    ?? (item.number.map(String.init) ?? "•")
-                return String(repeating: "  ", count: item.depth) + marker + " " + inlineText(item.inlines)
-            }.joined(separator: "\n")
+            for (index, item) in items.enumerated() {
+                if index > 0 { output.append(NSAttributedString(string: "\n", attributes: attributes)) }
+                let marker = item.taskState.map { $0 == .checked ? "☑" : "☐" } ?? (item.number.map(String.init) ?? "•")
+                output.append(NSAttributedString(string: String(repeating: "  ", count: item.depth) + marker + " ", attributes: attributes))
+                output.append(attributedInline(item.inlines, attributes: attributes))
+            }
         case .code(_, _, let language, let code):
-            body = (language.isEmpty ? "" : language + "\n") + code
-            attributes[.font] = NSFont.monospacedSystemFont(
-                ofSize: NSFont.preferredFont(forTextStyle: .callout).pointSize,
-                weight: .regular
-            )
-            paragraph = NSMutableParagraphStyle()
-            paragraph.lineSpacing = MessageTypography.bodyLineSpacing
-            paragraph.headIndent = MessageTypography.codePadding
-            paragraph.firstLineHeadIndent = MessageTypography.codePadding
-            paragraph.tailIndent = -MessageTypography.codePadding
-            attributes[.paragraphStyle] = paragraph
-            attributes[.backgroundColor] = NSColor.controlBackgroundColor.withAlphaComponent(0.42)
+            var codeAttributes = attributes
+            codeAttributes[.font] = NSFont.monospacedSystemFont(ofSize: NSFont.preferredFont(forTextStyle: .callout).pointSize, weight: .regular)
+            let codeParagraph = NSMutableParagraphStyle()
+            codeParagraph.lineSpacing = MessageTypography.bodyLineSpacing
+            codeParagraph.headIndent = MessageTypography.codePadding
+            codeParagraph.firstLineHeadIndent = MessageTypography.codePadding
+            codeParagraph.tailIndent = -MessageTypography.codePadding
+            codeAttributes[.paragraphStyle] = codeParagraph
+            codeAttributes[.backgroundColor] = NSColor.controlBackgroundColor.withAlphaComponent(0.42)
+            output.append(NSAttributedString(string: (language.isEmpty ? "" : language + "\n") + code, attributes: codeAttributes))
         case .table(_, _, let headers, let rows):
-            let header = headers.map(inlineText).joined(separator: "\t")
-            body = ([header] + rows.map { $0.cells.map(inlineText).joined(separator: "\t") }).joined(separator: "\n")
+            let tableRows = [headers] + rows.map(\.cells)
+            for (rowIndex, cells) in tableRows.enumerated() {
+                if rowIndex > 0 { output.append(NSAttributedString(string: "\n", attributes: attributes)) }
+                for (cellIndex, cell) in cells.enumerated() {
+                    if cellIndex > 0 { output.append(NSAttributedString(string: "\t", attributes: attributes)) }
+                    output.append(attributedInline(cell, attributes: attributes))
+                }
+            }
         case .footnote(_, _, let label, let inlines):
-            body = "[^\(label)]: " + inlineText(inlines)
-            attributes[.font] = NSFont.preferredFont(forTextStyle: .footnote)
-        case .source(_, _):
-            body = source.sourceText(for: block)
+            output.append(NSAttributedString(string: "[^\(label)]: ", attributes: attributes)); output.append(attributedInline(inlines, attributes: attributes))
+        case .source(_, _): output.append(NSAttributedString(string: source.sourceText(for: block), attributes: attributes))
         }
-        output.append(NSAttributedString(string: body, attributes: attributes))
+    }
+
+    private static func attributedInline(_ values: [MarkdownInline], attributes: [NSAttributedString.Key: Any]) -> NSAttributedString {
+        let output = NSMutableAttributedString()
+        for value in values {
+            switch value.kind {
+            case .text(let text): output.append(NSAttributedString(string: text, attributes: attributes))
+            case .emphasis(let children): output.append(attributedInline(children, attributes: fontTraits(.italicFontMask, attributes)))
+            case .strong(let children): output.append(attributedInline(children, attributes: fontTraits(.boldFontMask, attributes)))
+            case .strikethrough(let children):
+                var struck = attributes; struck[.strikethroughStyle] = NSNumber(value: NSUnderlineStyle.single.rawValue)
+                output.append(attributedInline(children, attributes: struck))
+            case .inlineCode(let text):
+                var code = attributes; code[.font] = NSFont.monospacedSystemFont(ofSize: (attributes[.font] as? NSFont)?.pointSize ?? NSFont.systemFontSize, weight: .regular)
+                output.append(NSAttributedString(string: text, attributes: code))
+            case .link(let destination, _, let children):
+                var link = attributes; link[.link] = URL(string: destination) ?? destination
+                output.append(attributedInline(children, attributes: link))
+            }
+        }
+        return output
+    }
+
+    private static func fontTraits(_ traits: NSFontTraitMask, _ attributes: [NSAttributedString.Key: Any]) -> [NSAttributedString.Key: Any] {
+        var result = attributes
+        result[.font] = NSFontManager.shared.convert((attributes[.font] as? NSFont) ?? NSFont.preferredFont(forTextStyle: .body), toHaveTrait: traits)
+        return result
     }
     private static func headingFont(_ level: Int, bodyFont: NSFont) -> NSFont {
         switch level {
