@@ -53,6 +53,27 @@ private func chatSession(id: String) -> ChatSession {
     ChatSession(from: .object(["id": .string(id)]))
 }
 
+@Test("A completed List tap uses only context and modified facts")
+@MainActor
+func completedTapActivationUsesClickFacts() {
+    #expect(
+        SidebarSelectionEventAdapter.allowsCompletedTapActivation(
+            isContextClick: false,
+            isModified: false
+        )
+    )
+    let contextClickActivation = SidebarSelectionEventAdapter.allowsCompletedTapActivation(
+        isContextClick: true,
+        isModified: false
+    )
+    #expect(!contextClickActivation)
+    let modifiedClickActivation = SidebarSelectionEventAdapter.allowsCompletedTapActivation(
+        isContextClick: false,
+        isModified: true
+    )
+    #expect(!modifiedClickActivation)
+}
+
 @Test("Observer registration ends repeated sidebar navigation once and cleans up")
 @MainActor
 func observerRegistrationEndsRepeatedSidebarNavigationOnceAndCleansUp() {

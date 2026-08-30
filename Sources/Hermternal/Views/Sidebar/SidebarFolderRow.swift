@@ -315,7 +315,7 @@ struct SidebarFolderRow: View {
         .simultaneousGesture(
             TapGesture(count: 1)
                 .onEnded {
-                    let allowed = SidebarSelectionEventAdapter.allowsPrimaryActivation()
+                    let allowed = SidebarSelectionEventAdapter.allowsCompletedTapActivation()
                     HermternalSwitchTrace.folder(
                         "folder.labelTapGate",
                         id: target.id,

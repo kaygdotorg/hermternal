@@ -40,11 +40,8 @@ enum SidebarSelectionEventAdapter {
     private struct Event {
         let isContextClick: Bool
         let isModified: Bool
-        let isDrag: Bool
     }
 
-    private static let dragThresholdSquared: CGFloat = 16
-    private static var mouseDownLocation: NSPoint?
     private static var navigationRepeatTracker = SidebarNavigationRepeatTracker()
     private static var navigationEndHandler: (@MainActor () -> Void)?
     private static var monitor: Any?
@@ -65,10 +62,8 @@ enum SidebarSelectionEventAdapter {
         monitor = NSEvent.addLocalMonitorForEvents(
             matching: [
                 .leftMouseDown,
-                .leftMouseDragged,
                 .leftMouseUp,
                 .rightMouseDown,
-                .rightMouseDragged,
                 .rightMouseUp,
                 .keyDown,
                 .keyUp
@@ -78,35 +73,18 @@ enum SidebarSelectionEventAdapter {
             case .leftMouseDown:
                 let modifiers = event.modifierFlags.intersection([.command, .shift, .control])
                 let isControlClick = modifiers.contains(.control)
-                mouseDownLocation = event.locationInWindow
                 _ = navigationRepeatTracker.reset()
                 pending = Event(
                     isContextClick: isControlClick,
-                    isModified: !modifiers.isEmpty,
-                    isDrag: false
+                    isModified: !modifiers.isEmpty
                 )
                 serial &+= 1
                 scheduleExpiry(for: serial)
-            case .leftMouseDragged:
-                guard let pending,
-                      let start = mouseDownLocation
-                else { break }
-                let delta = event.locationInWindow
-                let dx = delta.x - start.x
-                let dy = delta.y - start.y
-                guard dx * dx + dy * dy >= dragThresholdSquared else { break }
-                self.pending = Event(
-                    isContextClick: pending.isContextClick,
-                    isModified: pending.isModified,
-                    isDrag: true
-                )
             case .rightMouseDown:
                 _ = navigationRepeatTracker.reset()
-                pending = Event(isContextClick: true, isModified: true, isDrag: false)
+                pending = Event(isContextClick: true, isModified: true)
                 serial &+= 1
                 scheduleExpiry(for: serial)
-            case .rightMouseDragged:
-                pending = Event(isContextClick: true, isModified: true, isDrag: true)
             case .leftMouseUp, .rightMouseUp:
                 scheduleExpiry(for: serial)
             case .keyDown:
@@ -156,8 +134,7 @@ enum SidebarSelectionEventAdapter {
 
     static func current() -> (
         isContextClick: Bool,
-        isModified: Bool,
-        isDrag: Bool
+        isModified: Bool
     )? {
         guard let pending else {
             HermternalSwitchTrace.selectionGuard(
@@ -166,36 +143,28 @@ enum SidebarSelectionEventAdapter {
             )
             return nil
         }
-        return (pending.isContextClick, pending.isModified, pending.isDrag)
+        return (pending.isContextClick, pending.isModified)
     }
     static var isNavigationRepeat: Bool {
         navigationRepeatTracker.isNavigationRepeat
     }
 
-    static func allowsPrimaryActivation() -> Bool {
-        // Missing evidence means the user click may still be deliberate.
-        // Default to activation instead of turning a missed monitor event
-        // into a silent no-op.
-        guard let event = current() else {
-            HermternalSwitchTrace.selectionGuard(
-                "eventAdapter.allowsPrimaryActivation",
-                reason: "pendingEventMissing;defaultAllowed"
-            )
-            return true
-        }
-        return !event.isContextClick && !event.isModified && !event.isDrag
+    /// A SwiftUI-completed tap is already recognized as a tap.
+    /// Post-recognition code must not infer a drag again from local monitor
+    /// evidence. Context and modified clicks remain non-primary.
+    static func allowsCompletedTapActivation(
+        isContextClick: Bool,
+        isModified: Bool
+    ) -> Bool {
+        !isContextClick && !isModified
     }
 
-    /// A SwiftUI `TapGesture` has already resolved the pointer sequence as a
-    /// tap. The local event monitor can still see a sub-pixel
-    /// `leftMouseDragged` while the press is over a draggable title and mark
-    /// the same sequence as a drag. Rejecting that bit here loses a gesture the
-    /// framework has already accepted, which is why title clicks missed while
-    /// surrounding whitespace worked. Context and modified clicks remain
-    /// non-primary; the drag bit is relevant only before gesture recognition.
     static func allowsCompletedTapActivation() -> Bool {
         guard let event = current() else { return true }
-        return !event.isContextClick && !event.isModified
+        return allowsCompletedTapActivation(
+            isContextClick: event.isContextClick,
+            isModified: event.isModified
+        )
     }
     static func stop() {
         if let monitor {
@@ -209,7 +178,6 @@ enum SidebarSelectionEventAdapter {
         expiryTask?.cancel()
         expiryTask = nil
         pending = nil
-        mouseDownLocation = nil
         _ = navigationRepeatTracker.reset()
         navigationEndHandler = nil
     }
@@ -869,7 +837,6 @@ struct SidebarView: View {
         synchronizeArchivedRouteSelection()
     }
     private func handleArchivedSelectionChange(_ selection: Set<String>) {
-        let event = SidebarSelectionEventAdapter.current()
         guard model.sidebarContentMode == .archived,
               selection.count == 1,
               let id = selection.first,
@@ -897,12 +864,12 @@ struct SidebarView: View {
             programmaticArchivedSelectionID = nil
             return
         }
-        if let event, event.isContextClick || event.isModified || event.isDrag {
+        if !SidebarSelectionEventAdapter.allowsCompletedTapActivation() {
             HermternalSwitchTrace.selectionGuard(
                 "archivedSelection.pointerGate",
                 id: id,
                 messages: model.messages.count,
-                reason: "contextOrModifiedClickOrDrag"
+                reason: "contextOrModifiedClick"
             )
             pendingOpenTask?.cancel()
             pendingOpenTask = nil
@@ -1036,7 +1003,6 @@ struct SidebarView: View {
             selection: selection,
             messages: model.messages.count
         )
-        let event = SidebarSelectionEventAdapter.current()
         guard selection.count == 1,
               let item = selection.first,
               case let .chat(id) = item,
@@ -1078,13 +1044,13 @@ struct SidebarView: View {
             pointerActivatedID = nil
             return
         }
-        if let event, event.isContextClick || event.isModified || event.isDrag {
+        if !SidebarSelectionEventAdapter.allowsCompletedTapActivation() {
             HermternalSwitchTrace.selectionGuard(
                 "sidebarSelection.pointerGate",
                 selection: selection,
                 id: id,
                 messages: model.messages.count,
-                reason: "contextOrModifiedClickOrDrag"
+                reason: "contextOrModifiedClick"
             )
             pendingOpenTask?.cancel()
             pendingOpenTask = nil
