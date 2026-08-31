@@ -1,5 +1,25 @@
 import Foundation
 
+/// The measure the transcript lays a message out in.
+///
+/// Two states, not a dial. A reading measure has one right answer for a body
+/// font, and a continuous width would invite every wrong one. Full width is
+/// the reader's answer to a window held wide for tables, code, and side-by-side
+/// work, where wrapping costs more than a long line does.
+enum TranscriptWidthMode: String, CaseIterable, Sendable {
+    /// The centred reading column: `MessageTypography.readingMeasure`.
+    case standard
+    /// The window, its two gutters excluded.
+    case full
+
+    var other: TranscriptWidthMode {
+        switch self {
+        case .standard: .full
+        case .full: .standard
+        }
+    }
+}
+
 /// Shared transcript measurements for the macOS document renderer.
 ///
 /// These values describe the readable measure and the vertical rhythm.
@@ -20,7 +40,9 @@ enum MessageTypography {
     /// not a message measure: the eye loses the line on the way back to the
     /// start of the next one. 490pt holds about 70 characters, inside the band
     /// a reader scans without effort, so a wide window widens the gutters and
-    /// never the text.
+    /// never the text. `TranscriptWidthMode.full` is the reader's own answer to
+    /// a window held wide for tables and code, and it is the one state that
+    /// gives this cap up.
     ///
     /// Defended by rendererRowsKeepDocumentWidthThroughTableLayoutAndResize.
     static let readingMeasure: CGFloat = 490
@@ -59,44 +81,68 @@ enum MessageTypography {
     static let minimumTurnHeight: CGFloat = 92
     static let codePadding: CGFloat = 14
 
-    /// The share of the content column an outgoing bubble may fill.
+    /// The measure every reader of the column lays out in.
     ///
-    /// 0.7, the share Messages.app leaves a bubble. The empty 30% on the
-    /// leading side is what states the speaker: a bubble that fills the column
-    /// reads as a document, and its trailing edge is then the only clue left
-    /// that the user wrote it. The share is taken from the column and not from
-    /// the window, so the proportion holds at every window width.
+    /// `AppearanceSettings` owns the reader's choice, persists it, and writes
+    /// it here before it posts `TranscriptWidthStore.didChangeNotification`.
+    /// One value for the process: the measurement pass and the constraint chain
+    /// must read the same answer, and a row measured in one measure and laid
+    /// out in the other disagrees by every line it wraps.
     ///
-    /// Defended by longOutgoingMessageWrapsInsideTextCap and
-    /// narrowWindowKeepsRequiredTranscriptInsets.
-    static let outgoingBubbleShare: CGFloat = 0.7
+    /// Main-actor, which every reader already is: the row views, the height
+    /// delegate, and the pass that resolves a width before it hands the number
+    /// to a detached measurer.
+    @MainActor static var widthMode: TranscriptWidthMode = .standard
 
     /// The content column inside `availableWidth`.
     ///
     /// The column is the band both speakers share: centred, one gutter on each
-    /// side, and never wider than the readable measure. An agent answer fills
-    /// it after its own gutter. An outgoing bubble takes its share of it and
-    /// trails its trailing edge.
+    /// side. The standard measure caps it at `readingMeasure`, so a wide window
+    /// widens the gutters; the full measure gives it the window less its two
+    /// gutters. An agent answer fills the column after its own gutter. An
+    /// outgoing bubble fills it and trails its trailing edge.
     ///
-    /// Defended by outgoingRowTrailsGutterAndKeepsRowBands.
+    /// This is the only place the measure is decided. The row's column guide
+    /// and the measurement pass both read it, so the width toggle is one
+    /// constant switch instead of a second layout path.
+    ///
+    /// Defended by outgoingRowTrailsGutterAndKeepsRowBands and
+    /// theFullMeasureGivesBothSpeakersTheWindow.
+    @MainActor
     static func contentColumn(in availableWidth: CGFloat) -> CGFloat {
-        max(1, min(readingMeasure, availableWidth - 2 * transcriptInset))
+        let insideGutters = availableWidth - 2 * transcriptInset
+        return switch widthMode {
+        case .standard: max(1, min(readingMeasure, insideGutters))
+        case .full: max(1, insideGutters)
+        }
     }
 
     /// The outgoing text measure inside a content column.
     ///
-    /// The bubble's own box is its share of the column. The tail and both
-    /// paddings come off that box before the text gets any, so the box, and
-    /// not the text, is what holds the share.
+    /// The bubble's box is the column, not a share of it: the tail tip lands on
+    /// the column's trailing edge, and both paddings and the tail come off the
+    /// column before the text gets any. What is left is within a point of the
+    /// agent's own measure, `column - hermesIndent`, and that is the point —
+    /// one message measure for both speakers, at every window width and in both
+    /// width modes. The tail on the trailing edge states the speaker; an empty
+    /// leading third used to, and it cost the user's own words a third of the
+    /// column the answer below them was allowed.
+    ///
+    /// Defended by bothSpeakersShareOneTextMeasure.
     static func outgoingTextMeasure(in column: CGFloat) -> CGFloat {
-        max(1, column * outgoingBubbleShare
+        max(1, column
             - 2 * outgoingBubblePaddingH
             - OutgoingBubbleGeometry.tailWidth)
     }
 
-    /// The widest outgoing text the transcript can show: the measure inside a
-    /// full content column.
-    static let widestOutgoingText: CGFloat = outgoingTextMeasure(in: readingMeasure)
+    /// The widest outgoing text the standard measure holds.
+    ///
+    /// A row that has no measurement yet and no cap from its caller lays out at
+    /// this width, and its column cap trims it on a narrower window. It is not
+    /// the widest text the transcript can show: the full measure has no constant
+    /// answer, because the window decides it.
+    static let widestStandardOutgoingText: CGFloat =
+        outgoingTextMeasure(in: readingMeasure)
 
     /// The space between the bubble's side and its text.
     ///

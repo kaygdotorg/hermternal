@@ -507,7 +507,7 @@ struct BlockTranscriptView: NSViewRepresentable {
             cacheWork.measurementBatchState.reset()
             for observer in observers { NotificationCenter.default.removeObserver(observer) }
             observers.removeAll()
-            container.stopObservingSystemPalette()
+            container.stopObservingSystemChanges()
             container.onPaint = nil
             table.delegate = nil
             table.dataSource = nil
@@ -542,17 +542,19 @@ struct BlockTranscriptView: NSViewRepresentable {
                 toolsExpanded: expandedTools.contains(loaded.turn.id)
             )
             // The measured fitting width, so a short outgoing bubble hugs its
-            // text. It is `nil` until the measurement lands, and the bubble
-            // then renders at its cap.
+            // text. Until the measurement lands the row renders at the cap for
+            // this table width, and that is the width the measurement itself
+            // will be made at, so the bubble never steps between two measures.
+            let cap = TranscriptTurnTextRenderer.effectiveWidth(
+                for: loaded.turn,
+                availableWidth: tableView.bounds.width
+            )
             let outgoingTextWidth = measuredDocuments.layout(
                 for: row,
                 turn: loaded.turn,
-                effectiveWidth: TranscriptTurnTextRenderer.effectiveWidth(
-                    for: loaded.turn,
-                    availableWidth: tableView.bounds.width
-                ),
+                effectiveWidth: cap,
                 disclosure: disclosure
-            )?.textWidth
+            )?.textWidth ?? cap
             view.configure(
                 turn: loaded.turn,
                 document: document,
@@ -1147,10 +1149,12 @@ enum TranscriptRendererTestSeam {
 
     static func attributedAnswer(_ document: MarkdownDocument) -> NSAttributedString { TranscriptTurnTextRenderer.attributedAnswer(document) }
 
+    @MainActor
     static func effectiveWidth(for turn: TranscriptTurn, availableWidth: CGFloat) -> CGFloat {
         TranscriptTurnTextRenderer.effectiveWidth(for: turn, availableWidth: availableWidth)
     }
 
+    @MainActor
     static func provisionalHeight(
         for turn: TranscriptTurn,
         availableWidth: CGFloat,
@@ -1362,12 +1366,13 @@ final class BlockTranscriptContainerView: NSView {
     var onWidthChange: (() -> Void)?
     var onPaint: ((UInt64) -> Void)?
 
-    /// Observers for the outgoing bubble's colour inputs.
+    /// Observers on the default centre: the outgoing bubble's colour inputs,
+    /// and the measure the reader chose.
     ///
     /// They are registered once here, never per row: rows are recycled and
     /// dozens are live, so a per-row observer is exactly the allocation to
     /// avoid.
-    private var colorObservers: [NSObjectProtocol] = []
+    private var defaultCenterObservers: [NSObjectProtocol] = []
     private var accessibilityObservers: [NSObjectProtocol] = []
     private var didPaint = false
 
@@ -1419,7 +1424,7 @@ final class BlockTranscriptContainerView: NSView {
             scrollView.topAnchor.constraint(equalTo: topAnchor),
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
-        observeSystemPalette()
+        observeSystemChanges()
     }
 
     /// Turns the system's own scroll edge effect off on this surface.
@@ -1474,13 +1479,29 @@ final class BlockTranscriptContainerView: NSView {
     /// A system accent, appearance, or contrast change alters the bubble's fill
     /// and its text colour. `viewDidChangeEffectiveAppearance` covers the
     /// appearance, and the two notifications cover the other two inputs.
-    private func observeSystemPalette() {
-        colorObservers.append(NotificationCenter.default.addObserver(
+    ///
+    /// The reader's own measure is observed here for the same reason: one
+    /// observer for the surface, never one per row.
+    private func observeSystemChanges() {
+        defaultCenterObservers.append(NotificationCenter.default.addObserver(
             forName: NSColor.systemColorsDidChangeNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in self?.reloadOutgoingPalette() }
+        })
+        // No queue and no task hop, unlike the palette above it. The palette's
+        // notifications come from AppKit on whichever thread noticed the change;
+        // this one is posted by `AppearanceSettings`, which is main-actor, so the
+        // block already runs on the main actor and the measure can be applied in
+        // the same turn as the click. A queue hop would leave one frame in which
+        // the toolbar states one measure and the transcript lays out the other.
+        defaultCenterObservers.append(NotificationCenter.default.addObserver(
+            forName: TranscriptWidthStore.didChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.applyTranscriptMeasure() }
         })
         accessibilityObservers.append(
             NSWorkspace.shared.notificationCenter.addObserver(
@@ -1493,17 +1514,37 @@ final class BlockTranscriptContainerView: NSView {
         )
     }
 
-    /// Removes the palette observers. The renderer calls this when it takes the
-    /// container down.
-    func stopObservingSystemPalette() {
-        for observer in colorObservers {
+    /// Removes the palette and measure observers. The renderer calls this when
+    /// it takes the container down.
+    func stopObservingSystemChanges() {
+        for observer in defaultCenterObservers {
             NotificationCenter.default.removeObserver(observer)
         }
         for observer in accessibilityObservers {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
-        colorObservers.removeAll()
+        defaultCenterObservers.removeAll()
         accessibilityObservers.removeAll()
+    }
+
+    /// Lays the transcript out again in the measure the reader just chose.
+    ///
+    /// A measure change is a column change and nothing else, so it takes the
+    /// path a window resize takes: every materialised row resolves its column
+    /// again in `layout`, the heights cached against the old measure miss, and
+    /// the height delegate asks for the rows again. The walk is bounded by the
+    /// viewport, like the palette walk above it.
+    func applyTranscriptMeasure() {
+        tableView.enumerateAvailableRowViews { rowView, _ in
+            for case let cell as TranscriptTurnRowView in rowView.subviews {
+                cell.needsLayout = true
+            }
+        }
+        onWidthChange?()
+        guard tableView.numberOfRows > 0 else { return }
+        tableView.noteHeightOfRows(
+            withIndexesChanged: IndexSet(integersIn: 0..<tableView.numberOfRows)
+        )
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -1586,12 +1627,22 @@ final class TranscriptTurnRowView: NSTableCellView {
     private var bodyTrailingConstraints: [NSLayoutConstraint] = []
     /// The transcript's content column: the band this row's turn lives in.
     ///
-    /// Centred, one gutter on each side, and never wider than the readable
-    /// measure. Both speakers take their geometry from this one guide, so an
+    /// Centred, one gutter on each side, and as wide as the current measure
+    /// allows. Both speakers take their geometry from this one guide, so an
     /// answer and the bubble under it cannot land in two different columns.
-    /// The agent stack fills the column. The outgoing bubble trails the
-    /// column's trailing edge and holds its share of the column's width.
+    /// The agent stack fills the column after its own gutter. The outgoing
+    /// bubble fills the column and trails its trailing edge.
     private let column = NSLayoutGuide()
+
+    /// The column's width, held as a constant this row keeps current.
+    ///
+    /// The constant is `MessageTypography.contentColumn(in:)` of this row's own
+    /// width — the same call the measurement pass makes, so a measured height
+    /// and the height this row lays out cannot come from two measures. Stating
+    /// the width as one arithmetic answer is also what makes the width toggle
+    /// one switch: a measure that caps the column and a measure that does not
+    /// are two results of one function, not two constraint sets.
+    private var columnWidthConstraint: NSLayoutConstraint!
     private var columnLeadingConstraint: NSLayoutConstraint!
     private var columnTrailingConstraint: NSLayoutConstraint!
     private var stackTopConstraint: NSLayoutConstraint!
@@ -1624,16 +1675,18 @@ final class TranscriptTurnRowView: NSTableCellView {
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
         addLayoutGuide(column)
-        let columnWidthConstraint = column.widthAnchor.constraint(
-            equalTo: widthAnchor,
-            constant: -2 * MessageTypography.transcriptInset
+        columnWidthConstraint = column.widthAnchor.constraint(
+            equalToConstant: MessageTypography.contentColumn(in: frameRect.width)
         )
+        // 999, not required. Nothing in this row wants the column wider, so 999
+        // holds the measure exactly; what it buys is the escape valve at a width
+        // no window reaches. Under about 62pt the required gutters, the required
+        // `width >= 1` below, and the bubble's own trailing pin cannot all hold
+        // at this column, and a required constant would report an unsatisfiable
+        // layout instead of letting the column give way.
         columnWidthConstraint.priority = NSLayoutConstraint.Priority(999)
         NSLayoutConstraint.activate([
             column.centerXAnchor.constraint(equalTo: centerXAnchor),
-            column.widthAnchor.constraint(
-                lessThanOrEqualToConstant: MessageTypography.readingMeasure
-            ),
             column.widthAnchor.constraint(greaterThanOrEqualToConstant: 1),
             columnWidthConstraint,
             // A guide publishes no frame of its own. The two vertical pins
@@ -1662,18 +1715,21 @@ final class TranscriptTurnRowView: NSTableCellView {
                 + MessageTypography.outgoingBubblePaddingH)
         )
         userTrailingConstraint.isActive = false
-        // The bubble's box holds `outgoingBubbleShare` of the column at every
-        // window width, so the empty space on its leading side states the
-        // speaker. The share belongs to the box, so the tail and both paddings
-        // come off the stack's own width.
+        // The bubble's box IS the column: the tail tip lands on the column's
+        // trailing edge and the box's leading side lines up with the leading
+        // gutter, so the tail and both paddings come off the stack's own width
+        // and the text keeps what is left. That leaves the user's own words
+        // within a point of the measure the answer below them gets, which is
+        // the whole point of one column. The tail on the trailing edge states
+        // the speaker; the empty leading third that used to state it cost the
+        // user 30% of the measure.
         //
         // 999, not required. A window narrower than two gutters resolves the
-        // column to its 1pt floor, where the share is a negative width, and a
+        // column to its 1pt floor, where the cap is a negative width, and a
         // required cap would then fight the required `width >= 1` below. 999
         // still outranks the measured width, which is all the cap has to beat.
         userMaxWidthConstraint = stack.widthAnchor.constraint(
             lessThanOrEqualTo: column.widthAnchor,
-            multiplier: MessageTypography.outgoingBubbleShare,
             constant: -(2 * MessageTypography.outgoingBubblePaddingH
                 + OutgoingBubbleGeometry.tailWidth)
         )
@@ -1690,12 +1746,12 @@ final class TranscriptTurnRowView: NSTableCellView {
         // so a window too narrow for the measured width shrinks the stack
         // instead of breaking the layout.
         //
-        // One rank below the share cap, never level with it. The fallback
-        // constant is the measure of a full column, so on a narrower window the
-        // two disagree, and two constraints of one priority let the solver
-        // settle that disagreement wherever it likes.
+        // One rank below the column cap, never level with it. The fallback
+        // constant is the widest text a full column holds, so on a narrower
+        // window the two disagree, and two constraints of one priority let the
+        // solver settle that disagreement wherever it likes.
         userTextWidthConstraint = stack.widthAnchor.constraint(
-            equalToConstant: MessageTypography.widestOutgoingText
+            equalToConstant: MessageTypography.widestStandardOutgoingText
         )
         userTextWidthConstraint.priority = NSLayoutConstraint.Priority(998)
         userTextWidthConstraint.isActive = false
@@ -1707,10 +1763,11 @@ final class TranscriptTurnRowView: NSTableCellView {
             equalTo: bottomAnchor,
             constant: -MessageTypography.turnGap / 2
         )
-        // The column owns the readable measure, so the stack states no measure
-        // of its own. What stays required here is the gutter on each side and a
-        // width the solver cannot take to zero: both hold even at a width where
-        // the column's own optional constraints give way.
+        // The column owns the measure, so the stack states no measure of its
+        // own. What stays required here is the gutter on each side and a width
+        // the solver cannot take to zero: both hold at a width where the column
+        // has already resolved to its 1pt floor and the stack's own optional
+        // constraints have to give way.
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: MessageTypography.transcriptInset),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -MessageTypography.transcriptInset),
@@ -1831,6 +1888,23 @@ final class TranscriptTurnRowView: NSTableCellView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    /// Keeps the column at the current measure of this row's width.
+    ///
+    /// `layout` is the first point where the frame the table gave this row is
+    /// final, so it is where the measure is resolved: one call, the same one the
+    /// measurement pass makes, and both a window resize and the width toggle
+    /// come out of it. The guard is what keeps a scroll step free — the constant
+    /// is written only when the answer moved, and an unchanged write would dirty
+    /// the layout engine for every visible row.
+    override func layout() {
+        let measure = MessageTypography.contentColumn(in: bounds.width)
+        if abs(columnWidthConstraint.constant - measure)
+            > BlockTranscriptView.Coordinator.MeasuredDocumentCache.widthTolerance {
+            columnWidthConstraint.constant = measure
+        }
+        super.layout()
+    }
+
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let tracking { removeTrackingArea(tracking) }
@@ -1937,12 +2011,16 @@ final class TranscriptTurnRowView: NSTableCellView {
         userTrailingConstraint.isActive = isUser
         userMaxWidthConstraint.isActive = isUser
         userTextWidthConstraint.isActive = isUser
-        // The measured fitting width, or the widest text the column can hold
-        // until the measurement lands. Either value meets the share cap above,
-        // which is required and column-relative, so a wide window cannot widen
-        // a bubble past its share and a one-word bubble still hugs its text.
+        // The measured fitting width, or the standard measure's widest text
+        // until the measurement lands. The renderer hands this row the cap for
+        // the current table width, so the fallback is only for a caller that
+        // has none. Either value meets the cap above, which is column-relative,
+        // so a wide window cannot widen a bubble past the column and a one-word
+        // bubble still hugs its text. A frame is deliberately not read here:
+        // `configure` runs before the table gives this row its width, and a
+        // measure taken from a 0pt frame would lay the bubble out at 1pt.
         userTextWidthConstraint.constant = outgoingTextWidth
-            ?? MessageTypography.widestOutgoingText
+            ?? MessageTypography.widestStandardOutgoingText
         // The bubble's padding sits inside the same row band an agent row uses,
         // so both speakers keep one turn rhythm and consecutive bubbles stay
         // exactly `turnGap` apart.
@@ -2322,7 +2400,13 @@ private enum TranscriptTurnTextRenderer {
     ///
     /// The width is the constraint chain of the row, restated for a pass that
     /// runs with no views. Both come from `MessageTypography.contentColumn`, so
-    /// a measured height and the height the row lays out cannot disagree.
+    /// a measured height and the height the row lays out cannot disagree — and
+    /// the width mode reaches the pass through that one call, so a turn can
+    /// never be measured in the measure its row is not laid out in.
+    ///
+    /// Main-actor for that one read. The width is resolved here, on the main
+    /// actor, and only the resolved number travels to the detached measurer.
+    @MainActor
     static func effectiveWidth(
         for turn: TranscriptTurn,
         availableWidth: CGFloat
@@ -2330,8 +2414,9 @@ private enum TranscriptTurnTextRenderer {
         let column = MessageTypography.contentColumn(in: availableWidth)
         switch turn.speaker {
         case .me:
-            // The bubble's box holds its share of the column. The tail and both
-            // paddings come off that box before the text gets any.
+            // The bubble's box is the column, so the tail and both paddings
+            // come off it before the text gets any. What is left is the measure
+            // the agent's answer gets, less a point.
             return MessageTypography.outgoingTextMeasure(in: column)
         case .hermes:
             return max(1, column - MessageTypography.hermesIndent)
@@ -2357,6 +2442,9 @@ private enum TranscriptTurnTextRenderer {
         )
     }
 
+    /// Main-actor: it resolves the width through `effectiveWidth`, which reads
+    /// the current measure.
+    @MainActor
     static func provisionalHeight(
         turn: TranscriptTurn,
         availableWidth: CGFloat,

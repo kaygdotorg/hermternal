@@ -136,6 +136,64 @@ enum AccentColorStore {
     }
 }
 
+/// Stores the transcript's measure, and announces a change to AppKit.
+///
+/// `AppearanceSettings` is the only writer. The notification exists because
+/// the transcript is AppKit: its rows hold constraints and its height delegate
+/// holds measured heights, and neither re-renders from an observable read. Both
+/// have to invalidate together, which is what one notification buys.
+enum TranscriptWidthStore {
+    static let key = "appearance.transcriptWidth"
+
+    /// Posted after `MessageTypography.widthMode` already holds the new
+    /// measure, so every observer that lays out reads the new value and none
+    /// of them can lay out against the old one.
+    static let didChangeNotification = Notification.Name(
+        "HermternalTranscriptWidthDidChange"
+    )
+
+    static func load(from defaults: UserDefaults = .standard) -> TranscriptWidthMode {
+        TranscriptWidthMode(rawValue: defaults.string(forKey: key) ?? "")
+            ?? .standard
+    }
+
+    static func save(
+        _ mode: TranscriptWidthMode,
+        to defaults: UserDefaults = .standard
+    ) {
+        defaults.set(mode.rawValue, forKey: key)
+    }
+}
+
+extension TranscriptWidthMode {
+    /// The name of this measure, for a menu item that carries a checkmark.
+    var label: String {
+        switch self {
+        case .standard: "Standard Width"
+        case .full: "Full Width"
+        }
+    }
+
+    /// The symbol for a control that switches TO this measure.
+    ///
+    /// A toolbar button states the action, not the state, so the button shows
+    /// the symbol of the measure it would give the reader next.
+    var symbolName: String {
+        switch self {
+        case .standard: "rectangle.arrowtriangle.2.inward"
+        case .full: "rectangle.arrowtriangle.2.outward"
+        }
+    }
+
+    /// What the control that switches to this measure does, in words.
+    var actionDescription: String {
+        switch self {
+        case .standard: "Hold the transcript to the reading measure"
+        case .full: "Let the transcript fill the window"
+        }
+    }
+}
+
 /// User-tunable appearance, persisted in `UserDefaults`.
 @MainActor
 @Observable
@@ -197,6 +255,25 @@ final class AppearanceSettings {
         }
     }
 
+    /// The measure the transcript lays a message out in.
+    ///
+    /// The width toggle in the window's toolbar and the View menu item both
+    /// write here. `MessageTypography.widthMode` is what the AppKit transcript
+    /// reads on every measurement and every row layout, so this setter puts the
+    /// value there before it posts. Written to `UserDefaults` only when it
+    /// changes, so reading the appearance never touches the file.
+    var transcriptWidthMode: TranscriptWidthMode {
+        didSet {
+            guard oldValue != transcriptWidthMode else { return }
+            TranscriptWidthStore.save(transcriptWidthMode, to: defaults)
+            MessageTypography.widthMode = transcriptWidthMode
+            NotificationCenter.default.post(
+                name: TranscriptWidthStore.didChangeNotification,
+                object: nil
+            )
+        }
+    }
+
     /// Solid enough to read against any desktop, translucent enough that the
     /// blur behind it is plainly the point.
     private static let defaultBackgroundOpacity = 0.85
@@ -214,6 +291,7 @@ final class AppearanceSettings {
         static let backgroundOpacity = "appearance.backgroundOpacity"
         static let usesLiquidGlass = "appearance.usesLiquidGlass"
         static let alwaysShowsChatMetadata = "appearance.alwaysShowsChatMetadata"
+        static let transcriptWidth = TranscriptWidthStore.key
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -231,6 +309,10 @@ final class AppearanceSettings {
         alwaysShowsChatMetadata = defaults.bool(
             forKey: Keys.alwaysShowsChatMetadata
         )
+        transcriptWidthMode = TranscriptWidthStore.load(from: defaults)
+        // `didSet` never fires during init, so the transcript's own copy is
+        // written here. Nothing observes yet: the window does not exist.
+        MessageTypography.widthMode = transcriptWidthMode
         // System is already AppKit's inherited default. Avoid materializing
         // NSApplication just to assign its default `nil` appearance before the
         // first window; explicit light and dark modes remain synchronous.
@@ -247,6 +329,14 @@ final class AppearanceSettings {
     /// Removes the override and returns to the macOS system accent.
     func useSystemAccent() {
         accentOverride = nil
+    }
+
+    /// Switches the transcript to its other measure.
+    ///
+    /// The toolbar item and the View menu item are one command, so the flip
+    /// lives here and neither of them states the two states itself.
+    func toggleTranscriptWidth() {
+        transcriptWidthMode = transcriptWidthMode.other
     }
 
     /// SwiftUI's `preferredColorScheme` only updates SwiftUI's environment.
@@ -284,5 +374,6 @@ final class AppearanceSettings {
         backgroundOpacity = Self.defaultBackgroundOpacity
         persistBackgroundOpacity()
         usesLiquidGlass = false
+        transcriptWidthMode = .standard
     }
 }

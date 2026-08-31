@@ -364,12 +364,13 @@ private extension NSToolbarItem.Identifier {
     static let sidebarToggle = NSToolbarItem.Identifier("Hermternal.sidebarToggle")
     static let detailControls = NSToolbarItem.Identifier("Hermternal.detailControls")
     static let newChat = NSToolbarItem.Identifier("Hermternal.newChat")
-    static let reloadChats = NSToolbarItem.Identifier("Hermternal.reloadChats")
+    static let transcriptWidth = NSToolbarItem.Identifier("Hermternal.transcriptWidth")
 }
 
 @MainActor
 final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
     private var model: AppModel
+    private let appearance: AppearanceSettings
     private weak var toolbar: NSToolbar?
     private weak var visibilityBridge: MainSplitVisibilityBridgeView?
     private lazy var detailGroup = makeDetailGroup()
@@ -382,19 +383,46 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
         toolTip: "Start a new chat",
         action: #selector(firstDetailAction)
     )
-    private lazy var reloadItem = makeCommandItem(
-        identifier: .reloadChats,
-        symbol: "arrow.clockwise",
-        label: "Reload",
-        toolTip: "Reload chats",
-        action: #selector(secondDetailAction)
+    /// The transcript's measure, in the slot the reload button held.
+    ///
+    /// Reload is a rare command with a standard key equivalent, so it belongs in
+    /// the View menu and on ⌘R, not in a slot the reader passes every time they
+    /// look at the window. The measure is the opposite: it is the one thing
+    /// about a transcript a reader changes while reading it.
+    private lazy var widthItem = makeCommandItem(
+        identifier: .transcriptWidth,
+        symbol: appearance.transcriptWidthMode.other.symbolName,
+        label: appearance.transcriptWidthMode.other.label,
+        toolTip: appearance.transcriptWidthMode.other.actionDescription,
+        action: #selector(toggleTranscriptWidth)
     )
     private lazy var optionsMenu: NSMenu = makeOptionsMenu()
 
-    init(model: AppModel, visibilityBridge: MainSplitVisibilityBridgeView?) {
+    init(
+        model: AppModel,
+        appearance: AppearanceSettings,
+        visibilityBridge: MainSplitVisibilityBridgeView?
+    ) {
         self.model = model
+        self.appearance = appearance
         self.visibilityBridge = visibilityBridge
         super.init()
+        // The View menu flips the measure too, so the item follows the store
+        // rather than only its own click. The store posts from the main actor,
+        // so the block runs there: the item is relabelled in the same turn as
+        // the command, and the toolbar never states a measure the transcript
+        // has already left. No teardown: this controller belongs to the one
+        // main window, which belongs to the process.
+        NotificationCenter.default.addObserver(
+            forName: TranscriptWidthStore.didChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.configureWidthItem(commandable: self.widthItem.isEnabled)
+            }
+        }
         update(model: model)
     }
 
@@ -434,7 +462,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
         let group = NSToolbarItemGroup(itemIdentifier: .detailControls)
         group.label = "Chat"
         group.paletteLabel = "Chat"
-        group.subitems = [newChatItem, reloadItem]
+        group.subitems = [newChatItem, widthItem]
         group.isBordered = true
         group.isEnabled = true
         group.controlRepresentation = .expanded
@@ -444,7 +472,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
     }
 
     private var isReadyPhase: Bool {
-        model.phase == .ready
+        model.phase.presentsWorkspace
     }
 
     private func updateToolbarVisibility() {
@@ -473,7 +501,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
     }
 
     private func configureDetailItems(commandable: Bool) {
-        if let archivedSession {
+        if archivedSession != nil {
             newChatItem.image = NSImage(
                 systemSymbolName: "archivebox",
                 accessibilityDescription: "Restore"
@@ -481,14 +509,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
             newChatItem.label = "Restore"
             newChatItem.paletteLabel = "Restore"
             newChatItem.toolTip = "Restore chat"
-            reloadItem.image = NSImage(
-                systemSymbolName: "link",
-                accessibilityDescription: "Copy Link"
-            )
-            reloadItem.label = "Copy Link"
-            reloadItem.paletteLabel = "Copy Link"
-            reloadItem.toolTip = "Copy chat link"
-            detailGroup.isEnabled = commandable && archivedSession != nil
+            detailGroup.isEnabled = commandable
         } else {
             newChatItem.image = NSImage(
                 systemSymbolName: "plus",
@@ -497,16 +518,29 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
             newChatItem.label = "New Chat"
             newChatItem.paletteLabel = "New Chat"
             newChatItem.toolTip = "Start a new chat"
-            reloadItem.image = NSImage(
-                systemSymbolName: "arrow.clockwise",
-                accessibilityDescription: "Reload"
-            )
-            reloadItem.label = "Reload"
-            reloadItem.paletteLabel = "Reload"
-            reloadItem.toolTip = "Reload chats"
         }
         newChatItem.isEnabled = commandable
-        reloadItem.isEnabled = commandable
+        configureWidthItem(commandable: commandable)
+    }
+
+    /// The width toggle states the measure it would give the reader next, so the
+    /// button reads as an action rather than as a state.
+    ///
+    /// The measure belongs to the transcript and not to the chat, so this item
+    /// is the same for an archived chat as for a live one. The archived chat's
+    /// Copy Link went with the reload button it shared this slot with: it is on
+    /// the archived row's own menu in the sidebar, beside Restore, where every
+    /// other per-chat command already is.
+    private func configureWidthItem(commandable: Bool) {
+        let next = appearance.transcriptWidthMode.other
+        widthItem.image = NSImage(
+            systemSymbolName: next.symbolName,
+            accessibilityDescription: next.label
+        )
+        widthItem.label = next.label
+        widthItem.paletteLabel = next.label
+        widthItem.toolTip = next.actionDescription
+        widthItem.isEnabled = commandable
     }
 
     private var archivedSession: ChatSession? {
@@ -561,8 +595,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
             return detailGroup
         case .newChat:
             return newChatItem
-        case .reloadChats:
-            return reloadItem
+        case .transcriptWidth:
+            return widthItem
         default:
             return nil
         }
@@ -706,12 +740,12 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func secondDetailAction() {
-        if let archivedSession {
-            model.copyDeepLink(for: archivedSession)
-        } else {
-            Task { await model.loadSessions() }
-        }
+    /// Both measures are one command: the item says which one it would give.
+    ///
+    /// The item is not relabelled here. The store's notification does it, in
+    /// this same turn, and it is the one path the View menu takes too.
+    @objc private func toggleTranscriptWidth() {
+        appearance.toggleTranscriptWidth()
     }
 }
 
@@ -887,6 +921,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             MainWindowStartupConfiguration.attach(shellController, to: window)
             let toolbarController = MainToolbarController(
                 model: model,
+                appearance: appearance,
                 visibilityBridge: shellController.visibilityBridgeView
             )
             self.toolbarController = toolbarController

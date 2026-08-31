@@ -65,6 +65,70 @@ func signedOutToolbarSkipsReadyOnlyItems() {
     #expect(ready.filter { $0 == .flexibleSpace }.count == 2)
 }
 
+@Test("the toolbar's width toggle is two real symbols and one command")
+@MainActor
+func toolbarWidthToggleStatesTheMeasureItWouldGive() {
+    // The item states the action, so it carries the OTHER measure's symbol and
+    // label. Both symbols must exist: `NSImage(systemSymbolName:)` answers nil
+    // for a name macOS does not ship, and a toolbar button with no image is a
+    // blank square.
+    for mode in TranscriptWidthMode.allCases {
+        #expect(mode.other != mode)
+        #expect(mode.other.other == mode)
+        #expect(
+            NSImage(
+                systemSymbolName: mode.symbolName,
+                accessibilityDescription: mode.label
+            ) != nil
+        )
+        #expect(!mode.label.isEmpty)
+        #expect(!mode.actionDescription.isEmpty)
+    }
+    #expect(TranscriptWidthMode.standard.label != TranscriptWidthMode.full.label)
+    #expect(
+        TranscriptWidthMode.standard.symbolName != TranscriptWidthMode.full.symbolName
+    )
+}
+
+@Test("the transcript measure persists and reaches the layout")
+@MainActor
+func transcriptMeasurePersistsAndReachesTheLayout() throws {
+    let suiteName = "HermternalTests.TranscriptWidth.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer {
+        defaults.removePersistentDomain(forName: suiteName)
+        MessageTypography.widthMode = .standard
+    }
+
+    let appearance = AppearanceSettings(defaults: defaults)
+
+    // An absent preference is the standard measure, and reading it writes
+    // nothing.
+    #expect(appearance.transcriptWidthMode == .standard)
+    #expect(MessageTypography.widthMode == .standard)
+    #expect(defaults.object(forKey: TranscriptWidthStore.key) == nil)
+
+    appearance.toggleTranscriptWidth()
+
+    // The transcript reads `MessageTypography.widthMode` on every measurement
+    // and every row layout, so the setter must have written it already.
+    #expect(appearance.transcriptWidthMode == .full)
+    #expect(MessageTypography.widthMode == .full)
+    #expect(defaults.string(forKey: TranscriptWidthStore.key) == "full")
+
+    // Restoring the same defaults restores the measure, and it reaches the
+    // layout before any window exists.
+    MessageTypography.widthMode = .standard
+    let restored = AppearanceSettings(defaults: defaults)
+    #expect(restored.transcriptWidthMode == .full)
+    #expect(MessageTypography.widthMode == .full)
+
+    // A reset returns the reading measure.
+    restored.resetToDefaults()
+    #expect(restored.transcriptWidthMode == .standard)
+    #expect(MessageTypography.widthMode == .standard)
+}
+
 @Test("launch performance contract: system appearance keeps inherited AppKit appearance")
 @MainActor
 func systemAppearanceInitializationAvoidsGlobalReset() throws {

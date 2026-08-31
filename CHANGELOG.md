@@ -7,10 +7,19 @@ and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- A width toggle in the window's toolbar, and in the View menu, switches the
+  transcript between the reading measure and the full window. The choice is
+  remembered.
+
 ### Changed
 
 - Build and release tooling now refuses stale, incomplete, unsigned, or
   provenance-mismatched app bundles instead of handing them to callers.
+- Both speakers share one text measure. A message the user wrote is no longer
+  held to 70% of the column the answer below it fills.
+- Reload moved out of the toolbar into the View menu, on its standard ⌘R.
 
 ## [v0.0.4] — 2026-08-23
 

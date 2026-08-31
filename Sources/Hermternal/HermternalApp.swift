@@ -196,6 +196,24 @@ struct HermternalApp: App {
                 .keyboardShortcut("k", modifiers: .command)
                 .disabled(model.phase != .ready || model.searchQuerying == nil)
             }
+            // The View menu. Reload lives here, on its standard key
+            // equivalent, instead of in a toolbar slot: it is a command a
+            // reader reaches for once a session, and the slot it held now
+            // carries the transcript's measure, which they reach for while
+            // reading. The measure item states the measure it would give, the
+            // way "Hide Sidebar" states what it would do.
+            CommandGroup(after: .sidebar) {
+                Button("Reload Chats") {
+                    _ = applicationDelegate.showMainWindowIfReady()
+                    Task { await model.loadSessions() }
+                }
+                .keyboardShortcut("r", modifiers: .command)
+                .disabled(model.phase != .ready)
+                Button(appearance.transcriptWidthMode.other.label) {
+                    _ = applicationDelegate.showMainWindowIfReady()
+                    appearance.toggleTranscriptWidth()
+                }
+            }
             CommandGroup(replacing: .appSettings) {
                 Button("Settings…") {
                     SettingsWindowController.shared.show(

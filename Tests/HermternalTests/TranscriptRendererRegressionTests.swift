@@ -156,6 +156,7 @@ func emptyMeasurementWorkClearsQueuedReschedule() {
 }
 
 @Test("provisional transcript height is bounded at normal width")
+@MainActor
 func provisionalTranscriptHeightIsBoundedAtNormalWidth() {
     let turn = TranscriptTurn(
         id: "long",
@@ -563,15 +564,17 @@ func rendererRowsKeepDocumentWidthThroughTableLayoutAndResize() throws {
         ) < 1
     )
     #expect(initialAssistantTextWidth < initialTableWidth - 200)
-    // An outgoing row is no longer a full-measure column. It is capped at the
-    // bubble's share of the column and, with no measurement yet, it renders at
-    // that cap.
+    // An outgoing row is capped at the content column, less the bubble's own
+    // box, and with no measurement yet it lays out at that cap.
     #expect(
         abs(
             userRow.answerViewForTesting.bounds.width
-                - MessageTypography.widestOutgoingText
+                - MessageTypography.widestStandardOutgoingText
         ) < 1
     )
+    // One measure for both speakers: the mark's gutter and the bubble's box
+    // take the same 36 and 35 points out of the same column.
+    #expect(abs(initialAssistantTextWidth - userRow.answerViewForTesting.bounds.width) <= 1)
 
     // A window narrower than the readable measure: the column is the window
     // less its two gutters, so both speakers narrow with it.
@@ -600,6 +603,167 @@ func rendererRowsKeepDocumentWidthThroughTableLayoutAndResize() throws {
         resizedAssistantRow.answerViewForTesting.bounds.width
             < initialAssistantTextWidth - 100
     )
+}
+
+@Test("the width toggle gives both speakers the window and gives it back")
+@MainActor
+func widthToggleGivesBothSpeakersTheWindowAndGivesItBack() throws {
+    _ = NSApplication.shared
+    let fixture = TranscriptTableLayoutFixture()
+    let table = BlockTranscriptTableView()
+    table.headerView = nil
+    table.intercellSpacing = .zero
+    table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+    table.addTableColumn(NSTableColumn(identifier: .init("transcript")))
+    table.dataSource = fixture
+    table.delegate = fixture
+
+    let container = BlockTranscriptContainerView(tableView: table)
+    let root = NSView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 480))
+    root.addSubview(container)
+    NSLayoutConstraint.activate([
+        container.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+        container.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+        container.topAnchor.constraint(equalTo: root.topAnchor),
+        container.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+    ])
+    defer {
+        MessageTypography.widthMode = .standard
+        container.stopObservingSystemChanges()
+    }
+
+    func laidOutRow(_ ordinal: Int) throws -> TranscriptTurnRowView {
+        root.layoutSubtreeIfNeeded()
+        container.layoutTableDocument()
+        table.layoutSubtreeIfNeeded()
+        let row = try #require(
+            table.view(atColumn: 0, row: ordinal, makeIfNecessary: true)
+                as? TranscriptTurnRowView
+        )
+        row.layoutSubtreeIfNeeded()
+        return row
+    }
+
+    table.reloadData()
+    _ = try laidOutRow(0)
+    _ = try laidOutRow(1)
+    let tableWidth = table.bounds.width
+    #expect(tableWidth > MessageTypography.readingMeasure + 400)
+
+    MessageTypography.widthMode = .full
+    container.applyTranscriptMeasure()
+    let fullAgent = try laidOutRow(0)
+    let fullUser = try laidOutRow(1)
+    let fullColumn = MessageTypography.contentColumn(in: tableWidth)
+
+    // Every materialised row resolves the new measure in `layout`, so the agent
+    // text is the window less its gutters and the mark's own gutter.
+    #expect(
+        abs(
+            fullAgent.answerViewForTesting.bounds.width
+                - (fullColumn - MessageTypography.hermesIndent)
+        ) < 1
+    )
+    // The bubble's tail tip lands on the same column's trailing edge, so a
+    // bubble ends exactly where the answer above it ends, in either measure.
+    // Its text width waits for the next measurement, which is the same latency
+    // a window resize has; the column does not.
+    let fullColumnTrailing = (tableWidth + fullColumn) / 2
+    #expect(
+        abs(fullUser.bubbleForTesting.frame.maxX - fullColumnTrailing) < 1.5
+    )
+    #expect(fullColumnTrailing > (tableWidth + MessageTypography.readingMeasure) / 2)
+    #expect(
+        fullAgent.answerViewForTesting.bounds.width
+            > MessageTypography.readingMeasure
+    )
+
+    MessageTypography.widthMode = .standard
+    container.applyTranscriptMeasure()
+    let backAgent = try laidOutRow(0)
+    #expect(
+        abs(
+            backAgent.answerViewForTesting.bounds.width
+                - (MessageTypography.readingMeasure - MessageTypography.hermesIndent)
+        ) < 1
+    )
+    let standardColumnTrailing =
+        (tableWidth + MessageTypography.readingMeasure) / 2
+    let backUser = try laidOutRow(1)
+    #expect(
+        abs(backUser.bubbleForTesting.frame.maxX - standardColumnTrailing) < 1.5
+    )
+}
+
+@Test("the measure a reader chooses reaches the transcript through the store")
+@MainActor
+func chosenMeasureReachesTheTranscriptThroughTheStore() throws {
+    _ = NSApplication.shared
+    let fixture = TranscriptTableLayoutFixture()
+    let table = BlockTranscriptTableView()
+    table.headerView = nil
+    table.intercellSpacing = .zero
+    table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+    table.addTableColumn(NSTableColumn(identifier: .init("transcript")))
+    table.dataSource = fixture
+    table.delegate = fixture
+
+    let container = BlockTranscriptContainerView(tableView: table)
+    let root = NSView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 480))
+    root.addSubview(container)
+    NSLayoutConstraint.activate([
+        container.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+        container.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+        container.topAnchor.constraint(equalTo: root.topAnchor),
+        container.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+    ])
+
+    let suiteName = "HermternalTests.TranscriptWidthStore.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    let appearance = AppearanceSettings(defaults: defaults)
+    defer {
+        defaults.removePersistentDomain(forName: suiteName)
+        MessageTypography.widthMode = .standard
+        container.stopObservingSystemChanges()
+    }
+
+    func laidOutRow(_ ordinal: Int) throws -> TranscriptTurnRowView {
+        root.layoutSubtreeIfNeeded()
+        container.layoutTableDocument()
+        table.layoutSubtreeIfNeeded()
+        let row = try #require(
+            table.view(atColumn: 0, row: ordinal, makeIfNecessary: true)
+                as? TranscriptTurnRowView
+        )
+        row.layoutSubtreeIfNeeded()
+        return row
+    }
+
+    table.reloadData()
+    let standardWidth = try laidOutRow(0).answerViewForTesting.bounds.width
+
+    // The whole path, not the handler: the settings object writes the measure,
+    // persists it, and posts; the container's own observer invalidates; the rows
+    // resolve the new column in `layout`. All of it inside this one call, which
+    // is the contract — the store's observers are main-actor and synchronous, so
+    // the toolbar and the transcript can never state two different measures.
+    // This test therefore never suspends, which also keeps the process-wide
+    // measure it sets out of every other test's way.
+    appearance.toggleTranscriptWidth()
+
+    #expect(MessageTypography.widthMode == .full)
+
+    // The row's own width is what decides its column, so that is what the
+    // expectation is built from. Reading it off the table instead would race
+    // the document resize the invalidation kicks off.
+    let row = try laidOutRow(0)
+    let expected = MessageTypography.contentColumn(in: row.bounds.width)
+        - MessageTypography.hermesIndent
+    let width = row.answerViewForTesting.bounds.width
+
+    #expect(abs(width - expected) < 1)
+    #expect(width > standardWidth + 100)
+    #expect(row.bounds.width > MessageTypography.readingMeasure + 400)
 }
 
 @MainActor
@@ -1596,6 +1760,7 @@ private func laidOutAgentRow(
 }
 
 /// The measured height the renderer gives one agent turn.
+@MainActor
 private func measuredAgentRowHeight(
     turn: TranscriptTurn,
     document: MarkdownDocument,
