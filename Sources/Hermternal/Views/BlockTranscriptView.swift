@@ -1005,7 +1005,7 @@ struct BlockTranscriptView: NSViewRepresentable {
                           let target = self.targetOrdinal, target < self.rowCount
                     else { return }
                     self.table.selectRowIndexes(IndexSet(integer: target), byExtendingSelection: false)
-                    self.table.scrollRowToVisible(target)
+                    TranscriptViewportAnchoring.scrollRowIntoView(target, in: self.table)
                     if self.pendingMessageID == messageID,
                        self.consumedPendingMessageID != messageID {
                         self.consumedPendingMessageID = messageID
@@ -1215,18 +1215,87 @@ enum TranscriptViewportAnchoring {
     /// that no longer holds the anchor row moves nothing.
     static func restore(_ anchor: Anchor, in table: NSTableView) {
         guard anchor.ordinal >= 0, anchor.ordinal < table.numberOfRows else { return }
+        // The policy holds its origin at or below the top of the scrollable
+        // range, which it takes to be zero. A top content inset puts that top
+        // at a NEGATIVE clip origin, so the adapter hands the policy a
+        // distance measured from the inset top and puts the answer back into
+        // clip coordinates. The correction itself is a difference, so it is
+        // unchanged by the translation.
+        let inset = table.enclosingScrollView?.contentInsets.top ?? 0
         let origin = TranscriptViewportPolicy.preservedScrollOrigin(
-            currentOrigin: Double(anchor.documentOrigin),
+            currentOrigin: Double(anchor.documentOrigin + inset),
             oldAnchorOrigin: Double(anchor.rowOrigin),
             newAnchorOrigin: Double(table.rect(ofRow: anchor.ordinal).minY)
         )
-        scroll(table, to: CGFloat(origin))
+        scroll(table, to: CGFloat(origin) - inset)
     }
 
     /// Moves the viewport to the end of the document.
+    ///
+    /// `scroll` owns the scrollable range, so this asks for a point past the
+    /// end and lets the clamp resolve it. The end moves with a content inset;
+    /// the request does not.
     static func pinToBottom(_ table: NSTableView) {
-        guard let clip = table.enclosingScrollView?.contentView else { return }
-        scroll(table, to: table.bounds.height - clip.bounds.height)
+        scroll(table, to: table.bounds.height)
+    }
+
+    /// Brings one row into the READABLE viewport.
+    ///
+    /// `NSTableView.scrollRowToVisible` measures against the clip view's own
+    /// bounds, and this clip view runs to the physical window top, so a row
+    /// arriving from above would come to rest under the window's toolbar
+    /// controls and inside the transcript's top ramp. The readable viewport
+    /// starts one content inset lower, which is where a row scrolled to the
+    /// top comes to rest, so Find and a message deep link land a row exactly
+    /// where a reader can leave one.
+    ///
+    /// A turn too tall to fit in that viewport is handled on its own terms: it
+    /// is top-aligned from either direction, because its beginning is the part
+    /// a jump is aiming at, and it is left alone only while the reader still
+    /// has a readable line of it.
+    static func scrollRowIntoView(_ ordinal: Int, in table: NSTableView) {
+        guard ordinal >= 0,
+              ordinal < table.numberOfRows,
+              let scrollView = table.enclosingScrollView
+        else { return }
+        let clip = scrollView.contentView
+        let inset = scrollView.contentInsets.top
+        let readableTop = clip.bounds.origin.y + inset
+        let row = table.rect(ofRow: ordinal)
+        if row.height > clip.bounds.height - inset {
+            // A turn taller than the readable viewport can never be contained
+            // in it, so containment is the wrong question here. The question is
+            // whether the reader still has this turn to read, which needs two
+            // things: the turn has to cover the readable top edge, so that
+            // everything from there down is this turn, and what remains below
+            // that edge has to be worth reading. The renderer re-runs the same
+            // target for every publication that keeps it, so aligning in that
+            // state would drag a reader who scrolled into a long turn back to
+            // its first line.
+            //
+            // Both halves are load-bearing. Plain coverage is too weak at the
+            // tail: a row rectangle ends with the same empty half-gap it
+            // begins with, so a single point of it can cross the edge while
+            // every glyph is already above the viewport. Plain intersection is
+            // too weak at the head: a turn arriving from below can show a
+            // point of itself at the bottom edge and still be unread.
+            //
+            // One body line is the smallest remainder that is worth anything
+            // to a reader, and it is the same line height the rows are laid
+            // out on, so the test needs no measurement of its own.
+            let readableInk = row.maxY - MessageTypography.turnGap / 2 - readableTop
+            let readerIsInside = row.minY <= readableTop
+                && readableInk >= MessageTypography.bodyLineHeight
+            guard !readerIsInside else { return }
+            // Top-aligned from either direction. Bottom aligning a turn this
+            // tall would put its beginning above the readable top and under
+            // the chrome, which is the occlusion this edge exists to prevent.
+            scroll(table, to: row.minY - inset)
+        } else if row.minY < readableTop {
+            scroll(table, to: row.minY - inset)
+        } else if row.maxY > clip.bounds.maxY {
+            scroll(table, to: row.maxY - clip.bounds.height)
+        }
     }
 
     /// Writes one viewport origin, and only when the origin changes.
@@ -1236,8 +1305,17 @@ enum TranscriptViewportAnchoring {
     private static func scroll(_ table: NSTableView, to origin: CGFloat) {
         guard let scrollView = table.enclosingScrollView else { return }
         let clip = scrollView.contentView
-        let limit = max(0, table.bounds.height - clip.bounds.height)
-        let target = min(max(0, origin), limit)
+        let insets = scrollView.contentInsets
+        // The scrollable range with a content inset. The clip view keeps its
+        // full height, so the inset does not shorten the viewport; it adds
+        // range above the document's first point, at a negative origin.
+        // Without that floor the transcript could never come to rest below the
+        // window chrome, and a document shorter than the viewport would sit
+        // under it. Both limits collapse to the old arithmetic when the insets
+        // are zero.
+        let first = -insets.top
+        let last = max(first, table.bounds.height + insets.bottom - clip.bounds.height)
+        let target = min(max(first, origin), last)
         guard abs(target - clip.bounds.origin.y) > 0.5 else { return }
         clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: target))
         scrollView.reflectScrolledClipView(clip)
@@ -1267,6 +1345,32 @@ final class BlockTranscriptContainerView: NSView {
         translatesAutoresizingMaskIntoConstraints = false
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.drawsBackground = false
+        // The transcript's frame runs to the physical window top, so rows
+        // travel under the toolbar and dissolve into `ChatTranscriptTopEdge`
+        // on the way. The scroll CONTENT stops short of that ramp, so the
+        // first turn comes to rest below it and stays readable.
+        //
+        // `contentInsets` is the primitive that does this without moving the
+        // view: it extends the scrollable range, and the clip view keeps its
+        // full height and its full-bleed frame, so no row geometry, no
+        // document height, and no bottom edge moves. The automatic insets
+        // would derive this from a safe area the hosting boundary has already
+        // cleared, and overwrite it with zero. `scrollerInsets` follows the
+        // content, which is what the automatic path would also have done: the
+        // scroller belongs beside the content, not under the chrome.
+        scrollView.automaticallyAdjustsContentInsets = false
+        scrollView.contentInsets = NSEdgeInsets(
+            top: ChatTranscriptTopEdge.contentInset,
+            left: 0,
+            bottom: 0,
+            right: 0
+        )
+        scrollView.scrollerInsets = NSEdgeInsets(
+            top: ChatTranscriptTopEdge.contentInset,
+            left: 0,
+            bottom: 0,
+            right: 0
+        )
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.documentView = tableView
@@ -1283,6 +1387,8 @@ final class BlockTranscriptContainerView: NSView {
         observeSystemPalette()
     }
     func resetPaint() { didPaint = false }
+
+    var scrollViewForTesting: NSScrollView { scrollView }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -1385,13 +1491,18 @@ final class TranscriptTurnRowView: NSTableCellView {
     static let identifier = NSUserInterfaceItemIdentifier("TranscriptTurnRow")
 
     private let stack = NSStackView()
-    private let roleHeader = NSStackView()
+    /// The product mark, in the gutter beside the first line of the turn.
+    ///
+    /// The mark is a subview of the row, like the bubble. It is not a band of
+    /// the stack. No band of the turn can therefore push the mark away from
+    /// the line it marks.
     private let markView = NSImageView()
     private let roleLabel = NSTextField(labelWithString: "")
     private let answerView = NSTextView()
     private let reasoningButton = NSButton()
     var answerViewForTesting: NSTextView { answerView }
     var reasoningButtonForTesting: NSButton { reasoningButton }
+    var markViewForTesting: NSView { markView }
     private let reasoningView = NSTextView()
     private let toolsButton = NSButton()
     var toolsButtonForTesting: NSButton { toolsButton }
@@ -1411,6 +1522,7 @@ final class TranscriptTurnRowView: NSTableCellView {
     private var measureWidthConstraint: NSLayoutConstraint!
     private var stackTopConstraint: NSLayoutConstraint!
     private var stackBottomConstraint: NSLayoutConstraint!
+    private var markTopConstraint: NSLayoutConstraint!
     private var userTrailingConstraint: NSLayoutConstraint!
     private var userMaxWidthConstraint: NSLayoutConstraint!
     private var userTextWidthConstraint: NSLayoutConstraint!
@@ -1517,24 +1629,35 @@ final class TranscriptTurnRowView: NSTableCellView {
                 constant: MessageTypography.outgoingBubblePaddingV
             )
         ])
-        roleHeader.orientation = .horizontal
-        roleHeader.alignment = .top
-        roleHeader.spacing = 6
-        roleHeader.translatesAutoresizingMaskIntoConstraints = false
+        // The mark stands in the gutter that `hermesIndent` opens, beside the
+        // first line of the turn. A band of its own would stand above the
+        // answer, and every band under it would then move it further from the
+        // line it marks.
         markView.imageScaling = .scaleProportionallyUpOrDown
         markView.setAccessibilityElement(false)
         markView.translatesAutoresizingMaskIntoConstraints = false
-        roleHeader.addArrangedSubview(markView)
+        addSubview(markView)
+        markTopConstraint = markView.topAnchor.constraint(
+            equalTo: stack.topAnchor,
+            constant: MarkGeometry.topInset(
+                lineCenter: MarkGeometry.textLineCenter(
+                    font: NSFont.preferredFont(forTextStyle: .body)
+                )
+            )
+        )
+        NSLayoutConstraint.activate([
+            markView.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            markView.widthAnchor.constraint(equalToConstant: MarkGeometry.side),
+            markView.heightAnchor.constraint(equalToConstant: MarkGeometry.side),
+            markTopConstraint
+        ])
         roleLabel.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
         roleLabel.textColor = .secondaryLabelColor
         roleLabel.translatesAutoresizingMaskIntoConstraints = false
-        roleHeader.addArrangedSubview(roleLabel)
-        stack.addArrangedSubview(roleHeader)
-        NSLayoutConstraint.activate([
-            markView.widthAnchor.constraint(equalToConstant: 14),
-            markView.heightAnchor.constraint(equalToConstant: 14),
-            markView.topAnchor.constraint(equalTo: roleHeader.topAnchor)
-        ])
+        // The role band is the label itself. A hidden arranged subview leaves
+        // the stack, so a row with no role label has no empty band and no
+        // extra gap. A nested stack with one hidden view keeps both.
+        stack.addArrangedSubview(roleLabel)
         copyButton.title = "Copy code"
         copyButton.bezelStyle = .texturedRounded
         copyButton.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
@@ -1647,7 +1770,7 @@ final class TranscriptTurnRowView: NSTableCellView {
         measureWidthConstraint.isActive = true
         stackTopConstraint.constant = MessageTypography.turnGap / 2
         stackBottomConstraint.constant = -MessageTypography.turnGap / 2
-        roleHeader.isHidden = false
+        roleLabel.isHidden = true
         answerView.selectedTextAttributes = [
             .backgroundColor: NSColor.selectedTextBackgroundColor,
             .foregroundColor: NSColor.selectedTextColor
@@ -1706,10 +1829,6 @@ final class TranscriptTurnRowView: NSTableCellView {
             + (isUser ? MessageTypography.outgoingBubblePaddingV : 0)
         stackTopConstraint.constant = band
         stackBottomConstraint.constant = -band
-        // An `NSStackView` with no visible arranged subview still contributes
-        // one spacing gap to its parent. Against two required equalities that
-        // gap compresses the answer view and clips its last line.
-        roleHeader.isHidden = isUser
         let indent = isHermes ? MessageTypography.hermesIndent : 0
         for constraint in bodyLeadingConstraints {
             constraint.constant = indent
@@ -1796,10 +1915,94 @@ final class TranscriptTurnRowView: NSTableCellView {
             metadataStack.isHidden = modelLabel.isHidden && reasoningLabel.isHidden
             metadataStack.alphaValue = metadataAlwaysVisible ? 1 : 0
         }
+        // The mark follows the bands, so the row aligns it after it sets which
+        // bands it shows.
+        if isHermes { alignMark() }
         // A row recycled from `configureLoading` keeps announcing "Loading
         // transcript row" until a configured row replaces the label.
         setAccessibilityLabel(turn.speaker.label)
         needsLayout = true
+    }
+
+    /// Puts the mark beside the first line of the turn's first band.
+    ///
+    /// The stack pins its own top to the row, and the first band the row shows
+    /// stands at that top. One constant therefore states the whole alignment.
+    /// A turn with reasoning or tools shows a disclosure band first. An answer
+    /// with code shows the copy band first. Every other turn shows the answer
+    /// band first. A constant costs one layout pass. A separate anchor for each
+    /// band would need constraint activation on every reuse.
+    private func alignMark() {
+        let lineCenter: CGFloat
+        if !reasoningButton.isHidden {
+            lineCenter = MarkGeometry.controlLineCenter(of: reasoningButton)
+        } else if !toolsButton.isHidden {
+            lineCenter = MarkGeometry.controlLineCenter(of: toolsButton)
+        } else if !copyButton.isHidden {
+            lineCenter = MarkGeometry.controlLineCenter(of: copyButton)
+        } else {
+            lineCenter = MarkGeometry.textLineCenter(font: firstAnswerFont())
+        }
+        let inset = MarkGeometry.topInset(lineCenter: lineCenter)
+        // A write to a constant invalidates the layout, and a row is
+        // reconfigured on every reuse during a scroll. Most rows resolve to the
+        // same inset, so the row writes only a changed value.
+        guard markTopConstraint.constant != inset else { return }
+        markTopConstraint.constant = inset
+    }
+
+    /// The font of the answer's first character.
+    ///
+    /// A turn can start with a heading, and a heading line is taller than a
+    /// body line. The attributed answer already carries the font, so the row
+    /// reads it instead of assuming the body font.
+    private func firstAnswerFont() -> NSFont {
+        let body = NSFont.preferredFont(forTextStyle: .body)
+        guard let storage = answerView.textStorage, storage.length > 0 else {
+            return body
+        }
+        return storage.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+            ?? body
+    }
+
+    /// The mark's box beside one line of text.
+    ///
+    /// The mark is a drawing, so it carries no text baseline. A square drawing
+    /// looks aligned when its box holds the cap height of the line beside it in
+    /// the centre. The capital letters are the ink that states where the line
+    /// is. The row finds the centre of that ink. The row then puts the centre
+    /// of the mark on it. Every value comes from the current text metrics, so
+    /// the mark follows a text-size change with no new number.
+    @MainActor
+    private enum MarkGeometry {
+        /// The mark's side, in points.
+        ///
+        /// The side plus a 6pt gap fills `hermesIndent` exactly, so the mark
+        /// stands in the gutter and never under the text of the turn. The
+        /// gutter is a fixed width, so the side is a fixed width as well. A
+        /// larger text size moves the mark's centre, not its size, and the
+        /// mark keeps the gutter it was drawn for.
+        static let side: CGFloat = 14
+
+        /// The distance from the top of a text band to the centre of the cap
+        /// height of its first line.
+        static func textLineCenter(font: NSFont) -> CGFloat {
+            font.ascender - font.capHeight / 2
+        }
+
+        /// The distance from the top of a control band to the centre of its
+        /// title.
+        ///
+        /// A disclosure band and a copy band hold one line each, so the centre
+        /// of the title is half the height the control asks for.
+        static func controlLineCenter(of control: NSControl) -> CGFloat {
+            control.intrinsicContentSize.height / 2
+        }
+
+        /// The mark's top inset, measured down from the top of the first band.
+        static func topInset(lineCenter: CGFloat) -> CGFloat {
+            max(0, (lineCenter - side / 2).rounded())
+        }
     }
 
     /// Re-resolves the bubble's colours after a system colour, appearance, or
@@ -1856,6 +2059,10 @@ final class TranscriptTurnRowView: NSTableCellView {
         view.isSelectable = true
         view.drawsBackground = false
         view.textContainer?.lineFragmentPadding = 0
+        // The first line starts at the top edge of the band. The mark takes its
+        // position from that edge. The measured row height counts the bands
+        // only. Neither may pay for an inset the band does not need.
+        view.textContainerInset = .zero
         view.textContainer?.widthTracksTextView = true
         view.textContainer?.heightTracksTextView = true
         view.isVerticallyResizable = false
@@ -2165,7 +2372,14 @@ private enum TranscriptTurnTextRenderer {
             }
         }
         let channels = (turn.reasoning == nil ? 0 : 1) + (turn.tools.isEmpty ? 0 : 1)
-        let fixedHeight = MessageTypography.roleLabelHeight
+        // An agent row has no role band. The mark stands in the gutter, beside
+        // the first line of the turn, and takes no band of its own. A system
+        // row shows a role label, so a system row keeps the band.
+        let roleBand = turn.speaker == .system
+            ? MessageTypography.roleLabelHeight
+            : 0
+        let fixedHeight = roleBand
+            + MessageTypography.agentMeasurementReserve
             + CGFloat(channels) * MessageTypography.disclosureHeight
             + MessageTypography.metadataFooterHeight
             + CGFloat(channels + 1) * MessageTypography.internalBlockGap
@@ -2281,10 +2495,15 @@ private enum TranscriptTurnTextRenderer {
             nil
         )
         let channels = (turn.reasoning == nil ? 0 : 1) + (turn.tools.isEmpty ? 0 : 1)
+        // The role band belongs to a system row only. See `provisionalHeight`.
+        let roleBand = turn.speaker == .system
+            ? MessageTypography.roleLabelHeight
+            : 0
         let height = max(
             MessageTypography.minimumTurnHeight,
             ceil(size.height)
-                + MessageTypography.roleLabelHeight
+                + roleBand
+                + MessageTypography.agentMeasurementReserve
                 + CGFloat(channels) * MessageTypography.disclosureHeight
                 + MessageTypography.metadataFooterHeight
                 + CGFloat(channels + 1) * MessageTypography.internalBlockGap

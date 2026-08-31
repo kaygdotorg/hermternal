@@ -18,6 +18,11 @@ enum MessageTypography {
     static let hermesIndent: CGFloat = 20
     static let internalBlockGap: CGFloat = 8
     static let turnGap: CGFloat = 24
+    /// The height of a system row's role label band.
+    ///
+    /// Only a system row shows a role label. An agent row states its speaker
+    /// with the mark in the gutter, beside the first line of the turn, and the
+    /// mark takes no band of its own.
     static let roleLabelHeight: CGFloat = 18
     static let disclosureHeight: CGFloat = 24
     static let metadataFooterHeight: CGFloat = 22
@@ -60,6 +65,22 @@ enum MessageTypography {
     /// The two round a final line's ascent differently by less than a point.
     /// One point cannot clip a descender and is invisible in the bubble.
     static let outgoingMeasurementSlack: CGFloat = 1
+
+    /// The reserve between the agent measurement and the rendered answer.
+    ///
+    /// The agent measurement runs off the main thread. It measures the raw
+    /// Markdown source in Helvetica 13, with no line spacing and no paragraph
+    /// spacing. The row then renders the parsed document in the body font, with
+    /// `bodyLineSpacing` on every line and `paragraphGap` after every
+    /// paragraph. The rendered text is therefore taller than the measurement.
+    /// This reserve holds that difference.
+    ///
+    /// The reserve is not exact. The difference grows with the number of lines
+    /// and paragraphs, and an exact figure needs the rendered text, which the
+    /// measurement pass does not build. The value is the reserve the transcript
+    /// has always held: it was named after the agent role band, which the mark
+    /// in the gutter replaced.
+    static let agentMeasurementReserve: CGFloat = 18
 
     static func headingTracking(_ level: Int) -> CGFloat {
         switch level {

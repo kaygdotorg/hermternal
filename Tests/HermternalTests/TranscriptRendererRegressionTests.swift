@@ -1,5 +1,6 @@
 import AppKit
 import HermternalCore
+import SwiftUI
 import Testing
 @testable import Hermternal
 
@@ -691,13 +692,21 @@ private final class TranscriptViewportHeightFixture:
 /// The table owns its row rectangles and its document height. The harness reads
 /// every coordinate back from the table, so the tests assume no row origin, no
 /// document height, and no inset that the resolved table style adds.
+///
+/// `topInset` is the transcript's own top content inset. It defaults to zero,
+/// which is the uninset arithmetic every other test here measures.
 @MainActor
 private struct TranscriptViewportHarness {
     let fixture: TranscriptViewportHeightFixture
     let table: BlockTranscriptTableView
     let scrollView: NSScrollView
 
-    init(heights: [CGFloat], viewportHeight: CGFloat, width: CGFloat = 700) {
+    init(
+        heights: [CGFloat],
+        viewportHeight: CGFloat,
+        width: CGFloat = 700,
+        topInset: CGFloat = 0
+    ) {
         fixture = TranscriptViewportHeightFixture(heights: heights)
         table = BlockTranscriptTableView()
         table.headerView = nil
@@ -720,6 +729,8 @@ private struct TranscriptViewportHarness {
         scrollView.hasHorizontalScroller = false
         scrollView.drawsBackground = false
         scrollView.documentView = table
+        scrollView.automaticallyAdjustsContentInsets = false
+        scrollView.contentInsets = NSEdgeInsets(top: topInset, left: 0, bottom: 0, right: 0)
         scrollView.tile()
         table.reloadData()
         fitDocumentHeight()
@@ -827,6 +838,303 @@ func rendererPinsStreamingEndAgainAfterHeightCorrection() {
     #expect(abs(harness.clip.bounds.origin.y - (pinned + growth)) < 0.5)
     #expect(abs(harness.clip.bounds.maxY - harness.documentHeight) < 0.5)
     #expect(TranscriptViewportAnchoring.isNearBottom(harness.table))
+}
+
+/// The deepest ink of the window's own toolbar controls, in points down from
+/// the physical window top.
+///
+/// Measured at true 2x on macOS 26.6.2: the New Chat and Reload group is 70pt
+/// wide and 35.5pt tall, 8pt down the window, so its bottom edge is 43.5pt
+/// down. It is opaque, and an outgoing bubble is trailing aligned, so the
+/// bubble travels straight under it.
+private let measuredToolbarControlDepth: CGFloat = 43.5
+
+@Test("the transcript's top dissolve is complete before the window's toolbar controls")
+@MainActor
+func transcriptTopEdgeDissolvesBeforeTheToolbarControls() throws {
+    // The premise: the clear zone covers the whole band the system lays its
+    // titlebar controls out in, not the height one control happens to have.
+    #expect(ChatTranscriptTopEdge.chromeDepth >= measuredToolbarControlDepth)
+    #expect(ChatTranscriptTopEdge.reach > ChatTranscriptTopEdge.chromeDepth)
+
+    let stops = ChatTranscriptTopEdge.ramp.stops
+    let clearZone = ChatTranscriptTopEdge.chromeDepth / ChatTranscriptTopEdge.reach
+    var previousLocation: CGFloat = 0
+    var previousAlpha: CGFloat = -1
+    for stop in stops {
+        let color = try #require(NSColor(stop.color).usingColorSpace(.sRGB))
+        // One continuous ramp: distance and ink only ever increase, so no
+        // pair of stops can invert into a band or a seam.
+        #expect(stop.location >= previousLocation)
+        #expect(color.alphaComponent >= previousAlpha)
+        // No ink where a native control can cut it. Two stops at zero alpha
+        // cannot interpolate to anything else between them, so this covers
+        // the whole clear zone rather than sampling it.
+        if stop.location <= clearZone {
+            #expect(color.alphaComponent == 0)
+        }
+        previousLocation = stop.location
+        previousAlpha = color.alphaComponent
+    }
+
+    // The ramp spans its whole view, and it ends opaque: `reach` is where a
+    // row is readable again.
+    #expect(stops.first?.location == 0)
+    let last = try #require(stops.last)
+    #expect(last.location == 1)
+    let opaque = try #require(NSColor(last.color).usingColorSpace(.sRGB))
+    #expect(opaque.alphaComponent == 1)
+
+    // The content inset places the DOCUMENT's first point at the ramp's
+    // opaque end, less the empty band every row opens with. The resolved
+    // table style adds a document inset of its own above row 0, so the first
+    // ink rests at or below `reach` and never above it.
+    #expect(
+        ChatTranscriptTopEdge.contentInset + MessageTypography.turnGap / 2
+            == ChatTranscriptTopEdge.reach
+    )
+    #expect(ChatTranscriptTopEdge.contentInset > measuredToolbarControlDepth)
+}
+
+@Test("the transcript surface installs the top edge's content inset")
+@MainActor
+func transcriptSurfaceInstallsTopEdgeContentInset() {
+    _ = NSApplication.shared
+    let table = BlockTranscriptTableView()
+    table.addTableColumn(NSTableColumn(identifier: .init("transcript")))
+    let container = BlockTranscriptContainerView(tableView: table)
+    let scrollView = container.scrollViewForTesting
+
+    // The automatic insets would derive this from a safe area the hosting
+    // boundary clears, and overwrite it with zero.
+    #expect(!scrollView.automaticallyAdjustsContentInsets)
+    #expect(scrollView.contentInsets.top == ChatTranscriptTopEdge.contentInset)
+    #expect(scrollView.scrollerInsets.top == ChatTranscriptTopEdge.contentInset)
+    // Only the top edge. The composer owns the bottom one.
+    #expect(scrollView.contentInsets.bottom == 0)
+}
+
+@Test("insetted transcript content rests below the chrome and keeps its anchor and its end")
+@MainActor
+func transcriptContentInsetKeepsRestingRowsOutOfTheChrome() throws {
+    _ = NSApplication.shared
+    let inset = ChatTranscriptTopEdge.contentInset
+    let harness = TranscriptViewportHarness(
+        heights: Array(repeating: 100, count: 40),
+        viewportHeight: 400,
+        topInset: inset
+    )
+    #expect(harness.documentHeight > harness.clip.bounds.height + 3000)
+    // The premise of the ramp: a content inset adds scroll RANGE, it does not
+    // shorten the viewport, so rows still travel under the chrome and have
+    // something to dissolve into on the way.
+    #expect(abs(harness.clip.bounds.height - 400) < 0.5)
+
+    // The top of the scrollable range is one inset ABOVE the document's first
+    // point, so the first row comes to rest below the chrome, not under it.
+    harness.scroll(to: -inset)
+    #expect(abs(harness.clip.bounds.origin.y + inset) < 0.5)
+    // The row's SCREEN depth is measured from the clip origin, not from the
+    // row rectangle: `rect(ofRow:)` is in document coordinates, and the
+    // resolved table style adds its own inset above row 0 — 10pt, measured on
+    // the Mac. A resting row therefore sits at the content inset PLUS that
+    // document inset, so it can only ever be lower than the ramp, never
+    // inside it.
+    let documentTopInset = harness.rowOrigin(0)
+    #expect(documentTopInset >= 0)
+    let restingDepth = harness.rowOrigin(0) - harness.clip.bounds.origin.y
+    #expect(abs(restingDepth - (inset + documentTopInset)) < 0.5)
+    #expect(restingDepth >= inset - 0.5)
+    #expect(restingDepth > measuredToolbarControlDepth)
+    // The first ink of that row is at or below the ramp's opaque end, so no
+    // part of a resting turn is inside the dissolve.
+    #expect(
+        restingDepth + MessageTypography.turnGap / 2
+            >= ChatTranscriptTopEdge.reach - 0.5
+    )
+
+    // A height correction while parked at the top must not slide the document
+    // up under the chrome. The policy clamps at the top of the range, and the
+    // adapter is what tells it where that top now is.
+    let parked = try #require(TranscriptViewportAnchoring.anchor(in: harness.table))
+    #expect(parked.ordinal == 0)
+    harness.fixture.heights[0] += 40
+    harness.correctHeights(IndexSet(integer: 0))
+    TranscriptViewportAnchoring.restore(parked, in: harness.table)
+    #expect(abs(harness.clip.bounds.origin.y + inset) < 0.5)
+
+    // A reader in the middle still keeps the anchor across a correction above
+    // the viewport, exactly as an uninset transcript does.
+    let readerOrigin = harness.rowOrigin(12) + 30
+    harness.scroll(to: readerOrigin)
+    let anchor = try #require(TranscriptViewportAnchoring.anchor(in: harness.table))
+    #expect(anchor.ordinal == 12)
+    let growth: CGFloat = 250
+    for row in 0..<5 { harness.fixture.heights[row] += 50 }
+    harness.correctHeights(IndexSet(integersIn: 0..<5))
+    TranscriptViewportAnchoring.restore(anchor, in: harness.table)
+    #expect(abs(harness.clip.bounds.origin.y - (readerOrigin + growth)) < 0.5)
+
+    // The streaming end is untouched: the last row lands on the bottom edge
+    // of the viewport, not one inset short of it.
+    TranscriptViewportAnchoring.pinToBottom(harness.table)
+    #expect(abs(harness.clip.bounds.maxY - harness.documentHeight) < 0.5)
+    #expect(TranscriptViewportAnchoring.isNearBottom(harness.table))
+
+    // A row arriving from above lands in the READABLE viewport.
+    // `scrollRowToVisible` would align it with the clip view's own top edge,
+    // which is the physical window top. This aligns the ROW rectangle with the
+    // readable top, so the depth here is the content inset exactly, with no
+    // document inset above it.
+    TranscriptViewportAnchoring.scrollRowIntoView(0, in: harness.table)
+    #expect(abs(harness.clip.bounds.origin.y - (harness.rowOrigin(0) - inset)) < 0.5)
+    #expect(abs((harness.rowOrigin(0) - harness.clip.bounds.origin.y) - inset) < 0.5)
+}
+
+@Test("a transcript shorter than its viewport rests below the chrome")
+@MainActor
+func shortTranscriptRestsBelowTheChrome() throws {
+    _ = NSApplication.shared
+    let inset = ChatTranscriptTopEdge.contentInset
+    let harness = TranscriptViewportHarness(
+        heights: [100, 100],
+        viewportHeight: 400,
+        topInset: inset
+    )
+    #expect(harness.documentHeight < harness.clip.bounds.height)
+
+    // One short chat is the launch case, and a document that cannot scroll
+    // must still start below the chrome rather than under it.
+    TranscriptViewportAnchoring.pinToBottom(harness.table)
+    #expect(abs(harness.clip.bounds.origin.y + inset) < 0.5)
+    let documentTopInset = harness.rowOrigin(0)
+    let restingDepth = harness.rowOrigin(0) - harness.clip.bounds.origin.y
+    #expect(abs(restingDepth - (inset + documentTopInset)) < 0.5)
+    #expect(restingDepth >= inset - 0.5)
+    #expect(restingDepth > measuredToolbarControlDepth)
+    #expect(
+        restingDepth + MessageTypography.turnGap / 2
+            >= ChatTranscriptTopEdge.reach - 0.5
+    )
+    // The anchor a correction would restore is the resting one: the first row,
+    // at the clip origin the inset defines.
+    let parked = try #require(TranscriptViewportAnchoring.anchor(in: harness.table))
+    #expect(parked.ordinal == 0)
+    #expect(abs(parked.documentOrigin + inset) < 0.5)
+    #expect(TranscriptViewportAnchoring.isNearBottom(harness.table))
+}
+
+@Test("a turn taller than the readable viewport lands at the readable top")
+@MainActor
+func oversizedJumpTargetLandsAtTheReadableTop() {
+    _ = NSApplication.shared
+    let inset = ChatTranscriptTopEdge.contentInset
+    let harness = TranscriptViewportHarness(
+        heights: [100, 100, 100, 500] + Array(repeating: 100, count: 20),
+        viewportHeight: 400,
+        topInset: inset
+    )
+    let readable = harness.clip.bounds.height - inset
+    let tall = harness.table.rect(ofRow: 3)
+
+    // The premise: this turn cannot be brought inside the readable viewport at
+    // all, and from the top of the transcript it lies BELOW the viewport,
+    // which is the branch that bottom-aligns.
+    #expect(tall.height > readable)
+    harness.scroll(to: -inset)
+    #expect(tall.minY >= harness.clip.bounds.origin.y + inset)
+    #expect(tall.maxY > harness.clip.bounds.maxY)
+
+    TranscriptViewportAnchoring.scrollRowIntoView(3, in: harness.table)
+
+    // Its beginning lands at the readable top, below the chrome. Bottom
+    // alignment would have put that beginning at a depth of
+    // 400 - 500 = -100pt: a whole turn's first lines under the toolbar.
+    let depth = harness.rowOrigin(3) - harness.clip.bounds.origin.y
+    #expect(abs(depth - inset) < 0.5)
+    #expect(depth > measuredToolbarControlDepth)
+    #expect(abs(harness.clip.bounds.origin.y - (tall.minY - inset)) < 0.5)
+    // The turn still runs past the bottom of the viewport, because it cannot
+    // fit; that is the case, not a failure of it.
+    #expect(harness.clip.bounds.maxY < tall.maxY)
+
+    // A turn that DOES fit still bottom-aligns, so the ordinary jump is
+    // unchanged.
+    let fitting = harness.table.rect(ofRow: 10)
+    #expect(fitting.height < readable)
+    #expect(fitting.maxY > harness.clip.bounds.maxY)
+    TranscriptViewportAnchoring.scrollRowIntoView(10, in: harness.table)
+    #expect(abs(harness.clip.bounds.maxY - fitting.maxY) < 0.5)
+    #expect(fitting.minY - harness.clip.bounds.origin.y > inset)
+}
+
+@Test("retargeting a tall turn leaves a reader in the middle of it alone")
+@MainActor
+func retargetedTallTurnKeepsTheReaderInPlace() {
+    _ = NSApplication.shared
+    let inset = ChatTranscriptTopEdge.contentInset
+    let harness = TranscriptViewportHarness(
+        heights: [100, 100, 100, 500] + Array(repeating: 100, count: 20),
+        viewportHeight: 400,
+        topInset: inset
+    )
+    let readable = harness.clip.bounds.height - inset
+    let tall = harness.table.rect(ofRow: 3)
+    #expect(tall.height > readable)
+
+    // The reader is 200pt into the turn: its first line is above the readable
+    // top, and from that edge down there is nothing but this turn.
+    let midTurn = tall.minY + 200 - inset
+    harness.scroll(to: midTurn)
+    #expect(abs(harness.clip.bounds.origin.y - midTurn) < 0.5)
+    #expect(tall.minY < harness.clip.bounds.origin.y + inset)
+    #expect(tall.maxY > harness.clip.bounds.origin.y + inset)
+
+    // The renderer re-runs the same target for every publication that keeps
+    // it. A turn this tall can never be contained in the readable viewport, so
+    // re-aligning it would drag the reader back to its first line.
+    TranscriptViewportAnchoring.scrollRowIntoView(3, in: harness.table)
+    #expect(abs(harness.clip.bounds.origin.y - midTurn) < 0.5)
+
+    // The boundary of that no-op. One body line of the turn's ink is the least
+    // that is worth staying for; a row rectangle ends with the same empty
+    // half-gap it begins with, so the ink ends there, not at `maxY`.
+    let inkBottom = tall.maxY - MessageTypography.turnGap / 2
+    let oneLine = inkBottom - MessageTypography.bodyLineHeight - inset
+    harness.scroll(to: oneLine)
+    #expect(abs(harness.clip.bounds.origin.y - oneLine) < 0.5)
+    TranscriptViewportAnchoring.scrollRowIntoView(3, in: harness.table)
+    #expect(abs(harness.clip.bounds.origin.y - oneLine) < 0.5)
+
+    // One point further on there is less than a line left, so the turn is
+    // brought back to its beginning even though it still crosses the readable
+    // top. Coverage alone would have kept the reader here, looking at a line
+    // and a half of nothing.
+    harness.scroll(to: oneLine + 1)
+    TranscriptViewportAnchoring.scrollRowIntoView(3, in: harness.table)
+    #expect(abs((harness.rowOrigin(3) - harness.clip.bounds.origin.y) - inset) < 0.5)
+
+    // The counterexample itself: only the trailing half-gap crosses the
+    // readable top, so every glyph of the turn is already above the viewport.
+    let gapOnly = inkBottom + MessageTypography.turnGap / 2 / 2 - inset
+    harness.scroll(to: gapOnly)
+    #expect(tall.minY <= harness.clip.bounds.origin.y + inset)
+    #expect(tall.maxY > harness.clip.bounds.origin.y + inset)
+    TranscriptViewportAnchoring.scrollRowIntoView(3, in: harness.table)
+    #expect(abs((harness.rowOrigin(3) - harness.clip.bounds.origin.y) - inset) < 0.5)
+
+    // Back to the middle for the fitting-row contrast below.
+    harness.scroll(to: midTurn)
+
+    // The no-op belongs to the tall turn alone: a turn that fits and is only
+    // PARTLY readable is still aligned into the readable viewport.
+    let partly = harness.table.rect(ofRow: 4)
+    #expect(partly.height < readable)
+    #expect(partly.minY < harness.clip.bounds.maxY)
+    #expect(partly.maxY > harness.clip.bounds.maxY)
+    TranscriptViewportAnchoring.scrollRowIntoView(4, in: harness.table)
+    #expect(abs(harness.clip.bounds.maxY - partly.maxY) < 0.5)
+    #expect(partly.minY - harness.clip.bounds.origin.y > inset)
 }
 
 /// A page store that holds every read until a test releases it.
@@ -1070,4 +1378,312 @@ func rendererIgnoresPageCompletionFromSupersededGeneration() async throws {
 @MainActor
 private func clipOrigin(of table: NSTableView) -> CGFloat {
     table.enclosingScrollView?.contentView.bounds.origin.y ?? 0
+}
+
+/// One laid-out agent row, and the superview that publishes its width.
+///
+/// `measureWidthConstraint` relates the stack to the row's own `widthAnchor`.
+/// A row with no superview has no layout engine to publish that width from its
+/// frame. The caller keeps the root alive for as long as it reads frames.
+@MainActor
+private func laidOutAgentRow(
+    turn: TranscriptTurn,
+    document: MarkdownDocument,
+    rowWidth: CGFloat = 780,
+    rowHeight: CGFloat,
+    reasoningExpanded: Bool = false,
+    toolsExpanded: Bool = false
+) -> (root: NSView, row: TranscriptTurnRowView) {
+    let root = NSView(frame: NSRect(x: 0, y: 0, width: rowWidth, height: rowHeight + 40))
+    let row = TranscriptTurnRowView(
+        frame: NSRect(x: 0, y: 0, width: rowWidth, height: rowHeight)
+    )
+    root.addSubview(row)
+    row.configure(
+        turn: turn,
+        document: document,
+        reasoningExpanded: reasoningExpanded,
+        toolsExpanded: toolsExpanded,
+        showsMetadata: true,
+        findQuery: "",
+        onReasoning: { _ in },
+        onTools: { _ in },
+        onCopyCode: { _ in }
+    )
+    row.layoutSubtreeIfNeeded()
+    return (root, row)
+}
+
+/// The measured height the renderer gives one agent turn.
+private func measuredAgentRowHeight(
+    turn: TranscriptTurn,
+    document: MarkdownDocument,
+    availableWidth: CGFloat = 780,
+    reasoningExpanded: Bool = false,
+    toolsExpanded: Bool = false
+) -> CGFloat {
+    TranscriptRendererTestSeam.measuredLayout(
+        for: turn,
+        document: document,
+        width: TranscriptRendererTestSeam.effectiveWidth(
+            for: turn,
+            availableWidth: availableWidth
+        ),
+        reasoningExpanded: reasoningExpanded,
+        toolsExpanded: toolsExpanded
+    ).height
+}
+
+/// A row is not flipped, so the top of a band is the `maxY` of its frame.
+@MainActor
+private func bandRect(_ view: NSView, in row: TranscriptTurnRowView) -> NSRect {
+    row.convert(view.bounds, from: view)
+}
+
+@Test("the mark stands beside the first line of a wrapped assistant answer")
+@MainActor
+func markStandsBesideTheFirstLineOfAWrappedAnswer() {
+    _ = NSApplication.shared
+    let answer = String(
+        repeating: "A real assistant paragraph that wraps at the reading measure. ",
+        count: 8
+    )
+    let document = MarkdownDocument.parse(answer).document
+    let turn = TranscriptTurn(
+        id: "wrapped",
+        speaker: .hermes,
+        model: "hermes-1",
+        answer: answer
+    )
+    let height = measuredAgentRowHeight(turn: turn, document: document)
+    let laidOut = laidOutAgentRow(turn: turn, document: document, rowHeight: height)
+    let row = laidOut.row
+    let mark = bandRect(row.markViewForTesting, in: row)
+    let answerBand = bandRect(row.answerViewForTesting, in: row)
+    let band = MessageTypography.turnGap / 2
+
+    #expect(!row.markViewForTesting.isHidden)
+    // The premise. The answer holds several lines, so a mark placed by the
+    // band's centre would stand lines away from the first one.
+    #expect(answerBand.height >= 3 * MessageTypography.bodyLineHeight)
+    // The answer is the first band of the turn. The mark takes no band of its
+    // own, so nothing stands between the row's top and the first line.
+    #expect(abs((row.bounds.maxY - answerBand.maxY) - band) < 0.5)
+
+    // The mark stands in the gutter, and the text starts one indent to its
+    // right.
+    #expect(abs(mark.width - mark.height) < 0.5)
+    #expect(mark.width < MessageTypography.hermesIndent)
+    #expect(mark.maxX <= answerBand.minX)
+    #expect(abs((answerBand.minX - mark.minX) - MessageTypography.hermesIndent) < 0.5)
+
+    // The mark's box holds the cap height of the first line in its centre.
+    let font = NSFont.preferredFont(forTextStyle: .body)
+    let capCentre = answerBand.maxY - (font.ascender - font.capHeight / 2)
+    #expect(abs(mark.midY - capCentre) <= 1)
+    // The whole mark stands inside the first line, not above it and not on the
+    // second one.
+    #expect(mark.maxY <= answerBand.maxY + 0.5)
+    #expect(mark.minY >= answerBand.maxY - (font.ascender - font.descender) - 0.5)
+
+    // The mark's depth is the turn's, never the row's. A taller row holds the
+    // same turn at the same depth.
+    let taller = laidOutAgentRow(
+        turn: turn,
+        document: document,
+        rowHeight: height + 240
+    )
+    let tallerMark = bandRect(taller.row.markViewForTesting, in: taller.row)
+    #expect(
+        abs((taller.row.bounds.maxY - tallerMark.maxY) - (row.bounds.maxY - mark.maxY))
+            < 0.5
+    )
+}
+
+@Test("the mark stands beside the first band when reasoning and tools carry height")
+@MainActor
+func markStandsBesideTheFirstBandOfAChannelledTurn() {
+    _ = NSApplication.shared
+    let answer = String(
+        repeating: "The assistant answers under its reasoning and its tools. ",
+        count: 8
+    )
+    let document = MarkdownDocument.parse(answer).document
+    let turn = TranscriptTurn(
+        id: "channels",
+        speaker: .hermes,
+        model: "hermes-1",
+        reasoning: TranscriptReasoning(
+            id: "reasoning",
+            text: String(repeating: "a line of real reasoning\n", count: 20),
+            effort: "high"
+        ),
+        tools: [
+            TranscriptToolRun(
+                id: "tool",
+                name: "shell",
+                input: "ls -la",
+                output: String(repeating: "a line of real output\n", count: 10)
+            )
+        ],
+        answer: answer
+    )
+    let height = measuredAgentRowHeight(
+        turn: turn,
+        document: document,
+        reasoningExpanded: true,
+        toolsExpanded: true
+    )
+    let laidOut = laidOutAgentRow(
+        turn: turn,
+        document: document,
+        rowHeight: height,
+        reasoningExpanded: true,
+        toolsExpanded: true
+    )
+    let row = laidOut.row
+    let mark = bandRect(row.markViewForTesting, in: row)
+    let reasoningBand = bandRect(row.reasoningButtonForTesting, in: row)
+    let answerBand = bandRect(row.answerViewForTesting, in: row)
+    let band = MessageTypography.turnGap / 2
+
+    // The premise. Two expanded channels stand between the top of the turn and
+    // its answer, and the row is tall.
+    #expect(row.bounds.height > 300)
+    #expect(answerBand.maxY < mark.minY - 40)
+    // The disclosure band is the first band of the turn, and it starts at the
+    // row's top band.
+    #expect(abs((row.bounds.maxY - reasoningBand.maxY) - band) < 0.5)
+
+    // The mark marks that band, not the middle of the row. The band is a
+    // borderless footnote button, 13pt tall, so the band is shorter than the
+    // 14pt mark. The mark therefore overhangs the band, and the contract is the
+    // optical centre and not containment. The residual is the half point an
+    // integral position costs, because the ideal inset here is -0.5pt.
+    #expect(abs(mark.midY - reasoningBand.midY) <= 1)
+    // The mark stays out of the gap between two turns.
+    #expect(mark.maxY <= row.bounds.maxY - band + 0.5)
+    #expect(
+        row.bounds.maxY - mark.maxY
+            <= band + MessageTypography.disclosureHeight
+    )
+    #expect(mark.midY > row.bounds.midY)
+
+    // The mark's depth is the turn's, never the row's.
+    let taller = laidOutAgentRow(
+        turn: turn,
+        document: document,
+        rowHeight: height + 240,
+        reasoningExpanded: true,
+        toolsExpanded: true
+    )
+    let tallerMark = bandRect(taller.row.markViewForTesting, in: taller.row)
+    #expect(
+        abs((taller.row.bounds.maxY - tallerMark.maxY) - (row.bounds.maxY - mark.maxY))
+            < 0.5
+    )
+}
+
+@Test("a reused row moves the mark to the band the new turn shows")
+@MainActor
+func reusedRowMovesTheMarkToTheBandTheNewTurnShows() {
+    _ = NSApplication.shared
+    let answer = "One assistant line."
+    let document = MarkdownDocument.parse(answer).document
+    let channelled = TranscriptTurn(
+        id: "channels",
+        speaker: .hermes,
+        model: "hermes-1",
+        reasoning: TranscriptReasoning(id: "reasoning", text: "collapsed detail"),
+        answer: answer
+    )
+    let plain = TranscriptTurn(
+        id: "plain",
+        speaker: .hermes,
+        model: "hermes-1",
+        answer: answer
+    )
+    let laidOut = laidOutAgentRow(
+        turn: channelled,
+        document: document,
+        rowHeight: measuredAgentRowHeight(turn: channelled, document: document)
+    )
+    let row = laidOut.row
+    let disclosureBand = bandRect(row.reasoningButtonForTesting, in: row)
+    let markOnDisclosure = bandRect(row.markViewForTesting, in: row)
+    // The mark centres on the disclosure band it stands beside.
+    #expect(abs(markOnDisclosure.midY - disclosureBand.midY) <= 1)
+
+    row.configure(
+        turn: plain,
+        document: document,
+        reasoningExpanded: false,
+        toolsExpanded: false,
+        showsMetadata: true,
+        findQuery: "",
+        onReasoning: { _ in },
+        onTools: { _ in },
+        onCopyCode: { _ in }
+    )
+    row.layoutSubtreeIfNeeded()
+    let markOnAnswer = bandRect(row.markViewForTesting, in: row)
+    let answerBand = bandRect(row.answerViewForTesting, in: row)
+    let font = NSFont.preferredFont(forTextStyle: .body)
+
+    // The mark centres on the first line of the answer it now stands beside.
+    #expect(
+        abs(
+            markOnAnswer.midY
+                - (answerBand.maxY - (font.ascender - font.capHeight / 2))
+        ) <= 1
+    )
+    // A disclosure band and a body line are two heights, so the two states
+    // resolve to two insets. The row must move the mark, or the row is stale.
+    // The test states the movement and not its direction. The direction is a
+    // property of the two fonts: the 13pt disclosure band holds the mark 1pt
+    // higher than the body line holds it.
+    #expect(abs(markOnAnswer.maxY - markOnDisclosure.maxY) >= 0.5)
+
+    // The user's own turn shows no mark.
+    row.configure(
+        turn: TranscriptTurn(id: "outgoing", speaker: .me, answer: answer),
+        document: document,
+        reasoningExpanded: false,
+        toolsExpanded: false,
+        showsMetadata: true,
+        findQuery: "",
+        outgoingTextWidth: 120,
+        onReasoning: { _ in },
+        onTools: { _ in },
+        onCopyCode: { _ in }
+    )
+    row.layoutSubtreeIfNeeded()
+    #expect(row.markViewForTesting.isHidden)
+}
+
+@Test("an agent row measures no role band and a system row keeps one")
+func agentRowMeasuresNoRoleBand() {
+    let answer = String(repeating: "a measured assistant paragraph. ", count: 20)
+    let document = MarkdownDocument.parse(answer).document
+    let agent = TranscriptTurn(id: "agent", speaker: .hermes, answer: answer)
+    let system = TranscriptTurn(id: "system", speaker: .system, answer: answer)
+    let width: CGFloat = 340
+    let agentHeight = TranscriptRendererTestSeam.measuredLayout(
+        for: agent,
+        document: document,
+        width: width
+    ).height
+    let systemHeight = TranscriptRendererTestSeam.measuredLayout(
+        for: system,
+        document: document,
+        width: width
+    ).height
+
+    // The floor must not answer for the chain.
+    #expect(agentHeight > MessageTypography.minimumTurnHeight)
+    // Only the system row shows a role label, so only the system row measures
+    // the band. Both rows keep the reserve between the measurement and the
+    // rendered text. The two rows are measured at one width, because the agent
+    // width holds the gutter the mark stands in and the system width does not.
+    #expect(systemHeight - agentHeight == MessageTypography.roleLabelHeight)
 }
