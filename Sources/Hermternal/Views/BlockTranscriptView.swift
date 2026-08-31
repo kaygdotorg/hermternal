@@ -356,6 +356,8 @@ struct BlockTranscriptView: NSViewRepresentable {
         private var pageTasks: [Int: Task<Void, Never>] = [:]
         private var locateTask: Task<Void, Never>?
         private var generation = 0
+        /// Session identity for the painted transcript. Generation is not part
+        /// of this key: a store attach for the same chat is not a new route.
         private var routeKey = "none"
         private var revision: UInt64 = 0
         private var isReadOnly = false
@@ -416,6 +418,7 @@ struct BlockTranscriptView: NSViewRepresentable {
             let wasNearBottom = isNearBottom()
             container.onPaint = input.onPaint
             container.resetPaint()
+            let previousStore = store
             self.store = input.store
             self.route = input.route
             self.summary = input.summary
@@ -428,10 +431,15 @@ struct BlockTranscriptView: NSViewRepresentable {
             self.onCopyCode = input.onCopyCode
             self.showsMetadata = input.showsMetadata
 
-            let nextRouteKey = input.route.map {
-                "\($0.sessionID):\($0.generation)"
-            } ?? "none"
+            let nextRouteKey = input.route?.sessionID ?? "none"
+            // Keep painted published-tail rows when the paged store arrives
+            // for this same session. Generation is not identity.
+            let attachingStoreToPaintedSession = previousStore == nil
+                && input.store != nil
+                && !loadedTurns.isEmpty
+                && (routeKey == "none" || routeKey == nextRouteKey)
             let routeChanged = nextRouteKey != routeKey
+                && !attachingStoreToPaintedSession
             let revisionChanged = revision != input.revision
             if routeChanged {
                 generation &+= 1
@@ -542,9 +550,11 @@ struct BlockTranscriptView: NSViewRepresentable {
                 toolsExpanded: expandedTools.contains(loaded.turn.id)
             )
             // The measured fitting width, so a short outgoing bubble hugs its
-            // text. Until the measurement lands the row renders at the cap for
-            // this table width, and that is the width the measurement itself
-            // will be made at, so the bubble never steps between two measures.
+            // text. The cache is the hug when the detached pass has landed.
+            // Until then this pass measures with the same framesetter, against
+            // the table's cap, so the first paint already hugs and does not
+            // open at the column cap. `configure` still measures when a caller
+            // passes nothing.
             let cap = TranscriptTurnTextRenderer.effectiveWidth(
                 for: loaded.turn,
                 availableWidth: tableView.bounds.width
@@ -554,7 +564,15 @@ struct BlockTranscriptView: NSViewRepresentable {
                 turn: loaded.turn,
                 effectiveWidth: cap,
                 disclosure: disclosure
-            )?.textWidth ?? cap
+            )?.textWidth ?? (
+                loaded.turn.speaker == .me
+                    ? TranscriptTurnTextRenderer.fittingOutgoingTextWidth(
+                        document: document,
+                        answer: loaded.turn.answer,
+                        cap: cap
+                    )
+                    : nil
+            )
             view.configure(
                 turn: loaded.turn,
                 document: document,
@@ -2081,17 +2099,33 @@ final class TranscriptTurnRowView: NSTableCellView {
         columnTrailingConstraint.isActive = !isUser
         userTrailingConstraint.isActive = isUser
         userMaxWidthConstraint.isActive = isUser
+        // The measured fitting width, so a short bubble hugs its text on first
+        // layout. The caller may pass a cached hug or a test pin. When it
+        // passes nothing, this pass measures with the same framesetter as the
+        // detached height pass, before the 998 constraint is active, so the
+        // bubble never opens at the column cap and then snaps. A frame is
+        // deliberately not the only cap: `configure` can run before the table
+        // gives this row its width, and a measure taken from a 0pt frame would
+        // lay the bubble out at 1pt. The standard measure's widest text is
+        // then the framesetter cap, and the 999 column cap still outranks it.
+        if isUser {
+            let cap: CGFloat
+            if bounds.width > 1 {
+                cap = TranscriptTurnTextRenderer.effectiveWidth(
+                    for: turn,
+                    availableWidth: bounds.width
+                )
+            } else {
+                cap = MessageTypography.widestStandardOutgoingText
+            }
+            userTextWidthConstraint.constant = outgoingTextWidth
+                ?? TranscriptTurnTextRenderer.fittingOutgoingTextWidth(
+                    document: document,
+                    answer: turn.answer,
+                    cap: cap
+                )
+        }
         userTextWidthConstraint.isActive = isUser
-        // The measured fitting width, or the standard measure's widest text
-        // until the measurement lands. The renderer hands this row the cap for
-        // the current table width, so the fallback is only for a caller that
-        // has none. Either value meets the cap above, which is column-relative,
-        // so a wide window cannot widen a bubble past the column and a one-word
-        // bubble still hugs its text. A frame is deliberately not read here:
-        // `configure` runs before the table gives this row its width, and a
-        // measure taken from a 0pt frame would lay the bubble out at 1pt.
-        userTextWidthConstraint.constant = outgoingTextWidth
-            ?? MessageTypography.widestStandardOutgoingText
         // The bubble's padding sits inside the same row band an agent row uses,
         // so both speakers keep one turn rhythm and consecutive bubbles stay
         // exactly `turnGap` apart.
@@ -2623,6 +2657,29 @@ private enum TranscriptTurnTextRenderer {
             textHeight: CGFloat(lineCount)
                 * (MessageTypography.bodyLineHeight + MessageTypography.bodyLineSpacing)
         )
+    }
+
+    /// The framesetter's fitting width for an outgoing answer, never wider
+    /// than `cap`.
+    ///
+    /// `configure` needs this on the first pass, before the detached
+    /// measurement lands. Colour is not a metric. The same framesetter as
+    /// `outgoingLayout` so a short bubble hugs its text on first layout and
+    /// does not snap when the cache later repeats the number.
+    static func fittingOutgoingTextWidth(
+        document: MarkdownDocument?,
+        answer: String,
+        cap: CGFloat
+    ) -> CGFloat {
+        let width = max(1, cap)
+        let attributed: NSAttributedString
+        if let document {
+            attributed = attributedAnswer(document, foreground: .unstyled)
+        } else {
+            attributed = plainAnswer(answer, foreground: .unstyled)
+        }
+        let size = measuredText(attributed, width: width)
+        return min(width, ceil(size.width))
     }
 
     /// Measures one row off the main thread.

@@ -137,10 +137,11 @@ enum MessageTypography {
 
     /// The widest outgoing text the standard measure holds.
     ///
-    /// A row that has no measurement yet and no cap from its caller lays out at
-    /// this width, and its column cap trims it on a narrower window. It is not
-    /// the widest text the transcript can show: the full measure has no constant
-    /// answer, because the window decides it.
+    /// A first configure with no row width yet uses this as the framesetter
+    /// cap, then hugs the text inside it. The 999 column cap still trims the
+    /// result on a narrower window. It is not the widest text the transcript
+    /// can show: the full measure has no constant answer, because the window
+    /// decides it.
     static let widestStandardOutgoingText: CGFloat =
         outgoingTextMeasure(in: readingMeasure)
 

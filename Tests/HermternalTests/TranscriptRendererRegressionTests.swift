@@ -288,6 +288,92 @@ func cachedPublishedTailPaintsWithoutLoadingPlaceholder() {
     coordinator.dismantle(container: container)
 }
 
+@Test("store attach keeps painted published-tail rows for the same session")
+@MainActor
+func storeAttachKeepsPaintedPublishedTailRowsForTheSameSession() async throws {
+    _ = NSApplication.shared
+    let messages = (0..<4).map { index in
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: Int64(index))),
+            role: index.isMultiple(of: 2) ? .user : .assistant,
+            text: "cached \(index)"
+        )
+    }
+    let coordinator = BlockTranscriptView.Coordinator()
+    let container = coordinator.makeContainer()
+    let root = attachedTranscriptRoot(container)
+    coordinator.update(
+        container: container,
+        input: TranscriptRendererInput(
+            store: nil,
+            route: nil,
+            summary: nil,
+            revision: 0,
+            isReadOnly: false,
+            isStreaming: false,
+            findQuery: "",
+            pendingMessageID: nil,
+            findMessageID: nil,
+            showsMetadata: false,
+            publishedTail: messages,
+            onCopyCode: { _ in },
+            onPaint: { _ in }
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    let table = container.tableView
+    let paintedRows = table.numberOfRows
+    #expect(paintedRows > 0)
+    let painted = try #require(
+        table.view(atColumn: 0, row: 0, makeIfNecessary: true)
+            as? TranscriptTurnRowView
+    )
+    let paintedLabel = painted.accessibilityLabel()
+    #expect(paintedLabel != "Loading transcript row")
+
+    // Hold the first store page. Teardown would show Loading placeholders
+    // at the summary count before that page could land.
+    let store = HeldTranscriptPageStore(
+        page: TranscriptTurnPage(
+            turns: [TranscriptTurn(id: "stale", speaker: .hermes, answer: "from store")],
+            startOrdinal: 0,
+            nextOrdinal: 1,
+            totalTurnCount: 128,
+            hasMore: false
+        )
+    )
+    coordinator.update(
+        container: container,
+        input: TranscriptRendererInput(
+            store: store,
+            route: TranscriptRoute(sessionID: "restored-chat", generation: 7),
+            summary: TranscriptSummary(rowCount: 128, messageCount: 128),
+            revision: 1,
+            isReadOnly: false,
+            isStreaming: false,
+            findQuery: "",
+            pendingMessageID: nil,
+            findMessageID: nil,
+            showsMetadata: false,
+            publishedTail: messages,
+            onCopyCode: { _ in },
+            onPaint: { _ in }
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    table.layoutSubtreeIfNeeded()
+    #expect(table.numberOfRows == paintedRows)
+    let attached = try #require(
+        table.view(atColumn: 0, row: 0, makeIfNecessary: false)
+            as? TranscriptTurnRowView
+    )
+    #expect(attached === painted)
+    #expect(attached.accessibilityLabel() == paintedLabel)
+    #expect(attached.accessibilityLabel() != "Loading transcript row")
+    coordinator.dismantle(container: container)
+    await store.releaseAllReads()
+}
+
 @Test("renderer maps viewport inputs through the Core policy")
 func rendererMapsViewportInputsThroughCorePolicy() {
     #expect(
@@ -564,17 +650,27 @@ func rendererRowsKeepDocumentWidthThroughTableLayoutAndResize() throws {
         ) < 1
     )
     #expect(initialAssistantTextWidth < initialTableWidth - 200)
-    // An outgoing row is capped at the content column, less the bubble's own
-    // box, and with no measurement yet it lays out at that cap.
-    #expect(
-        abs(
-            userRow.answerViewForTesting.bounds.width
-                - MessageTypography.widestStandardOutgoingText
-        ) < 1
+    // An outgoing row hugs its text on first layout. The column cap is the
+    // ceiling, not the first width.
+    let userTurn = TranscriptTurn(
+        id: "user",
+        speaker: .me,
+        answer: "User messages also keep their readable trailing-aligned text width."
     )
+    let userCap = MessageTypography.outgoingTextMeasure(
+        in: MessageTypography.contentColumn(in: initialTableWidth)
+    )
+    let userHug = TranscriptRendererTestSeam.measuredLayout(
+        for: userTurn,
+        document: MarkdownDocument.parse(userTurn.answer).document,
+        width: userCap
+    ).textWidth
+    #expect(abs(userRow.answerViewForTesting.bounds.width - userHug) < 1)
+    #expect(userRow.answerViewForTesting.bounds.width < userCap - 50)
     // One measure for both speakers: the mark's gutter and the bubble's box
-    // take the same 36 and 35 points out of the same column.
-    #expect(abs(initialAssistantTextWidth - userRow.answerViewForTesting.bounds.width) <= 1)
+    // take the same 36 and 35 points out of the same column. The assistant
+    // fills that measure. The user hugs inside it.
+    #expect(abs(initialAssistantTextWidth - userCap) <= 1)
 
     // A window narrower than the readable measure: the column is the window
     // less its two gutters, so both speakers narrow with it.

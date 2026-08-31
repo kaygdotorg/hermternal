@@ -498,6 +498,92 @@ func tinyOutgoingBubbleHugsItsTextAndMeetsTheGutter() {
     }
 }
 
+@Test("first layout of a short outgoing message hugs its text")
+@MainActor
+func firstLayoutOfAShortOutgoingMessageHugsItsText() {
+    _ = NSApplication.shared
+    defer { MessageTypography.widthMode = .standard }
+
+    let short = TranscriptTurn(id: "short", speaker: .me, answer: "ok")
+    let long = TranscriptTurn(
+        id: "long",
+        speaker: .me,
+        answer: String(repeating: "wrapping outgoing message ", count: 40)
+    )
+
+    for mode in TranscriptWidthMode.allCases {
+        MessageTypography.widthMode = mode
+        for rowWidth in [CGFloat(780), 1_200] {
+            for turn in [short, long] {
+                let documents: [MarkdownDocument?] = [
+                    MarkdownDocument.parse(turn.answer).document,
+                    nil
+                ]
+                for document in documents {
+                    let root = NSView(
+                        frame: NSRect(x: 0, y: 0, width: rowWidth, height: 400)
+                    )
+                    let row = TranscriptTurnRowView(
+                        frame: NSRect(x: 0, y: 0, width: rowWidth, height: 140)
+                    )
+                    root.addSubview(row)
+
+                    let cap = TranscriptRendererTestSeam.effectiveWidth(
+                        for: turn,
+                        availableWidth: rowWidth
+                    )
+                    let hug = TranscriptRendererTestSeam.measuredLayout(
+                        for: turn,
+                        document: MarkdownDocument.parse(turn.answer).document,
+                        width: cap
+                    ).textWidth
+
+                    // No measured width. This is first configure, before the
+                    // async measurement pass lands.
+                    row.configure(
+                        turn: turn,
+                        document: document,
+                        reasoningExpanded: false,
+                        toolsExpanded: false,
+                        showsMetadata: false,
+                        findQuery: "",
+                        onReasoning: { _ in },
+                        onTools: { _ in },
+                        onCopyCode: { _ in }
+                    )
+                    row.layoutSubtreeIfNeeded()
+
+                    let first = row.answerViewForTesting.bounds.width
+                    #expect(abs(first - hug) < 1)
+                    #expect(first <= cap + 0.5)
+                    if turn.id == "short" {
+                        #expect(first < 60)
+                        #expect(first < cap - 100)
+                    } else {
+                        #expect(first > cap / 2)
+                    }
+
+                    // The later measurement pass must not change the width.
+                    row.configure(
+                        turn: turn,
+                        document: document,
+                        reasoningExpanded: false,
+                        toolsExpanded: false,
+                        showsMetadata: false,
+                        findQuery: "",
+                        outgoingTextWidth: hug,
+                        onReasoning: { _ in },
+                        onTools: { _ in },
+                        onCopyCode: { _ in }
+                    )
+                    row.layoutSubtreeIfNeeded()
+                    #expect(abs(row.answerViewForTesting.bounds.width - first) < 1)
+                }
+            }
+        }
+    }
+}
+
 @Test("a narrow window keeps the required transcript insets")
 @MainActor
 func narrowWindowKeepsRequiredTranscriptInsets() {
