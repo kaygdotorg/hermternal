@@ -183,6 +183,61 @@ func sendRollsBackPublishedTurnOnPreparationFailure() async {
     #expect(turn.submissionSessionIDs.isEmpty)
 }
 
+@Test("Escape during an in-flight send restores the draft")
+@MainActor
+func escapeDuringInFlightSendRestoresDraft() async {
+    let turn = RuntimeMenuTurnSpy(sessionID: "live", blocksPreparation: true)
+    let completion = RuntimeMenuOperationCompletion(expectedCount: 1)
+    let route = ComposerRoute(identity: "escape-during-send", generation: 6)
+    let model = makeRuntimeMenuModel(
+        route: route,
+        runtime: RuntimeMenuSpy(),
+        turn: turn,
+        operationCompletion: completion
+    )
+    _ = model.mount()
+    model.text = "please cancel me"
+    model.submit()
+    #expect(turn.publishedTexts == ["please cancel me"])
+    #expect(model.text.isEmpty)
+    #expect(model.isSubmitting)
+    #expect(model.handleEscape())
+    #expect(model.text == "please cancel me")
+    #expect(!model.isSubmitting)
+    #expect(turn.rolledBackRoutes == [route.token])
+
+    turn.finishPreparation()
+    await completion.wait()
+    #expect(model.text == "please cancel me")
+    #expect(!model.isSubmitting)
+    #expect(turn.submissionSessionIDs.isEmpty)
+}
+
+@Test("Shutdown during an in-flight send does not restore into later text")
+@MainActor
+func shutdownDuringInFlightSendDoesNotRestoreIntoLaterText() async {
+    let turn = RuntimeMenuTurnSpy(sessionID: "live", blocksPreparation: true)
+    let completion = RuntimeMenuOperationCompletion(expectedCount: 1)
+    let route = ComposerRoute(identity: "shutdown-during-send", generation: 7)
+    let model = makeRuntimeMenuModel(
+        route: route,
+        runtime: RuntimeMenuSpy(),
+        turn: turn,
+        operationCompletion: completion
+    )
+    _ = model.mount()
+    model.text = "overlap"
+    model.submit()
+    #expect(turn.publishedTexts == ["overlap"])
+    model.shutdown()
+    model.text = "after shutdown"
+    model.submit()
+    turn.finishPreparation()
+    await completion.wait()
+    #expect(model.text == "after shutdown")
+    #expect(!model.isSubmitting)
+}
+
 @Test("Adopting the new chat keeps the in-flight send")
 @MainActor
 func adoptingNewChatKeepsInFlightSend() async {

@@ -273,6 +273,7 @@ final class ComposerModel {
     /// A single shared send task refuses every other route.
     /// Defended by adoptingNewChatKeepsInFlightSend.
     @ObservationIgnored private var sendTasks: [ComposerRouteToken: Task<Void, Never>] = [:]
+    @ObservationIgnored private var inFlightDrafts: [ComposerRouteToken: ComposerDraft] = [:]
     @ObservationIgnored private var preparationTasks: [ComposerRouteToken: SessionPreparation] = [:]
     @ObservationIgnored private var preparationEpochs: [ComposerRouteToken: UInt64] = [:]
     @ObservationIgnored private var importTask: Task<Void, Never>?
@@ -657,6 +658,7 @@ final class ComposerModel {
         sendReceiptIDs[target] = operationID
         // Echo the prompt before any RPC. Defended by sendPublishesUserTurnBeforePreparation.
         turn.publishUserTurn(text: submission.text, route: target)
+        inFlightDrafts[target] = submitted
         sendTasks[target] = Task { [weak self] in
             await self?.performSend(
                 submission,
@@ -746,6 +748,7 @@ final class ComposerModel {
                 }
                 sendReceiptIDs.removeValue(forKey: target)
                 sendTasks.removeValue(forKey: target)
+                inFlightDrafts.removeValue(forKey: target)
             }
             operationDidFinish?()
         }
@@ -864,7 +867,7 @@ final class ComposerModel {
             if shouldRollbackPublishedTurn(
                 error,
                 promptSubmissionBegan: promptSubmissionBegan
-            ) {
+            ), sendReceiptIDs[target] == operationID {
                 turn.rollbackUserTurn(route: target)
             }
             switch error {
@@ -872,8 +875,6 @@ final class ComposerModel {
                 await compensate(transaction)
                 if sendReceiptIDs[target] == operationID {
                     restore(submitted, routeIdentity: target.identity, notice: nil)
-                } else {
-                    restoreSuperseded(submitted, routeIdentity: target.identity)
                 }
             case ComposerOperationError.staleRoute:
                 await compensate(transaction)
@@ -1013,6 +1014,7 @@ final class ComposerModel {
         notice failure: ComposerNotice?,
         noticeRoute: ComposerRouteToken? = nil
     ) {
+        guard !isUnmounted else { return }
         let identity = draftIdentity(for: routeIdentity)
         mutateDraft(for: identity) { current in
             current = ComposerSendPolicy.restore(submitted, into: current)
@@ -1040,6 +1042,7 @@ final class ComposerModel {
     }
 
     private func restoreSuperseded(_ submitted: ComposerDraft, routeIdentity: String) {
+        guard !isUnmounted else { return }
         let identity = draftIdentity(for: routeIdentity)
         var saved = drafts[identity] ?? ComposerDraft()
         saved = ComposerSendPolicy.restore(submitted, into: saved)
@@ -1968,8 +1971,9 @@ final class ComposerModel {
             cancelDictation()
             return true
         }
-        if let task = sendTasks[originSendToken(for: route.token)] {
-            task.cancel()
+        if sendTasks[originSendToken(for: route.token)] != nil
+            || sendTasks[route.token] != nil {
+            cancelInFlightSendFromEscape()
             return true
         }
         if notice != nil {
@@ -1977,6 +1981,38 @@ final class ComposerModel {
             return true
         }
         return false
+    }
+
+
+    /// Restores the captured draft and settles send state without waiting for
+    /// the cancelled preparation to throw.
+    /// Defended by escapeDuringInFlightSendRestoresDraft.
+    private func cancelInFlightSendFromEscape() {
+        let sendToken = originSendToken(for: route.token)
+        let task = sendTasks.removeValue(forKey: sendToken)
+            ?? sendTasks.removeValue(forKey: route.token)
+        let submitted = inFlightDrafts.removeValue(forKey: sendToken)
+            ?? inFlightDrafts.removeValue(forKey: route.token)
+        if let submitted {
+            restore(submitted, routeIdentity: sendToken.identity, notice: nil)
+            turn?.rollbackUserTurn(route: sendToken)
+        }
+        sendReceiptIDs.removeValue(forKey: sendToken)
+        sendReceiptIDs.removeValue(forKey: route.token)
+        submittingRoutes.remove(sendToken)
+        submittingRoutes.remove(route.token)
+        outgoingByRoute.removeValue(forKey: sendToken)
+        outgoingByRoute.removeValue(forKey: route.token)
+        progressByRoute.removeValue(forKey: sendToken)
+        progressByRoute.removeValue(forKey: route.token)
+        if routeOwnsSend(sendToken) || routeOwnsSend(route.token) {
+            isSubmitting = false
+            stagingProgress = nil
+            outgoing = []
+        }
+        invalidatePreparation(for: sendToken)
+        invalidatePreparation(for: route.token)
+        task?.cancel()
     }
 
     // MARK: - Per-chat drafts

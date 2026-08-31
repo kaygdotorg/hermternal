@@ -33,10 +33,10 @@ private struct ComposerEditorHarness: View {
                     ),
                     isEditable: true,
                     focusRequest: 0,
-                    formatRequest: nil,
+                    formatRequest: store.formatRequest,
                     onSubmit: {},
                     onEscape: { false },
-                    onFormatHandled: {}
+                    onFormatHandled: { store.formatRequest = nil }
                 )
                 Text("Message Hermes…")
                     .foregroundStyle(.secondary)
@@ -57,6 +57,7 @@ private final class ComposerEditorHarnessStore {
     var text = ""
     var mode: ComposerEditorMode = .wysiwyg
     var isFocused = false
+    var formatRequest: ComposerEditorFormat?
 }
 
 @Test("Typing keeps one editor, its first responder, and one bounded height")
@@ -235,6 +236,303 @@ func editorWrapsAtTheColumnItOccupies() async throws {
     #expect(abs(container.size.width - field.contentSize.width) < 0.5)
 }
 
+/// Wrapped typing has to keep the caret in the visible band.
+///
+/// The field reports a bounded height to SwiftUI, but the document has to
+/// grow with the laid-out text. If the document stays at the first line,
+/// the next wrapped line is off the field and no amount of scrolling can
+/// bring it back. After eight lines the field stops growing and scrolls.
+@Test("Wrapped typing keeps the caret in view and lets overflow scroll")
+@MainActor
+func wrappedTypingKeepsCaretInViewAndLetsOverflowScroll() async throws {
+    _ = NSApplication.shared
+    let store = ComposerEditorHarnessStore()
+    let hosting = NSHostingView(rootView: ComposerEditorHarness(store: store))
+    hosting.frame = NSRect(x: 0, y: 0, width: 360, height: 280)
+    let window = NSWindow(
+        contentRect: hosting.frame,
+        styleMask: [.titled, .resizable],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.animationBehavior = .none
+    window.contentView = hosting
+    window.makeKeyAndOrderFront(nil)
+    defer {
+        window.contentView = nil
+        window.close()
+    }
+    hosting.layoutSubtreeIfNeeded()
+
+    let editor = try #require(firstTextView(in: hosting))
+    #expect(window.makeFirstResponder(editor))
+
+    // Short words in a 360pt column wrap well before eight lines.
+    let wrapped = String(repeating: "composer wrap ", count: 24)
+    editor.insertText(wrapped, replacementRange: editor.selectedRange())
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+
+    let live = try #require(firstTextView(in: hosting))
+    let field = try #require(live.enclosingScrollView)
+    #expect(lineFragmentCount(in: live) >= 3)
+    #expect(field.frame.height > CGFloat(ComposerEditorHeightPolicy.minimum))
+    #expect(field.frame.height <= CGFloat(ComposerEditorHeightPolicy.maximum))
+    #expect(documentContainsLaidOutText(live))
+    #expect(visibleBandContainsInsertionLine(live))
+
+    // Past the eight line cap the field stays at the cap, and the document
+    // has to grow so the caret and the last line can scroll into view.
+    let overflow = String(repeating: "\ncomposer wrap overflow", count: 16)
+    live.insertText(overflow, replacementRange: live.selectedRange())
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+
+    let overflowing = try #require(firstTextView(in: hosting))
+    let overflowingField = try #require(overflowing.enclosingScrollView)
+    let maximum = CGFloat(ComposerEditorHeightPolicy.maximum)
+    #expect(abs(overflowingField.frame.height - maximum) < 1)
+    #expect(documentContainsLaidOutText(overflowing))
+    #expect(overflowing.frame.height > overflowingField.contentSize.height + 1)
+
+    overflowing.scroll(NSPoint.zero)
+    hosting.layoutSubtreeIfNeeded()
+    #expect(!visibleBandContainsInsertionLine(overflowing))
+
+    let bottom = NSPoint(
+        x: 0,
+        y: max(0, overflowing.frame.height - overflowingField.contentSize.height)
+    )
+    overflowing.scroll(bottom)
+    hosting.layoutSubtreeIfNeeded()
+    #expect(visibleBandContainsInsertionLine(overflowing))
+
+    overflowing.scroll(NSPoint.zero)
+    hosting.layoutSubtreeIfNeeded()
+    overflowing.scrollRangeToVisible(overflowing.selectedRange())
+    hosting.layoutSubtreeIfNeeded()
+    #expect(visibleBandContainsInsertionLine(overflowing))
+}
+
+/// A graphic pasted into the field must not become Markdown source.
+///
+/// NSTextView can insert an NSTextAttachment whose character is U+FFFC.
+/// That character is not a file, and sending it submits garbage. The field
+/// keeps the surrounding text and refuses the graphic.
+@Test("Pasted graphics do not enter Markdown source")
+@MainActor
+func pastedGraphicsDoNotEnterMarkdownSource() async throws {
+    _ = NSApplication.shared
+    let store = ComposerEditorHarnessStore()
+    let hosting = NSHostingView(rootView: ComposerEditorHarness(store: store))
+    hosting.frame = NSRect(x: 0, y: 0, width: 360, height: 220)
+    let window = NSWindow(
+        contentRect: hosting.frame,
+        styleMask: [.titled, .resizable],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.animationBehavior = .none
+    window.contentView = hosting
+    window.makeKeyAndOrderFront(nil)
+    defer {
+        window.contentView = nil
+        window.close()
+    }
+    hosting.layoutSubtreeIfNeeded()
+
+    let editor = try #require(firstTextView(in: hosting))
+    #expect(window.makeFirstResponder(editor))
+    editor.insertText("before ", replacementRange: editor.selectedRange())
+    let attachment = NSTextAttachment()
+    attachment.image = NSImage(size: NSSize(width: 8, height: 8))
+    editor.textStorage?.append(NSAttributedString(attachment: attachment))
+    editor.insertText(" after", replacementRange: editor.selectedRange())
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+
+    let live = try #require(firstTextView(in: hosting))
+    #expect(!live.string.contains("\u{FFFC}"))
+    #expect(!store.text.contains("\u{FFFC}"))
+    #expect(store.text.contains("before"))
+    #expect(store.text.contains("after"))
+}
+
+/// Format must be an undo step. Otherwise Cmd-Z undoes the last typed
+/// characters against Markdown source and the patch drops characters.
+@Test("Format then undo restores the typed source")
+@MainActor
+func formatThenUndoRestoresTypedSource() async throws {
+    _ = NSApplication.shared
+    let store = ComposerEditorHarnessStore()
+    let hosting = NSHostingView(rootView: ComposerEditorHarness(store: store))
+    hosting.frame = NSRect(x: 0, y: 0, width: 360, height: 220)
+    let window = NSWindow(
+        contentRect: hosting.frame,
+        styleMask: [.titled, .resizable],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.animationBehavior = .none
+    window.contentView = hosting
+    window.makeKeyAndOrderFront(nil)
+    defer {
+        window.contentView = nil
+        window.close()
+    }
+    hosting.layoutSubtreeIfNeeded()
+
+    let editor = try #require(firstTextView(in: hosting))
+    #expect(window.makeFirstResponder(editor))
+    editor.insertText("hello world", replacementRange: editor.selectedRange())
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+    editor.setSelectedRange(NSRange(location: 0, length: 5))
+    store.formatRequest = .strong
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+
+    let formatted = try #require(firstTextView(in: hosting))
+    #expect(store.text == "**hello** world")
+    #expect(formatted.string == "hello world")
+    #expect(formatted.undoManager?.canUndo == true)
+    formatted.undoManager?.undo()
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+
+    let restored = try #require(firstTextView(in: hosting))
+    #expect(restored.string == "hello world")
+    #expect(store.text == "hello world")
+}
+
+@Test("WYSIWYG typing at a list bullet edits the item text")
+@MainActor
+func wysiwygListPrefixEditKeepsListSource() async throws {
+    _ = NSApplication.shared
+    let store = ComposerEditorHarnessStore()
+    store.text = "- item"
+    let hosting = NSHostingView(rootView: ComposerEditorHarness(store: store))
+    hosting.frame = NSRect(x: 0, y: 0, width: 360, height: 220)
+    let window = NSWindow(
+        contentRect: hosting.frame,
+        styleMask: [.titled, .resizable],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.animationBehavior = .none
+    window.contentView = hosting
+    window.makeKeyAndOrderFront(nil)
+    defer {
+        window.contentView = nil
+        window.close()
+    }
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+
+    let editor = try #require(firstTextView(in: hosting))
+    #expect(window.makeFirstResponder(editor))
+    editor.setSelectedRange(NSRange(location: 0, length: 0))
+    editor.insertText("X", replacementRange: editor.selectedRange())
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+
+    #expect(store.text.hasPrefix("- "))
+    #expect(store.text.contains("X"))
+    #expect(!store.text.hasPrefix("X-"))
+}
+
+@Test("WYSIWYG typing at a quote bar edits the quote text")
+@MainActor
+func wysiwygQuotePrefixEditKeepsQuoteSource() async throws {
+    _ = NSApplication.shared
+    let store = ComposerEditorHarnessStore()
+    store.text = "> hello"
+    let hosting = NSHostingView(rootView: ComposerEditorHarness(store: store))
+    hosting.frame = NSRect(x: 0, y: 0, width: 360, height: 220)
+    let window = NSWindow(
+        contentRect: hosting.frame,
+        styleMask: [.titled, .resizable],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.animationBehavior = .none
+    window.contentView = hosting
+    window.makeKeyAndOrderFront(nil)
+    defer {
+        window.contentView = nil
+        window.close()
+    }
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+
+    let editor = try #require(firstTextView(in: hosting))
+    #expect(window.makeFirstResponder(editor))
+    editor.setSelectedRange(NSRange(location: 0, length: 0))
+    editor.insertText("X", replacementRange: editor.selectedRange())
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+
+    #expect(store.text.hasPrefix("> "))
+    #expect(store.text.contains("X"))
+    #expect(!store.text.hasPrefix("X>"))
+}
+
+@Test("WYSIWYG insert after bold text stays inside that span")
+@MainActor
+func wysiwygInsertAfterBoldStaysInSpan() async throws {
+    _ = NSApplication.shared
+    let store = ComposerEditorHarnessStore()
+    store.text = "**aa** aa"
+    let hosting = NSHostingView(rootView: ComposerEditorHarness(store: store))
+    hosting.frame = NSRect(x: 0, y: 0, width: 360, height: 220)
+    let window = NSWindow(
+        contentRect: hosting.frame,
+        styleMask: [.titled, .resizable],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.animationBehavior = .none
+    window.contentView = hosting
+    window.makeKeyAndOrderFront(nil)
+    defer {
+        window.contentView = nil
+        window.close()
+    }
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+
+    let editor = try #require(firstTextView(in: hosting))
+    #expect(window.makeFirstResponder(editor))
+    editor.setSelectedRange(NSRange(location: 2, length: 0))
+    editor.insertText("x", replacementRange: editor.selectedRange())
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+
+    #expect(store.text == "**aax** aa")
+}
+
+
 @MainActor
 private func firstTextView(in view: NSView) -> NSTextView? {
     if let textView = view as? NSTextView { return textView }
@@ -244,3 +542,55 @@ private func firstTextView(in view: NSView) -> NSTextView? {
     return nil
 }
 
+@MainActor
+private func lineFragmentCount(in textView: NSTextView) -> Int {
+    guard let layoutManager = textView.layoutManager else { return 0 }
+    var count = 0
+    var glyphIndex = 0
+    let glyphCount = layoutManager.numberOfGlyphs
+    while glyphIndex < glyphCount {
+        var lineRange = NSRange()
+        layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: &lineRange)
+        count += 1
+        glyphIndex = NSMaxRange(lineRange)
+    }
+    return count
+}
+
+@MainActor
+private func documentContainsLaidOutText(_ textView: NSTextView) -> Bool {
+    guard let layoutManager = textView.layoutManager,
+          let container = textView.textContainer else { return false }
+    let used = layoutManager.usedRect(for: container)
+    let needed = used.height + textView.textContainerInset.height * 2
+    return textView.frame.height + 1 >= needed
+}
+
+@MainActor
+private func insertionLineRect(in textView: NSTextView) -> NSRect {
+    guard let layoutManager = textView.layoutManager else { return .zero }
+    let length = (textView.string as NSString).length
+    let origin = textView.textContainerOrigin
+    if length == 0 || layoutManager.numberOfGlyphs == 0 {
+        return layoutManager.extraLineFragmentRect.offsetBy(dx: origin.x, dy: origin.y)
+    }
+    let location = min(textView.selectedRange().location, length)
+    if location >= length, layoutManager.extraLineFragmentRect.height > 0 {
+        return layoutManager.extraLineFragmentRect.offsetBy(dx: origin.x, dy: origin.y)
+    }
+    let characterIndex = min(max(0, location), length - 1)
+    let glyphIndex = layoutManager.glyphIndexForCharacter(at: characterIndex)
+    var lineRange = NSRange()
+    let rect = layoutManager.lineFragmentRect(
+        forGlyphAt: min(glyphIndex, layoutManager.numberOfGlyphs - 1),
+        effectiveRange: &lineRange
+    )
+    return rect.offsetBy(dx: origin.x, dy: origin.y)
+}
+
+@MainActor
+private func visibleBandContainsInsertionLine(_ textView: NSTextView) -> Bool {
+    let line = insertionLineRect(in: textView)
+    let visible = textView.visibleRect.insetBy(dx: 0, dy: -1)
+    return visible.maxY > line.minY && visible.minY < line.maxY
+}

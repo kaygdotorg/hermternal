@@ -2,8 +2,8 @@ import AppKit
 import HermternalCore
 import SwiftUI
 
-/// The editor's scroll view. It keeps the text view exactly as wide as the
-/// column the user can see.
+/// The editor's scroll view. It keeps the text view as wide as the column
+/// the user can see, and as tall as the laid-out text.
 ///
 /// Measurement sets the text view's width directly, because the text
 /// container tracks the text view and that is what makes the measured height
@@ -15,26 +15,37 @@ import SwiftUI
 /// last — observed at 196.5pt inside a 714pt field, which wraps a message
 /// after a third of the line it has room for.
 ///
-/// Two things can break the rule, so it is asserted at both: `layout`, which
-/// is the only place that sees the applied geometry, and the end of a
+/// Two things can break the width rule, so it is asserted at both: `layout`,
+/// which is the only place that sees the applied geometry, and the end of a
 /// measurement, which is where a probe width gets written. Every assignment is
 /// guarded on a real change, so a pass that changes nothing costs no text
 /// relayout.
-/// Defended by editorWrapsAtTheColumnItOccupies.
+///
+/// The field's height is the bounded size SwiftUI applies. The document has
+/// to grow with the text, including past the eight line cap, so overflow can
+/// scroll and the caret can stay in the visible band.
+/// Defended by editorWrapsAtTheColumnItOccupies and
+/// wrappedTypingKeepsCaretInViewAndLetsOverflowScroll.
 @MainActor
 final class ComposerEditorScrollView: NSScrollView {
-    /// Makes the text view exactly as wide as the visible column.
+    /// Makes the text view as wide as the visible column, and as tall as the
+    /// laid-out text.
     func synchronizeColumn() {
-        guard let documentView,
-              contentSize.width > 1,
-              abs(documentView.frame.width - contentSize.width) > 0.5
-        else { return }
-        documentView.frame.size.width = contentSize.width
-        guard let textView = documentView as? NSTextView,
-              let container = textView.textContainer,
-              let layoutManager = textView.layoutManager
-        else { return }
-        layoutManager.ensureLayout(for: container)
+        guard let textView = documentView as? NSTextView else { return }
+        if contentSize.width > 1, abs(textView.frame.width - contentSize.width) > 0.5 {
+            textView.frame.size.width = contentSize.width
+            if let container = textView.textContainer,
+               let layoutManager = textView.layoutManager {
+                layoutManager.ensureLayout(for: container)
+            }
+        }
+        fitDocumentToLaidOutText()
+    }
+
+    /// Scrolls the insertion point into the visible band of the field.
+    func scrollInsertionPointIntoView() {
+        guard let textView = documentView as? NSTextView else { return }
+        textView.scrollRangeToVisible(textView.selectedRange())
     }
 
     override func layout() {
@@ -42,6 +53,43 @@ final class ComposerEditorScrollView: NSScrollView {
         // Re-sync after sizeThatFits probe widths leak onto the live text view.
         // Defended by editorWrapsAtTheColumnItOccupies.
         synchronizeColumn()
+    }
+
+    /// Grows the document with the laid-out text, never with the field cap.
+    ///
+    /// The field reports `ComposerEditorHeightPolicy.maximum` and stops
+    /// growing. The document must not use that same cap as `maxSize`, or the
+    /// extra lines sit outside the text view and cannot scroll into view.
+    /// Defended by wrappedTypingKeepsCaretInViewAndLetsOverflowScroll.
+    private func fitDocumentToLaidOutText() {
+        guard let textView = documentView as? NSTextView,
+              let container = textView.textContainer,
+              let layoutManager = textView.layoutManager else { return }
+        let unbounded = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        if textView.maxSize.height != unbounded.height {
+            textView.maxSize = unbounded
+        }
+        layoutManager.ensureLayout(for: container)
+        let used = layoutManager.usedRect(for: container)
+        let extra = layoutManager.extraLineFragmentRect
+        let textBottom = max(used.maxY, extra.maxY)
+        let contentHeight = ceil(
+            textView.textContainerOrigin.y + textBottom + textView.textContainerInset.height
+        )
+        let minHeight = max(
+            contentSize.height,
+            CGFloat(ComposerEditorHeightPolicy.minimum)
+        )
+        let documentHeight = max(minHeight, contentHeight)
+        if abs(textView.frame.height - documentHeight) > 0.5 {
+            textView.frame.size.height = documentHeight
+        }
+        if abs(textView.minSize.height - minHeight) > 0.5 {
+            textView.minSize = NSSize(width: textView.minSize.width, height: minHeight)
+        }
     }
 }
 
@@ -157,6 +205,7 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
 
 
         var didApplyFormat = false
+        var didChangeText = false
         if let format = formatRequest, formatRequest != context.coordinator.lastFormatRequest {
             context.coordinator.apply(format, to: textView)
             context.coordinator.lastFormatRequest = formatRequest
@@ -186,6 +235,11 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
             }
             context.coordinator.lastMode = mode
             context.coordinator.lastSource = source
+            didChangeText = true
+        }
+        if didApplyFormat || didChangeText {
+            scrollView.synchronizeColumn()
+            scrollView.scrollInsertionPointIntoView()
         }
         if focusRequest != context.coordinator.lastFocusRequest {
             context.coordinator.lastFocusRequest = focusRequest
@@ -199,12 +253,20 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
     private func configure(_ textView: NSTextView) {
         textView.isEditable = isEditable
         textView.isRichText = true
-        textView.importsGraphics = true
+        // Graphics become U+FFFC in Markdown source. Refuse them here.
+        // Defended by pastedGraphicsDoNotEnterMarkdownSource.
+        textView.importsGraphics = false
         textView.allowsUndo = true
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.minSize = NSSize(width: 0, height: CGFloat(ComposerEditorHeightPolicy.minimum))
-        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat(ComposerEditorHeightPolicy.maximum))
+        // The eight line cap is the field height from sizeThatFits. The
+        // document uses an unbounded maxSize so overflow can scroll.
+        // Defended by wrappedTypingKeepsCaretInViewAndLetsOverflowScroll.
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
         textView.textContainerInset = NSSize(width: 0, height: 7)
         textView.textContainer?.containerSize = NSSize(
             width: 0,
@@ -291,7 +353,14 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard !isApplying,
                   let textView = notification.object as? NSTextView else { return }
-            let visible = textView.string
+            let visible: String
+            if textView.string.contains("\u{FFFC}") {
+                isApplying = true
+                visible = Self.strippingObjectReplacement(in: textView)
+                isApplying = false
+            } else {
+                visible = textView.string
+            }
             if mode.wrappedValue == .source {
                 source.wrappedValue = visible
             } else {
@@ -303,6 +372,31 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
             }
             lastSource = source.wrappedValue
             lastVisibleText = visible
+            revealInsertionPoint(in: textView)
+        }
+
+        func revealInsertionPoint(in textView: NSTextView) {
+            if let scrollView = textView.enclosingScrollView as? ComposerEditorScrollView {
+                scrollView.synchronizeColumn()
+                scrollView.scrollInsertionPointIntoView()
+            } else {
+                textView.scrollRangeToVisible(textView.selectedRange())
+            }
+        }
+
+        static func strippingObjectReplacement(in textView: NSTextView) -> String {
+            let objectReplacement = "\u{FFFC}"
+            guard textView.string.contains(objectReplacement) else { return textView.string }
+            let cleaned = textView.string.replacingOccurrences(of: objectReplacement, with: "")
+            let selected = textView.selectedRange()
+            textView.string = cleaned
+            let length = (cleaned as NSString).length
+            let location = min(selected.location, length)
+            textView.setSelectedRange(NSRange(
+                location: location,
+                length: min(selected.length, max(0, length - location))
+            ))
+            return cleaned
         }
 
         func textView(_ textView: NSTextView, doCommandBy selector: Selector) -> Bool {
@@ -337,21 +431,28 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
                   oldUnits[oldUnits.count - suffix - 1] == newUnits[newUnits.count - suffix - 1] {
                 suffix += 1
             }
-            let sourceBase: Int
-            if let range = source.range(of: oldVisible) {
-                sourceBase = source.utf16.distance(from: source.utf16.startIndex, to: range.lowerBound)
+            let inserted = Array(newUnits[prefix..<(newUnits.count - suffix)])
+            let oldEnd = oldUnits.count - suffix
+            let carets = Self.caretSourceOffsets(for: source, visible: oldVisible)
+            let lower: Int
+            let upper: Int
+            if carets.count == oldUnits.count + 1 {
+                lower = carets[prefix]
+                upper = carets[oldEnd]
+            } else if let range = source.range(of: oldVisible) {
+                let sourceBase = source.utf16.distance(
+                    from: source.utf16.startIndex,
+                    to: range.lowerBound
+                )
+                lower = sourceBase + prefix
+                upper = sourceBase + oldEnd
             } else {
-                sourceBase = 0
+                return source
             }
-            let lower = sourceBase + prefix
-            let upper = sourceBase + oldUnits.count - suffix
             var result = Array(source.utf16)
             let boundedLower = min(max(0, lower), result.count)
             let boundedUpper = min(max(boundedLower, upper), result.count)
-            result.replaceSubrange(
-                boundedLower..<boundedUpper,
-                with: newUnits[prefix..<(newUnits.count - suffix)]
-            )
+            result.replaceSubrange(boundedLower..<boundedUpper, with: inserted)
             return String(decoding: result, as: UTF16.self)
         }
         func render(source: String, mode: ComposerEditorMode, in textView: NSTextView) {
@@ -373,6 +474,8 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
         }
 
         func apply(_ format: ComposerEditorFormat, to textView: NSTextView) {
+            let previousSource = source.wrappedValue
+            let previousMode = mode.wrappedValue
             let selected = textView.selectedRange()
             let visibleSelection = (textView.string as NSString).substring(with: selected)
             let selectedRange: Range<Int>
@@ -413,6 +516,187 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
             isApplying = false
             lastSource = edit.source
             lastVisibleText = textView.string
+            registerFormatUndo(
+                previousSource: previousSource,
+                previousMode: previousMode,
+                previousRange: selected,
+                in: textView
+            )
+            revealInsertionPoint(in: textView)
+        }
+
+        func registerFormatUndo(
+            previousSource: String,
+            previousMode: ComposerEditorMode,
+            previousRange: NSRange,
+            in textView: NSTextView
+        ) {
+            guard let undo = textView.undoManager else { return }
+            let currentSource = source.wrappedValue
+            let currentMode = mode.wrappedValue
+            let currentRange = textView.selectedRange()
+            undo.registerUndo(withTarget: self) { coordinator in
+                coordinator.restoreSource(
+                    previousSource,
+                    mode: previousMode,
+                    selectedRange: previousRange,
+                    in: textView
+                )
+                coordinator.registerFormatUndo(
+                    previousSource: currentSource,
+                    previousMode: currentMode,
+                    previousRange: currentRange,
+                    in: textView
+                )
+            }
+        }
+
+        func restoreSource(
+            _ restored: String,
+            mode restoredMode: ComposerEditorMode,
+            selectedRange: NSRange,
+            in textView: NSTextView
+        ) {
+            isApplying = true
+            source.wrappedValue = restored
+            lastSource = restored
+            lastMode = restoredMode
+            mode.wrappedValue = restoredMode
+            render(source: restored, mode: restoredMode, in: textView)
+            let length = (textView.string as NSString).length
+            let location = min(selectedRange.location, length)
+            textView.setSelectedRange(NSRange(
+                location: location,
+                length: min(selectedRange.length, max(0, length - location))
+            ))
+            lastVisibleText = textView.string
+            isApplying = false
+        }
+
+
+        /// Maps each caret in the rendered field onto a UTF-16 source offset.
+        ///
+        /// The walk matches `attributedString(for:)`. Synthetic markers stay
+        /// pinned to the start of the item text, so typing at the bullet lands
+        /// in the item, not in the Markdown marker.
+        static func caretSourceOffsets(for source: String, visible: String) -> [Int] {
+            let parsed = MarkdownDocument.parse(source)
+            var rendered: [UInt16] = []
+            var carets: [Int] = [0]
+            let sourceCount = source.utf16.count
+
+            func emit(_ text: String, sourceIndex: Int, mapsToSource: Bool) {
+                let units = Array(text.utf16)
+                if rendered.isEmpty {
+                    carets = [min(max(0, sourceIndex), sourceCount)]
+                }
+                for (index, unit) in units.enumerated() {
+                    rendered.append(unit)
+                    if mapsToSource {
+                        carets.append(min(sourceIndex + index + 1, sourceCount))
+                    } else {
+                        carets.append(min(max(0, sourceIndex), sourceCount))
+                    }
+                }
+            }
+
+            func emitInlines(_ inlines: [MarkdownInline]) {
+                for inline in inlines { emitInline(inline) }
+            }
+
+            func emitInline(_ inline: MarkdownInline) {
+                let start = inline.sourceRange.location
+                switch inline.kind {
+                case let .text(value):
+                    emit(value, sourceIndex: start, mapsToSource: true)
+                case let .inlineCode(value):
+                    let inner = source.utf16.count > start && Array(source.utf16)[start] == 96
+                        ? start + 1 : start
+                    emit(value, sourceIndex: inner, mapsToSource: true)
+                case let .emphasis(children):
+                    emitInlines(children)
+                case let .strong(children):
+                    emitInlines(children)
+                case let .strikethrough(children):
+                    emitInlines(children)
+                case let .link(_, _, children):
+                    emitInlines(children)
+                }
+            }
+
+            func contentStart(_ inlines: [MarkdownInline], fallback: Int) -> Int {
+                inlines.first?.sourceRange.location ?? fallback
+            }
+
+            for (index, block) in parsed.document.blocks.enumerated() {
+                if index > 0 {
+                    emit("\n\n", sourceIndex: block.sourceRange.location, mapsToSource: false)
+                }
+                switch block {
+                case let .paragraph(_, _, inlines):
+                    emitInlines(inlines)
+                case let .heading(_, _, _, inlines):
+                    emitInlines(inlines)
+                case let .list(_, _, items), let .taskList(_, _, items):
+                    for (itemIndex, item) in items.enumerated() {
+                        if itemIndex > 0 {
+                            emit("\n", sourceIndex: item.sourceRange.location, mapsToSource: false)
+                        }
+                        let marker = item.taskState == .checked ? "☑ "
+                            : item.taskState == .unchecked ? "☐ " : "• "
+                        let prefix = String(repeating: "  ", count: item.depth) + marker
+                        emit(
+                            prefix,
+                            sourceIndex: contentStart(item.inlines, fallback: item.sourceRange.location),
+                            mapsToSource: false
+                        )
+                        emitInlines(item.inlines)
+                    }
+                case let .quote(_, _, inlines):
+                    emit(
+                        "▏ ",
+                        sourceIndex: contentStart(inlines, fallback: block.sourceRange.location),
+                        mapsToSource: false
+                    )
+                    emitInlines(inlines)
+                case let .code(_, range, language, body):
+                    let value = language.isEmpty ? body : "\(language)\n\(body)"
+                    let inner = language.isEmpty ? range.location : range.location
+                    emit(value, sourceIndex: inner, mapsToSource: false)
+                case let .table(_, _, headers, rows):
+                    func emitRow(_ cells: [[MarkdownInline]], at sourceIndex: Int) {
+                        for (cellIndex, cell) in cells.enumerated() {
+                            if cellIndex > 0 {
+                                emit(" | ", sourceIndex: contentStart(cell, fallback: sourceIndex), mapsToSource: false)
+                            }
+                            emitInlines(cell)
+                        }
+                    }
+                    emitRow(headers, at: block.sourceRange.location)
+                    for row in rows {
+                        emit("\n", sourceIndex: row.sourceRange.location, mapsToSource: false)
+                        emitRow(row.cells, at: row.sourceRange.location)
+                    }
+                case let .footnote(_, _, label, inlines):
+                    emit(
+                        "[^\(label)]: ",
+                        sourceIndex: contentStart(inlines, fallback: block.sourceRange.location),
+                        mapsToSource: false
+                    )
+                    emitInlines(inlines)
+                case .source:
+                    emit(
+                        parsed.document.sourceText(for: block),
+                        sourceIndex: block.sourceRange.location,
+                        mapsToSource: true
+                    )
+                }
+            }
+
+            guard rendered == Array(visible.utf16), carets.count == rendered.count + 1 else {
+                return []
+            }
+            return carets
         }
 
         private static let baseAttributes: [NSAttributedString.Key: Any] = [
@@ -527,6 +811,15 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
 @MainActor
 private final class ComposerTextView: NSTextView {
     var onFocusChange: ((Bool) -> Void)?
+
+    override func paste(_ sender: Any?) {
+        let pasteboard = NSPasteboard.general
+        if let string = pasteboard.string(forType: .string) {
+            insertText(string, replacementRange: selectedRange())
+            return
+        }
+        // Image-only paste has no string. Refuse it so U+FFFC never enters.
+    }
 
     override func becomeFirstResponder() -> Bool {
         let becameFirstResponder = super.becomeFirstResponder()
