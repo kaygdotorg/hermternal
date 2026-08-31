@@ -3250,6 +3250,18 @@ final class AppModel: ComposerTurnRouting {
         let warmStoreForOpen = warmStore
         let cacheEnabledForOpen = cacheEnabled
         let generationsForOpen = openGenerations
+        let historyCacheForOpen = historyCache
+        // Overlap the v3 tail read with the selection-transaction yield.
+        // This task never starts a paged migration.
+        let prefetchVisibleTail: Task<[ChatMessage], Never>?
+        if cacheEnabled {
+            let sessionID = session.id
+            prefetchVisibleTail = Task {
+                await historyCacheForOpen.visibleTail(for: sessionID)
+            }
+        } else {
+            prefetchVisibleTail = nil
+        }
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
@@ -3279,20 +3291,13 @@ final class AppModel: ComposerTurnRouting {
                 )
                 return
             }
-            var warm = await Task.detached(priority: .userInitiated) {
-                () -> WarmTranscriptProjection? in
-                guard cacheEnabledForOpen,
-                      generationsForOpen.isCurrent(generation)
-                else { return nil }
-                let projection = warmStoreForOpen.projection(
+            var warm: WarmTranscriptProjection?
+            if cacheEnabledForOpen, generationsForOpen.isCurrent(generation) {
+                warm = warmStoreForOpen.projection(
                     for: session.id,
                     minimumServerTotal: session.messageCount
                 )
-                guard generationsForOpen.isCurrent(generation) else {
-                    return nil
-                }
-                return projection
-            }.value
+            }
             guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
                 HermternalSwitchTrace.selectionGuard(
                     "requestOpen.afterWarmLookup",
@@ -3308,34 +3313,8 @@ final class AppModel: ComposerTurnRouting {
             var initialMessages = warm.map {
                 Array($0.messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
             } ?? []
-            if initialMessages.isEmpty, cacheEnabledForOpen {
-                let historyCacheForOpen = self.historyCache
-                let transcript = await Task.detached(priority: .userInitiated) {
-                    await historyCacheForOpen.readForWarming(for: session.id).transcript
-                }.value
-                if let transcript, !transcript.messages.isEmpty {
-                    initialMessages = Array(
-                        transcript.messages.suffix(TranscriptPublicationPolicy.initialMessageCount)
-                    )
-                    let snapshot = transcript.snapshot ?? AuthoritativeTranscriptSnapshot(
-                        sessionID: session.id,
-                        serverTotal: max(session.messageCount, transcript.messages.count),
-                        fetchedRows: transcript.messages.count,
-                        projectedMessages: transcript.messages.count,
-                        truncated: false,
-                        fetchedAt: Date(timeIntervalSince1970: 0)
-                    )
-                    _ = self.warmStore.publish(
-                        messages: transcript.messages,
-                        snapshot: snapshot,
-                        for: session.id,
-                        minimumServerTotal: session.messageCount
-                    )
-                    warm = self.warmStore.projection(
-                        for: session.id,
-                        minimumServerTotal: session.messageCount
-                    )
-                }
+            if initialMessages.isEmpty, let prefetchVisibleTail {
+                initialMessages = await prefetchVisibleTail.value
             }
             guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
                 return
