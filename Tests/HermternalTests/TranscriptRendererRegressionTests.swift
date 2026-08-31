@@ -849,32 +849,28 @@ func rendererPinsStreamingEndAgainAfterHeightCorrection() {
 /// bubble travels straight under it.
 private let measuredToolbarControlDepth: CGFloat = 43.5
 
-@Test("the transcript's top dissolve is complete before the window's toolbar controls")
+@Test("the transcript's top dissolve begins at the window's top edge")
 @MainActor
-func transcriptTopEdgeDissolvesBeforeTheToolbarControls() throws {
-    // The premise: the clear zone covers the whole band the system lays its
-    // titlebar controls out in, not the height one control happens to have.
+func transcriptTopEdgeDissolvesFromTheWindowTop() throws {
+    // The premise: the ramp crosses the whole band the system lays its
+    // titlebar controls out in, and then some, so content is readable again
+    // only below that band.
     #expect(ChatTranscriptTopEdge.chromeDepth >= measuredToolbarControlDepth)
     #expect(ChatTranscriptTopEdge.reach > ChatTranscriptTopEdge.chromeDepth)
 
     let stops = ChatTranscriptTopEdge.ramp.stops
-    let clearZone = ChatTranscriptTopEdge.chromeDepth / ChatTranscriptTopEdge.reach
     var previousLocation: CGFloat = 0
     var previousAlpha: CGFloat = -1
+    var curve: [(location: CGFloat, alpha: CGFloat)] = []
     for stop in stops {
         let color = try #require(NSColor(stop.color).usingColorSpace(.sRGB))
         // One continuous ramp: distance and ink only ever increase, so no
         // pair of stops can invert into a band or a seam.
         #expect(stop.location >= previousLocation)
         #expect(color.alphaComponent >= previousAlpha)
-        // No ink where a native control can cut it. Two stops at zero alpha
-        // cannot interpolate to anything else between them, so this covers
-        // the whole clear zone rather than sampling it.
-        if stop.location <= clearZone {
-            #expect(color.alphaComponent == 0)
-        }
         previousLocation = stop.location
         previousAlpha = color.alphaComponent
+        curve.append((stop.location, color.alphaComponent))
     }
 
     // The ramp spans its whole view, and it ends opaque: `reach` is where a
@@ -885,6 +881,24 @@ func transcriptTopEdgeDissolvesBeforeTheToolbarControls() throws {
     let opaque = try #require(NSColor(last.color).usingColorSpace(.sRGB))
     #expect(opaque.alphaComponent == 1)
 
+    // Exactly one stop is clear, and it is the one at the window's top edge.
+    // Two zero-alpha stops cannot interpolate to anything else between them,
+    // so a second one is a flat clear zone — the empty band over the titlebar
+    // that reads as chrome, and the defect this ramp exists to remove.
+    #expect(curve.filter { $0.alpha == 0 }.count == 1)
+    #expect(curve.first?.alpha == 0)
+
+    // Ink under the toolbar controls: present, so rows visibly continue under
+    // the chrome, and far from opaque, so nothing reaches a control's own edge
+    // at full strength.
+    let alphaAtControls = interpolatedAlpha(
+        in: curve,
+        atDepth: measuredToolbarControlDepth,
+        reach: ChatTranscriptTopEdge.reach
+    )
+    #expect(alphaAtControls > 0.2)
+    #expect(alphaAtControls < 0.7)
+
     // The content inset places the DOCUMENT's first point at the ramp's
     // opaque end, less the empty band every row opens with. The resolved
     // table style adds a document inset of its own above row 0, so the first
@@ -894,6 +908,27 @@ func transcriptTopEdgeDissolvesBeforeTheToolbarControls() throws {
             == ChatTranscriptTopEdge.reach
     )
     #expect(ChatTranscriptTopEdge.contentInset > measuredToolbarControlDepth)
+}
+
+/// The ramp's alpha at one depth, read the way Core Animation reads it:
+/// linearly between the two stops that bracket the depth.
+private func interpolatedAlpha(
+    in curve: [(location: CGFloat, alpha: CGFloat)],
+    atDepth depth: CGFloat,
+    reach: CGFloat
+) -> CGFloat {
+    let location = depth / reach
+    guard let upperIndex = curve.firstIndex(where: { $0.location >= location })
+    else {
+        return curve.last?.alpha ?? 0
+    }
+    let upper = curve[upperIndex]
+    guard upperIndex > 0 else { return upper.alpha }
+    let lower = curve[upperIndex - 1]
+    let span = upper.location - lower.location
+    guard span > 0 else { return upper.alpha }
+    return lower.alpha
+        + (location - lower.location) / span * (upper.alpha - lower.alpha)
 }
 
 @Test("the transcript surface installs the top edge's content inset")
@@ -912,6 +947,25 @@ func transcriptSurfaceInstallsTopEdgeContentInset() {
     #expect(scrollView.scrollerInsets.top == ChatTranscriptTopEdge.contentInset)
     // Only the top edge. The composer owns the bottom one.
     #expect(scrollView.contentInsets.bottom == 0)
+}
+
+@Test("the transcript surface leaves the system no top scroll edge effect")
+@MainActor
+func transcriptSurfaceSuppressesTheSystemScrollEdgeEffect() throws {
+    _ = NSApplication.shared
+    let table = BlockTranscriptTableView()
+    table.addTableColumn(NSTableColumn(identifier: .init("transcript")))
+    let container = BlockTranscriptContainerView(tableView: table)
+    let scrollView = container.scrollViewForTesting
+
+    // macOS 26 gives a scroll view in the titlebar safe area a plate over the
+    // whole band and dissolves content at that band's lower edge. This window
+    // draws its own top edge, from the physical window top, so the system's is
+    // off. On a build with no such property there is no pocket to turn off.
+    guard scrollView.responds(to: NSSelectorFromString("setAllowedPocketEdges:"))
+    else { return }
+    let edges = try #require(scrollView.value(forKey: "allowedPocketEdges") as? Int)
+    #expect(edges == 0)
 }
 
 @Test("insetted transcript content rests below the chrome and keeps its anchor and its end")

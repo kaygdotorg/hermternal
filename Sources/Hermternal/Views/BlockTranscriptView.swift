@@ -1371,6 +1371,7 @@ final class BlockTranscriptContainerView: NSView {
             bottom: 0,
             right: 0
         )
+        suppressSystemScrollEdgeEffect()
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.documentView = tableView
@@ -1386,6 +1387,43 @@ final class BlockTranscriptContainerView: NSView {
         ])
         observeSystemPalette()
     }
+
+    /// Turns the system's own scroll edge effect off on this surface.
+    ///
+    /// macOS 26 gives a scroll view that reaches into the window's titlebar
+    /// safe area an `NSScrollPocket`. Measured on macOS 26.6.2 with a toolbar
+    /// that has items: a material plate the full width of the scroll view over
+    /// the whole 52pt titlebar band, plus a masked blur reaching 28pt below
+    /// it. That plate IS a titlebar strip over the transcript, and its blur
+    /// dissolves content at the band's lower edge — the wrong edge. This
+    /// window's top edge is its own, and `ChatTranscriptTopEdge` draws it.
+    ///
+    /// The app carried the equivalent until the window moved to AppKit:
+    /// `toolbarBackgroundVisibility(.hidden, for: .windowToolbar)` on the
+    /// SwiftUI scene, which the same measurement recorded as removing the
+    /// built-in scroll edge effect along with the toolbar's backing. The scene
+    /// went with the move and nothing replaced it.
+    ///
+    /// `allowedPocketEdges` is the lever this build has. There is no public
+    /// one: `NSScrollEdgeEffectStyle` reaches the effect only through titlebar
+    /// and split-view accessory controllers, and picks a style rather than
+    /// turning the effect off, while SwiftUI's `scrollEdgeEffectHidden` does
+    /// not cross a representable boundary into an AppKit scroll view. Guarded
+    /// on the setter, so a build where the property has moved leaves the
+    /// system drawing its own top edge — a cosmetic regression rather than a
+    /// broken window.
+    ///
+    /// Re-asserted on every window change, because the pocket is created for
+    /// the titlebar the scroll view lands under, not once for the view.
+    private func suppressSystemScrollEdgeEffect() {
+        guard scrollView.responds(to: Self.allowedPocketEdgesSetter) else { return }
+        scrollView.setValue(0, forKey: Self.allowedPocketEdgesKey)
+    }
+
+    private static let allowedPocketEdgesKey = "allowedPocketEdges"
+    private static let allowedPocketEdgesSetter =
+        NSSelectorFromString("setAllowedPocketEdges:")
+
     func resetPaint() { didPaint = false }
 
     var scrollViewForTesting: NSScrollView { scrollView }
@@ -1403,6 +1441,11 @@ final class BlockTranscriptContainerView: NSView {
     override func layout() {
         super.layout()
         layoutTableDocument()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        suppressSystemScrollEdgeEffect()
     }
 
     /// A system accent, appearance, or contrast change alters the bubble's fill

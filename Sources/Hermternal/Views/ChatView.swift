@@ -242,10 +242,10 @@ struct ChatView: View {
 
         BlockTranscriptView(input: rendererInput)
             .id(route.map { "\($0.sessionID):\($0.generation)" } ?? "none")
-            // Rows travel under the window's own chrome, so the CONTENT
-            // dissolves before it reaches the toolbar controls. A `Material`
-            // behind those controls could not do this: it is behind-window
-            // vibrancy and cannot obscure an in-window sibling.
+            // Rows travel to the window's own top edge, so the CONTENT
+            // dissolves before it reaches it. A `Material` behind the toolbar
+            // controls could not do this: it is behind-window vibrancy and
+            // cannot obscure an in-window sibling.
             //
             // The mask sits on the SCROLLING renderer, inside the overlays
             // below. Applied to the whole pane it would also fade the find
@@ -291,27 +291,27 @@ struct ChatView: View {
 /// two literals they would drift, and the drift is invisible until a row is
 /// unreadable.
 ///
+/// The ramp starts AT the window top, because this window has no titlebar
+/// chrome for it to start under. `BlockTranscriptContainerView` turns the
+/// system's own scroll edge effect off; it drew a material plate over the
+/// whole titlebar band and dissolved content at that band's LOWER edge, which
+/// is a strip of chrome over the transcript. A ramp that began there too left
+/// the band with no ink at all, which reads as the same strip. One edge, on
+/// the window's own top edge, is the whole design.
+///
 /// `chromeDepth` is the window's top safe-area inset, measured at 52pt on
-/// macOS 26.6.2 while the window has toolbar items. The New Chat and Reload
-/// group lives inside that band: measured at true 2x on the same build, the
-/// group is 70pt wide and 35.5pt tall, 8pt down the window and 10pt in from
-/// its trailing edge, so its deepest ink is 43.5pt down. The clear zone
-/// covers the WHOLE band rather than the 43.5pt the group occupies today,
-/// because AppKit owns that group's height and style, and a system that lays
-/// the item out taller must not be able to reintroduce this bug.
-///
-/// That 52pt is conditional, and the sidebar records the same probe: 52pt
-/// while the window has toolbar items, 32pt when it has none. The clear zone
-/// takes the larger of the two, because the state that has controls is the
-/// only state with ink to protect, and a window with no toolbar items is a
-/// signed-out window with no transcript to dissolve.
-///
-/// Nothing above `chromeDepth` receives ink. An outgoing bubble is trailing
-/// aligned, so it travels directly under that group, and the group is opaque:
-/// any ink left up there is ink the group cuts. The 28pt reach this replaces
-/// released rows to FULL opacity 15.5pt above the group's bottom edge, and
-/// the result was a rectangular bite — 71pt of a readable message ending at
-/// the pill's edge with no fade at all.
+/// macOS 26.6.2 while the window has toolbar items and 32pt when it has none;
+/// the larger is the state with controls to protect. It is not a clear zone.
+/// It is the depth the ramp must cross before content is readable, because
+/// the New Chat and Reload group lives in that band: measured at true 2x on
+/// the same build, the group is 70pt wide and 35.5pt tall, 8pt down the
+/// window and 10pt in from its trailing edge, so its deepest ink is 43.5pt
+/// down, and an outgoing bubble is trailing aligned, so it travels straight
+/// under it. The ramp holds content to 0.55 alpha at that depth and reaches
+/// full opacity only 32pt further down, so nothing arrives at a control's
+/// glass edge at full strength. The sidebar's shipped ramp answers the
+/// traffic lights the same way and accepts the same tradeoff: faint ink under
+/// the chrome rather than an empty band beneath it.
 ///
 /// One vertical gradient covers the full width, even though the group
 /// occupies only its trailing 70pt. A mask that also varied along x would
@@ -320,14 +320,12 @@ struct ChatView: View {
 /// into the one place that has to stay cheap: the mask over the scrolling
 /// viewport.
 ///
-/// The SHAPE is the sidebar's shipped curve, and only the distances are this
-/// pane's own: seven ink stops every 4pt tracking a smoothstep, whose slope
-/// leaves zero and returns to zero, so no join in the perceptible band
-/// changes slope by more than 1.33x. The ramp crosses 32pt, which is under
-/// two body lines and over one turn gap: long enough that no single line
-/// wipes from 0.06 to 0.96 within its own height, short enough that only one
-/// turn is ever fading. It is also entirely in open air, below the chrome,
-/// which is the same case the sidebar's bottom ramp answers.
+/// The SHAPE is the sidebar's shipped curve: seven ink stops tracking a
+/// smoothstep, whose slope leaves zero and returns to zero, so no join in the
+/// perceptible band changes slope by more than 1.33x. The seven alphas are a
+/// smoothstep sampled at eighths, which is the same set of numbers the
+/// sidebar carries, so both columns dissolve on one curve and differ only in
+/// reach.
 ///
 /// `reach` is where content is opaque again, and `contentInset` keeps a
 /// resting row out of the ramp. The transcript's own frame keeps its full
@@ -361,30 +359,24 @@ enum ChatTranscriptTopEdge {
     /// One continuous gradient. Stacked opacity bands would step and seam,
     /// and a second mask would be a second compositing group.
     ///
-    /// The ramp view is exactly `reach` tall, so a depth in points converts
-    /// to a location on its own. Computed, as the sidebar's ramp is: the mask
-    /// is rebuilt when the transcript's own body runs, not when it scrolls,
-    /// because AppKit scrolls the rows inside it.
+    /// Clear at the window's own top edge, opaque at `reach`, and with no flat
+    /// stretch between them: a second zero-alpha stop is exactly what put an
+    /// empty band back over the titlebar. The stops carry fractions rather
+    /// than points because the curve is a smoothstep sampled at eighths, and
+    /// eighths keep it a smoothstep if the reach ever moves.
     static var ramp: Gradient {
         Gradient(stops: [
             .init(color: .clear, location: 0),
-            // No ink in the chrome band. The seven stops below are spaced
-            // every 4pt through the open air under it; the distances have one
-            // consumer each, so they sit beside the opacity they carry rather
-            // than becoming seven more names.
-            .init(color: .clear, location: location(chromeDepth)),
-            .init(color: .black.opacity(0.06), location: location(chromeDepth + 4)),
-            .init(color: .black.opacity(0.18), location: location(chromeDepth + 8)),
-            .init(color: .black.opacity(0.34), location: location(chromeDepth + 12)),
-            .init(color: .black.opacity(0.52), location: location(chromeDepth + 16)),
-            .init(color: .black.opacity(0.70), location: location(chromeDepth + 20)),
-            .init(color: .black.opacity(0.85), location: location(chromeDepth + 24)),
-            .init(color: .black.opacity(0.96), location: location(chromeDepth + 28)),
+            .init(color: .black.opacity(0.06), location: 1 / 8),
+            .init(color: .black.opacity(0.18), location: 2 / 8),
+            .init(color: .black.opacity(0.34), location: 3 / 8),
+            .init(color: .black.opacity(0.52), location: 4 / 8),
+            .init(color: .black.opacity(0.70), location: 5 / 8),
+            .init(color: .black.opacity(0.85), location: 6 / 8),
+            .init(color: .black.opacity(0.96), location: 7 / 8),
             .init(color: .black, location: 1)
         ])
     }
-
-    private static func location(_ depth: CGFloat) -> CGFloat { depth / reach }
 }
 
 private struct ChatTranscriptTopEdgeMask: View {
