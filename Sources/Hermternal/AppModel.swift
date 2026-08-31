@@ -2426,9 +2426,12 @@ final class AppModel: ComposerTurnRouting {
         transcriptRevision &+= 1
     }
 
-    /// Installs the disk-backed store before the first transcript frame. A
-    /// store generation is advanced for every route so stale page reads and
-    /// writes cannot publish into a replacement selection.
+    /// Installs the disk-backed store for the selected route.
+    ///
+    /// First paint does not wait for this install. A later swap keeps the
+    /// displayed transcript. A store generation is advanced for every route
+    /// so stale page reads and writes cannot publish into a replacement
+    /// selection.
     private func prepareActiveTranscriptStore(
         sessionID: String,
         appGeneration: Int
@@ -3107,6 +3110,19 @@ final class AppModel: ComposerTurnRouting {
             reason: "taskFinishedOrCancelledOrSuperseded"
         )
     }
+    /// Lets stream events reduce after first paint. The paged-store swap
+    /// must not reset the displayed transcript.
+    private func releaseOpenEventGate(generation: Int, sessionID: String) {
+        guard preparingOpenGeneration == generation else { return }
+        isPreparingOpen = false
+        HermternalSwitchTrace.selectionGuard(
+            "requestOpen.eventGate.release",
+            id: sessionID,
+            generation: generation,
+            messages: messages.count,
+            reason: "firstPaintPublished"
+        )
+    }
     /// Publishes the first transcript snapshot after the selection turn.
     ///
     /// The main-queue hop runs after the current run-loop transaction commits.
@@ -3263,7 +3279,7 @@ final class AppModel: ComposerTurnRouting {
                 )
                 return
             }
-            let warm = await Task.detached(priority: .userInitiated) {
+            var warm = await Task.detached(priority: .userInitiated) {
                 () -> WarmTranscriptProjection? in
                 guard cacheEnabledForOpen,
                       generationsForOpen.isCurrent(generation)
@@ -3289,24 +3305,49 @@ final class AppModel: ComposerTurnRouting {
                 )
                 return
             }
+            var initialMessages = warm.map {
+                Array($0.messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
+            } ?? []
+            if initialMessages.isEmpty, cacheEnabledForOpen {
+                let historyCacheForOpen = self.historyCache
+                let transcript = await Task.detached(priority: .userInitiated) {
+                    await historyCacheForOpen.readForWarming(for: session.id).transcript
+                }.value
+                if let transcript, !transcript.messages.isEmpty {
+                    initialMessages = Array(
+                        transcript.messages.suffix(TranscriptPublicationPolicy.initialMessageCount)
+                    )
+                    let snapshot = transcript.snapshot ?? AuthoritativeTranscriptSnapshot(
+                        sessionID: session.id,
+                        serverTotal: max(session.messageCount, transcript.messages.count),
+                        fetchedRows: transcript.messages.count,
+                        projectedMessages: transcript.messages.count,
+                        truncated: false,
+                        fetchedAt: Date(timeIntervalSince1970: 0)
+                    )
+                    _ = self.warmStore.publish(
+                        messages: transcript.messages,
+                        snapshot: snapshot,
+                        for: session.id,
+                        minimumServerTotal: session.messageCount
+                    )
+                    warm = self.warmStore.projection(
+                        for: session.id,
+                        minimumServerTotal: session.messageCount
+                    )
+                }
+            }
+            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                return
+            }
             SelectionLatencySignposts.markWarmProjection(
                 warm != nil,
                 sessionID: session.id,
                 generation: generation
             )
-            await self.prepareActiveTranscriptStore(
-                sessionID: session.id,
-                appGeneration: generation
-            )
-            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
-                return
-            }
-            let initialMessages = warm.map {
-                Array($0.messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
-            } ?? []
             // The first-frame tail is bounded. Publish it after the
-            // selection transaction has completed, not after a scheduler
-            // yield that can resume inside the same Core Animation commit.
+            // selection transaction has completed, and never after a
+            // v3-to-paged migration. A later store swap keeps this tail.
             guard await self.publishTranscriptAfterSelectionTurn(
                 initialMessages,
                 session: session,
@@ -3315,6 +3356,15 @@ final class AppModel: ComposerTurnRouting {
             ) else {
                 return
             }
+            self.releaseOpenEventGate(generation: generation, sessionID: session.id)
+            await self.prepareActiveTranscriptStore(
+                sessionID: session.id,
+                appGeneration: generation
+            )
+            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                return
+            }
+            await self.persistTranscriptTail(self.messages)
             _ = await self.open(
                 session,
                 generation: generation,
@@ -3467,8 +3517,20 @@ final class AppModel: ComposerTurnRouting {
                     minimumServerTotal: session.messageCount
                 )
             }
-            if !rejectsCacheDerivedDowngrade
-                && (!sameWarmProjection || warmTailNeedsExpansion) {
+            // A live row that is not in this result stays on screen.
+            // A REST result may replace it.
+            let liveHasDistinctMessages = messages.contains { displayed in
+                !result.messages.contains { candidate in candidate.id == displayed.id }
+            }
+            let cacheWouldDropVisibleTail = result.isCachedPhase
+                && !result.didFetchREST
+                && !messages.isEmpty
+                && result.messages.count < messages.count
+            let preservesLiveReductions = !result.didFetchREST
+                && (liveHasDistinctMessages || cacheWouldDropVisibleTail)
+            if !preservesLiveReductions,
+               !rejectsCacheDerivedDowngrade,
+               (!sameWarmProjection || warmTailNeedsExpansion) {
                 streamingReducer.reset(
                     messages: Array(result.messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
                 )

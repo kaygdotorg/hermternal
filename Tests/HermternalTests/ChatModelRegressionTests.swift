@@ -1,7 +1,7 @@
 import Foundation
-import HermternalCore
 import Testing
 @testable import Hermternal
+@testable import HermternalCore
 
 @Test("Terminal reconciliation removes only provisional rows with the durable turn identity")
 @MainActor
@@ -260,3 +260,137 @@ func foreignSessionEventsDoNotReduceOpenChat() async throws {
 
     #expect(model.messages.map(\.text) == ["Keep"])
 }
+
+@Test("requestOpen publishes the cache tail before paged store install")
+@MainActor
+func requestOpenPublishesCacheTailBeforePagedStoreInstall() async throws {
+    let directory = try chatModelTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let messages = (0..<500).map { index in
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: Int64(index))),
+            role: index.isMultiple(of: 2) ? .user : .assistant,
+            text: "cached transcript row \(index)"
+        )
+    }
+    let session = chatSession(id: "five-hundred", messageCount: 500)
+    let snapshot = AuthoritativeTranscriptSnapshot(
+        sessionID: session.id,
+        serverTotal: 500,
+        fetchedRows: 500,
+        projectedMessages: 500,
+        truncated: false,
+        fetchedAt: Date(timeIntervalSince1970: 0)
+    )
+    let cache = HistoryCache(directory: directory)
+    _ = await cache.store(messages, snapshot: snapshot, for: session.id)
+    let model = AppModel(
+        cache: cache,
+        transcriptSource: TranscriptFixtureSource(rows: []),
+        warmStore: TranscriptWarmStore()
+    )
+    model.sessions = [session]
+    model.cacheEnabled = true
+
+    let task = model.requestOpen(session)
+    let painted = await chatOpenWait(
+        until: "first paint publishes 12 cached messages",
+        holds: { model.messages.count == TranscriptPublicationPolicy.initialMessageCount }
+    )
+    #expect(painted)
+    #expect(model.messages.map(\.text) == Array(messages.suffix(12).map(\.text)))
+    #expect(await cache.existingPagedStore(for: session.id) == nil)
+    model.cancelOpenPreparation()
+    _ = task
+}
+
+@Test("requestOpen keeps live reductions when the paged store installs")
+@MainActor
+func requestOpenKeepsLiveReductionsAcrossPagedStoreInstall() async throws {
+    let directory = try chatModelTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let messages = (0..<20).map { index in
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: Int64(index))),
+            role: index.isMultiple(of: 2) ? .user : .assistant,
+            text: "cached transcript row \(index)"
+        )
+    }
+    let session = chatSession(id: "live-swap", messageCount: 20)
+    let snapshot = AuthoritativeTranscriptSnapshot(
+        sessionID: session.id,
+        serverTotal: 20,
+        fetchedRows: 20,
+        projectedMessages: 20,
+        truncated: false,
+        fetchedAt: Date(timeIntervalSince1970: 0)
+    )
+    let cache = HistoryCache(directory: directory)
+    _ = await cache.store(messages, snapshot: snapshot, for: session.id)
+    let model = AppModel(
+        cache: cache,
+        transcriptSource: TranscriptFixtureSource(rows: []),
+        warmStore: TranscriptWarmStore()
+    )
+    model.sessions = [session]
+    model.cacheEnabled = true
+
+    let task = model.requestOpen(session)
+    let painted = await chatOpenWait(
+        until: "first paint publishes the cached tail",
+        holds: { model.messages.count == TranscriptPublicationPolicy.initialMessageCount }
+    )
+    #expect(painted)
+    let gateReleased = await chatOpenWait(
+        until: "first paint releases the open event gate",
+        holds: { !model.isPreparingTranscriptOpen }
+    )
+    #expect(gateReleased)
+
+    await model.handle(GatewayEvent(
+        type: "message.start",
+        sessionID: session.id,
+        payload: .object(["id": .integer(9_001), "text": .string("")])
+    ))
+    await model.handle(GatewayEvent(
+        type: "message.delta",
+        sessionID: session.id,
+        payload: .object(["id": .integer(9_001), "text": .string("live tail")])
+    ))
+    #expect(model.messages.contains { $0.text == "live tail" })
+
+
+    let installed = await chatOpenWait(
+        until: "paged store install completes",
+        holds: { model.activeTranscriptStore != nil }
+    )
+    #expect(installed)
+    #expect(model.messages.contains { $0.text == "live tail" })
+    model.cancelOpenPreparation()
+    _ = task
+}
+
+private let chatOpenWaitBound = Duration.seconds(15)
+
+@MainActor
+private func chatOpenWait(
+    until condition: String,
+    sourceLocation: SourceLocation = #_sourceLocation,
+    holds: @MainActor () async -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now + chatOpenWaitBound
+    while true {
+        if await holds() { return true }
+        guard ContinuousClock.now < deadline else {
+            Issue.record(
+                "The wait ended after \(chatOpenWaitBound). The condition did not occur: \(condition).",
+                sourceLocation: sourceLocation
+            )
+            return false
+        }
+        await Task.yield()
+    }
+}
+

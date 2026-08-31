@@ -1,5 +1,5 @@
 import Foundation
-import HermternalCore
+@testable import HermternalCore
 import Testing
 
 @Test("punctuated session IDs use distinct cache files")
@@ -397,6 +397,49 @@ func cacheFileRecognitionAndValidationAreIndependent() throws {
         ) == .legacyCollision
     )
 }
+
+@Test("visible tail reads v3 cache without starting paged migration")
+func visibleTailDoesNotStartPagedMigration() async throws {
+    let directory = try historyCacheTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let cache = HistoryCache(directory: directory)
+    let messages = (0..<40).map { index in
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: Int64(index))),
+            role: index.isMultiple(of: 2) ? .user : .assistant,
+            text: "row \(index)"
+        )
+    }
+    _ = await cache.store(messages, for: "session")
+
+    let tail = await cache.visibleTail(for: "session")
+    #expect(tail.map(\.text) == messages.suffix(12).map(\.text))
+    #expect(await cache.existingPagedStore(for: "session") == nil)
+}
+
+@Test("concurrent pagedStore callers share one v3 migration")
+func concurrentPagedStoreCallersShareOneMigration() async throws {
+    let directory = try historyCacheTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let cache = HistoryCache(directory: directory)
+    let messages = (0..<40).map { index in
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: Int64(index))),
+            role: index.isMultiple(of: 2) ? .user : .assistant,
+            text: "row \(index)"
+        )
+    }
+    _ = await cache.store(messages, for: "session")
+
+    async let first = cache.pagedStore(for: "session")
+    async let second = cache.pagedStore(for: "session")
+    let left = try await first
+    let right = try await second
+    #expect(left === right)
+    #expect(try await left.summary().messageCount == 40)
+    #expect(await cache.existingPagedStore(for: "session") === left)
+}
+
 private actor PrefetchGate {
     private var started = false
     private var released = false

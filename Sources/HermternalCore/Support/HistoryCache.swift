@@ -319,6 +319,9 @@ public actor HistoryCache: TranscriptPersisting {
     /// Paged stores are disk-backed actors. The dictionary only retains the
     /// small actor handles and never a transcript corpus.
     private var pagedStores: [String: PagedTranscriptStore] = [:]
+    /// One in-flight v3-to-paged migration per session. Concurrent callers join
+    /// this task so a cancelled waiter cannot start a second copy.
+    private var pagedStoreFlights: [String: Task<PagedTranscriptStore, Error>] = [:]
     // A write is valid only if no clear happened after the read it derives
     // from. The epoch is actor-local so checking it and touching disk are
     // one atomic operation relative to clear().
@@ -475,6 +478,17 @@ public actor HistoryCache: TranscriptPersisting {
         pagedStores[id]
     }
 
+    /// Returns the bounded visible tail from the v3 cache.
+    ///
+    /// This read never starts a v3-to-paged migration.
+    public func visibleTail(
+        for id: String,
+        count: Int = TranscriptPublicationPolicy.initialMessageCount
+    ) -> [ChatMessage] {
+        let messages = readForWarming(for: id).transcript?.messages ?? []
+        guard count > 0 else { return [] }
+        return Array(messages.suffix(count))
+    }
 
     /// Returns the disk-backed store for a session. A v3 flat cache entry is
     /// migrated one record at a time on first access, then the old file is
@@ -484,9 +498,50 @@ public actor HistoryCache: TranscriptPersisting {
             throw PagedError.unavailable
         }
         if let existing = pagedStores[id] { return existing }
+        let flight: Task<PagedTranscriptStore, Error>
+        if let existingFlight = pagedStoreFlights[id] {
+            flight = existingFlight
+        } else {
+            let expectedEpoch = epoch
+            let directory = pagedDirectory
+            flight = Task {
+                try await self.migrateV3CacheIfNeeded(
+                    id: id,
+                    directory: directory,
+                    expectedEpoch: expectedEpoch
+                )
+            }
+            pagedStoreFlights[id] = flight
+        }
+        do {
+            let store = try await flight.value
+            pagedStores[id] = store
+            pagedStoreFlights[id] = nil
+            return store
+        } catch is CancellationError {
+            // A cancelled waiter must not drop the in-flight migration.
+            // The next caller joins the same task and records the store.
+            throw CancellationError()
+        } catch {
+            pagedStoreFlights[id] = nil
+            throw error
+        }
+    }
+
+    private func migrateV3CacheIfNeeded(
+        id: String,
+        directory: URL,
+        expectedEpoch: UInt64
+    ) async throws -> PagedTranscriptStore {
+        if let existing = pagedStores[id] {
+            return existing
+        }
+        guard epoch == expectedEpoch else {
+            throw TranscriptStoreError.staleEpoch(expected: expectedEpoch, actual: epoch)
+        }
         let store = PagedTranscriptStore(
             route: TranscriptRoute(sessionID: id, epoch: epoch),
-            directory: pagedDirectory,
+            directory: directory,
             fileSystem: PagedFileSystemAdapter(base: fileSystem)
         )
         try await store.load()
@@ -498,14 +553,16 @@ public actor HistoryCache: TranscriptPersisting {
         {
             for message in legacy.messages {
                 try Task.checkCancellation()
-                try await store.append(Self.wireRecord(from: message))
+                guard epoch == expectedEpoch else {
+                    throw TranscriptStoreError.staleEpoch(expected: expectedEpoch, actual: epoch)
+                }
+                _ = try await store.append(Self.wireRecord(from: message))
             }
             if let old = url(for: id) {
                 try? fileSystem.removeItem(at: old)
             }
             forget(id)
         }
-        pagedStores[id] = store
         return store
     }
 
@@ -1147,6 +1204,7 @@ public actor HistoryCache: TranscriptPersisting {
     public func remove(sessionID: String) -> SessionLocalCleanupResult {
         forget(sessionID)
         pagedStores.removeValue(forKey: sessionID)
+        pagedStoreFlights.removeValue(forKey: sessionID)
         let targets = [url(for: sessionID), legacyURL(for: sessionID), pagedDirectory(for: sessionID)]
             .compactMap { $0 }
             .reduce(into: [String: URL]()) { result, target in
@@ -1257,6 +1315,8 @@ public actor HistoryCache: TranscriptPersisting {
         do {
             if fileSystem.fileExists(at: directory) { try fileSystem.removeItem(at: directory) }
             pagedStores.removeAll(keepingCapacity: true)
+            for flight in pagedStoreFlights.values { flight.cancel() }
+            pagedStoreFlights.removeAll(keepingCapacity: true)
             memory.removeAll()
             memoryOrder.removeAll()
             memoryBytes = 0

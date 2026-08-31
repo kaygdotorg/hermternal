@@ -15,3 +15,9 @@ func initialPublicationShortTranscript() {
     let start = max(0, count - TranscriptPublicationPolicy.initialMessageCount)
     #expect(start..<count == 0..<5)
 }
+
+@Test("first paint budget matches the switch contract")
+func firstPaintBudgetMatchesSwitchContract() {
+    #expect(TranscriptPublicationPolicy.firstPaintBudgetMilliseconds == 100)
+    #expect(TranscriptPublicationPolicy.initialMessageCount == 12)
+}

@@ -5,4 +5,6 @@
 public enum TranscriptPublicationPolicy {
     /// The tail copied before the first await on the selection path.
     public static let initialMessageCount = 12
+    /// Wall-clock budget for publishing that tail from cache or a warm projection.
+    public static let firstPaintBudgetMilliseconds = 100
 }
