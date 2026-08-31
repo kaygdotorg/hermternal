@@ -1242,8 +1242,17 @@ final class ComposerModel {
     /// Loads the model list of the open chat.
     ///
     /// Prefetch on mount fills the cache. A later menu open reads that cache
-    /// and does not wait on the network.
+    /// and does not wait on the network. An explicit menu open still prepares
+    /// a session when the cache is empty.
     func loadModels(refresh: Bool = false) {
+        requestInventory(refresh: refresh, preparesSession: true)
+    }
+
+    /// Loads inventory. Browse prefetch does not prepare a live session.
+    ///
+    /// A nil session id calls `model.options` with no `session_id`.
+    /// A live session id is used only when the route already has one.
+    private func requestInventory(refresh: Bool, preparesSession: Bool) {
         if !refresh {
             if case .loaded = inventory { return }
             if case .loading = inventory { return }
@@ -1268,17 +1277,29 @@ final class ComposerModel {
             }
             do {
                 guard let self else { return }
-                let preparedSession = try await self.prepareRuntimeSession(expectedRoute: routeToken)
+                let sessionID: String?
+                let preparedEpoch: UInt64?
+                if preparesSession {
+                    let preparedSession = try await self.prepareRuntimeSession(expectedRoute: routeToken)
+                    sessionID = preparedSession.id
+                    preparedEpoch = preparedSession.epoch
+                } else if let liveID = self.route.liveSessionID, !liveID.isEmpty {
+                    sessionID = liveID
+                    preparedEpoch = nil
+                } else {
+                    sessionID = nil
+                    preparedEpoch = nil
+                }
                 let result = try await self.runtime.modelInventory(
-                    sessionID: preparedSession.id,
+                    sessionID: sessionID,
                     refresh: refresh
                 )
-                self.rememberInventory(result, sessionID: preparedSession.id, identity: routeToken.identity)
+                self.rememberInventory(result, sessionID: sessionID ?? "", identity: routeToken.identity)
                 guard self.inventoryOperationID == operationID,
                       self.isCurrentWritableRoute(
                           routeToken,
                           requiresDurableIdentity: false,
-                          preparationEpoch: preparedSession.epoch
+                          preparationEpoch: preparedEpoch
                       )
                 else {
                     self.clearLoadingInventoryIfNeeded()
@@ -1657,14 +1678,15 @@ final class ComposerModel {
         }
     }
 
+    /// Browse prefetch loads `model.options` without `session.resume`.
+    ///
+    /// It uses a live session id only when the route already has one.
+    /// It does not wait for a session that does not exist.
+    /// Defended by mountPrefetchesAndCachesInventory.
     private func prefetchInventoryIfEligible() {
         guard hasAppeared, !isUnmounted, canChangeRuntime else { return }
-        // Prefetch needs a turn router or a live session. Without either,
-        // the load cannot complete, so skip it. Do not start a parked wait.
-        // Defended by mountPrefetchesAndCachesInventory.
-        guard turn != nil || (route.liveSessionID?.isEmpty == false) else { return }
         if restoreInventoryFromCache() { return }
-        loadModels()
+        requestInventory(refresh: false, preparesSession: false)
     }
 
     // MARK: - Dictation

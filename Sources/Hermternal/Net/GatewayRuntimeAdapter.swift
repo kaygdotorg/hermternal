@@ -17,6 +17,7 @@ import Glibc
 public actor GatewayRuntimeAdapter: SessionRuntimeControlling, AttachmentStaging {
     private let gateway: GatewayClient
     /// Last successful `model.options` payload, keyed by live session id.
+    /// An empty key stores the catalog from a call with no session id.
     private var inventoryCache: [String: ModelInventory] = [:]
     /// In-flight inventory loads. Cancel must drop the parked task.
     private var inventoryInFlight: [String: Task<ModelInventory, Error>] = [:]
@@ -28,6 +29,9 @@ public actor GatewayRuntimeAdapter: SessionRuntimeControlling, AttachmentStaging
 
     // MARK: SessionRuntimeControlling
 
+    /// Loads the model catalog. A nil session id omits `session_id` on the wire.
+    ///
+    /// Browse prefetch uses that catalog path. Warming chats does not resume sessions.
     public func modelInventory(sessionID: String?, refresh: Bool) async throws -> ModelInventory {
         let cacheKey = sessionID ?? ""
         if !refresh, let cached = inventoryCache[cacheKey] {

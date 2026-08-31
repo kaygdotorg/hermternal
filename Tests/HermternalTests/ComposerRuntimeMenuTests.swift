@@ -245,6 +245,7 @@ func adoptingNewChatKeepsInventoryAndPendingModel() async {
 @MainActor
 func mountPrefetchesAndCachesInventory() async {
     let runtime = RuntimeMenuSpy()
+    let turn = RuntimeMenuTurnSpy(sessionID: "prepared-live")
     let completion = RuntimeMenuOperationCompletion(expectedCount: 1)
     let route = ComposerRoute(
         identity: "prefetch-inventory",
@@ -260,6 +261,7 @@ func mountPrefetchesAndCachesInventory() async {
     let model = makeRuntimeMenuModel(
         route: route,
         runtime: runtime,
+        turn: turn,
         operationCompletion: completion
     )
 
@@ -275,6 +277,9 @@ func mountPrefetchesAndCachesInventory() async {
     #expect(model.reasoningOptions.choices.contains(.off))
     #expect(model.reasoningOptions.choices.contains(.effort(.medium)))
     #expect(model.reasoningOptions.current == .effort(.medium))
+    #expect(turn.prepareRequests.isEmpty)
+    model.loadModels()
+    #expect(turn.prepareRequests.isEmpty)
 
     model.unmount(firstMount)
     model.update(route: ComposerRoute(identity: "other-prefetch", generation: 7, liveSessionID: "other"))
@@ -284,6 +289,46 @@ func mountPrefetchesAndCachesInventory() async {
     _ = model.mount()
     #expect(model.inventory == .loaded(runtimeMenuInventory))
     #expect(await runtime.inventorySessionIDs() == ["live"])
+    #expect(turn.prepareRequests.isEmpty)
+}
+
+@Test("Browse prefetch loads inventory without preparing a session")
+@MainActor
+func browsePrefetchDoesNotPrepareSession() async {
+    let runtime = RuntimeMenuSpy()
+    let turn = RuntimeMenuTurnSpy(sessionID: "prepared-live")
+    let completion = RuntimeMenuOperationCompletion(expectedCount: 3)
+    let first = ComposerRoute(identity: "browse-first", generation: 30)
+    let second = ComposerRoute(identity: "browse-second", generation: 31)
+    let model = makeRuntimeMenuModel(
+        route: first,
+        runtime: runtime,
+        turn: turn,
+        operationCompletion: completion
+    )
+
+    _ = model.mount()
+    await runtime.waitForInventory()
+    await completion.wait(for: 1)
+    #expect(turn.prepareRequests.isEmpty)
+    #expect(await runtime.inventorySessionIDs() == [nil])
+    #expect(model.inventory == .loaded(runtimeMenuInventory))
+    model.loadModels()
+    #expect(turn.prepareRequests.isEmpty)
+
+    model.update(route: second)
+    await runtime.waitForInventory(count: 2)
+    await completion.wait(for: 2)
+    #expect(turn.prepareRequests.isEmpty)
+    #expect(await runtime.inventorySessionIDs() == [nil, nil])
+    #expect(model.inventory == .loaded(runtimeMenuInventory))
+
+    model.text = "Send now"
+    model.submit()
+    await turn.waitForSubmission()
+    await completion.wait()
+    #expect(turn.prepareRequests == [second.token])
+    #expect(turn.submissionSessionIDs == ["prepared-live"])
 }
 
 @Test("Concurrent inventory, model, and send share preparation")
