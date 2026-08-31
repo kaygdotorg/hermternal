@@ -62,6 +62,37 @@ public struct ChatSession: Identifiable, Hashable, Sendable {
         displayTitle = Self.deriveDisplayTitle(title: title, preview: preview)
     }
 
+    /// Rebuilds a sidebar row from persisted cache fields.
+    ///
+    /// `displayTitle` is derived here so a disk snapshot does not store a
+    /// second copy of the label.
+    public init(
+        id: String,
+        title: String = "",
+        preview: String = "",
+        startedAt: Date? = nil,
+        lastActive: Date? = nil,
+        pinned: Bool = false,
+        archived: Bool = false,
+        source: String = "",
+        profile: String? = nil,
+        messageCount: Int = 0
+    ) {
+        self.init(
+            id: id,
+            title: title,
+            preview: preview,
+            startedAt: startedAt,
+            lastActive: lastActive,
+            pinned: pinned,
+            archived: archived,
+            source: source,
+            profile: profile,
+            messageCount: messageCount,
+            displayTitle: Self.deriveDisplayTitle(title: title, preview: preview)
+        )
+    }
+
     /// Returns a copy with only the server pin state changed.
     public func withPinned(_ pinned: Bool) -> ChatSession {
         ChatSession(

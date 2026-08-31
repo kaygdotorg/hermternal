@@ -504,14 +504,25 @@ final class AppModel: ComposerTurnRouting {
 
     enum Phase: Equatable {
         case signedOut
+        case restoring
         case connecting
         case ready
         case failed(String)
+
+        /// The split workspace can paint. Network work may still be in flight.
+        var presentsWorkspace: Bool {
+            switch self {
+            case .restoring, .connecting, .ready: true
+            case .signedOut, .failed: false
+            }
+        }
     }
 
     // MARK: - Observable state
 
-    var phase: Phase = .signedOut
+    var phase: Phase = .restoring
+    /// True after a refresh rejection. The cached workspace stays on screen.
+    var sessionExpiredBanner = false
     var sessions: [ChatSession] = []
     var sortMode: SortMode = .lastActivity
     var groupByDate = true
@@ -618,6 +629,7 @@ final class AppModel: ComposerTurnRouting {
         let url = serverURL ?? URL(string: Self.defaultServer)!
         let connection: GatewayConnectionState = switch phase {
         case .signedOut: .signedOut
+        case .restoring: .restoring
         case .connecting: .connecting
         case .ready: .ready
         case .failed(let message): .failed(message)
@@ -714,6 +726,9 @@ final class AppModel: ComposerTurnRouting {
     private var capabilityModule: GatewayCapabilityModule?
     private var composerRuntime: GatewayRuntimeAdapter?
     private let organizationStore: SessionOrganizationStore
+    private let sessionListCache: SessionListCache
+    private let credentialStore: (any CredentialStoring)?
+    private var didPublishRestoredTranscript = false
     private var organizationSnapshot: SessionOrganization?
     private var organizationLoaded = false
     /// True only after a complete REST paging pass has loaded the sessions.
@@ -785,12 +800,17 @@ final class AppModel: ComposerTurnRouting {
         toastPresenter: ToastPresenter = ToastPresenter(),
         organizationStore: SessionOrganizationStore = SessionOrganizationStore(),
         warmStore: TranscriptWarmStore = TranscriptWarmStore(),
+        credentialStore: (any CredentialStoring)? = nil,
         debugModules: any DebugModuleCapability = OmittedDebugModuleCapability()
     ) {
         self.debugModules = debugModules
         self.injectedTranscriptSource = transcriptSource
         self.toastPresenter = toastPresenter
         self.organizationStore = organizationStore
+        self.credentialStore = credentialStore
+        self.sessionListCache = SessionListCache(
+            directory: cache.storageDirectory.map(SessionListCache.directory(forHistoryDirectory:))
+        )
         self.historyCache = cache
         self.warmStore = warmStore
         HermternalSwitchTrace.configure(capability: debugModules)
@@ -798,6 +818,7 @@ final class AppModel: ComposerTurnRouting {
             self.cache = cache
             self.searchQuerying = nil
             self.searchUnavailableReason = "The system cache directory is unavailable."
+            installCachedSessionList()
             return
         }
 
@@ -813,6 +834,7 @@ final class AppModel: ComposerTurnRouting {
             self.searchUnavailableReason = error.localizedDescription
             Log.error("Search index unavailable; using transcript cache only: \(error)")
         }
+        installCachedSessionList()
     }
 
     /// Search lives beside the default history directory, and inside any
@@ -828,8 +850,8 @@ final class AppModel: ComposerTurnRouting {
     }
 
     // MARK: - Lifecycle
-    /// Reconnect silently when a stored session is already present, so a
-    /// relaunch lands straight in the chat.
+    /// Restore the last chat from disk so a relaunch paints the workspace
+    /// before any network work starts.
     func restoreOrPromptSignIn() async {
         await loadOrganizationIfNeeded()
         // Cache disablement is a privacy/storage promise and must not depend
@@ -845,13 +867,19 @@ final class AppModel: ComposerTurnRouting {
             cacheTotalCount = 0
             cacheBytes = 0
             isCacheWarming = false
+        } else {
+            publishRestoredTranscript()
         }
 
         guard let url = serverURL else {
             phase = .failed(AuthError.badServerURL.localizedDescription)
             return
         }
-        let auth = AuthClient(server: url, openURL: { NSWorkspace.shared.open($0) })
+        let auth = AuthClient(
+            server: url,
+            openURL: { NSWorkspace.shared.open($0) },
+            credentialStore: credentialStore
+        )
         self.auth = auth
         do {
             guard try await auth.loadStoredCredentials() != nil else {
@@ -862,9 +890,62 @@ final class AppModel: ComposerTurnRouting {
             phase = .failed(error.localizedDescription)
             return
         }
+        if phase == .signedOut {
+            phase = .restoring
+        }
+        sessionExpiredBanner = false
         await refreshGatewayDiscovery(using: auth)
         accountIdentity = await auth.fetchAccountIdentity()
         await connect()
+    }
+
+    /// Loads the cached sidebar and last selection with no network work.
+    private func installCachedSessionList() {
+        let cached = sessionListCache.loadSessions()
+        sessions = cached.sorted(by: Self.sessionComesBefore)
+        guard !sessions.isEmpty else {
+            phase = .signedOut
+            return
+        }
+        phase = .restoring
+        let storedID = sessionListCache.loadSelectedSessionID()
+        let restored = storedID.flatMap { id in
+            sessions.first { candidate in candidate.id == id }
+        } ?? sessions.first
+        guard let restored else { return }
+        selectedSessionID = restored.id
+        if storedID != restored.id {
+            sessionListCache.saveSelectedSessionID(restored.id)
+        }
+    }
+
+    /// Publishes the restored chat from disk before authentication starts.
+    ///
+    /// The call stays on the current MainActor turn. `requestOpen` publishes
+    /// the cache-resident tail. Launch then strips in-flight flags so the
+    /// first paint is static.
+    func publishRestoredTranscript() {
+        guard cacheEnabled, phase == .restoring else { return }
+        guard !didPublishRestoredTranscript else { return }
+        guard let sessionID = selectedSessionID,
+              let session = sessions.first(where: { candidate in candidate.id == sessionID })
+        else { return }
+        didPublishRestoredTranscript = true
+        _ = requestOpen(session)
+        applyScrubbedRestoredSnapshot()
+    }
+
+    /// Strips launch-time streaming flags from the snapshot that `requestOpen`
+    /// just published. SwiftUI does not paint between these two assignments.
+    private func applyScrubbedRestoredSnapshot() {
+        let published = messages
+        let scrubbed = CachedTranscriptScrubbing.scrub(published)
+        if CachedTranscriptScrubbing.needsScrub(published)
+            || scrubbed.count != published.count {
+            streamingReducer.reset(messages: scrubbed)
+            messages = scrubbed
+        }
+        isAwaitingReply = false
     }
 
     private func loadOrganizationIfNeeded() async {
@@ -911,20 +992,27 @@ final class AppModel: ComposerTurnRouting {
             return
         }
         UserDefaults.standard.set(serverText, forKey: Self.serverKey)
-        let auth = AuthClient(server: url, openURL: { NSWorkspace.shared.open($0) })
+        let auth = AuthClient(
+            server: url,
+            openURL: { NSWorkspace.shared.open($0) },
+            credentialStore: credentialStore
+        )
         self.auth = auth
         await refreshGatewayDiscovery(using: auth)
 
-        phase = .connecting
         do {
             Log.info("signIn: starting native PKCE flow against \(url.absoluteString)")
             _ = try await auth.signIn()
             accountIdentity = await auth.fetchAccountIdentity()
             Log.info("signIn: token exchange succeeded")
+            sessionExpiredBanner = false
+            if phase == .signedOut {
+                phase = .restoring
+            }
             await connect()
         } catch {
             Log.error("signIn failed: \(error)")
-            phase = .failed(error.localizedDescription)
+            handleConnectionFailure(error)
         }
     }
 
@@ -943,6 +1031,9 @@ final class AppModel: ComposerTurnRouting {
         archivedSessions = []
         setSelectedSessionID(nil, event: "selectedSessionID.signOut")
         viewingArchivedSessionID = nil
+        sessionExpiredBanner = false
+        didPublishRestoredTranscript = false
+        sessionListCache.clear()
         phase = .signedOut
         eventTask?.cancel()
         eventTask = nil
@@ -1122,7 +1213,9 @@ final class AppModel: ComposerTurnRouting {
     private func connect() async {
         await loadOrganizationIfNeeded()
         guard let auth, let url = serverURL else { return }
-        phase = .connecting
+        if !phase.presentsWorkspace {
+            phase = .restoring
+        }
         do {
             let ticket = try await auth.webSocketTicket()
             Log.info("connect: minted ws ticket")
@@ -1140,14 +1233,53 @@ final class AppModel: ComposerTurnRouting {
                 ?? "Complete deletion is unavailable on this gateway."
             observeEvents(on: gateway)
             phase = .ready
+            sessionExpiredBanner = false
             await loadComposerDefaults()
             await loadSessions()
+            await reconcileRestoredSessionIfNeeded()
         } catch is CancellationError {
             return
         } catch {
             Log.error("connect failed: \(error)")
-            phase = .failed(error.localizedDescription)
+            handleConnectionFailure(error)
         }
+    }
+
+    func handleConnectionFailure(_ error: Error) {
+        if isRefreshRejection(error) {
+            sessionExpiredBanner = true
+            if !phase.presentsWorkspace {
+                phase = .restoring
+            }
+            return
+        }
+        if phase.presentsWorkspace {
+            postError("Could not connect", detail: error.localizedDescription)
+            return
+        }
+        phase = .failed(error.localizedDescription)
+    }
+
+    private func isRefreshRejection(_ error: Error) -> Bool {
+        if let authError = error as? AuthError, case .sessionExpired = authError {
+            return true
+        }
+        return false
+    }
+
+    private func reconcileRestoredSessionIfNeeded() async {
+        guard let selectedSessionID,
+              let session = sessions.first(where: { candidate in candidate.id == selectedSessionID })
+        else { return }
+        let generation = openGenerations.begin()
+        let handle = TranscriptOpenHandle()
+        activeOpenHandle = handle
+        _ = await open(
+            session,
+            generation: generation,
+            selectionAlreadyPublished: true,
+            handle: handle
+        )
     }
 
     private func observeEvents(on gateway: GatewayClient) {
@@ -1178,6 +1310,7 @@ final class AppModel: ComposerTurnRouting {
             // pass before retention or disk/index reconciliation can run.
             cancelPrefetch()
             sessions.sort(by: Self.sessionComesBefore)
+            sessionListCache.saveSessions(sessions)
             if viewingArchivedSessionID == nil,
                selectedSessionID == nil,
                let liveSessionID,
@@ -2400,6 +2533,7 @@ final class AppModel: ComposerTurnRouting {
             displayedTranscriptSessionID = nil
         }
         selectedSessionID = value
+        sessionListCache.saveSelectedSessionID(value)
         updateComposerRoute()
         HermternalSwitchTrace.session(
             "\(event).after",
@@ -2973,7 +3107,7 @@ final class AppModel: ComposerTurnRouting {
     private var pendingRoutePhase: PendingRouteCoordinator.Phase {
         switch phase {
         case .signedOut: .signedOut
-        case .connecting: .connecting
+        case .restoring, .connecting: .connecting
         case .ready: .ready
         case .failed: .failed
         }
@@ -3389,6 +3523,9 @@ final class AppModel: ComposerTurnRouting {
         // to the previously selected chat and must not leak into a later send.
         if selectedSessionID != session.id {
             liveSessionID = nil
+        }
+        if phase == .restoring, selectionAlreadyPublished {
+            return true
         }
         guard let source = transcriptSource(for: session) else {
             HermternalSwitchTrace.selectionGuard(

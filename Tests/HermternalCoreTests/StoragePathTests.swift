@@ -22,6 +22,20 @@ func historyPathComposition() {
     )
 }
 
+@Test("session list paths sit beside history in the bundle cache")
+func sessionListPathComposition() {
+    let caches = URL(fileURLWithPath: "/fixture/caches", isDirectory: true)
+
+    #expect(
+        SessionListCache.fileURL(cachesDirectory: caches).path
+            == "/fixture/caches/\(AppIdentity.bundleID)/sessions.json"
+    )
+    #expect(
+        SessionListCache.selectedSessionFileURL(cachesDirectory: caches).path
+            == "/fixture/caches/\(AppIdentity.bundleID)/selected-session-id"
+    )
+}
+
 @Test("logs use app-owned application support rather than a platform-specific logs root")
 func logPathComposition() {
     let applicationSupport = URL(fileURLWithPath: "/fixture/application-support", isDirectory: true)

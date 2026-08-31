@@ -69,7 +69,7 @@ struct GatewaySettingsView: View {
         switch status.connection {
         case .ready: .green
         case .failed: .orange
-        case .signedOut, .connecting: .secondary
+        case .signedOut, .restoring, .connecting: .secondary
         }
     }
 }

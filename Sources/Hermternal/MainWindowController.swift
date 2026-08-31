@@ -1031,15 +1031,21 @@ final class HermternalApplicationDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func launchIfNeeded() {
-        guard didFinishLaunching,
-              showMainWindowIfReady(),
-              !fixtureMode,
-              !didStartRestore,
-              let model
-        else { return }
+        guard didFinishLaunching else { return }
+        if fixtureMode {
+            _ = showMainWindowIfReady()
+            return
+        }
+        guard !didStartRestore else {
+            _ = showMainWindowIfReady()
+            return
+        }
+        guard let model else { return }
         didStartRestore = true
-        Task { @MainActor in
-            await model.restoreOrPromptSignIn()
+        model.publishRestoredTranscript()
+        _ = showMainWindowIfReady()
+        Task { @MainActor [weak self] in
+            await self?.model?.restoreOrPromptSignIn()
         }
     }
 

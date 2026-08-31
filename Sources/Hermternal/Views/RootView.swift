@@ -18,15 +18,20 @@ struct RootView: View {
             switch model.phase {
             case .signedOut:
                 SignInView(model: model)
-            case .connecting:
-                ConnectingView()
-            case .ready:
+            case .restoring, .connecting, .ready:
                 ChatView(
                     model: model,
                     isReadOnly: model.isViewingArchivedTranscript
                 )
             case .failed(let message):
                 FailureView(message: message, model: model)
+            }
+        }
+        .overlay(alignment: .top) {
+            if model.sessionExpiredBanner, model.phase.presentsWorkspace {
+                SessionExpiredBanner {
+                    Task { await model.signIn() }
+                }
             }
         }
         .onChange(of: model.isSearchPresented) { _, presented in
@@ -74,7 +79,7 @@ struct MainSplitRoot: View {
         self.appearance = appearance
         self.onModelStateChanged = onModelStateChanged
         self.isActive = isActive
-        let startsReady = model.phase == .ready
+        let startsReady = model.phase.presentsWorkspace
         self._columnVisibility = State(initialValue: startsReady ? .all : .detailOnly)
         self._readyVisibility = State(initialValue: .all)
         self._wasReady = State(initialValue: startsReady)
@@ -84,7 +89,7 @@ struct MainSplitRoot: View {
         Group {
             if !isActive {
                 Color.clear
-            } else if model.phase == .ready {
+            } else if model.phase.presentsWorkspace {
                 splitContent
             } else {
                 RootView(model: model, onModelStateChanged: onModelStateChanged)
@@ -139,7 +144,7 @@ struct MainSplitRoot: View {
                 .accessibilityHidden(true)
         }
         .onChange(of: columnVisibility) { _, visibility in
-            guard model.phase == .ready else { return }
+            guard model.phase.presentsWorkspace else { return }
             readyVisibility = visibility
         }
     }
@@ -147,7 +152,7 @@ struct MainSplitRoot: View {
 
 
     private func toggleSidebar() {
-        guard model.phase == .ready else { return }
+        guard model.phase.presentsWorkspace else { return }
         withAnimation(.snappy(duration: 0.24, extraBounce: 0)) {
             columnVisibility = columnVisibility == .detailOnly
                 ? readyVisibility == .detailOnly ? .all : readyVisibility
@@ -157,13 +162,13 @@ struct MainSplitRoot: View {
 
     private func synchronizeVisibility(for phase: AppModel.Phase) {
         switch phase {
-        case .ready:
+        case .ready, .restoring, .connecting:
             guard !wasReady else { return }
             wasReady = true
             withAnimation(.snappy(duration: 0.24, extraBounce: 0)) {
                 columnVisibility = readyVisibility == .detailOnly ? .all : readyVisibility
             }
-        case .signedOut, .connecting, .failed:
+        case .signedOut, .failed:
             if wasReady {
                 readyVisibility = columnVisibility
                 wasReady = false
@@ -175,15 +180,29 @@ struct MainSplitRoot: View {
     }
 }
 
-private struct ConnectingView: View {
+/// Names the expired session and offers one Sign In action. It does not
+/// block the cached workspace.
+private struct SessionExpiredBanner: View {
+    let onSignIn: () -> Void
+
     var body: some View {
-        VStack(spacing: 14) {
-            ProgressView()
-                .controlSize(.large)
-            Text("Connecting to Hermes…")
-                .foregroundStyle(.secondary)
+        HStack(spacing: 12) {
+            Text("Session expired. Sign in again.")
+                .font(.callout)
+            Spacer(minLength: 8)
+            Button("Sign In", action: onSignIn)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .bottom) {
+            Divider()
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Session expired. Sign in again.")
     }
 }
 

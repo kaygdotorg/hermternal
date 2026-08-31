@@ -63,6 +63,7 @@ public enum AuthMethod: String, Codable, CaseIterable, Equatable, Identifiable, 
 /// Connection phase shown by Settings without exposing AppModel to the view.
 public enum GatewayConnectionState: Equatable, Sendable {
     case signedOut
+    case restoring
     case connecting
     case ready
     case failed(String)
@@ -70,6 +71,7 @@ public enum GatewayConnectionState: Equatable, Sendable {
     public var displayName: String {
         switch self {
         case .signedOut: "Signed out"
+        case .restoring: "Restoring…"
         case .connecting: "Connecting…"
         case .ready: "Connected"
         case .failed: "Connection failed"
