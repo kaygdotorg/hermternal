@@ -124,7 +124,15 @@ public struct GatewayEvent: Sendable {
         self.payload = payload
     }
 
-    public var text: String? { payload?["text"]?.stringValue }
+    /// Text-bearing events retain their established `text` field. Deferred
+    /// failures may instead carry a top-level message or a narrow error shape.
+    /// Structured error values are intentionally never rendered.
+    public var text: String? {
+        payload?["text"]?.stringValue
+            ?? payload?["message"]?.stringValue
+            ?? payload?["error"]?.stringValue
+            ?? payload?["error"]?["message"]?.stringValue
+    }
     /// Reserved for a future gateway payload carrying the durable row id.
     /// Current live events are unverified and therefore remain provisional.
     public var serverMessageID: ServerMessageID? {

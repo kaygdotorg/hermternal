@@ -3675,7 +3675,7 @@ final class AppModel: ComposerTurnRouting {
 
     // MARK: - Events
 
-    private func handle(_ event: GatewayEvent) async {
+    func handle(_ event: GatewayEvent) async {
         guard !isViewingArchivedTranscript else {
             HermternalSwitchTrace.selectionGuard(
                 "gatewayEvent.archivedTranscript",

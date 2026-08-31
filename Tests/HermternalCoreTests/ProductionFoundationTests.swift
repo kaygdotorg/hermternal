@@ -153,6 +153,27 @@ func productionReducerReducesStreamingEvents() {
     #expect(complete.terminal == .complete)
 }
 
+@Test("production reducer surfaces nested error text and defaults empty payloads")
+func productionReducerSurfacesDeferredErrorText() {
+    var reducer = StreamingEventReducer()
+    let nestedError = reducer.reduce(GatewayEvent(
+        type: "error",
+        sessionID: "session",
+        payload: .object(["error": .object(["message": .string("Missing model.")])])
+    ))
+    #expect(nestedError.terminal == .error)
+    #expect(nestedError.notice == "Missing model.")
+
+    var fallbackReducer = StreamingEventReducer()
+    let emptyError = fallbackReducer.reduce(GatewayEvent(
+        type: "error",
+        sessionID: "session",
+        payload: .object([:])
+    ))
+    #expect(emptyError.terminal == .error)
+    #expect(emptyError.notice == "The agent reported an error.")
+}
+
 @Test("prefetch coordinator bounds active work and cancels queued work")
 func prefetchConcurrencyAndCancellation() async {
     let coordinator = BoundedPrefetchCoordinator(limit: 2)

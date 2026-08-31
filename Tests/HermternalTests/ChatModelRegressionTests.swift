@@ -88,6 +88,24 @@ func browsingChatDoesNotPrepareLiveSession() async throws {
     #expect(await source.resumeCalls == 0)
 }
 
+@Test("Gateway error event posts one title-detail toast")
+@MainActor
+func gatewayErrorEventPostsOneTitleDetailToast() async throws {
+    let toastPresenter = ToastPresenter()
+    let model = AppModel(toastPresenter: toastPresenter)
+
+    await model.handle(GatewayEvent(
+        type: "error",
+        sessionID: nil,
+        payload: .object(["message": .string("Agent initialization failed.")])
+    ))
+
+    let entry = try #require(toastPresenter.entries.first)
+    #expect(toastPresenter.entries.count == 1)
+    #expect(entry.message.title == "The gateway reported an error")
+    #expect(entry.message.detail == "Agent initialization failed.")
+}
+
 private actor BrowseOnlyTranscriptSource: TranscriptSource {
     let rows: [JSONValue]
     private(set) var resumeCalls = 0

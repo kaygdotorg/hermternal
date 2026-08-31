@@ -80,3 +80,45 @@ func gatewayCancellationOutcomesAreDistinct() {
     #expect(GatewayError.outcomeUnknownAfterSend.localizedDescription
         == "Gateway request cancelled after sending; its outcome is unknown.")
 }
+
+@Test("Gateway event text accepts message and narrowly shaped error payloads")
+func gatewayEventTextUsesSafeErrorPayloadPrecedence() {
+    let message = GatewayEvent(
+        type: "error",
+        sessionID: "session",
+        payload: .object(["message": .string("Agent initialization failed.")])
+    )
+    #expect(message.text == "Agent initialization failed.")
+
+    let stringError = GatewayEvent(
+        type: "error",
+        sessionID: "session",
+        payload: .object(["error": .string("Missing provider.")])
+    )
+    #expect(stringError.text == "Missing provider.")
+
+    let nestedError = GatewayEvent(
+        type: "error",
+        sessionID: "session",
+        payload: .object(["error": .object(["message": .string("Missing model.")])])
+    )
+    #expect(nestedError.text == "Missing model.")
+
+    let existingText = GatewayEvent(
+        type: "message.delta",
+        sessionID: "session",
+        payload: .object([
+            "text": .string("Existing text wins."),
+            "message": .string("Ignored message."),
+            "error": .string("Ignored error.")
+        ])
+    )
+    #expect(existingText.text == "Existing text wins.")
+
+    let structuredError = GatewayEvent(
+        type: "error",
+        sessionID: "session",
+        payload: .object(["error": .object(["code": .integer(500)])])
+    )
+    #expect(structuredError.text == nil)
+}
