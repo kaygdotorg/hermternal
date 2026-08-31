@@ -142,6 +142,87 @@ func typingKeepsEditorIdentityFocusAndBoundedHeight() async throws {
     #expect(store.text.count == message.count)
 }
 
+/// The composer's own shape around the field.
+///
+/// The field sits above a control row whose fixed-width controls and trailing
+/// `Spacer` give the panel a narrow ideal width, and the whole panel is a
+/// bottom safe-area inset. That combination is what makes a layout pass apply
+/// the panel its ideal width once before applying the width it occupies, which
+/// is the pass the field used to keep.
+private struct ComposerColumnHarness: View {
+    let store: ComposerEditorHarnessStore
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Color.clear
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                ComposerEditorHarness(store: store)
+                HStack(spacing: 8) {
+                    ForEach(0..<4, id: \.self) { _ in
+                        Color.clear.frame(width: 28, height: 22)
+                    }
+                    Spacer(minLength: 8)
+                    Text("glm-5.3-flash").lineLimit(1)
+                    Text("Medium").lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+        }
+    }
+}
+
+/// The field has to wrap at the column it occupies.
+///
+/// Measurement writes the proposed width onto the text view, because the text
+/// container tracks the text view and that is what makes the measured height
+/// and the visible line breaks agree. Most of the widths a layout pass
+/// proposes are probes though: measured on macOS 26.6.2, one pass over the
+/// real composer proposed 0, 4, 32, 196.5 and 714 points, and the live field
+/// kept 196.5 inside a 714pt column — a message wrapping after a third of the
+/// line it had room for.
+@Test("The message field wraps at the column it occupies, not at a probe width")
+@MainActor
+func editorWrapsAtTheColumnItOccupies() async throws {
+    _ = NSApplication.shared
+    let store = ComposerEditorHarnessStore()
+    // Long enough that the wrap width is visible in the height as well.
+    store.text = String(repeating: "Hermes names the column. ", count: 6)
+    let hosting = NSHostingView(rootView: ComposerColumnHarness(store: store))
+    hosting.frame = NSRect(x: 0, y: 0, width: 720, height: 260)
+    let window = NSWindow(
+        contentRect: hosting.frame,
+        styleMask: [.titled, .resizable],
+        backing: .buffered,
+        defer: false
+    )
+    window.contentView = hosting
+    window.makeKeyAndOrderFront(nil)
+    hosting.layoutSubtreeIfNeeded()
+
+    // The measurements a host runs for its own constraints, ordered after the
+    // real layout. This is where the probe widths come from.
+    _ = hosting.fittingSize
+    _ = hosting.intrinsicContentSize
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+
+    let textView = try #require(firstTextView(in: hosting))
+    let field = try #require(textView.enclosingScrollView)
+    // The column is genuinely wide, so a match below is not two small numbers
+    // agreeing with each other.
+    #expect(field.contentSize.width > 600)
+    #expect(abs(textView.frame.width - field.contentSize.width) < 0.5)
+    // And the text container followed, which is what decides the line breaks.
+    let container = try #require(textView.textContainer)
+    #expect(abs(container.size.width - field.contentSize.width) < 0.5)
+}
+
 @MainActor
 private func firstTextView(in view: NSView) -> NSTextView? {
     if let textView = view as? NSTextView { return textView }

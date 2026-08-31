@@ -34,6 +34,13 @@ public enum ComposerControlLayout {
             if width < condensedMinimumWidth - hysteresis { return .minimal }
             return .condensed
         case .minimal:
+            // Minimal has an upper dead band, and a route out to either band
+            // above it. It used to reach only `condensed`, whatever the width,
+            // which made a single narrow measurement permanent: a layout pass
+            // applies the composer its ideal width once — observed at 196.5pt
+            // for a composer that then occupies 714 — and the row stayed one
+            // level below what it had room for until the window was resized.
+            if width >= fullMinimumWidth + hysteresis { return .full }
             return width >= condensedMinimumWidth + hysteresis ? .condensed : .minimal
         }
     }

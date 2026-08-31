@@ -2,6 +2,46 @@ import AppKit
 import HermternalCore
 import SwiftUI
 
+/// The editor's scroll view. It keeps the text view exactly as wide as the
+/// column the user can see.
+///
+/// Measurement sets the text view's width directly, because the text
+/// container tracks the text view and that is what makes the measured height
+/// and the visible line breaks agree. But a layout pass proposes more than
+/// one width: measured on macOS 26.6.2 in a 1040pt window, one pass over this
+/// composer proposed 0, 4, 32, 196.5 and 714 points, in that order, and only
+/// the last is the column the field is then given. Nothing put the text view
+/// back afterwards, so the live field kept whichever probe width was written
+/// last — observed at 196.5pt inside a 714pt field, which wraps a message
+/// after a third of the line it has room for.
+///
+/// Two things can break the rule, so it is asserted at both: `layout`, which
+/// is the only place that sees the applied geometry, and the end of a
+/// measurement, which is where a probe width gets written. Every assignment is
+/// guarded on a real change, so a pass that changes nothing costs no text
+/// relayout.
+@MainActor
+final class ComposerEditorScrollView: NSScrollView {
+    /// Makes the text view exactly as wide as the visible column.
+    func synchronizeColumn() {
+        guard let documentView,
+              contentSize.width > 1,
+              abs(documentView.frame.width - contentSize.width) > 0.5
+        else { return }
+        documentView.frame.size.width = contentSize.width
+        guard let textView = documentView as? NSTextView,
+              let container = textView.textContainer,
+              let layoutManager = textView.layoutManager
+        else { return }
+        layoutManager.ensureLayout(for: container)
+    }
+
+    override func layout() {
+        super.layout()
+        synchronizeColumn()
+    }
+}
+
 /// A native NSTextView adapter for the composer's two Markdown representations.
 ///
 /// MarkdownDocument remains the only parser. NSTextView owns selection, undo,
@@ -20,7 +60,7 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     @MainActor
-    func makeNSView(context: Context) -> NSScrollView {
+    func makeNSView(context: Context) -> ComposerEditorScrollView {
         let textView = ComposerTextView()
         textView.delegate = context.coordinator
         textView.onFocusChange = { [weak coordinator = context.coordinator] focused in
@@ -37,7 +77,7 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
         configure(textView)
         context.coordinator.render(source: source, mode: mode, in: textView)
 
-        let scrollView = NSScrollView()
+        let scrollView = ComposerEditorScrollView()
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
         scrollView.hasVerticalScroller = true
@@ -68,7 +108,7 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
     @MainActor
     func sizeThatFits(
         _ proposal: ProposedViewSize,
-        nsView: NSScrollView,
+        nsView: ComposerEditorScrollView,
         context: Context
     ) -> CGSize? {
         guard let textView = nsView.documentView as? NSTextView,
@@ -84,25 +124,27 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
             )
         }
         // The container tracks the text view, so this one assignment gives the
-        // measurement and the visible line breaks the same width. It is the
-        // width SwiftUI is about to apply, which is why measuring here cannot
-        // disagree with what the editor then draws.
+        // measurement and the visible line breaks the same width.
         if textView.frame.width != width {
             textView.frame.size.width = width
         }
         layoutManager.ensureLayout(for: textContainer)
-        return CGSize(
-            width: width,
-            height: context.coordinator.recordMeasurement(
-                contentHeight: Double(layoutManager.usedRect(for: textContainer).height),
-                layoutWidth: width
-            )
+        let height = context.coordinator.recordMeasurement(
+            contentHeight: Double(layoutManager.usedRect(for: textContainer).height),
+            layoutWidth: width
         )
+        // A measurement must not leave the live field wrapped at a width it was
+        // only asked about. Most of the widths one pass proposes are probes,
+        // and the one SwiftUI applies arrives afterwards through the scroll
+        // view's own layout.
+        nsView.synchronizeColumn()
+        return CGSize(width: width, height: height)
     }
 
     @MainActor
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+    func updateNSView(_ scrollView: ComposerEditorScrollView, context: Context) {
         guard let textView = scrollView.documentView as? NSTextView else { return }
+        textView.isEditable = isEditable
         context.coordinator.source = $source
         context.coordinator.mode = $mode
         context.coordinator.focus = $isFocused
@@ -151,6 +193,7 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
     }
 
     private func configure(_ textView: NSTextView) {
+        textView.isEditable = isEditable
         textView.isRichText = true
         textView.importsGraphics = true
         textView.allowsUndo = true

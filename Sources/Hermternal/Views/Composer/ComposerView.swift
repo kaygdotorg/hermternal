@@ -134,29 +134,37 @@ struct ComposerView: View {
         // guessed number. `WindowBackdrop` records the same limit for the
         // window glass.
         //
-        // The composition is unchanged from the composer this one replaced:
-        // the same `GlassEffectContainer(spacing: 14)`, the same
-        // `.regular.interactive()` glass, and the same 16/11 padding inside
-        // the shape.
+        // One glass shape, and therefore no `GlassEffectContainer`. A
+        // container exists to union and morph glass effects that sit near each
+        // other; the union of a single shape is that shape, so `spacing: 14`
+        // had nothing to merge and the container was a second geometry to
+        // resolve for no change to the picture.
+        //
+        // Removing it also removes a place a stale panel width could come
+        // from, and this composer is laid out at more than one width: measured
+        // on macOS 26.6.2 in a 1040pt window, one pass applies the rows their
+        // ideal 196.5pt and a later pass applies the 714pt they occupy. A
+        // panel drawn at the first of those is a box the trailing controls sit
+        // outside of, which is the reported defect. The panel is drawn by the
+        // compositor rather than by a layer this process can read, so that
+        // last step is reasoning rather than a measurement.
         let shape = RoundedRectangle(
             cornerRadius: AppShapeScale.toast,
             style: .continuous
         )
-        return GlassEffectContainer(spacing: 14) {
-            rows
-                .padding(.horizontal, 16)
-                .padding(.vertical, 11)
-                .glassEffect(.regular.interactive(), in: shape)
-        }
-        .tint(accentColor)
-        // 18pt matches the find bar and the transcript gutter. It is also
-        // what holds the panel off the split divider on the leading side, and
-        // off the window edge on the trailing side.
-        .padding(.horizontal, 18)
-        // Outside the panel, and therefore transparent: this is the space the
-        // safe area inset reserves, and nothing paints in it.
-        .padding(.top, 10)
-        .padding(.bottom, 16)
+        return rows
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+            .glassEffect(.regular.interactive(), in: shape)
+            .tint(accentColor)
+            // 18pt matches the find bar and the transcript gutter. It is also
+            // what holds the panel off the split divider on the leading side,
+            // and off the window edge on the trailing side.
+            .padding(.horizontal, 18)
+            // Outside the panel, and therefore transparent: this is the space
+            // the safe area inset reserves, and nothing paints in it.
+            .padding(.top, 10)
+            .padding(.bottom, 16)
     }
 
     private var rows: some View {
@@ -180,6 +188,14 @@ struct ComposerView: View {
         .onGeometryChange(for: Double.self) { proxy in
             proxy.size.width
         } action: { width in
+            // A zero width is not a narrow composer. The composer is a bottom
+            // safe-area inset, and a layout pass applies a no-size geometry to
+            // this subtree while it resolves how much room to reserve —
+            // observed on macOS 26.6.2 as one 0x0 pass per cycle. Reporting it
+            // would drop the whole control row to its narrowest arrangement
+            // and back on every pass, which is two rebuilds of the row for a
+            // width the composer never draws at.
+            guard width > 0 else { return }
             model.updateWidth(width)
         }
     }

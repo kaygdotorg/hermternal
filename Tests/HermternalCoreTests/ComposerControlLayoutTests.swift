@@ -20,3 +20,21 @@ func densityHysteresis() {
     #expect(ComposerControlLayout.density(availableWidth: 384, previous: .minimal) == .condensed)
     #expect(ComposerControlLayout.density(availableWidth: 383.99, previous: .minimal) == .minimal)
 }
+
+/// A width that has room for the full row must reach it in one update.
+///
+/// A layout pass applies the composer its ideal width once — measured at
+/// 196.5pt for a composer that then occupies 714 — so the model does see a
+/// narrow width it never draws at. While `minimal` could only step up to
+/// `condensed`, that single measurement cost a level the composer never got
+/// back: an idle chat reports no further width, and the row stayed one level
+/// below what it had room for until the window was resized.
+@Test("composer density leaves minimal for the band the width supports")
+func densityLeavesMinimalForTheWidestBandItFits() {
+    #expect(ComposerControlLayout.density(availableWidth: 714, previous: .minimal) == .full)
+    #expect(ComposerControlLayout.density(availableWidth: 504, previous: .minimal) == .full)
+    // The upper dead band still holds: leaving one band takes the hysteresis.
+    #expect(ComposerControlLayout.density(availableWidth: 503.99, previous: .minimal) == .condensed)
+    #expect(ComposerControlLayout.density(availableWidth: 384, previous: .minimal) == .condensed)
+    #expect(ComposerControlLayout.density(availableWidth: 383.99, previous: .minimal) == .minimal)
+}
