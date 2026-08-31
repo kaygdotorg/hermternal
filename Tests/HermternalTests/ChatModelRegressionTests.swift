@@ -495,6 +495,112 @@ private func chatOpenWait(
     }
 }
 
+@Test("A pristine model-defaults draft takes the loaded gateway values")
+func pristineComposerDefaultsDraftTakesGatewayValues() {
+    let applied = ComposerDefaultsDraft.appliedGatewayValues(
+        draftModel: "",
+        draftProvider: "",
+        draftReasoning: "none",
+        loadedModel: "gpt-4.1",
+        loadedProvider: "openai",
+        loadedReasoning: .effort(.high)
+    )
+    #expect(applied.model == "gpt-4.1")
+    #expect(applied.provider == "openai")
+    #expect(applied.reasoning == "high")
+}
+
+@Test("A dirty model-defaults draft keeps local edits")
+func dirtyComposerDefaultsDraftKeepsLocalEdits() {
+    let applied = ComposerDefaultsDraft.appliedGatewayValues(
+        draftModel: "local-model",
+        draftProvider: "",
+        draftReasoning: "none",
+        loadedModel: "gpt-4.1",
+        loadedProvider: "openai",
+        loadedReasoning: .effort(.high)
+    )
+    #expect(applied.model == "local-model")
+    #expect(applied.provider == "")
+    #expect(applied.reasoning == "none")
+}
+
+@Test("A blank default model does not clear the stored snapshot")
+@MainActor
+func blankComposerDefaultDoesNotMutateSnapshot() async throws {
+    let toastPresenter = ToastPresenter()
+    let model = AppModel(toastPresenter: toastPresenter)
+    model.testingSetComposerDefaultSnapshot(
+        model: "gpt-4",
+        provider: "openai",
+        reasoning: .off
+    )
+
+    await model.setComposerDefaults(model: nil, provider: nil, reasoning: nil)
+
+    #expect(model.composerDefaultModel == "gpt-4")
+    #expect(model.composerDefaultProvider == "openai")
+    #expect(model.composerDefaultReasoning == .off)
+    let entry = try #require(toastPresenter.entries.first)
+    #expect(entry.message.title == "Could not save model defaults")
+    #expect(entry.message.detail == "The default model cannot be empty.")
+}
+
+@Test("A whitespace-only default model does not clear the stored snapshot")
+@MainActor
+func whitespaceComposerDefaultDoesNotMutateSnapshot() async throws {
+    let toastPresenter = ToastPresenter()
+    let model = AppModel(toastPresenter: toastPresenter)
+    model.testingSetComposerDefaultSnapshot(
+        model: "gpt-4",
+        provider: "openai",
+        reasoning: .effort(.low)
+    )
+
+    await model.setComposerDefaults(model: "   ", provider: "ignored", reasoning: .off)
+
+    #expect(model.composerDefaultModel == "gpt-4")
+    #expect(model.composerDefaultProvider == "openai")
+    #expect(model.composerDefaultReasoning == .effort(.low))
+    #expect(toastPresenter.entries.count == 1)
+}
+
+@Test("Rebuild Cache is busy during the clear before warming starts")
+@MainActor
+func rebuildCacheMarksClearingBeforeWarming() async throws {
+    let directory = try chatModelTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let model = AppModel(
+        cache: HistoryCache(directory: directory),
+        transcriptSource: TranscriptFixtureSource(rows: [
+            transcriptRow(id: 1, text: "Cached", turnID: "turn-1")
+        ])
+    )
+    model.sessions = [chatSession(id: "chat", messageCount: 1)]
+    model.cacheEnabled = true
+    model.cacheTotalCount = 1
+
+    model.rebuildCache()
+
+    #expect(model.cacheOperationPhase == .clearing)
+    #expect(model.isCacheOperating)
+    #expect(!model.isCacheWarming)
+
+    let leftClearing = await chatOpenWait(until: "rebuild left the clearing phase") {
+        model.cacheOperationPhase != .clearing
+    }
+    #expect(leftClearing)
+
+    let settled = await chatOpenWait(until: "rebuild returned to idle") {
+        model.cacheOperationPhase == .idle
+    }
+    #expect(settled)
+    #expect(!model.isCacheOperating)
+}
+
+@Test("Archived refresh keeps last successful rows through loading and failure")
+@MainActor
 func archivedRefreshRetainsRowsThroughLoadingAndFailure() async throws {
     let directory = try chatModelTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }

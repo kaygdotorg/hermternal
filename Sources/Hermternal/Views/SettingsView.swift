@@ -284,12 +284,51 @@ private struct ChatSettingsView: View {
     }
 }
 
+enum ComposerDefaultsDraft {
+    static func isPristine(model: String, provider: String, reasoning: String) -> Bool {
+        model.isEmpty && provider.isEmpty && reasoning == "none"
+    }
+
+    static func appliedGatewayValues(
+        draftModel: String,
+        draftProvider: String,
+        draftReasoning: String,
+        loadedModel: String?,
+        loadedProvider: String?,
+        loadedReasoning: ReasoningSetting?
+    ) -> (model: String, provider: String, reasoning: String) {
+        guard isPristine(model: draftModel, provider: draftProvider, reasoning: draftReasoning) else {
+            return (draftModel, draftProvider, draftReasoning)
+        }
+        return (
+            loadedModel ?? "",
+            loadedProvider ?? "",
+            loadedReasoning?.wireValue ?? "none"
+        )
+    }
+}
+
 private struct ModelsSettingsView: View {
     @Bindable var model: AppModel
     @State private var defaultModel = ""
     @State private var defaultProvider = ""
     @State private var defaultReasoning = "none"
     @State private var isSaving = false
+    @State private var hasLoadedDefaults = false
+
+    private var isDefaultsFormLocked: Bool {
+        !model.composerDefaultsAvailable || !hasLoadedDefaults
+    }
+
+    private var saveDefaultsTitle: String {
+        if isSaving { return "Saving…" }
+        if !hasLoadedDefaults { return "Loading…" }
+        return "Save Defaults"
+    }
+
+    private var trimmedDefaultModel: String {
+        defaultModel.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     var body: some View {
         Form {
@@ -313,35 +352,48 @@ private struct ModelsSettingsView: View {
             } footer: {
                 Text("These settings apply to new chats. Changing them does not change the current chat.")
             }
-            .disabled(!model.composerDefaultsAvailable)
+            .disabled(isDefaultsFormLocked)
 
             Section {
-                Button(isSaving ? "Saving…" : "Save Defaults") {
+                Button(saveDefaultsTitle) {
                     isSaving = true
-                    let modelValue = defaultModel.isEmpty ? nil : defaultModel
-                    let providerValue = defaultProvider.isEmpty ? nil : defaultProvider
+                    let providerValue = defaultProvider.trimmingCharacters(in: .whitespacesAndNewlines)
                     let reasoning: ReasoningSetting? = defaultReasoning == "none"
                         ? .off
                         : ReasoningEffort(rawValue: defaultReasoning).map(ReasoningSetting.effort)
                     Task { @MainActor in
                         await model.setComposerDefaults(
-                            model: modelValue,
-                            provider: providerValue,
+                            model: trimmedDefaultModel,
+                            provider: providerValue.isEmpty ? nil : providerValue,
                             reasoning: reasoning
                         )
                         isSaving = false
                     }
                 }
-                .disabled(isSaving || model.phase != .ready || !model.composerDefaultsAvailable)
+                .disabled(
+                    isSaving
+                        || model.phase != .ready
+                        || isDefaultsFormLocked
+                        || trimmedDefaultModel.isEmpty
+                )
             }
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
         .task {
             await model.loadComposerDefaults()
-            defaultModel = model.composerDefaultModel ?? ""
-            defaultProvider = model.composerDefaultProvider ?? ""
-            defaultReasoning = model.composerDefaultReasoning?.wireValue ?? "none"
+            let applied = ComposerDefaultsDraft.appliedGatewayValues(
+                draftModel: defaultModel,
+                draftProvider: defaultProvider,
+                draftReasoning: defaultReasoning,
+                loadedModel: model.composerDefaultModel,
+                loadedProvider: model.composerDefaultProvider,
+                loadedReasoning: model.composerDefaultReasoning
+            )
+            defaultModel = applied.model
+            defaultProvider = applied.provider
+            defaultReasoning = applied.reasoning
+            hasLoadedDefaults = true
         }
     }
 }
@@ -363,6 +415,35 @@ private struct CacheSettingsView: View {
             fromByteCount: model.cacheBytes,
             countStyle: .file
         )
+    }
+
+    private var showsCacheOperationProgress: Bool {
+        switch model.cacheOperationPhase {
+        case .idle: false
+        case .clearing: true
+        case .warming: model.cacheTotalCount > 0
+        }
+    }
+
+    private var cacheOperationStatusText: String? {
+        switch model.cacheOperationPhase {
+        case .idle:
+            nil
+        case .clearing:
+            "Clearing the local cache…"
+        case .warming:
+            model.cacheTotalCount > 0
+                ? "Caching in the background…"
+                : "Caching will begin after chats load."
+        }
+    }
+
+    private var rebuildCacheButtonTitle: String {
+        switch model.cacheOperationPhase {
+        case .idle: "Rebuild Cache"
+        case .clearing: "Clearing…"
+        case .warming: "Caching…"
+        }
     }
 
     var body: some View {
@@ -392,23 +473,19 @@ private struct CacheSettingsView: View {
 
                 Section {
                     HStack {
-                        if model.isCacheWarming && model.cacheTotalCount > 0 {
+                        if showsCacheOperationProgress {
                             ProgressView()
                                 .controlSize(.small)
                         }
-                        if model.isCacheWarming {
-                            Text(
-                                model.cacheTotalCount > 0
-                                    ? "Caching in the background…"
-                                    : "Caching will begin after chats load."
-                            )
-                            .foregroundStyle(.secondary)
+                        if let status = cacheOperationStatusText {
+                            Text(status)
+                                .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Button("Rebuild Cache") {
+                        Button(rebuildCacheButtonTitle) {
                             model.rebuildCache()
                         }
-                        .disabled(model.isCacheWarming || model.cacheTotalCount == 0)
+                        .disabled(model.isCacheOperating || model.cacheTotalCount == 0)
                     }
                 }
             }

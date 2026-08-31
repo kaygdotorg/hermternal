@@ -518,6 +518,13 @@ final class AppModel: ComposerTurnRouting {
         }
     }
 
+    /// Spans cache clear and warm so Rebuild can show real in-flight work.
+    enum CacheOperationPhase: Equatable {
+        case idle
+        case clearing
+        case warming
+    }
+
     // MARK: - Observable state
 
     var phase: Phase = .restoring
@@ -737,7 +744,9 @@ final class AppModel: ComposerTurnRouting {
     var cacheCachedCount = 0
     var cacheTotalCount = 0
     var cacheBytes: Int64 = 0
-    var isCacheWarming = false
+    private(set) var cacheOperationPhase: CacheOperationPhase = .idle
+    var isCacheWarming: Bool { cacheOperationPhase == .warming }
+    var isCacheOperating: Bool { cacheOperationPhase != .idle }
 
     var cacheProgress: Double {
         guard cacheTotalCount > 0 else { return cacheEnabled ? 0 : 1 }
@@ -789,6 +798,15 @@ final class AppModel: ComposerTurnRouting {
         sessionLoadGeneration += 1
     }
 
+    func testingSetComposerDefaultSnapshot(
+        model: String?,
+        provider: String?,
+        reasoning: ReasoningSetting?
+    ) {
+        composerDefaultModel = model
+        composerDefaultProvider = provider
+        composerDefaultReasoning = reasoning
+    }
     /// Counts AuthClient constructions so tests can prove single-flight sign-in.
     @ObservationIgnored
     private(set) var testingAuthClientCount = 0
@@ -956,7 +974,7 @@ final class AppModel: ComposerTurnRouting {
             cacheCachedCount = 0
             cacheTotalCount = 0
             cacheBytes = 0
-            isCacheWarming = false
+            cacheOperationPhase = .idle
         } else {
             publishRestoredTranscript()
         }
@@ -1225,7 +1243,7 @@ final class AppModel: ComposerTurnRouting {
         cacheCachedCount = 0
         cacheTotalCount = 0
         cacheBytes = 0
-        isCacheWarming = false
+        cacheOperationPhase = .idle
         accountIdentity = nil
         discoveredProvider = nil
         gatewayAdvertisedMethods = [.browserPKCE]
@@ -1332,6 +1350,15 @@ final class AppModel: ComposerTurnRouting {
         provider: String?,
         reasoning: ReasoningSetting?
     ) async {
+        let trimmedModel = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // config.set has no unset. An empty model must not clear the local snapshot.
+        guard !trimmedModel.isEmpty else {
+            postError(
+                "Could not save model defaults",
+                detail: "The default model cannot be empty."
+            )
+            return
+        }
         guard composerDefaultsUnavailableReason == nil, let gateway else {
             if composerDefaultsUnavailableReason == nil {
                 postError("Could not save model defaults", detail: "The gateway connection is unavailable.")
@@ -1339,27 +1366,31 @@ final class AppModel: ComposerTurnRouting {
             return
         }
         do {
-            if let model, !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                let normalizedProvider = provider?.trimmingCharacters(in: .whitespacesAndNewlines)
-                let wireValue: String
-                if let normalizedProvider, !normalizedProvider.isEmpty {
-                    wireValue = "\(model) --provider \(normalizedProvider)"
-                } else {
-                    wireValue = model
-                }
-                _ = try await gateway.call(
-                    "config.set",
-                    params: ["key": "model", "value": wireValue]
-                )
+            let normalizedProvider = provider?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let wireValue: String
+            if let normalizedProvider, !normalizedProvider.isEmpty {
+                wireValue = "\(trimmedModel) --provider \(normalizedProvider)"
+            } else {
+                wireValue = trimmedModel
             }
+            _ = try await gateway.call(
+                "config.set",
+                params: ["key": "model", "value": wireValue]
+            )
             if let reasoning {
                 _ = try await gateway.call(
                     "config.set",
                     params: ["key": "reasoning", "value": reasoning.wireValue]
                 )
             }
-            composerDefaultModel = model
-            composerDefaultProvider = provider
+            let storedProvider: String?
+            if let normalizedProvider, !normalizedProvider.isEmpty {
+                storedProvider = normalizedProvider
+            } else {
+                storedProvider = nil
+            }
+            composerDefaultModel = trimmedModel
+            composerDefaultProvider = storedProvider
             composerDefaultReasoning = reasoning
         } catch {
             if isUnsupportedComposerDefaultsError(error) {
@@ -2586,7 +2617,7 @@ final class AppModel: ComposerTurnRouting {
                 guard generation == cacheControlGeneration, cacheEnabled else { return }
                 prefetchTranscripts()
             } else {
-                isCacheWarming = false
+                cacheOperationPhase = .idle
                 guard generation == cacheControlGeneration, !cacheEnabled else { return }
                 guard (try? await cache.clear()) == true else {
                     postError("Could not clear the local chat cache.")
@@ -2612,12 +2643,16 @@ final class AppModel: ComposerTurnRouting {
         cancelPrefetch()
         warmStore.clear()
         cacheControlTask?.cancel()
+        cacheOperationPhase = .clearing
         cacheControlTask = Task { [weak self] in
             guard let self else { return }
             guard generation == cacheControlGeneration, cacheEnabled else { return }
             guard (try? await cache.clear()) == true else {
                 postError("Could not rebuild the local chat cache.")
                 Log.error("cache: rebuild clear failed")
+                if generation == cacheControlGeneration {
+                    cacheOperationPhase = .idle
+                }
                 return
             }
             guard generation == cacheControlGeneration, cacheEnabled else { return }
@@ -2635,12 +2670,12 @@ final class AppModel: ComposerTurnRouting {
             guard (try? await cache.clear()) == true else {
                 postError("Could not clear the disabled chat cache.")
                 Log.error("cache: deferred disabled purge failed")
-                isCacheWarming = false
+                cacheOperationPhase = .idle
                 return
             }
             cacheCachedCount = 0
             cacheBytes = 0
-            isCacheWarming = false
+            cacheOperationPhase = .idle
             return
         }
         guard sessionsLoadedCompletely else {
@@ -2651,7 +2686,7 @@ final class AppModel: ComposerTurnRouting {
             return
         }
         guard let statistics = try? await cache.reconcile(validIDs: sessions.map(\.id)) else {
-            isCacheWarming = false
+            cacheOperationPhase = .idle
             postError("Could not reconcile the local chat cache.")
             return
         }
@@ -2663,7 +2698,7 @@ final class AppModel: ComposerTurnRouting {
         prefetchTask?.cancel()
         prefetchTask = nil
         prefetchGeneration += 1
-        isCacheWarming = false
+        cacheOperationPhase = .idle
     }
 
     /// Warm the transcript cache in the background so switching chats never
@@ -2684,12 +2719,12 @@ final class AppModel: ComposerTurnRouting {
         guard cacheEnabled,
               let source = transcriptSource(sessionID: nil, serverTotal: nil)
         else {
-            isCacheWarming = false
+            cacheOperationPhase = .idle
             return
         }
         let ordered = sessions.map(\.id)
         guard !ordered.isEmpty else {
-            isCacheWarming = false
+            cacheOperationPhase = .idle
             return
         }
 
@@ -2705,7 +2740,7 @@ final class AppModel: ComposerTurnRouting {
             )
         }
         let coordinator = TranscriptSyncCoordinator(concurrency: 4)
-        isCacheWarming = true
+        cacheOperationPhase = .warming
         prefetchTask = Task { [weak self, cache, source] in
             guard let self else { return }
             defer {
@@ -2713,7 +2748,7 @@ final class AppModel: ComposerTurnRouting {
                 // account/cache/list generation.
                 if generation == self.prefetchGeneration,
                    expectedAccountGeneration == self.accountGeneration {
-                    self.isCacheWarming = false
+                    self.cacheOperationPhase = .idle
                 }
             }
 
