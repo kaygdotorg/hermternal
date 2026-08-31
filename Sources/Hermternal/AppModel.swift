@@ -733,7 +733,20 @@ final class AppModel: ComposerTurnRouting {
     private var organizationLoaded = false
     /// True only after a complete REST paging pass has loaded the sessions.
     /// Reconciliation must never use a partial page as the authoritative set.
+    ///
+    /// ObservationIgnored: this is a coordination flag, not UI state. A
+    /// `Task` spawned from `loadSessions` inherited SwiftUI's AccessList and
+    /// re-registered this read until `NativeDictionary.copy` overflowed the
+    /// main-thread stack (kayg launch crash, 2026-08-31).
+    @ObservationIgnored
     private var sessionsLoadedCompletely = false
+
+    /// Test seam. The stored flag is not part of the Observation graph.
+    var sessionListIsComplete: Bool { sessionsLoadedCompletely }
+
+    func testingSetSessionListComplete(_ value: Bool) {
+        sessionsLoadedCompletely = value
+    }
     /// Injectable seam for exercising cache-first opening without a live app
     /// connection; production builds construct the gateway/rest adapter.
     private let injectedTranscriptSource: (any TranscriptSource)?
@@ -1343,16 +1356,16 @@ final class AppModel: ComposerTurnRouting {
             // The gateway already denies tool and kanban rows. Subagent rows
             // are machine sessions, not chats, and the server excludes them.
             let rows = try await rest.allSessions(excludeSources: Self.nonChatSources)
-            sessions = rows.compactMap { row in
+            let loaded = rows.compactMap { row -> ChatSession? in
                 let session = ChatSession(from: row)
                 guard !session.id.isEmpty else { return nil }
                 return session
-            }
+            }.sorted(by: Self.sessionComesBefore)
             // A complete authoritative list supersedes every in-flight warm
             // pass before retention or disk/index reconciliation can run.
             cancelPrefetch()
-            sessions.sort(by: Self.sessionComesBefore)
-            sessionListCache.saveSessions(sessions)
+            sessions = loaded
+            sessionListCache.saveSessions(loaded)
             if viewingArchivedSessionID == nil,
                selectedSessionID == nil,
                let liveSessionID,
@@ -1372,17 +1385,23 @@ final class AppModel: ComposerTurnRouting {
             }
             sessionsLoadedCompletely = true
             warmStore.retain(sessionIDs: Set(sessions.map(\.id)))
-            drainPendingExternalRouteIfReady()
             cacheTotalCount = sessions.count
             Log.info("REST session list returned \(sessions.count) sessions")
             let expectedAccountGeneration = accountGeneration
-            Task { @MainActor [weak self] in
+            // GCD hop, not Task: unstructured tasks inherit Observation's
+            // AccessList from this mutation. Detached follow-up work never
+            // reads sessionsLoadedCompletely (the getter that overflowed).
+            ObservationHop.enqueue { [weak self] in
                 guard let self else { return }
-                await self.refreshCacheStatistics()
-                guard self.accountGeneration == expectedAccountGeneration,
-                      self.sessionsLoadedCompletely
-                else { return }
-                self.prefetchTranscripts()
+                self.drainPendingExternalRouteIfReady()
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    await self.refreshCacheStatistics()
+                    guard self.accountGeneration == expectedAccountGeneration else {
+                        return
+                    }
+                    self.prefetchTranscripts()
+                }
             }
         } catch {
             Log.error("REST session list failed: \(error)")

@@ -979,7 +979,9 @@ struct SidebarView: View {
     private func sidebarLifecycle(_ content: some View) -> some View {
         content
             .onChange(of: model.selectedSessionID) { _, newValue in
-                handleModelSelectionChange(newValue)
+                ObservationHop.enqueue {
+                    handleModelSelectionChange(newValue)
+                }
             }
             .onChange(of: sidebarSelection) { _, selection in
                 handleSidebarSelectionChange(selection)
@@ -988,19 +990,29 @@ struct SidebarView: View {
                 handleArchivedSelectionChange(selection)
             }
             .onChange(of: model.viewingArchivedSessionID) { _, _ in
-                synchronizeModelSelection(forceChats: true)
+                ObservationHop.enqueue {
+                    synchronizeModelSelection(forceChats: true)
+                }
             }
             .onChange(of: model.sidebarContentMode) { _, mode in
                 handleContentModeChange(mode)
             }
             .onChange(of: model.archivedSessions) { _, sessions in
-                handleArchivedSessionsChange(sessions)
+                ObservationHop.enqueue {
+                    handleArchivedSessionsChange(sessions)
+                }
             }
             .onChange(of: model.sessions) { _, sessions in
-                pruneSelection(validChatIDs: Set(sessions.map(\.id)))
+                let ids = Set(sessions.map(\.id))
+                ObservationHop.enqueue {
+                    pruneSelection(validChatIDs: ids)
+                }
             }
             .onChange(of: model.folders) { _, folders in
-                pruneSelection(validFolderIDs: Set(folders.map(\.id)))
+                let ids = Set(folders.map(\.id))
+                ObservationHop.enqueue {
+                    pruneSelection(validFolderIDs: ids)
+                }
             }
             .onAppear {
                 SidebarSelectionEventAdapter.start()
