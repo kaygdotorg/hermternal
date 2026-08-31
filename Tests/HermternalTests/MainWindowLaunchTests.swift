@@ -263,6 +263,71 @@ func mainWindowStaysResizableAfterContentAttachment() throws {
     #expect(window.contentMinSize == MainWindowStartupConfiguration.minimumContentSize)
 }
 
+/// Launch orders the prepared window front, then attaches the content host.
+/// Attachment still has to keep the restored size and stay resizable.
+@Test("launch contract: attaching after orderFront leaves the window resizable")
+@MainActor
+func mainWindowStaysResizableWhenAttachedAfterOrderFront() throws {
+    _ = NSApplication.shared
+    let directory = FileManager.default.temporaryDirectory
+        .appending(path: "HermternalTests.MainWindow.AfterFront.\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let suiteName = "HermternalTests.AppearanceSettings.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let model = AppModel(cache: HistoryCache(directory: directory))
+    let shell = MainShellViewController(
+        appearance: AppearanceSettings(defaults: defaults),
+        model: model,
+        onModelStateChanged: {}
+    )
+    let window = NSWindow(
+        contentRect: NSRect(
+            origin: .zero,
+            size: MainWindowStartupConfiguration.defaultContentSize
+        ),
+        styleMask: [
+            .titled,
+            .closable,
+            .miniaturizable,
+            .resizable,
+            .fullSizeContentView
+        ],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    MainWindowStartupConfiguration.prepare(window, restoringFrameNamed: nil)
+    let restored = MainWindowStartupConfiguration.defaultContentSize.width + 320
+    window.setContentSize(
+        NSSize(
+            width: restored,
+            height: MainWindowStartupConfiguration.defaultContentSize.height
+        )
+    )
+    window.makeKeyAndOrderFront(nil)
+    // AppKit may clamp the ordered window to the visible display. Attach
+    // has to keep that on-screen frame, not the pre-front restored size.
+    let widthAfterFront = window.contentRect(forFrameRect: window.frame).width
+    MainWindowStartupConfiguration.attach(shell, to: window)
+    defer { window.close() }
+
+    #expect(!window.ignoresMouseEvents)
+    #expect(window.contentRect(forFrameRect: window.frame).width == widthAfterFront)
+    shell.view.layoutSubtreeIfNeeded()
+    #expect(shell.preferredContentSize == .zero)
+
+    let wider = widthAfterFront + 200
+    window.setFrame(
+        NSRect(x: 0, y: 0, width: wider, height: window.frame.height),
+        display: false
+    )
+    #expect(window.frame.width == wider)
+    #expect(window.contentMinSize == MainWindowStartupConfiguration.minimumContentSize)
+}
+
 /// The window's translucency has to follow the Appearance pane.
 ///
 /// `AppearanceSettings` is `@Observable`, and the backdrop reaches the window

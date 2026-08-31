@@ -7,6 +7,7 @@ private struct MainOverlayRoot: View {
     let appearance: AppearanceSettings
 
     let reportToastRegion: ToastLayerHitRegionReporter?
+    let reportHitTestFlags: ((Bool, Bool) -> Void)?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -42,6 +43,22 @@ private struct MainOverlayRoot: View {
             appearance.alwaysShowsChatMetadata
         )
         .tint(Color(nsColor: appearance.effectiveAccentColor))
+        .task { publishHitTestFlags() }
+        .onChange(of: model.isSearchPresented) { _, _ in
+            publishHitTestFlags()
+        }
+        .onChange(of: model.toastPresenter.entries.count) { _, _ in
+            publishHitTestFlags()
+        }
+    }
+
+    private func publishHitTestFlags() {
+        // `isSuppressed` is ObservationIgnored. Search presentation is the
+        // same condition RootView uses to suppress toasts.
+        reportHitTestFlags?(
+            model.isSearchPresented,
+            !model.isSearchPresented && !model.toastPresenter.entries.isEmpty
+        )
     }
 }
 
@@ -71,6 +88,12 @@ private final class MainOverlayHostingView: NSHostingView<MainOverlayRoot> {
     let model: AppModel
 
     private var toastHitRegion: CGRect?
+    /// Copies of overlay flags for AppKit hit-testing. `hitTest` is not an
+    /// Observation tracking context; IPS 213646 crashed in
+    /// `ObservationTracking._AccessList` when this view read AppModel here
+    /// during `NSDisplayCycleFlush`.
+    private var searchPresented = false
+    private var toastHitEnabled = false
 
     init(model: AppModel, appearance: AppearanceSettings) {
         self.model = model
@@ -78,16 +101,11 @@ private final class MainOverlayHostingView: NSHostingView<MainOverlayRoot> {
             rootView: MainOverlayRoot(
                 model: model,
                 appearance: appearance,
-                reportToastRegion: nil
+                reportToastRegion: nil,
+                reportHitTestFlags: nil
             )
         )
-        rootView = MainOverlayRoot(
-            model: model,
-            appearance: appearance,
-            reportToastRegion: { [weak self] region in
-                self?.toastHitRegion = region
-            }
-        )
+        installRoot(appearance: appearance)
         safeAreaRegions = []
         // This layer is pinned to all four edges of the shell. It must report
         // no size of its own: `sizingOptions` defaults to `.standardBounds`,
@@ -104,11 +122,19 @@ private final class MainOverlayHostingView: NSHostingView<MainOverlayRoot> {
         sizingOptions = []
     }
     func update(appearance: AppearanceSettings) {
+        installRoot(appearance: appearance)
+    }
+
+    private func installRoot(appearance: AppearanceSettings) {
         rootView = MainOverlayRoot(
             model: model,
             appearance: appearance,
             reportToastRegion: { [weak self] region in
                 self?.toastHitRegion = region
+            },
+            reportHitTestFlags: { [weak self] searchPresented, toastHitEnabled in
+                self?.searchPresented = searchPresented
+                self?.toastHitEnabled = toastHitEnabled
             }
         )
     }
@@ -120,11 +146,10 @@ private final class MainOverlayHostingView: NSHostingView<MainOverlayRoot> {
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        if model.isSearchPresented {
+        if searchPresented {
             return super.hitTest(point)
         }
-        guard !model.toastPresenter.isSuppressed,
-              !model.toastPresenter.entries.isEmpty,
+        guard toastHitEnabled,
               let toastHitRegion
         else {
             return nil
@@ -182,6 +207,14 @@ final class MainSplitVisibilityBridgeView: NSView {
     @objc func toggleSidebar(_ sender: Any?) {
         action()
     }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil else { return }
+        // First time the hosted split exists in a window. This is the
+        // SwiftUI tree, not the empty shell view.
+        LaunchClock.mark("window.firstSwiftUIRender")
+    }
 }
 
 /// AppKit owns the window and its full-window layers. SwiftUI owns the split,
@@ -230,7 +263,9 @@ final class MainShellViewController: NSViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         addChild(contentHosting)
+        LaunchClock.mark("window.hostingView.begin")
         let contentView = contentHosting.view
+        LaunchClock.mark("window.hostingView.end")
         contentView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(contentView)
         NSLayoutConstraint.activate([
@@ -240,6 +275,7 @@ final class MainShellViewController: NSViewController {
             contentView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
         makeOverlay(model: model, appearance: appearance)
+        LaunchClock.mark("window.shellViewDidLoad")
     }
 
     @available(*, unavailable)
@@ -321,6 +357,7 @@ final class MainShellViewController: NSViewController {
         // Re-applying it here makes AppKit lay out the titlebar and toolbar
         // again during the launch turn.
         if backgroundHosting == nil {
+            LaunchClock.mark("window.backdrop.begin")
             let hosting = NSHostingView(
                 rootView: WindowBackdropRoot(appearance: appearance)
             )
@@ -337,6 +374,7 @@ final class MainShellViewController: NSViewController {
                 hosting.bottomAnchor.constraint(equalTo: view.bottomAnchor)
             ])
             backgroundHosting = hosting
+            LaunchClock.mark("window.backdropHosted")
         }
         if overlayHosting == nil {
             makeOverlay(model: model, appearance: appearance)
@@ -749,9 +787,10 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
     }
 }
 
-/// The launch-time window state must be complete before attaching SwiftUI's
-/// expensive hosting hierarchy. `prepare` asserts that ordering so a later
-/// refactor cannot silently restore redundant titlebar and frame work.
+/// Chrome and the restored frame must be complete before the content host
+/// attaches. `prepare` asserts that the content host is still absent.
+/// The window orders front after `prepare` and before `attach`, so the first
+/// SwiftUI layout does not block the first visible frame.
 @MainActor
 enum MainWindowStartupConfiguration {
     static let defaultContentSize = NSSize(width: 1_040, height: 720)
@@ -809,10 +848,30 @@ enum MainWindowStartupConfiguration {
     /// including the accessibility resizes a tiling window manager makes.
     /// Defended by mainWindowStaysResizableAfterContentAttachment.
     static func attach(_ contentHost: NSViewController, to window: NSWindow) {
+        LaunchClock.mark("window.attach.begin")
         let preparedFrame = window.frame
+        // Size the host to the prepared content rect first. On a visible
+        // window, an unsized hosted split reports a fitting size at the
+        // content minimum and AppKit shrinks the frame before we can put
+        // it back. Measured as a 66 ms second layout plus a visible jump.
+        let contentSize = window.contentRect(forFrameRect: preparedFrame).size
+        contentHost.view.setFrameSize(contentSize)
+        // The window is already ordered front. Mouse tracking during this
+        // layout must not walk the overlay before SwiftUI publishes flags.
+        let shouldIgnoreMouse = window.isVisible
+        if shouldIgnoreMouse {
+            window.ignoresMouseEvents = true
+        }
         window.contentViewController = contentHost
-        guard window.frame != preparedFrame else { return }
-        window.setFrame(preparedFrame, display: false)
+        LaunchClock.mark("window.contentViewAssigned")
+        if window.frame != preparedFrame {
+            window.setFrame(preparedFrame, display: false)
+            LaunchClock.mark("window.frameRestored")
+        }
+        if shouldIgnoreMouse {
+            window.ignoresMouseEvents = false
+        }
+        LaunchClock.mark("window.attach.end")
     }
 
     fileprivate static func setDefaultFrame(on window: NSWindow) {
@@ -883,10 +942,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         self.appearance = appearance
         self.registry = registry
         self.debugModules = debugModules
+        var didOrderFrontThisTurn = false
         if let shellController {
             shellController.update(appearance: appearance, model: model)
             toolbarController?.update(model: model)
         } else {
+            LaunchClock.mark("window.shellConstruct.begin")
             let shellController = MainShellViewController(
                 appearance: appearance,
                 model: model,
@@ -895,10 +956,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                     self?.refreshChrome()
                 }
             )
+            LaunchClock.mark("window.shellConstruct.end")
             self.shellController = shellController
             // The shell carries no `preferredContentSize`; see
             // `MainWindowStartupConfiguration.attach` for what that cost.
             // Defended by mainWindowStaysResizableAfterContentAttachment.
+            LaunchClock.mark("window.create.begin")
             let window = NSWindow(
                 contentRect: NSRect(
                     origin: .zero,
@@ -914,30 +977,48 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 backing: .buffered,
                 defer: false
             )
+            LaunchClock.mark("window.create.end")
             // Configure the final frame and titlebar before AppKit instantiates
             // the content host and toolbar. The launch profile showed each of
             // those mutations otherwise triggering titlebar layout separately.
+            LaunchClock.mark("window.prepare.begin")
             MainWindowStartupConfiguration.prepare(window)
+            LaunchClock.mark("window.prepare.end")
             window.delegate = self
-            MainWindowStartupConfiguration.attach(shellController, to: window)
+            // Toolbar does not walk the hosted split. The bridge is bound
+            // after the first yield, once attach has built the SwiftUI tree.
+            LaunchClock.mark("window.toolbar.begin")
             let toolbarController = MainToolbarController(
                 model: model,
                 appearance: appearance,
-                visibilityBridge: shellController.visibilityBridgeView
+                visibilityBridge: nil
             )
             self.toolbarController = toolbarController
             window.toolbar = toolbarController.makeToolbar()
+            LaunchClock.mark("window.toolbar.end")
             self.window = window
-        }
-        if let window {
+            // Measured: attach laid out the full ChatView tree for ~300 ms
+            // before the window could order front. Native chrome and the
+            // restored frame are already on the window, so order it first.
+            // Attach still owns the first SwiftUI layout; it just no longer
+            // blocks the first visible frame. No placeholder chrome.
+            LaunchClock.mark("window.orderFront.begin")
             window.makeKeyAndOrderFront(nil)
             LaunchClock.mark("window.orderedFront")
-            LaunchClock.reportBreakdown()
+            MainWindowStartupConfiguration.attach(shellController, to: window)
+            didOrderFrontThisTurn = true
+        }
+        if let window {
+            if !didOrderFrontThisTurn {
+                window.makeKeyAndOrderFront(nil)
+            }
             Task { @MainActor [weak self] in
                 await Task.yield()
                 self?.toolbarController?.setVisibilityBridge(
                     self?.shellController?.visibilityBridgeView
                 )
+                // Backdrop installs in viewDidAppear, after attach returns.
+                LaunchClock.reportBreakdown()
             }
             if !hasShownWindow {
                 hasShownWindow = true
