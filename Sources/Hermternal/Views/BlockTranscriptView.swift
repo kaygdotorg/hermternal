@@ -1593,6 +1593,42 @@ final class BlockTranscriptTableView: NSTableView {
     }
 }
 
+
+/// A transcript text view that claims the height of its glyphs.
+///
+/// The table gives the row a measured height. The stack then has two text
+/// views — reasoning and answer — that both want the leftover space. An
+/// `NSTextView` whose container tracks the view has no intrinsic height, so
+/// Auto Layout can leave one view one point tall and clip its glyphs. This
+/// view reports the used rect at its current width, so each band keeps the
+/// height the measurement already paid for.
+private final class TranscriptFittingTextView: NSTextView {
+    override var intrinsicContentSize: NSSize {
+        guard let manager = layoutManager, let container = textContainer else {
+            return super.intrinsicContentSize
+        }
+        let width = max(1, bounds.width)
+        container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
+        manager.ensureLayout(for: container)
+        let used = manager.usedRect(for: container)
+        return NSSize(
+            width: NSView.noIntrinsicMetric,
+            height: ceil(used.height)
+        )
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let widthChanged = abs(newSize.width - bounds.width) > 0.5
+        super.setFrameSize(newSize)
+        if widthChanged { invalidateIntrinsicContentSize() }
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        invalidateIntrinsicContentSize()
+    }
+}
+
 @MainActor
 final class TranscriptTurnRowView: NSTableCellView {
     static let identifier = NSUserInterfaceItemIdentifier("TranscriptTurnRow")
@@ -1605,16 +1641,20 @@ final class TranscriptTurnRowView: NSTableCellView {
     /// the line it marks.
     private let markView = NSImageView()
     private let roleLabel = NSTextField(labelWithString: "")
-    private let answerView = NSTextView()
+    private let answerView = TranscriptFittingTextView()
     private let reasoningButton = NSButton()
     var answerViewForTesting: NSTextView { answerView }
     var reasoningButtonForTesting: NSButton { reasoningButton }
     var markViewForTesting: NSView { markView }
-    private let reasoningView = NSTextView()
+    var arrangedSubviewsForTesting: [NSView] { stack.arrangedSubviews }
+    var stackSpacingForTesting: CGFloat { stack.spacing }
+    var metadataStackForTesting: NSStackView { metadataStack }
+    var reasoningViewForTesting: NSTextView { reasoningView }
+    private let reasoningView = TranscriptFittingTextView()
     private let toolsButton = NSButton()
     var toolsButtonForTesting: NSButton { toolsButton }
     private let copyButton = NSButton()
-    private let toolsView = NSTextView()
+    private let toolsView = TranscriptFittingTextView()
     private let metadataStack = NSStackView()
     private let modelLabel = NSTextField(labelWithString: "")
     private let reasoningLabel = NSTextField(labelWithString: "")
@@ -1652,6 +1692,10 @@ final class TranscriptTurnRowView: NSTableCellView {
     private var userTextWidthConstraint: NSLayoutConstraint!
     private var tracking: NSTrackingArea?
     private var metadataAlwaysVisible = false
+    private(set) var mouseEnterCountForTesting = 0
+    private(set) var mouseExitCountForTesting = 0
+    private(set) var trackingAreaRebuildCountForTesting = 0
+    private(set) var metadataAnimatorCountForTesting = 0
 
     /// The outgoing bubble's fill, behind the answer text.
     private let bubble = OutgoingBubbleView(frame: .zero)
@@ -1857,6 +1901,8 @@ final class TranscriptTurnRowView: NSTableCellView {
         toolsButton.action = #selector(toolsAction)
         metadataStack.orientation = .horizontal
         metadataStack.spacing = MessageTypography.metadataGap
+        metadataStack.wantsLayer = true
+        metadataStack.layerContentsRedrawPolicy = .onSetNeedsDisplay
         metadataStack.addArrangedSubview(modelLabel)
         metadataStack.addArrangedSubview(reasoningLabel)
         metadataStack.translatesAutoresizingMaskIntoConstraints = false
@@ -1907,22 +1953,47 @@ final class TranscriptTurnRowView: NSTableCellView {
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
+        // Rebuilding the area while the pointer is inside sends another enter
+        // and another exit. One area with `inVisibleRect` already tracks the
+        // row, so a layout pass must not replace it.
+        if let tracking, trackingAreas.contains(where: { area in area === tracking }) {
+            return
+        }
+        trackingAreaRebuildCountForTesting += 1
         if let tracking { removeTrackingArea(tracking) }
-        let next = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil)
+        let next = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
         addTrackingArea(next)
         tracking = next
     }
 
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
-        guard !metadataAlwaysVisible else { return }
-        metadataStack.animator().alphaValue = 1
+        mouseEnterCountForTesting += 1
+        revealMetadata(true)
     }
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
+        mouseExitCountForTesting += 1
+        revealMetadata(false)
+    }
+
+    /// Animates only the metadata stack's own layer.
+    ///
+    /// The stack is layer-backed, so the opacity animation does not dirty the
+    /// answer text beside it. A same-value write is skipped, so a second enter
+    /// while the pointer stays inside does not start another transaction.
+    private func revealMetadata(_ visible: Bool) {
         guard !metadataAlwaysVisible else { return }
-        metadataStack.animator().alphaValue = 0
+        let target: CGFloat = visible ? 1 : 0
+        guard metadataStack.alphaValue != target else { return }
+        metadataAnimatorCountForTesting += 1
+        metadataStack.animator().alphaValue = target
     }
     func configureLoading(showText: Bool) {
         turnID = ""
@@ -2117,6 +2188,9 @@ final class TranscriptTurnRowView: NSTableCellView {
         // A row recycled from `configureLoading` keeps announcing "Loading
         // transcript row" until a configured row replaces the label.
         setAccessibilityLabel(turn.speaker.label)
+        answerView.invalidateIntrinsicContentSize()
+        reasoningView.invalidateIntrinsicContentSize()
+        toolsView.invalidateIntrinsicContentSize()
         needsLayout = true
     }
 
@@ -2179,9 +2253,11 @@ final class TranscriptTurnRowView: NSTableCellView {
         // only. Neither may pay for an inset the band does not need.
         view.textContainerInset = .zero
         view.textContainer?.widthTracksTextView = true
-        view.textContainer?.heightTracksTextView = true
-        view.isVerticallyResizable = false
+        view.textContainer?.heightTracksTextView = false
+        view.isVerticallyResizable = true
         view.isHorizontallyResizable = false
+        view.setContentHuggingPriority(.defaultHigh, for: .vertical)
+        view.setContentCompressionResistancePriority(.required, for: .vertical)
         view.font = NSFont.preferredFont(forTextStyle: .body)
     }
 
@@ -2193,7 +2269,7 @@ final class TranscriptTurnRowView: NSTableCellView {
     /// an appearance change with no rebuild.
     @MainActor
     private enum DisclosureBand {
-        static let font = NSFont.preferredFont(forTextStyle: .footnote)
+        static let font = NSFont.systemFont(ofSize: 15, weight: .semibold)
         static let reasoning = title("Reasoning")
         static let hideReasoning = title("Hide reasoning")
         static let tools = title("Tools")
@@ -2217,7 +2293,7 @@ final class TranscriptTurnRowView: NSTableCellView {
         private static func chevron(_ name: String) -> NSImage? {
             NSImage(systemSymbolName: name, accessibilityDescription: nil)?
                 .withSymbolConfiguration(
-                    NSImage.SymbolConfiguration(textStyle: .footnote)
+                    NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
                 )
         }
     }
@@ -2502,11 +2578,16 @@ private enum TranscriptTurnTextRenderer {
         let roleBand = turn.speaker == .system
             ? MessageTypography.roleLabelHeight
             : 0
+        var bands = channels
+        if turn.speaker == .system { bands += 1 }
+        if reasoningExpanded, turn.reasoning != nil { bands += 1 }
+        if toolsExpanded, !turn.tools.isEmpty { bands += 1 }
+        if !turn.answer.isEmpty { bands += 1 }
+        bands += 1
         let fixedHeight = roleBand
-            + MessageTypography.agentMeasurementReserve
             + CGFloat(channels) * MessageTypography.disclosureHeight
             + MessageTypography.metadataFooterHeight
-            + CGFloat(channels + 1) * MessageTypography.internalBlockGap
+            + CGFloat(max(0, bands - 1)) * MessageTypography.internalBlockGap
             + MessageTypography.turnGap
         return max(
             MessageTypography.minimumTurnHeight,
@@ -2571,23 +2652,46 @@ private enum TranscriptTurnTextRenderer {
         }
     }
 
-    private static func outgoingLayout(
-        document: MarkdownDocument,
+    /// The size of one attributed string in `width`.
+    ///
+    /// Colour is not a metric. The off-main measurement pass and the on-main
+    /// row use this framesetter, so a measured height is the height the text
+    /// view lays out.
+    private static func measuredText(
+        _ value: NSAttributedString,
         width: CGFloat
-    ) -> TranscriptTurnLayout {
-        // The display string, without its colours. The agent branch measures
-        // raw Markdown source in a substitute font, which a height with slack
-        // survives but a width does not: a wrong width wraps differently from
-        // the view, and the cached height is then wrong for the width the view
-        // lays out at, which is clipped text.
-        let value = attributedAnswer(document, foreground: .unstyled)
+    ) -> CGSize {
+        guard value.length > 0 else { return .zero }
         let framesetter = CTFramesetterCreateWithAttributedString(value)
-        let size = CTFramesetterSuggestFrameSizeWithConstraints(
+        return CTFramesetterSuggestFrameSizeWithConstraints(
             framesetter,
             CFRange(location: 0, length: value.length),
             nil,
             CGSize(width: width, height: .greatestFiniteMagnitude),
             nil
+        )
+    }
+
+    /// Body text as the reasoning and tools views draw it.
+    ///
+    /// Those views hold a plain string in the body font. They have no
+    /// paragraph spacing.
+    private static func bodyText(_ text: String) -> NSAttributedString {
+        NSAttributedString(
+            string: text,
+            attributes: [.font: NSFont.preferredFont(forTextStyle: .body)]
+        )
+    }
+
+    private static func outgoingLayout(
+        document: MarkdownDocument,
+        width: CGFloat
+    ) -> TranscriptTurnLayout {
+        // The display string, without its colours. The width is the
+        // framesetter's fitting width, so a short bubble hugs its text.
+        let size = measuredText(
+            attributedAnswer(document, foreground: .unstyled),
+            width: width
         )
         return TranscriptTurnLayout(
             textWidth: min(width, ceil(size.width)),
@@ -2602,36 +2706,42 @@ private enum TranscriptTurnTextRenderer {
         reasoningExpanded: Bool,
         toolsExpanded: Bool
     ) -> TranscriptTurnLayout {
-        let body = document.source
-            + (reasoningExpanded ? "\n" + (turn.reasoning?.text ?? "") : "")
-            + (toolsExpanded ? "\n" + toolText(turn.tools) : "")
-        let font = CTFontCreateWithName("Helvetica" as CFString, 13, nil)
-        let value = NSAttributedString(
-            string: body,
-            attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font]
-        )
-        let framesetter = CTFramesetterCreateWithAttributedString(value)
-        let size = CTFramesetterSuggestFrameSizeWithConstraints(
-            framesetter,
-            CFRange(location: 0, length: value.length),
-            nil,
-            CGSize(width: width, height: .greatestFiniteMagnitude),
-            nil
-        )
-        let channels = (turn.reasoning == nil ? 0 : 1) + (turn.tools.isEmpty ? 0 : 1)
-        // The role band belongs to a system row only. See `provisionalHeight`.
-        let roleBand = turn.speaker == .system
-            ? MessageTypography.roleLabelHeight
-            : 0
+        // The same attributed strings the row draws. The earlier Helvetica
+        // substitute of the Markdown source was shorter than the body font
+        // with line spacing and paragraph spacing, and a long answer clipped.
+        var parts: [CGFloat] = []
+        if turn.speaker == .system {
+            parts.append(MessageTypography.roleLabelHeight)
+        }
+        if turn.reasoning != nil {
+            parts.append(MessageTypography.disclosureHeight)
+            if reasoningExpanded, let text = turn.reasoning?.text, !text.isEmpty {
+                parts.append(measuredText(bodyText(text), width: width).height)
+            }
+        }
+        if !turn.tools.isEmpty {
+            parts.append(MessageTypography.disclosureHeight)
+            if toolsExpanded {
+                let tools = toolText(turn.tools)
+                if !tools.isEmpty {
+                    parts.append(measuredText(bodyText(tools), width: width).height)
+                }
+            }
+        }
+        if !turn.answer.isEmpty {
+            parts.append(
+                measuredText(
+                    attributedAnswer(document, foreground: .unstyled),
+                    width: width
+                ).height
+            )
+        }
+        parts.append(MessageTypography.metadataFooterHeight)
+        let gaps = CGFloat(max(0, parts.count - 1))
+            * MessageTypography.internalBlockGap
         let height = max(
             MessageTypography.minimumTurnHeight,
-            ceil(size.height)
-                + roleBand
-                + MessageTypography.agentMeasurementReserve
-                + CGFloat(channels) * MessageTypography.disclosureHeight
-                + MessageTypography.metadataFooterHeight
-                + CGFloat(channels + 1) * MessageTypography.internalBlockGap
-                + MessageTypography.turnGap
+            ceil(parts.reduce(0, +) + gaps + MessageTypography.turnGap)
         )
         return TranscriptTurnLayout(textWidth: width, height: height)
     }

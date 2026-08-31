@@ -172,22 +172,6 @@ enum MessageTypography {
     /// One point cannot clip a descender and is invisible in the bubble.
     static let outgoingMeasurementSlack: CGFloat = 1
 
-    /// The reserve between the agent measurement and the rendered answer.
-    ///
-    /// The agent measurement runs off the main thread. It measures the raw
-    /// Markdown source in Helvetica 13, with no line spacing and no paragraph
-    /// spacing. The row then renders the parsed document in the body font, with
-    /// `bodyLineSpacing` on every line and `paragraphGap` after every
-    /// paragraph. The rendered text is therefore taller than the measurement.
-    /// This reserve holds that difference.
-    ///
-    /// The reserve is not exact. The difference grows with the number of lines
-    /// and paragraphs, and an exact figure needs the rendered text, which the
-    /// measurement pass does not build. The value is the reserve the transcript
-    /// has always held: it was named after the agent role band, which the mark
-    /// in the gutter replaced.
-    static let agentMeasurementReserve: CGFloat = 18
-
     static func headingTracking(_ level: Int) -> CGFloat {
         switch level {
         case 1: -0.2

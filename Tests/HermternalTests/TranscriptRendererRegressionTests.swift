@@ -867,6 +867,19 @@ func rendererDisclosureBandsDrawWholeTitleAtLeadingEdge() throws {
             button.intrinsicContentSize.height
                 <= MessageTypography.disclosureHeight
         )
+        #expect(button.font?.pointSize == 15)
+        let titleFont = button.attributedTitle.attribute(
+            .font,
+            at: 0,
+            effectiveRange: nil
+        ) as? NSFont
+        #expect(titleFont?.pointSize == 15)
+        let traits = titleFont?.fontDescriptor.object(forKey: .traits)
+            as? [NSFontDescriptor.TraitKey: Any]
+        let weight = traits?[.weight] as? CGFloat ?? 0
+        #expect(abs(weight - NSFont.Weight.semibold.rawValue) < 0.05)
+        #expect(button.contentTintColor == .secondaryLabelColor)
+        #expect(button.image != nil)
         // A band announces the state it is in.
         #expect(button.accessibilityLabel() == expected)
     }
@@ -1725,6 +1738,47 @@ private func clipOrigin(of table: NSTableView) -> CGFloat {
     table.enclosingScrollView?.contentView.bounds.origin.y ?? 0
 }
 
+
+/// Height of the glyphs a text view holds, at the width it laid out.
+///
+/// The layout manager is the same path the view draws. A framesetter of the
+/// same string can round a different last-line ascent, so the clip contract
+/// reads the used rect with an unbounded container height.
+@MainActor
+private func naturalTextHeight(_ view: NSTextView) -> CGFloat {
+    guard let manager = view.layoutManager, let container = view.textContainer else {
+        return 0
+    }
+    let saved = container.containerSize
+    container.containerSize = NSSize(
+        width: max(1, view.bounds.width),
+        height: .greatestFiniteMagnitude
+    )
+    manager.ensureLayout(for: container)
+    let height = ceil(manager.usedRect(for: container).height)
+    container.containerSize = saved
+    manager.ensureLayout(for: container)
+    return height
+}
+
+/// Height the stack's visible bands need at the widths they laid out.
+@MainActor
+private func arrangedContentHeight(_ row: TranscriptTurnRowView) -> CGFloat {
+    let visible = row.arrangedSubviewsForTesting.filter { view in !view.isHidden }
+    var height: CGFloat = 0
+    for view in visible {
+        if let text = view as? NSTextView {
+            height += naturalTextHeight(text)
+        } else {
+            height += ceil(view.intrinsicContentSize.height)
+        }
+    }
+    if visible.count > 1 {
+        height += CGFloat(visible.count - 1) * row.stackSpacingForTesting
+    }
+    return height
+}
+
 /// One laid-out agent row, and the superview that publishes its width.
 ///
 /// The column guide relates the row's content to the row's own `widthAnchor`.
@@ -1910,9 +1964,9 @@ func markStandsBesideTheFirstBandOfAChannelledTurn() {
 
     // The mark marks that band, not the middle of the row. The box starts at
     // the top of the disclosure band. The box is taller than the band, which a
-    // borderless footnote button keeps to 13pt, so it reaches past it: the mark
-    // states the speaker of the whole turn, and the first band is where the
-    // turn starts.
+    // 15pt semibold title keeps shorter than the 28pt mark, so the mark
+    // reaches past it: the mark states the speaker of the whole turn, and the
+    // first band is where the turn starts.
     #expect(abs(mark.maxY - reasoningBand.maxY) <= 1)
     #expect(mark.height > reasoningBand.height)
     // The mark stays out of the gap between two turns.
@@ -2030,8 +2084,154 @@ func agentRowMeasuresNoRoleBand() {
     // The floor must not answer for the chain.
     #expect(agentHeight > MessageTypography.minimumTurnHeight)
     // Only the system row shows a role label, so only the system row measures
-    // the band. Both rows keep the reserve between the measurement and the
-    // rendered text. The two rows are measured at one width, because the agent
-    // width holds the gutter the mark stands in and the system width does not.
-    #expect(systemHeight - agentHeight == MessageTypography.roleLabelHeight)
+    // the band. Both rows measure the same attributed answer. The two rows are
+    // measured at one width, because the agent width holds the gutter the mark
+    // stands in and the system width does not.
+    #expect(
+        systemHeight - agentHeight
+            == MessageTypography.roleLabelHeight
+                + MessageTypography.internalBlockGap
+    )
+}
+
+@Test("expanded reasoning pushes a long answer without clipping")
+@MainActor
+func expandedReasoningPushesALongAnswerWithoutClipping() {
+    _ = NSApplication.shared
+    let paragraph = String(
+        repeating: "The assistant writes a complete paragraph that wraps at the reading measure. ",
+        count: 6
+    )
+    let answer = Array(repeating: paragraph, count: 6).joined(separator: "\n\n")
+    let reasoning = Array(
+        repeating: "A line of expanded reasoning that also wraps at the column.",
+        count: 12
+    ).joined(separator: "\n")
+    let document = MarkdownDocument.parse(answer).document
+    let turn = TranscriptTurn(
+        id: "expanded-clip",
+        speaker: .hermes,
+        model: "hermes-1",
+        reasoning: TranscriptReasoning(id: "reasoning", text: reasoning, effort: "high"),
+        answer: answer
+    )
+    let height = measuredAgentRowHeight(
+        turn: turn,
+        document: document,
+        reasoningExpanded: true
+    )
+    let laidOut = laidOutAgentRow(
+        turn: turn,
+        document: document,
+        rowHeight: height,
+        reasoningExpanded: true
+    )
+    let row = laidOut.row
+    let contentHeight = arrangedContentHeight(row)
+
+    // The premise. Several paragraphs and an expanded reasoning band make a
+    // tall turn. A height from the raw source in Helvetica 13 is shorter than
+    // the rendered bands, and the last lines of the answer then clip.
+    #expect(contentHeight > MessageTypography.minimumTurnHeight)
+    #expect(row.answerViewForTesting.bounds.height > 3 * MessageTypography.bodyLineHeight)
+    // The applied row height is the table height. It must fit every visible
+    // band at the width the row laid out, with the turn gap around the stack.
+    #expect(contentHeight + MessageTypography.turnGap <= height + 1)
+    #expect(
+        naturalTextHeight(row.answerViewForTesting)
+            <= row.answerViewForTesting.bounds.height + 1
+    )
+    #expect(
+        naturalTextHeight(row.reasoningViewForTesting)
+            <= row.reasoningViewForTesting.bounds.height + 1
+    )
+    for view in row.arrangedSubviewsForTesting where !view.isHidden {
+        guard let text = view as? NSTextView else { continue }
+        #expect(naturalTextHeight(text) <= text.bounds.height + 1)
+    }
+}
+
+@Test("hovering a row counts enter exit without redrawing the answer")
+@MainActor
+func hoveringARowCountsEnterExitWithoutRedrawingTheAnswer() {
+    _ = NSApplication.shared
+    let answer = "A short assistant answer for the hover probe."
+    let document = MarkdownDocument.parse(answer).document
+    let turn = TranscriptTurn(
+        id: "hover",
+        speaker: .hermes,
+        model: "hermes-1",
+        reasoning: TranscriptReasoning(id: "reasoning", text: "detail", effort: "high"),
+        answer: answer
+    )
+    let height = measuredAgentRowHeight(turn: turn, document: document)
+    let laidOut = laidOutAgentRow(
+        turn: turn,
+        document: document,
+        rowHeight: height
+    )
+    laidOut.row.configure(
+        turn: turn,
+        document: document,
+        reasoningExpanded: false,
+        toolsExpanded: false,
+        showsMetadata: false,
+        findQuery: "",
+        onReasoning: { _ in },
+        onTools: { _ in },
+        onCopyCode: { _ in }
+    )
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: 780, height: height + 80),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    window.contentView = laidOut.root
+    window.makeKeyAndOrderFront(nil)
+    laidOut.row.layoutSubtreeIfNeeded()
+    let row = laidOut.row
+    let answerView = row.answerViewForTesting
+    answerView.needsDisplay = false
+
+    let enter = NSEvent.enterExitEvent(
+        with: .mouseEntered,
+        location: NSPoint(x: 40, y: height / 2),
+        modifierFlags: [],
+        timestamp: ProcessInfo.processInfo.systemUptime,
+        windowNumber: window.windowNumber,
+        context: nil,
+        eventNumber: 1,
+        trackingNumber: 0,
+        userData: nil
+    )!
+    #expect(row.metadataStackForTesting.wantsLayer)
+    let rebuilds = row.trackingAreaRebuildCountForTesting
+    row.mouseEntered(with: enter)
+    for _ in 0..<8 {
+        row.updateTrackingAreas()
+    }
+    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    #expect(row.trackingAreaRebuildCountForTesting == rebuilds)
+
+    let exit = NSEvent.enterExitEvent(
+        with: .mouseExited,
+        location: NSPoint(x: -40, y: height / 2),
+        modifierFlags: [],
+        timestamp: ProcessInfo.processInfo.systemUptime,
+        windowNumber: window.windowNumber,
+        context: nil,
+        eventNumber: 2,
+        trackingNumber: 0,
+        userData: nil
+    )!
+    row.mouseExited(with: exit)
+    window.orderOut(nil)
+
+    // One enter and one exit. Rebuilding the tracking area during the
+    // reveal must not start more animator transactions.
+    #expect(row.mouseEnterCountForTesting == 1)
+    #expect(row.mouseExitCountForTesting == 1)
+    #expect(row.metadataAnimatorCountForTesting == 2)
+    #expect(!answerView.needsDisplay)
 }
