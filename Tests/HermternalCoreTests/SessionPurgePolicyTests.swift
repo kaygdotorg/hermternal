@@ -152,3 +152,40 @@ func emptyFolderPlanIsValid() {
     #expect(plan.folderCount == 1)
     #expect(plan.chatIDs.isEmpty)
 }
+
+@Test("purge phases reject a second start while active")
+func purgePhasesRejectReentryEvents() {
+    #expect(SessionPurgePolicy.canAccept(.idle, .beginPrepare))
+    #expect(!SessionPurgePolicy.canAccept(.idle, .confirm))
+    #expect(!SessionPurgePolicy.canAccept(.idle, .cancel))
+
+    #expect(!SessionPurgePolicy.canAccept(.preparing, .beginPrepare))
+    #expect(SessionPurgePolicy.canAccept(.preparing, .prepareSucceeded))
+    #expect(SessionPurgePolicy.canAccept(.preparing, .prepareFailed))
+    #expect(SessionPurgePolicy.canAccept(.preparing, .cancel))
+    #expect(!SessionPurgePolicy.canAccept(.preparing, .confirm))
+
+    let plan = SessionPurgePolicy.plan(
+        selectedChatIDs: ["chat"],
+        selectedFolderIDs: [],
+        mode: .chatsOnly,
+        membership: [:],
+        visibleChatIDs: ["chat"],
+        activeSessionID: nil,
+        isStreaming: false
+    )
+    #expect(!SessionPurgePolicy.canAccept(.confirming(plan), .beginPrepare))
+    #expect(SessionPurgePolicy.canAccept(.confirming(plan), .confirm))
+    #expect(SessionPurgePolicy.canAccept(.confirming(plan), .cancel))
+    #expect(!SessionPurgePolicy.canAccept(.confirming(plan), .executionFinished))
+
+    #expect(!SessionPurgePolicy.canAccept(.executing(plan), .beginPrepare))
+    #expect(!SessionPurgePolicy.canAccept(.executing(plan), .confirm))
+    #expect(!SessionPurgePolicy.canAccept(.executing(plan), .cancel))
+    #expect(SessionPurgePolicy.canAccept(.executing(plan), .executionFinished))
+    #expect(!SessionPurgePhase.preparing.allowsNewCommand)
+    #expect(SessionPurgePhase.idle.allowsNewCommand)
+    #expect(SessionPurgePhase.preparing.showsProgress)
+    #expect(SessionPurgePhase.executing(plan).showsProgress)
+    #expect(!SessionPurgePhase.confirming(plan).showsProgress)
+}

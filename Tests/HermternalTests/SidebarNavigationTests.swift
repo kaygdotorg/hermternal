@@ -50,6 +50,7 @@ func fortySidebarSelectionsStartCachedOpensImmediately() async throws {
         transcriptSource: source,
         warmStore: warmStore
     )
+    model.phase = .ready
     let sessions = (1...40).map { chatSession(id: "chat-\($0)", messageCount: 1) }
     model.sessions = sessions
 

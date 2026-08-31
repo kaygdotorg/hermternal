@@ -301,6 +301,68 @@ func unnamedSessionEventsDoNotReduceOpenChat() async throws {
 
 @Test("requestOpen of the displayed session keeps the in-flight stream")
 @MainActor
+func requestOpenOfDisplayedSessionKeepsInFlightStream() async throws {
+    let directory = try chatModelTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let model = AppModel(
+        cache: HistoryCache(directory: directory),
+        transcriptSource: TranscriptFixtureSource(rows: [
+            transcriptRow(id: 1, text: "seed", turnID: "turn-seed")
+        ])
+    )
+    let session = chatSession(id: "chat-adopt", messageCount: 1)
+    model.phase = .ready
+    model.sessions = [session]
+    model.cacheEnabled = true
+    #expect(await model.open(session))
+    await model.handle(GatewayEvent(
+        type: "message.start",
+        sessionID: session.id,
+        payload: .object(["id": .integer(70), "text": .string("")])
+    ))
+    await model.handle(GatewayEvent(
+        type: "message.delta",
+        sessionID: session.id,
+        payload: .object(["id": .integer(70), "text": .string("in-flight")])
+    ))
+    #expect(model.isAwaitingReply)
+    #expect(model.activeTranscriptStore != nil)
+
+    model.selectedSessionID = nil
+    let task = model.requestOpen(session)
+    await task.value
+
+    #expect(model.selectedSessionID == session.id)
+    #expect(model.messages.contains { $0.text.contains("in-flight") })
+    #expect(model.isAwaitingReply)
+}
+
+@Test("newChat without a gateway leaves the open transcript in place")
+@MainActor
+func newChatWithoutGatewayLeavesOpenTranscript() async throws {
+    let directory = try chatModelTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let model = AppModel(
+        cache: HistoryCache(directory: directory),
+        transcriptSource: TranscriptFixtureSource(rows: [])
+    )
+    let session = chatSession(id: "chat", messageCount: 0)
+    model.phase = .ready
+    model.sessions = [session]
+    model.cacheEnabled = true
+    #expect(await model.open(session))
+    model.messages = [ChatMessage(role: .user, text: "Keep")]
+    #expect(model.activeTranscriptStore != nil)
+
+    await model.newChat()
+
+    #expect(model.messages.map(\.text) == ["Keep"])
+    #expect(model.activeTranscriptStore != nil)
+    #expect(model.selectedSessionID == session.id)
+}
+
 @Test("requestOpen publishes the cache tail before paged store install")
 @MainActor
 func requestOpenPublishesCacheTailBeforePagedStoreInstall() async throws {
@@ -330,6 +392,7 @@ func requestOpenPublishesCacheTailBeforePagedStoreInstall() async throws {
         transcriptSource: TranscriptFixtureSource(rows: []),
         warmStore: TranscriptWarmStore()
     )
+    model.phase = .ready
     model.sessions = [session]
     model.cacheEnabled = true
 
@@ -371,6 +434,7 @@ func requestOpenKeepsLiveReductionsAcrossPagedStoreInstall() async throws {
         transcriptSource: TranscriptFixtureSource(rows: []),
         warmStore: TranscriptWarmStore()
     )
+    model.phase = .ready
     model.sessions = [session]
     model.cacheEnabled = true
 
@@ -431,3 +495,182 @@ private func chatOpenWait(
     }
 }
 
+func archivedRefreshRetainsRowsThroughLoadingAndFailure() async throws {
+    let directory = try chatModelTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let model = AppModel(cache: HistoryCache(directory: directory))
+    model.archivedSessions = [chatSession(id: "kept", messageCount: 1)]
+
+    let failure = ChatModelGatedSessionList(result: .failure(URLError(.notConnectedToInternet)))
+    model.testingSetSessionListProvider { filter in
+        try await failure.provide(filter)
+    }
+
+    let task = Task { await model.loadArchivedSessions() }
+    let started = await chatOpenWait(until: "archived load is in flight") {
+        model.archivedSessionsLoading
+    }
+    #expect(started)
+    #expect(model.archivedSessions.map(\.id) == ["kept"])
+    #expect(model.archivedSessionsError == nil)
+
+    failure.release()
+    await task.value
+
+    #expect(model.archivedSessions.map(\.id) == ["kept"])
+    #expect(model.archivedSessionsError != nil)
+    #expect(!model.archivedSessionsLoading)
+
+    let success = ChatModelGatedSessionList(result: .success([
+        .object(["id": .string("fresh"), "title": .string("Fresh")])
+    ]))
+    success.release()
+    model.testingSetSessionListProvider { filter in
+        try await success.provide(filter)
+    }
+    await model.loadArchivedSessions()
+    #expect(model.archivedSessions.map(\.id) == ["fresh"])
+    #expect(model.archivedSessionsError == nil)
+
+    model.testingSetSessionListProvider(nil)
+    await model.loadArchivedSessions()
+    #expect(model.archivedSessions.map(\.id) == ["fresh"])
+    #expect(model.archivedSessionsError == "The server connection is unavailable.")
+}
+
+@Test("Chat reload joins the in-flight load and discards a stale completion")
+@MainActor
+func chatReloadJoinsInFlightAndDiscardsStaleCompletion() async throws {
+    let directory = try chatModelTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let model = AppModel(cache: HistoryCache(directory: directory))
+    model.sessions = [chatSession(id: "cached", messageCount: 1)]
+
+    let gate = ChatModelGatedSessionList(result: .success([
+        .object(["id": .string("fresh"), "title": .string("Fresh")])
+    ]))
+    model.testingSetSessionListProvider { filter in
+        try await gate.provide(filter)
+    }
+
+    let first = Task { await model.loadSessions() }
+    let started = await chatOpenWait(until: "session reload entered the provider") {
+        model.isReloadingSessions && gate.callCount == 1
+    }
+    #expect(started)
+    #expect(gate.callCount == 1)
+
+    let second = Task { await model.loadSessions() }
+    await Task.yield()
+    await Task.yield()
+    #expect(gate.callCount == 1)
+    #expect(model.isReloadingSessions)
+
+    model.testingInvalidateSessionLoad()
+    gate.release()
+    await first.value
+    await second.value
+
+    #expect(model.sessions.map(\.id) == ["cached"])
+    #expect(!model.isReloadingSessions)
+
+    let later = ChatModelGatedSessionList(result: .success([
+        .object(["id": .string("newer"), "title": .string("Newer")])
+    ]))
+    later.release()
+    model.testingSetSessionListProvider { filter in
+        try await later.provide(filter)
+    }
+    await model.loadSessions()
+    #expect(model.sessions.map(\.id) == ["newer"])
+    #expect(!model.isReloadingSessions)
+}
+
+@Test("Purge prepare is non-reentrant while preparing or confirming")
+@MainActor
+func purgePhasesRejectReentry() async throws {
+    let directory = try chatModelTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let model = AppModel(cache: HistoryCache(directory: directory))
+    model.sessionPurgeCapability = try SessionPurgeCapability(
+        method: "POST",
+        path: "/api/sessions/purge",
+        maxBatch: 500
+    )
+    let gate = ChatModelGatedSessionList(result: .success([
+        .object(["id": .string("chat-1"), "title": .string("One")])
+    ]))
+    model.testingSetSessionListProvider { filter in
+        try await gate.provide(filter)
+    }
+
+    let first = Task {
+        await model.preparePurge(
+            selectedChatIDs: ["chat-1"],
+            selectedFolderIDs: [],
+            mode: .chatsOnly
+        )
+    }
+    let preparing = await chatOpenWait(until: "purge is preparing") {
+        if case .preparing = model.sessionPurgePhase { return true }
+        return false
+    }
+    #expect(preparing)
+    #expect(!model.canBeginPurge)
+
+    let duringPrepare = await model.preparePurge(
+        selectedChatIDs: ["chat-1"],
+        selectedFolderIDs: [],
+        mode: .chatsOnly
+    )
+    #expect(duringPrepare == nil)
+
+    gate.release()
+    let plan = await first.value
+    #expect(plan?.chatIDs == ["chat-1"])
+    guard case .confirming = model.sessionPurgePhase else {
+        Issue.record("expected confirming after prepare")
+        return
+    }
+    #expect(!model.canBeginPurge)
+
+    let duringConfirm = await model.preparePurge(
+        selectedChatIDs: ["chat-1"],
+        selectedFolderIDs: [],
+        mode: .chatsOnly
+    )
+    #expect(duringConfirm == nil)
+
+    model.cancelPendingPurge()
+    #expect(model.sessionPurgePhase == .idle)
+    #expect(model.canBeginPurge)
+}
+
+@MainActor
+private final class ChatModelGatedSessionList {
+    private(set) var callCount = 0
+    var result: Result<[JSONValue], Error>
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    init(result: Result<[JSONValue], Error>) {
+        self.result = result
+    }
+
+    func provide(_ filter: SessionArchiveFilter) async throws -> [JSONValue] {
+        _ = filter
+        callCount += 1
+        if !released {
+            await withCheckedContinuation { continuation in
+                self.continuation = continuation
+            }
+        }
+        return try result.get()
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
+    }
+}

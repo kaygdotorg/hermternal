@@ -65,6 +65,41 @@ func signedOutToolbarSkipsReadyOnlyItems() {
     #expect(ready.filter { $0 == .flexibleSpace }.count == 2)
 }
 
+@Test("toolbar New Chat enablement follows ready, not workspace visibility")
+@MainActor
+func toolbarDetailActionEnablementTruthTable() {
+    struct Row {
+        let phase: AppModel.Phase
+        let searchPresented: Bool
+        let viewingArchived: Bool
+        let showsChrome: Bool
+        let newChat: Bool
+        let restore: Bool
+    }
+    let rows: [Row] = [
+        .init(phase: .signedOut, searchPresented: false, viewingArchived: false, showsChrome: false, newChat: false, restore: false),
+        .init(phase: .restoring, searchPresented: false, viewingArchived: false, showsChrome: true, newChat: false, restore: false),
+        .init(phase: .connecting, searchPresented: false, viewingArchived: false, showsChrome: true, newChat: false, restore: false),
+        .init(phase: .ready, searchPresented: false, viewingArchived: false, showsChrome: true, newChat: true, restore: false),
+        .init(phase: .ready, searchPresented: true, viewingArchived: false, showsChrome: true, newChat: false, restore: false),
+        .init(phase: .ready, searchPresented: false, viewingArchived: true, showsChrome: true, newChat: false, restore: true),
+        .init(phase: .ready, searchPresented: true, viewingArchived: true, showsChrome: true, newChat: false, restore: false),
+        .init(phase: .failed("unavailable"), searchPresented: false, viewingArchived: false, showsChrome: false, newChat: false, restore: false)
+    ]
+    for row in rows {
+        let state = MainToolbarController.DetailCommandEnablement.resolve(
+            phase: row.phase,
+            searchPresented: row.searchPresented,
+            viewingArchived: row.viewingArchived
+        )
+        #expect(state.showsWorkspaceChrome == row.showsChrome)
+        #expect(state.isNewChatEnabled == row.newChat)
+        #expect(state.isRestoreEnabled == row.restore)
+        #expect(state.isDetailActionEnabled == (row.newChat || row.restore))
+        #expect(state.areChromeCommandsEnabled == (row.showsChrome && !row.searchPresented))
+    }
+}
+
 @Test("the toolbar's width toggle is two real symbols and one command")
 @MainActor
 func toolbarWidthToggleStatesTheMeasureItWouldGive() {

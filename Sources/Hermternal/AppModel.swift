@@ -550,6 +550,11 @@ final class AppModel: ComposerTurnRouting {
     var archivedSessions: [ChatSession] = []
     var archivedSessionsLoading = false
     var archivedSessionsError: String?
+    /// True while a session-list reload is in flight. Cmd-R joins that task.
+    private(set) var isReloadingSessions = false
+    /// Model-owned purge command phase. Duplicate destructive commands stay
+    /// disabled until this returns to idle.
+    private(set) var sessionPurgePhase: SessionPurgePhase = .idle
     var folders: [Folder] = []
     var membership: [String: String] = [:]
     /// A bounded presentation of the active transcript. Full history lives in
@@ -663,6 +668,14 @@ final class AppModel: ComposerTurnRouting {
     var sessionPurgeCapability: SessionPurgeCapability?
     var sessionPurgeUnavailableReason: String = "Complete deletion is unavailable on this gateway."
     var canPurgeSessions: Bool { sessionPurgeCapability != nil }
+    var canBeginPurge: Bool {
+        canPurgeSessions && sessionPurgePhase.allowsNewCommand
+    }
+    var purgeCommandHelp: String {
+        sessionPurgePhase.allowsNewCommand
+            ? sessionPurgeUnavailableReason
+            : "Deletion is already in progress."
+    }
 
     var accountPresentation: AccountIdentityPresentation {
         AccountIdentityResolver.resolve(
@@ -763,6 +776,19 @@ final class AppModel: ComposerTurnRouting {
     func testingSetSessionListComplete(_ value: Bool) {
         sessionsLoadedCompletely = value
     }
+
+    /// Test seam. Production uses the connected REST client.
+    func testingSetSessionListProvider(
+        _ provider: (@MainActor (SessionArchiveFilter) async throws -> [JSONValue])?
+    ) {
+        sessionListProvider = provider
+    }
+
+    /// Test seam. Marks the in-flight session reload stale without joining it.
+    func testingInvalidateSessionLoad() {
+        sessionLoadGeneration += 1
+    }
+
     /// Counts AuthClient constructions so tests can prove single-flight sign-in.
     @ObservationIgnored
     private(set) var testingAuthClientCount = 0
@@ -794,6 +820,12 @@ final class AppModel: ComposerTurnRouting {
     private var accountGeneration = 0
     private var archivedLoadGeneration = 0
     private var purgePreparationGeneration = 0
+    private var sessionLoadGeneration = 0
+    @ObservationIgnored
+    private var sessionLoadTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var sessionListProvider:
+        (@MainActor (SessionArchiveFilter) async throws -> [JSONValue])?
     /// Core-owned generation guard used to invalidate superseded opens.
     private struct PendingMessageRoute: Equatable {
         let location: MessageLocation
@@ -1155,6 +1187,11 @@ final class AppModel: ComposerTurnRouting {
         accountGeneration += 1
         archivedLoadGeneration += 1
         purgePreparationGeneration += 1
+        sessionLoadGeneration += 1
+        sessionLoadTask?.cancel()
+        sessionLoadTask = nil
+        isReloadingSessions = false
+        sessionPurgePhase = .idle
         pendingExternalRoute.clearPending()
         pendingMessageRoute = nil
         sessionsLoadedCompletely = false
@@ -1441,17 +1478,54 @@ final class AppModel: ComposerTurnRouting {
     // MARK: - Sessions
 
     func loadSessions() async {
-        guard let rest else { return }
+        if let sessionLoadTask {
+            await sessionLoadTask.value
+            return
+        }
+        sessionLoadGeneration += 1
+        let generation = sessionLoadGeneration
+        let requestAccountGeneration = accountGeneration
+        isReloadingSessions = true
+        let task = Task { @MainActor in
+            await self.performLoadSessions(
+                generation: generation,
+                requestAccountGeneration: requestAccountGeneration
+            )
+        }
+        sessionLoadTask = task
+        await task.value
+        if sessionLoadTask == task {
+            sessionLoadTask = nil
+            isReloadingSessions = false
+        }
+    }
+
+    private func performLoadSessions(
+        generation: Int,
+        requestAccountGeneration: Int
+    ) async {
+        guard sessionLoadGeneration == generation,
+              accountGeneration == requestAccountGeneration
+        else { return }
         sessionsLoadedCompletely = false
         do {
             // The gateway already denies tool and kanban rows. Subagent rows
             // are machine sessions, not chats, and the server excludes them.
-            let rows = try await rest.allSessions(excludeSources: Self.nonChatSources)
+            guard let rows = try await fetchSessionRows(archived: .exclude) else {
+                return
+            }
+            guard sessionLoadGeneration == generation,
+                  accountGeneration == requestAccountGeneration,
+                  !Task.isCancelled
+            else { return }
             let loaded = rows.compactMap { row -> ChatSession? in
                 let session = ChatSession(from: row)
                 guard !session.id.isEmpty else { return nil }
                 return session
             }.sorted(by: Self.sessionComesBefore)
+            guard sessionLoadGeneration == generation,
+                  accountGeneration == requestAccountGeneration
+            else { return }
             // A complete authoritative list supersedes every in-flight warm
             // pass before retention or disk/index reconciliation can run.
             cancelPrefetch()
@@ -1496,15 +1570,18 @@ final class AppModel: ComposerTurnRouting {
                 }
             }
         } catch {
+            guard sessionLoadGeneration == generation,
+                  accountGeneration == requestAccountGeneration
+            else { return }
             Log.error("REST session list failed: \(error)")
             postError("Could not load sessions", detail: error.localizedDescription)
         }
     }
+
     func loadArchivedSessions() async {
         archivedLoadGeneration += 1
         let loadGeneration = archivedLoadGeneration
         let requestAccountGeneration = accountGeneration
-        archivedSessions = []
         archivedSessionsError = nil
         archivedSessionsLoading = true
         defer {
@@ -1513,15 +1590,11 @@ final class AppModel: ComposerTurnRouting {
                 archivedSessionsLoading = false
             }
         }
-        guard let rest else {
-            archivedSessionsError = "The server connection is unavailable."
-            return
-        }
         do {
-            let rows = try await rest.allSessions(
-                archived: .only,
-                excludeSources: Self.nonChatSources
-            )
+            guard let rows = try await fetchSessionRows(archived: .only) else {
+                archivedSessionsError = "The server connection is unavailable."
+                return
+            }
             guard archivedLoadGeneration == loadGeneration,
                   accountGeneration == requestAccountGeneration,
                   !Task.isCancelled
@@ -1537,10 +1610,23 @@ final class AppModel: ComposerTurnRouting {
             guard archivedLoadGeneration == loadGeneration,
                   accountGeneration == requestAccountGeneration
             else { return }
-            archivedSessions = []
             archivedSessionsError = error.localizedDescription
         }
     }
+
+    private func fetchSessionRows(
+        archived: SessionArchiveFilter
+    ) async throws -> [JSONValue]? {
+        if let sessionListProvider {
+            return try await sessionListProvider(archived)
+        }
+        guard let rest else { return nil }
+        return try await rest.allSessions(
+            archived: archived,
+            excludeSources: Self.nonChatSources
+        )
+    }
+
     func restoreArchived(_ selected: [ChatSession]) async {
         pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
@@ -1672,18 +1758,25 @@ final class AppModel: ComposerTurnRouting {
         selectedFolderIDs: [String],
         mode: SessionPurgeActionMode
     ) async -> SessionPurgePlan? {
+        guard SessionPurgePolicy.canAccept(sessionPurgePhase, .beginPrepare) else {
+            return nil
+        }
+        sessionPurgePhase = .preparing
         purgePreparationGeneration += 1
         let preparationGeneration = purgePreparationGeneration
         let requestAccountGeneration = accountGeneration
-        guard let rest else {
-            postError("Complete deletion unavailable", detail: sessionPurgeUnavailableReason)
-            return nil
+        defer {
+            if purgePreparationGeneration == preparationGeneration,
+               accountGeneration == requestAccountGeneration,
+               case .preparing = sessionPurgePhase {
+                sessionPurgePhase = .idle
+            }
         }
         do {
-            let rows = try await rest.allSessions(
-                archived: .include,
-                excludeSources: Self.nonChatSources
-            )
+            guard let rows = try await fetchSessionRows(archived: .include) else {
+                postError("Complete deletion unavailable", detail: sessionPurgeUnavailableReason)
+                return nil
+            }
             guard purgePreparationGeneration == preparationGeneration,
                   accountGeneration == requestAccountGeneration,
                   !Task.isCancelled
@@ -1703,7 +1796,7 @@ final class AppModel: ComposerTurnRouting {
                 ?? [:]
             let folderIDs = Set(organization.folders.map(\.id))
             let requestedFolders = selectedFolderIDs.filter { folderIDs.contains($0) }
-            return SessionPurgePolicy.plan(
+            let plan = SessionPurgePolicy.plan(
                 selectedChatIDs: selectedChatIDs,
                 selectedFolderIDs: requestedFolders,
                 mode: mode,
@@ -1713,6 +1806,12 @@ final class AppModel: ComposerTurnRouting {
                 isStreaming: isAwaitingReply,
                 authoritativeSessions: authoritativeSessions
             )
+            guard purgePreparationGeneration == preparationGeneration,
+                  accountGeneration == requestAccountGeneration,
+                  SessionPurgePolicy.canAccept(sessionPurgePhase, .prepareSucceeded)
+            else { return nil }
+            sessionPurgePhase = .confirming(plan)
+            return plan
         } catch is CancellationError {
             return nil
         } catch {
@@ -1724,8 +1823,23 @@ final class AppModel: ComposerTurnRouting {
         }
     }
 
+    func cancelPendingPurge() {
+        guard SessionPurgePolicy.canAccept(sessionPurgePhase, .cancel) else { return }
+        purgePreparationGeneration += 1
+        sessionPurgePhase = .idle
+    }
+
     /// Executes the exact immutable plan shown by the confirmation surface.
     func purge(plan: SessionPurgePlan) async {
+        guard SessionPurgePolicy.canAccept(sessionPurgePhase, .confirm) else {
+            return
+        }
+        sessionPurgePhase = .executing(plan)
+        defer {
+            if case .executing = sessionPurgePhase {
+                sessionPurgePhase = .idle
+            }
+        }
         guard !Task.isCancelled else {
             cancelPrefetch()
             return
@@ -3172,6 +3286,7 @@ final class AppModel: ComposerTurnRouting {
     }
 
     func newChat() async {
+        guard gateway != nil else { return }
         pendingExternalRoute.clearPending()
         _ = openGenerations.begin()
         pendingMessageRoute = nil
@@ -3486,14 +3601,29 @@ final class AppModel: ComposerTurnRouting {
     func requestOpen(
         _ session: ChatSession
     ) -> Task<Void, Never> {
-        // The first prompt makes the live session durable. Adopting that
-        // row must not reset the reducer or the store; those already hold
-        // the optimistic turn and the in-flight stream.
-        // Defended by adoptingNewChatKeepsInFlightSend.
+        switch phase {
+        case .signedOut, .failed:
+            HermternalSwitchTrace.selectionGuard(
+                "requestOpen.phase",
+                id: session.id,
+                messages: messages.count,
+                reason: "signedOutOrFailedIsolatesOpen"
+            )
+            return Task { }
+        case .restoring, .connecting, .ready:
+            break
+        }
+        // The first prompt makes the live session durable. Re-selecting the
+        // already-displayed row after a selection clear must not reset the
+        // reducer or the store; those already hold the optimistic turn and
+        // the in-flight stream.
+        // Defended by adoptingNewChatKeepsInFlightSend and
+        // requestOpenOfDisplayedSessionKeepsInFlightStream.
         if selectedSessionID == nil,
-           liveSessionID == session.id,
-           activeTranscriptRoute?.sessionID == session.id,
-           activeTranscriptStore != nil {
+           viewingArchivedSessionID == nil,
+           activeTranscriptStore != nil,
+           (liveSessionID == session.id
+            || activeTranscriptRoute?.sessionID == session.id) {
             setSelectedSessionID(
                 session.id,
                 event: "selectedSessionID.adoptLive",

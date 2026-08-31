@@ -533,11 +533,8 @@ struct SidebarView: View {
     @State private var renameTitle = ""
     @State private var renameFolderTarget: SidebarFolderTarget?
     @State private var deleteFolderTarget: SidebarFolderDeletionTarget?
-    @State private var purgePreparationTask: Task<Void, Never>?
-    @State private var purgeRequestGeneration = 0
-    /// Shared by the create and the rename alert. Only one of the two can be
-    @State private var purgeTarget: SidebarPurgeTarget?
     @State private var purgeConfirmation = ""
+    /// Shared by the create and the rename alert. Only one of the two can be
     /// on screen, so a second field would only be a second thing to reset.
     @State private var folderNameField = ""
     /// Height of the floating pinned layer. The chat list's dissolve is
@@ -639,8 +636,8 @@ struct SidebarView: View {
                     onCopyDeepLinks: { sessions in
                         model.copyDeepLinks(for: sessions)
                     },
-                    canPurge: model.canPurgeSessions,
-                    purgeUnavailableReason: model.sessionPurgeUnavailableReason,
+                    canPurge: model.canBeginPurge,
+                    purgeUnavailableReason: model.purgeCommandHelp,
                     onPurge: { ids in
                         requestPurge(chatIDs: ids, folderIDs: [], mode: .chatsOnly)
                     }
@@ -802,8 +799,8 @@ struct SidebarView: View {
             },
             onNewFolder: { model.beginFolderCreate() },
             onPurge: requestPurge,
-            purgeAvailable: model.canPurgeSessions,
-            purgeUnavailableReason: model.sessionPurgeUnavailableReason,
+            purgeAvailable: model.canBeginPurge,
+            purgeUnavailableReason: model.purgeCommandHelp,
             onReorderFolders: { ids in
                 Task { await model.reorderFolders(ids: ids) }
             }
@@ -869,8 +866,8 @@ struct SidebarView: View {
             onRename: { session in beginRename(session) },
             onCopyDeepLinks: { sessions in model.copyDeepLinks(for: sessions) },
             onPurge: requestPurge,
-            purgeAvailable: model.canPurgeSessions,
-            purgeUnavailableReason: model.sessionPurgeUnavailableReason,
+            purgeAvailable: model.canBeginPurge,
+            purgeUnavailableReason: model.purgeCommandHelp,
             onMove: { sessions, folderID in
                 Task { await model.assign(sessions, toFolder: folderID) }
             }
@@ -949,9 +946,9 @@ struct SidebarView: View {
                 )
             }
             .alert(
-                purgeTarget.map { purgeTitle(for: $0.plan) } ?? "Permanently Delete",
+                confirmingPurgeTarget.map { purgeTitle(for: $0.plan) } ?? "Permanently Delete",
                 isPresented: purgePresented,
-                presenting: purgeTarget
+                presenting: confirmingPurgeTarget
             ) { target in
                 TextField(
                     "Type delete to confirm \(purgeScope(for: target.plan))",
@@ -979,7 +976,11 @@ struct SidebarView: View {
                         + "Backups or external memory may retain data. No undo."
                 )
             }
-        return sidebarLifecycle(chrome)
+        return sidebarLifecycle(
+            chrome.overlay(alignment: .top) {
+                purgeProgressBanner
+            }
+        )
     }
 
     private func sidebarLifecycle(_ content: some View) -> some View {
@@ -1029,9 +1030,7 @@ struct SidebarView: View {
                 pendingOpenTask?.cancel()
                 pendingOpenTask = nil
                 model.cancelOpenPreparation()
-                purgePreparationTask?.cancel()
-                purgePreparationTask = nil
-                purgeRequestGeneration &+= 1
+                model.cancelPendingPurge()
             }
     }
     private func handleModelSelectionChange(_ newValue: String?) {
@@ -1425,13 +1424,41 @@ struct SidebarView: View {
             }
         )
     }
+    private var confirmingPurgeTarget: SidebarPurgeTarget? {
+        guard case .confirming(let plan) = model.sessionPurgePhase else { return nil }
+        return SidebarPurgeTarget(plan: plan)
+    }
+
     private var purgePresented: Binding<Bool> {
         Binding(
-            get: { purgeTarget != nil },
+            get: {
+                if case .confirming = model.sessionPurgePhase { return true }
+                return false
+            },
             set: { presented in
                 if !presented { cancelPurge() }
             }
         )
+    }
+
+    @ViewBuilder
+    private var purgeProgressBanner: some View {
+        if let label = model.sessionPurgePhase.progressLabel {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(label)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.bar)
+            .allowsHitTesting(false)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(label)
+        }
     }
 
 
@@ -1488,25 +1515,13 @@ struct SidebarView: View {
         folderIDs: [String],
         mode: SessionPurgeActionMode
     ) {
-        guard model.canPurgeSessions else { return }
-        purgePreparationTask?.cancel()
-        purgeRequestGeneration &+= 1
-        let generation = purgeRequestGeneration
-        purgeTarget = nil
-        purgeConfirmation = ""
-        purgePreparationTask = Task {
-            guard !Task.isCancelled,
-                  let plan = await model.preparePurge(
-                      selectedChatIDs: chatIDs,
-                      selectedFolderIDs: folderIDs,
-                      mode: mode
-                  ),
-                  !Task.isCancelled,
-                  generation == purgeRequestGeneration,
-                  !plan.isEmpty
-            else { return }
-            purgeTarget = SidebarPurgeTarget(plan: plan)
-            purgePreparationTask = nil
+        guard model.canBeginPurge else { return }
+        Task {
+            _ = await model.preparePurge(
+                selectedChatIDs: chatIDs,
+                selectedFolderIDs: folderIDs,
+                mode: mode
+            )
         }
     }
 
@@ -1529,10 +1544,7 @@ struct SidebarView: View {
 
     private func completePurge(_ target: SidebarPurgeTarget) {
         guard SessionPurgeConfirmation.isExact(purgeConfirmation) else { return }
-        purgeTarget = nil
         purgeConfirmation = ""
-        purgePreparationTask?.cancel()
-        purgePreparationTask = nil
         Task {
             await model.purge(plan: target.plan)
         }
@@ -1540,6 +1552,7 @@ struct SidebarView: View {
 
     private func cancelPurge() {
         purgeConfirmation = ""
+        model.cancelPendingPurge()
     }
 
     private func beginFolderRename(_ target: SidebarFolderTarget) {

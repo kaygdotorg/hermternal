@@ -66,6 +66,46 @@ public struct SessionPurgeReconciliation: Equatable, Sendable {
         self.removableFolderIDs = removableFolderIDs
     }
 }
+
+/// Model-owned purge command phase. Preparing and executing count real
+/// in-flight work; confirming is the dialog. Duplicate destructive commands
+/// are rejected until the phase returns to idle.
+public enum SessionPurgePhase: Equatable, Sendable {
+    case idle
+    case preparing
+    case confirming(SessionPurgePlan)
+    case executing(SessionPurgePlan)
+
+    public var allowsNewCommand: Bool {
+        if case .idle = self { return true }
+        return false
+    }
+
+    public var showsProgress: Bool {
+        switch self {
+        case .preparing, .executing: true
+        case .idle, .confirming: false
+        }
+    }
+
+    public var progressLabel: String? {
+        switch self {
+        case .preparing: "Preparing deletion…"
+        case .executing: "Deleting…"
+        case .idle, .confirming: nil
+        }
+    }
+}
+
+public enum SessionPurgePhaseEvent: Equatable, Sendable {
+    case beginPrepare
+    case prepareSucceeded
+    case prepareFailed
+    case confirm
+    case executionFinished
+    case cancel
+}
+
 public enum SessionPurgePolicy {
     /// Prepares the immutable set of folder and chat targets for permanent
     /// deletion. `selectedFolderIDs` is authoritative: folders are never
@@ -152,6 +192,28 @@ public enum SessionPurgePolicy {
             failedIDs: failed,
             removableFolderIDs: removable
         )
+    }
+
+    /// Both preparation and execution refuse a second start while the first
+    /// is still active. Cancel is valid only before execution begins.
+    public static func canAccept(
+        _ phase: SessionPurgePhase,
+        _ event: SessionPurgePhaseEvent
+    ) -> Bool {
+        switch (phase, event) {
+        case (.idle, .beginPrepare):
+            true
+        case (.preparing, .prepareSucceeded),
+             (.preparing, .prepareFailed),
+             (.preparing, .cancel):
+            true
+        case (.confirming, .confirm), (.confirming, .cancel):
+            true
+        case (.executing, .executionFinished):
+            true
+        default:
+            false
+        }
     }
 
     private static func unique(_ ids: [String]) -> [String] {

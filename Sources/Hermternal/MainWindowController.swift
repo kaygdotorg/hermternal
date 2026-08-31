@@ -466,7 +466,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
 
     func setVisibilityBridge(_ bridge: MainSplitVisibilityBridgeView?) {
         visibilityBridge = bridge
-        guard isReadyPhase else { return }
+        guard showsWorkspaceChrome else { return }
         toggleItem.target = bridge
     }
 
@@ -483,7 +483,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
 
     func update(model: AppModel) {
         self.model = model
-        guard isReadyPhase else {
+        guard showsWorkspaceChrome else {
             updateToolbarVisibility()
             return
         }
@@ -492,7 +492,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
         optionsItem.isEnabled = commandable
         toggleItem.isEnabled = commandable
         detailGroup.isEnabled = commandable
-        configureDetailItems(commandable: commandable)
+        configureDetailItems(searchPresented: model.isSearchPresented)
         updateToolbarVisibility()
     }
     
@@ -509,8 +509,36 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
         return group
     }
 
-    private var isReadyPhase: Bool {
+    /// Workspace chrome can paint. Network work may still be in flight, so
+    /// this is visibility, not per-item enablement.
+    private var showsWorkspaceChrome: Bool {
         model.phase.presentsWorkspace
+    }
+
+    struct DetailCommandEnablement: Equatable {
+        var showsWorkspaceChrome: Bool
+        var isNewChatEnabled: Bool
+        var isRestoreEnabled: Bool
+        var areChromeCommandsEnabled: Bool
+
+        /// New Chat and Restore follow the state their handlers accept.
+        /// Chrome visibility is `presentsWorkspace` and stays separate.
+        static func resolve(
+            phase: AppModel.Phase,
+            searchPresented: Bool,
+            viewingArchived: Bool
+        ) -> Self {
+            let chrome = phase.presentsWorkspace
+            let handlerReady = phase == .ready && !searchPresented
+            return Self(
+                showsWorkspaceChrome: chrome,
+                isNewChatEnabled: handlerReady && !viewingArchived,
+                isRestoreEnabled: handlerReady && viewingArchived,
+                areChromeCommandsEnabled: chrome && !searchPresented
+            )
+        }
+
+        var isDetailActionEnabled: Bool { isNewChatEnabled || isRestoreEnabled }
     }
 
     private func updateToolbarVisibility() {
@@ -521,7 +549,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
             .sidebarTrackingSeparator,
             .detailControls
         ]
-        if isReadyPhase {
+        if showsWorkspaceChrome {
             for (index, identifier) in toolbarDefaultItemIdentifiers(toolbar).enumerated()
                 where chromeIdentifiers.contains(identifier)
                     && !toolbar.items.contains(where: { $0.itemIdentifier == identifier }) {
@@ -538,8 +566,9 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
         }
     }
 
-    private func configureDetailItems(commandable: Bool) {
-        if archivedSession != nil {
+    private func configureDetailItems(searchPresented: Bool) {
+        let viewingArchived = archivedSession != nil
+        if viewingArchived {
             newChatItem.image = NSImage(
                 systemSymbolName: "archivebox",
                 accessibilityDescription: "Restore"
@@ -547,7 +576,6 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
             newChatItem.label = "Restore"
             newChatItem.paletteLabel = "Restore"
             newChatItem.toolTip = "Restore chat"
-            detailGroup.isEnabled = commandable
         } else {
             newChatItem.image = NSImage(
                 systemSymbolName: "plus",
@@ -557,8 +585,13 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
             newChatItem.paletteLabel = "New Chat"
             newChatItem.toolTip = "Start a new chat"
         }
-        newChatItem.isEnabled = commandable
-        configureWidthItem(commandable: commandable)
+        let enablement = DetailCommandEnablement.resolve(
+            phase: model.phase,
+            searchPresented: searchPresented,
+            viewingArchived: viewingArchived
+        )
+        newChatItem.isEnabled = enablement.isDetailActionEnabled
+        configureWidthItem(commandable: enablement.areChromeCommandsEnabled)
     }
 
     /// The width toggle states the measure it would give the reader next, so the
@@ -587,7 +620,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        Self.defaultItemIdentifiers(isReady: isReadyPhase)
+        Self.defaultItemIdentifiers(isReady: showsWorkspaceChrome)
     }
 
     /// A signed-out launch has no actionable toolbar controls. Supplying only
@@ -623,7 +656,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
         itemForItemIdentifier identifier: NSToolbarItem.Identifier,
         willBeInsertedIntoToolbar flag: Bool
     ) -> NSToolbarItem? {
-        guard isReadyPhase else { return nil }
+        guard showsWorkspaceChrome else { return nil }
         switch identifier {
         case .sidebarOptions:
             return optionsItem

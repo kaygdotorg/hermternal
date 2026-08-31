@@ -25,6 +25,7 @@ func performanceUnmigratedRequestOpenFirstPaintContract() async throws {
             transcriptSource: RequestOpenPerformanceSource(),
             warmStore: TranscriptWarmStore()
         )
+        model.phase = .ready
         model.sessions = [fixture.session]
         model.cacheEnabled = true
 
@@ -82,6 +83,7 @@ func performanceMigratedRequestOpenFirstPaintContract() async throws {
             transcriptSource: RequestOpenPerformanceSource(),
             warmStore: warmStore
         )
+        model.phase = .ready
         model.sessions = [fixture.session]
         model.cacheEnabled = true
 
@@ -138,6 +140,7 @@ func performanceWarmKeypressRequestOpenPublishesOnTheSameTurn() async throws {
             transcriptSource: RequestOpenPerformanceSource(),
             warmStore: warmStore
         )
+        model.phase = .ready
         model.sessions = [fixture.session]
         model.cacheEnabled = true
 

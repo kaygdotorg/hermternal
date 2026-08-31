@@ -229,7 +229,7 @@ struct HermternalApp: App {
                     Task { await model.loadSessions() }
                 }
                 .keyboardShortcut("r", modifiers: .command)
-                .disabled(model.phase != .ready)
+                .disabled(model.phase != .ready || model.isReloadingSessions)
                 Button(appearance.transcriptWidthMode.other.label) {
                     _ = applicationDelegate.showMainWindowIfReady()
                     appearance.toggleTranscriptWidth()
