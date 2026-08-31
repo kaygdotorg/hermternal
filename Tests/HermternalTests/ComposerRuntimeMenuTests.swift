@@ -24,7 +24,7 @@ private let runtimeMenuInventory = ModelInventory(providers: [
     )
 ])
 
-@Test("Runtime menu eligibility uses durable writable routes")
+@Test("Runtime menu eligibility uses writable routes")
 @MainActor
 func runtimeMenuEligibilityTruthTable() async {
     let runtime = RuntimeMenuSpy()
@@ -36,8 +36,8 @@ func runtimeMenuEligibilityTruthTable() async {
         ),
         (
             ComposerRoute(identity: "new", liveSessionID: nil),
-            false,
-            "The model can change after the chat starts."
+            true,
+            nil
         ),
         (
             ComposerRoute(identity: "runtime-menu-eligibility-read-only", liveSessionID: nil, isReadOnly: true),
@@ -93,6 +93,197 @@ func runtimeMenuEligibilityTruthTable() async {
     await unsupportedRuntime.waitForInventory()
     await unsupportedCompletion.wait()
     #expect(unsupported.reasoningOptions.unavailableReason == "beta does not support reasoning.")
+}
+
+@Test("A new chat prepares a live session for model menus")
+@MainActor
+func newChatPreparesLiveSessionForRuntimeMenus() async {
+    let runtime = RuntimeMenuSpy()
+    let turn = RuntimeMenuTurnSpy(sessionID: "live-new", blocksPreparation: true)
+    let operationCompletion = RuntimeMenuOperationCompletion(expectedCount: 2)
+    let route = ComposerRoute(identity: "new", generation: 3, liveSessionID: nil)
+    let model = makeRuntimeMenuModel(
+        route: route,
+        runtime: runtime,
+        turn: turn,
+        operationCompletion: operationCompletion
+    )
+
+    #expect(model.canChangeRuntime)
+    #expect(model.runtimeDisabledReason == nil)
+
+    model.loadModels()
+    model.selectModel("alpha", provider: "test")
+
+    await turn.waitForPreparation()
+    #expect(turn.prepareRequests == [route.token])
+
+    turn.finishPreparation()
+    await runtime.waitForInventory()
+    await runtime.waitForModelChange()
+    await operationCompletion.wait()
+
+    #expect(turn.prepareRequests == [route.token])
+    #expect(await runtime.inventorySessionIDs() == ["live-new"])
+    #expect(await runtime.modelSessionIDs() == ["live-new"])
+    #expect(model.inventory == .loaded(runtimeMenuInventory))
+    #expect(model.modelSelection.pending == "alpha")
+    #expect(model.canChangeRuntime)
+}
+
+@Test("Send publishes the user turn before session preparation")
+@MainActor
+func sendPublishesUserTurnBeforePreparation() async {
+    let turn = RuntimeMenuTurnSpy(sessionID: "live", blocksPreparation: true)
+    let completion = RuntimeMenuOperationCompletion(expectedCount: 1)
+    let route = ComposerRoute(identity: "publish-before-prepare", generation: 4)
+    let model = makeRuntimeMenuModel(
+        route: route,
+        runtime: RuntimeMenuSpy(),
+        turn: turn,
+        operationCompletion: completion
+    )
+
+    model.text = "Hello bubble"
+    model.submit()
+
+    #expect(turn.publishedTexts == ["Hello bubble"])
+    #expect(turn.publishedRoutes == [route.token])
+    #expect(model.text.isEmpty)
+
+    turn.finishPreparation()
+    await turn.waitForSubmission()
+    await completion.wait()
+    #expect(turn.rolledBackRoutes.isEmpty)
+}
+
+@Test("Send rolls back the published turn when preparation fails")
+@MainActor
+func sendRollsBackPublishedTurnOnPreparationFailure() async {
+    let turn = RuntimeMenuTurnSpy(
+        sessionID: "live",
+        prepareFailure: .unroutableFrame("Composer route changed.")
+    )
+    let completion = RuntimeMenuOperationCompletion(expectedCount: 1)
+    let route = ComposerRoute(identity: "rollback-on-prepare", generation: 5)
+    let model = makeRuntimeMenuModel(
+        route: route,
+        runtime: RuntimeMenuSpy(),
+        turn: turn,
+        operationCompletion: completion
+    )
+
+    model.text = "Keep this draft"
+    model.submit()
+    await completion.wait()
+
+    #expect(turn.publishedTexts == ["Keep this draft"])
+    #expect(turn.rolledBackRoutes == [route.token])
+    #expect(model.text == "Keep this draft")
+    #expect(turn.submissionSessionIDs.isEmpty)
+}
+
+@Test("Adopting the new chat keeps the in-flight send")
+@MainActor
+func adoptingNewChatKeepsInFlightSend() async {
+    let turn = RuntimeMenuTurnSpy(sessionID: "live", blocksPreparation: true)
+    let completion = RuntimeMenuOperationCompletion(expectedCount: 1)
+    let newRoute = ComposerRoute(identity: "new", generation: 1, liveSessionID: "live")
+    let adopted = ComposerRoute(identity: "live", generation: 2, liveSessionID: "live")
+    let model = makeRuntimeMenuModel(
+        route: newRoute,
+        runtime: RuntimeMenuSpy(),
+        turn: turn,
+        operationCompletion: completion
+    )
+
+    model.text = "First prompt"
+    model.submit()
+    #expect(turn.publishedTexts == ["First prompt"])
+
+    await turn.waitForPreparation()
+    model.update(route: adopted)
+    #expect(model.text.isEmpty)
+
+    turn.finishPreparation()
+    await turn.waitForSubmission()
+    await completion.wait()
+
+    #expect(turn.rolledBackRoutes.isEmpty)
+    #expect(turn.submissionSessionIDs == ["live"])
+    #expect(model.text.isEmpty)
+}
+
+@Test("Adopting the new chat keeps inventory and pending model")
+@MainActor
+func adoptingNewChatKeepsInventoryAndPendingModel() async {
+    let runtime = RuntimeMenuSpy()
+    let completion = RuntimeMenuOperationCompletion(expectedCount: 2)
+    let newRoute = ComposerRoute(identity: "new", generation: 1, liveSessionID: "live")
+    let adopted = ComposerRoute(identity: "live", generation: 2, liveSessionID: "live")
+    let model = makeRuntimeMenuModel(
+        route: newRoute,
+        runtime: runtime,
+        operationCompletion: completion
+    )
+
+    _ = model.mount()
+    model.selectModel("alpha", provider: "test")
+    await runtime.waitForInventory()
+    await runtime.waitForModelChange()
+    await completion.wait()
+    #expect(model.inventory == .loaded(runtimeMenuInventory))
+    #expect(model.modelSelection.pending == "alpha")
+
+    model.update(route: adopted)
+    #expect(model.inventory == .loaded(runtimeMenuInventory))
+    #expect(model.modelSelection.pending == "alpha")
+    #expect(await runtime.inventorySessionIDs() == ["live"])
+}
+
+@Test("Mount prefetches inventory and restores it from cache")
+@MainActor
+func mountPrefetchesAndCachesInventory() async {
+    let runtime = RuntimeMenuSpy()
+    let completion = RuntimeMenuOperationCompletion(expectedCount: 1)
+    let route = ComposerRoute(
+        identity: "prefetch-inventory",
+        generation: 6,
+        liveSessionID: "live",
+        runtime: SessionRuntimeSnapshot(
+            model: "alpha",
+            provider: "test",
+            reasoning: .effort(.medium),
+            isRunning: false
+        )
+    )
+    let model = makeRuntimeMenuModel(
+        route: route,
+        runtime: runtime,
+        operationCompletion: completion
+    )
+
+    #expect(model.inventory == .notLoaded)
+    #expect(model.reasoningOptions.choices == [.effort(.medium)])
+    #expect(model.reasoningOptions.unavailableReason == nil)
+
+    let firstMount = model.mount()
+    await runtime.waitForInventory()
+    await completion.wait()
+
+    #expect(model.inventory == .loaded(runtimeMenuInventory))
+    #expect(model.reasoningOptions.choices.contains(.off))
+    #expect(model.reasoningOptions.choices.contains(.effort(.medium)))
+    #expect(model.reasoningOptions.current == .effort(.medium))
+
+    model.unmount(firstMount)
+    model.update(route: ComposerRoute(identity: "other-prefetch", generation: 7, liveSessionID: "other"))
+    #expect(model.inventory == .notLoaded)
+
+    model.update(route: route)
+    _ = model.mount()
+    #expect(model.inventory == .loaded(runtimeMenuInventory))
+    #expect(await runtime.inventorySessionIDs() == ["live"])
 }
 
 @Test("Concurrent inventory, model, and send share preparation")
@@ -801,9 +992,35 @@ func shutdownCancelsStartingRecorder() async {
     #expect(model.recordingStatus == .idle)
 }
 
+@Test("An out-of-order unmount does not block submit")
+@MainActor
+func outOfOrderUnmountDoesNotBlockSubmit() async {
+    let turn = RuntimeMenuTurnSpy(sessionID: "live")
+    let completion = RuntimeMenuOperationCompletion(expectedCount: 1)
+    let model = makeRuntimeMenuModel(
+        route: ComposerRoute(identity: "mount-token-submit", generation: 3),
+        runtime: RuntimeMenuSpy(),
+        turn: turn,
+        operationCompletion: completion
+    )
 
+    let stale = model.mount()
+    let live = model.mount()
+    model.unmount(stale)
 
+    model.text = "Still send"
+    model.submit()
+    await turn.waitForSubmission()
+    await completion.wait()
 
+    #expect(stale != live)
+    #expect(turn.submissionSessionIDs == ["live"])
+
+    model.unmount(live)
+    model.text = "After live unmount"
+    model.submit()
+    #expect(turn.submissionSessionIDs == ["live"])
+}
 
 @Test("A canceled runtime change cannot clear its replacement")
 @MainActor
@@ -1528,6 +1745,9 @@ private final class RuntimeMenuTurnSpy: ComposerTurnRouting {
     let submitFailure: GatewayError?
     private(set) var prepareRequests: [ComposerRouteToken] = []
     private(set) var submissionSessionIDs: [String] = []
+    private(set) var publishedTexts: [String] = []
+    private(set) var publishedRoutes: [ComposerRouteToken] = []
+    private(set) var rolledBackRoutes: [ComposerRouteToken] = []
     private var preparationWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     private var preparationReleaseWaiters: [CheckedContinuation<Void, Never>] = []
     private var pendingPreparationReleases = 0
@@ -1560,6 +1780,15 @@ private final class RuntimeMenuTurnSpy: ComposerTurnRouting {
         }
         if let prepareFailure { throw prepareFailure }
         return sessionID
+    }
+
+    func publishUserTurn(text: String, route: ComposerRouteToken) {
+        publishedTexts.append(text)
+        publishedRoutes.append(route)
+    }
+
+    func rollbackUserTurn(route: ComposerRouteToken) {
+        rolledBackRoutes.append(route)
     }
 
     func submit(text _: String, sessionID: String) async throws {

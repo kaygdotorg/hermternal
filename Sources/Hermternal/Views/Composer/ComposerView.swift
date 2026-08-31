@@ -25,6 +25,7 @@ struct ComposerView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.hermternalAccentColor) private var accentColor
 
+    @State private var mountToken: ComposerMountToken?
     @State private var handledFocusRequest = 0
     @State private var isFileImporterPresented = false
     @State private var filePickerTarget: ComposerRouteToken?
@@ -83,10 +84,13 @@ struct ComposerView: View {
             handledFocusRequest = request
         }
         .onAppear {
-            model.activate()
+            mountToken = model.mount()
         }
         .onDisappear {
-            model.shutdown()
+            if let mountToken {
+                model.unmount(mountToken)
+            }
+            mountToken = nil
         }
         // A refused or failed action states its reason once. The composer has
         // no room for a fourth row, and an alert is the system answer.

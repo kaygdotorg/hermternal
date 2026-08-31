@@ -20,6 +20,15 @@ struct ComposerRouteToken: Equatable, Hashable, Sendable {
     let generation: UInt64
 }
 
+/// Token for one on-screen ComposerView of this model.
+///
+/// SwiftUI can call onDisappear of a replaced view after onAppear of the
+/// live view. The live view holds the current token, so a late unmount
+/// from the replaced view does not take the composer down.
+struct ComposerMountToken: Equatable, Hashable, Sendable {
+    let id: UInt64
+}
+
 /// The chat the composer writes to.
 ///
 /// The composer owns no session state. The caller owns the chat and pushes
@@ -75,8 +84,18 @@ protocol ComposerTurnRouting: AnyObject {
     /// chat when it does not exist yet. Implementations must reject a stale
     /// route rather than silently retargeting the request.
     func prepareSession(expectedRoute: ComposerRouteToken) async throws -> String
+    /// Publishes the user turn on this route before session preparation.
+    ///
+    /// Call this on the send press. Do not wait for the network.
+    func publishUserTurn(text: String, route: ComposerRouteToken)
     /// Submits one prompt, including any gateway file references.
+    ///
+    /// The user turn is already published. Do not append it again.
     func submit(text: String, sessionID: String) async throws
+    /// Removes the optimistic user turn when send fails before acceptance.
+    ///
+    /// Ignore the call when `route` is no longer the published transcript.
+    func rollbackUserTurn(route: ComposerRouteToken)
     /// Interrupts the running turn.
     func stop() async
 }
@@ -246,7 +265,9 @@ final class ComposerModel {
     @ObservationIgnored private let files: ComposerDraftFiles
     @ObservationIgnored private weak var turn: (any ComposerTurnRouting)?
     @ObservationIgnored private let operationDidFinish: (@MainActor () -> Void)?
-    @ObservationIgnored private var sendTask: Task<Void, Never>?
+    /// Send work in progress, keyed by route token.
+    /// A send on one route does not block a send on a different route.
+    @ObservationIgnored private var sendTasks: [ComposerRouteToken: Task<Void, Never>] = [:]
     @ObservationIgnored private var preparationTasks: [ComposerRouteToken: SessionPreparation] = [:]
     @ObservationIgnored private var preparationEpochs: [ComposerRouteToken: UInt64] = [:]
     @ObservationIgnored private var importTask: Task<Void, Never>?
@@ -255,10 +276,15 @@ final class ComposerModel {
     @ObservationIgnored private var recordingTicker: Task<Void, Never>?
     @ObservationIgnored private var inventoryTask: Task<Void, Never>?
     @ObservationIgnored private var runtimeTask: Task<Void, Never>?
-    @ObservationIgnored private var sendOperationID: UUID?
     @ObservationIgnored private var inventoryOperationID: UUID?
     @ObservationIgnored private var runtimeOperationID: UUID?
     @ObservationIgnored private var isUnmounted = false
+    @ObservationIgnored private var hasAppeared = false
+    @ObservationIgnored private var mountGeneration: UInt64 = 0
+    /// Last loaded inventory for a live session or a non-durable route.
+    @ObservationIgnored private var inventoryBySession: [String: ModelInventory] = [:]
+    /// Press-time token of a new-chat send after the sidebar adopts the live id.
+    @ObservationIgnored private var adoptedNewChatOrigin: (sessionID: String, token: ComposerRouteToken)?
     @ObservationIgnored private var drafts: [String: ComposerDraft] = [:]
     @ObservationIgnored private var draftOrder: [String] = []
     @ObservationIgnored private var sendReceiptIDs: [ComposerRouteToken: UUID] = [:]
@@ -385,8 +411,20 @@ final class ComposerModel {
 
     /// Applies the current chat. A new chat identity swaps the draft, so text
     func update(route newRoute: ComposerRoute) {
-        let routeChanged = newRoute.token != route.token
-        if routeChanged {
+        let isAdoption = isNewChatAdoption(from: route, to: newRoute)
+        let previousToken = route.token
+        let routeChanged = newRoute.token != previousToken && !isAdoption
+        if isAdoption {
+            if let sessionID = newRoute.liveSessionID,
+               sendTasks[previousToken] != nil || submittingRoutes.contains(previousToken) {
+                adoptedNewChatOrigin = (sessionID, previousToken)
+            }
+            adoptInventory(from: route.identity, to: newRoute)
+            if let notice = sendNoticesByIdentity.removeValue(forKey: route.identity) {
+                sendNoticesByIdentity[newRoute.identity] = notice
+            }
+        } else if routeChanged {
+            adoptedNewChatOrigin = nil
             cancelRouteRuntimeTasks()
             cancelPreparationTasks()
             cancelDictation()
@@ -396,7 +434,7 @@ final class ComposerModel {
             invalidatePreparation(for: newRoute.token)
             inventory = .notLoaded
         }
-        if newRoute.identity != route.identity {
+        if newRoute.identity != route.identity, !isAdoption {
             if let recovery = drafts[route.identity], !draft.isEmpty {
                 store(ComposerSendPolicy.restore(recovery, into: draft), for: route.identity)
             } else if !draft.isEmpty || drafts[route.identity] == nil {
@@ -419,11 +457,13 @@ final class ComposerModel {
         // the whole composer, and re-laid out the message field, once per
         // streamed token while the user was typing the next message.
         if newRoute != route { route = newRoute }
-        let routeOutgoing = outgoingByRoute[newRoute.token] ?? []
+        let sendToken = originSendToken(for: newRoute.token)
+        let routeOutgoing = outgoingByRoute[sendToken] ?? outgoingByRoute[newRoute.token] ?? []
         if routeOutgoing != outgoing { outgoing = routeOutgoing }
-        let routeProgress = progressByRoute[newRoute.token]
+        let routeProgress = progressByRoute[sendToken] ?? progressByRoute[newRoute.token]
         if routeProgress != stagingProgress { stagingProgress = routeProgress }
-        let routeIsSubmitting = submittingRoutes.contains(newRoute.token)
+        let routeIsSubmitting = submittingRoutes.contains(sendToken)
+            || submittingRoutes.contains(newRoute.token)
         if routeIsSubmitting != isSubmitting { isSubmitting = routeIsSubmitting }
         if routeChanged {
             notice = sendNoticesByIdentity[newRoute.identity]
@@ -439,6 +479,11 @@ final class ComposerModel {
         }
         if let pendingReasoning, newRoute.runtime.reasoning == pendingReasoning {
             self.pendingReasoning = nil
+        }
+        rememberInventorySession(for: newRoute)
+        if hasAppeared, !isUnmounted {
+            restoreInventoryFromCache()
+            prefetchInventoryIfEligible()
         }
     }
 
@@ -561,7 +606,19 @@ final class ComposerModel {
     }
 
     func submit() {
-        guard !isUnmounted, sendTask == nil else { return }
+        let target = route.token
+        if isUnmounted {
+            Log.error(
+                "composer.send code=unmounted identity=\(target.identity) generation=\(target.generation)"
+            )
+            return
+        }
+        if sendTasks[target] != nil {
+            Log.error(
+                "composer.send code=in_flight identity=\(target.identity) generation=\(target.generation)"
+            )
+            return
+        }
         let decision = ComposerSendPolicy.decide(
             draft: draft,
             isAwaitingReply: route.isAwaitingReply,
@@ -572,13 +629,15 @@ final class ComposerModel {
             return
         }
         guard let turn else {
+            Log.error(
+                "composer.send code=disconnected identity=\(target.identity) generation=\(target.generation)"
+            )
             notice = ComposerNotice("The composer is not connected to a chat.")
             return
         }
 
         // Capture the complete route before the first suspension point.
         let submitted = draft
-        let target = route.token
         draft = ComposerDraft()
         outgoingByRoute[target] = submitted.attachments
         outgoing = submitted.attachments
@@ -586,9 +645,9 @@ final class ComposerModel {
         submittingRoutes.insert(target)
         isSubmitting = true
         let operationID = UUID()
-        sendOperationID = operationID
         sendReceiptIDs[target] = operationID
-        sendTask = Task { [weak self] in
+        turn.publishUserTurn(text: submission.text, route: target)
+        sendTasks[target] = Task { [weak self] in
             await self?.performSend(
                 submission,
                 submitted: submitted,
@@ -606,12 +665,47 @@ final class ComposerModel {
 
     /// Shows a refused send only when the composer does not show the reason
     /// already. An empty draft and a running reply are both visible states.
+    /// Every refusal writes one diagnostic line.
     private func report(_ rejection: ComposerSendRejection) {
+        logSendRejection(rejection)
         switch rejection {
         case .emptyDraft, .awaitingReply:
             return
         case .readOnlyTranscript, .oversizeAttachment, .tooManyAttachments, .invalidRoute:
             if let reason = sendDisabledReason { notice = ComposerNotice(reason) }
+        }
+    }
+
+    /// One-line send refusal. The line has the reason and route context.
+    /// Empty-draft logs the editor source length, not the prompt text.
+    private func logSendRejection(_ rejection: ComposerSendRejection) {
+        let identity = route.identity
+        let generation = route.generation
+        switch rejection {
+        case .emptyDraft:
+            Log.error(
+                "composer.send code=empty_draft chars=\(text.count) attachments=\(draft.attachments.count) identity=\(identity) generation=\(generation)"
+            )
+        case .awaitingReply:
+            Log.error(
+                "composer.send code=awaiting_reply identity=\(identity) generation=\(generation)"
+            )
+        case .readOnlyTranscript:
+            Log.error(
+                "composer.send code=read_only identity=\(identity) generation=\(generation)"
+            )
+        case let .oversizeAttachment(id, limit):
+            Log.error(
+                "composer.send code=oversize_attachment id=\(id.uuidString) limit=\(limit) identity=\(identity) generation=\(generation)"
+            )
+        case let .tooManyAttachments(limit):
+            Log.error(
+                "composer.send code=too_many_attachments limit=\(limit) identity=\(identity) generation=\(generation)"
+            )
+        case .invalidRoute:
+            Log.error(
+                "composer.send code=invalid_route identity=\(identity) generation=\(generation)"
+            )
         }
     }
 
@@ -630,16 +724,17 @@ final class ComposerModel {
                 submittingRoutes.remove(target)
                 progressByRoute.removeValue(forKey: target)
                 outgoingByRoute.removeValue(forKey: target)
-                if route.token == target {
+                let routeOwnsSend = self.routeOwnsSend(target)
+                if adoptedNewChatOrigin?.token == target {
+                    adoptedNewChatOrigin = nil
+                }
+                if routeOwnsSend {
                     isSubmitting = false
                     stagingProgress = nil
                     outgoing = []
                 }
                 sendReceiptIDs.removeValue(forKey: target)
-            }
-            if sendOperationID == operationID {
-                sendTask = nil
-                sendOperationID = nil
+                sendTasks.removeValue(forKey: target)
             }
             operationDidFinish?()
         }
@@ -755,6 +850,12 @@ final class ComposerModel {
                 await files.discardAndWait(submitted.attachments)
                 return
             }
+            if shouldRollbackPublishedTurn(
+                error,
+                promptSubmissionBegan: promptSubmissionBegan
+            ) {
+                turn.rollbackUserTurn(route: target)
+            }
             switch error {
             case is CancellationError:
                 await compensate(transaction)
@@ -837,7 +938,9 @@ final class ComposerModel {
                 }
             default:
                 await compensate(transaction)
-                Log.error("composer.send code=failed")
+                Log.error(
+                    "composer.send code=failed identity=\(target.identity) generation=\(target.generation) error=\(composerSendFailureDetail(error))"
+                )
                 restore(
                     submitted,
                     routeIdentity: target.identity,
@@ -899,12 +1002,13 @@ final class ComposerModel {
         notice failure: ComposerNotice?,
         noticeRoute: ComposerRouteToken? = nil
     ) {
-        mutateDraft(for: routeIdentity) { current in
+        let identity = draftIdentity(for: routeIdentity)
+        mutateDraft(for: identity) { current in
             current = ComposerSendPolicy.restore(submitted, into: current)
         }
         if let failure, let noticeRoute {
-            setSendNotice(failure, for: noticeRoute.identity)
-        } else if routeIdentity == route.identity, let failure {
+            setSendNotice(failure, for: draftIdentity(for: noticeRoute.identity))
+        } else if identity == route.identity, let failure {
             notice = failure
         }
     }
@@ -925,9 +1029,10 @@ final class ComposerModel {
     }
 
     private func restoreSuperseded(_ submitted: ComposerDraft, routeIdentity: String) {
-        var saved = drafts[routeIdentity] ?? ComposerDraft()
+        let identity = draftIdentity(for: routeIdentity)
+        var saved = drafts[identity] ?? ComposerDraft()
         saved = ComposerSendPolicy.restore(submitted, into: saved)
-        store(saved, for: routeIdentity)
+        store(saved, for: identity)
     }
 
     // MARK: - Attachments
@@ -1071,27 +1176,42 @@ final class ComposerModel {
         )
     }
 
+    /// A writable chat can change the model. Archive and read-only chats cannot.
     var canChangeRuntime: Bool {
-        route.hasDurableIdentity && !route.isReadOnly && runtimeTask == nil
+        runtimeTask == nil && !route.isReadOnly
     }
 
     /// The reason the model and reasoning menus cannot change a value.
     var runtimeDisabledReason: String? {
         if route.isReadOnly { return "This transcript is read only." }
-        if !route.hasDurableIdentity { return "The model can change after the chat starts." }
         if runtimeTask != nil { return "The last change is still going out." }
         return nil
     }
 
     var reasoningOptions: ComposerReasoningOptions {
+        let current = route.runtime.reasoning
+        let pending = pendingReasoning
         let capabilities = currentModelCapabilities()
         if let capabilities, !capabilities.supportsReasoning {
-            let name = route.runtime.model ?? "This model"
+            let name = pendingModel ?? route.runtime.model ?? "This model"
             return ComposerReasoningOptions(
-                current: route.runtime.reasoning,
-                pending: pendingReasoning,
+                current: current,
+                pending: pending,
                 choices: [],
                 unavailableReason: "\(name) does not support reasoning."
+            )
+        }
+        guard case .loaded = inventory, capabilities != nil else {
+            // Inventory has not reported this model's capabilities yet.
+            // Show the gateway current setting only. Do not invent a list.
+            var choices: [ReasoningSetting] = []
+            if let current { choices.append(current) }
+            if let pending, pending != current { choices.append(pending) }
+            return ComposerReasoningOptions(
+                current: current,
+                pending: pending,
+                choices: choices,
+                unavailableReason: nil
             )
         }
         var choices: [ReasoningSetting] = ReasoningEffort.allCases.map { .effort($0) }
@@ -1099,21 +1219,32 @@ final class ComposerModel {
         // does not report the flag, the choice stays, and the gateway rejects
         // it if the model needs reasoning.
         if capabilities?.canDisableReasoning != false { choices.insert(.off, at: 0) }
+        if let current, !choices.contains(current) { choices.append(current) }
         return ComposerReasoningOptions(
-            current: route.runtime.reasoning,
-            pending: pendingReasoning,
+            current: current,
+            pending: pending,
             choices: choices,
             unavailableReason: nil
         )
     }
 
-    /// Loads the model list of the open chat. The menu calls this when it
-    /// opens, so a chat that never opens the menu makes no gateway call.
+    /// Loads the model list of the open chat.
+    ///
+    /// Prefetch on mount fills the cache. A later menu open reads that cache
+    /// and does not wait on the network.
     func loadModels(refresh: Bool = false) {
-        if !refresh, inventory != .notLoaded { return }
+        if !refresh {
+            if case .loaded = inventory { return }
+            if case .loading = inventory { return }
+            if restoreInventoryFromCache() { return }
+        }
         guard canChangeRuntime, !isUnmounted, inventoryTask == nil else { return }
         let routeToken = route.token
         let authorizationEpoch = preparationEpoch(for: routeToken)
+        if refresh {
+            invalidateInventoryCache(for: route)
+        }
+        inventory = .loading
         let operationID = UUID()
         inventoryOperationID = operationID
         inventoryTask = Task { [weak self] in
@@ -1127,34 +1258,34 @@ final class ComposerModel {
             do {
                 guard let self else { return }
                 let preparedSession = try await self.prepareRuntimeSession(expectedRoute: routeToken)
-                guard self.inventoryOperationID == operationID,
-                      self.isCurrentWritableRoute(
-                          routeToken,
-                          requiresDurableIdentity: true,
-                          preparationEpoch: preparedSession.epoch
-                      )
-                else { return }
                 let result = try await self.runtime.modelInventory(
                     sessionID: preparedSession.id,
                     refresh: refresh
                 )
+                self.rememberInventory(result, sessionID: preparedSession.id, identity: routeToken.identity)
                 guard self.inventoryOperationID == operationID,
                       self.isCurrentWritableRoute(
                           routeToken,
-                          requiresDurableIdentity: true,
+                          requiresDurableIdentity: false,
                           preparationEpoch: preparedSession.epoch
                       )
-                else { return }
+                else {
+                    self.clearLoadingInventoryIfNeeded()
+                    return
+                }
                 self.inventory = .loaded(result)
             } catch {
                 guard let self,
                       self.inventoryOperationID == operationID,
                       self.isCurrentWritableRoute(
                           routeToken,
-                          requiresDurableIdentity: true,
+                          requiresDurableIdentity: false,
                           preparationEpoch: authorizationEpoch
                       )
-                else { return }
+                else {
+                    self?.clearLoadingInventoryIfNeeded()
+                    return
+                }
                 Log.error("composer.models code=load_failed")
                 self.inventory = .failed("Models could not be loaded.")
             }
@@ -1184,7 +1315,7 @@ final class ComposerModel {
                 guard self.runtimeOperationID == operationID,
                       self.isCurrentWritableRoute(
                           routeToken,
-                          requiresDurableIdentity: true,
+                          requiresDurableIdentity: false,
                           preparationEpoch: preparedSession.epoch
                       )
                 else { return }
@@ -1196,7 +1327,7 @@ final class ComposerModel {
                 guard self.runtimeOperationID == operationID,
                       self.isCurrentWritableRoute(
                           routeToken,
-                          requiresDurableIdentity: true,
+                          requiresDurableIdentity: false,
                           preparationEpoch: preparedSession.epoch
                       )
                 else { return }
@@ -1208,7 +1339,7 @@ final class ComposerModel {
                       self.runtimeOperationID == operationID,
                       self.isCurrentWritableRoute(
                           routeToken,
-                          requiresDurableIdentity: true,
+                          requiresDurableIdentity: false,
                           preparationEpoch: authorizationEpoch
                       )
                 else { return }
@@ -1242,7 +1373,7 @@ final class ComposerModel {
                 guard self.runtimeOperationID == operationID,
                       self.isCurrentWritableRoute(
                           routeToken,
-                          requiresDurableIdentity: true,
+                          requiresDurableIdentity: false,
                           preparationEpoch: preparedSession.epoch
                       )
                 else { return }
@@ -1250,7 +1381,7 @@ final class ComposerModel {
                 guard self.runtimeOperationID == operationID,
                       self.isCurrentWritableRoute(
                           routeToken,
-                          requiresDurableIdentity: true,
+                          requiresDurableIdentity: false,
                           preparationEpoch: preparedSession.epoch
                       )
                 else { return }
@@ -1259,7 +1390,7 @@ final class ComposerModel {
                       self.runtimeOperationID == operationID,
                       self.isCurrentWritableRoute(
                           routeToken,
-                          requiresDurableIdentity: true,
+                          requiresDurableIdentity: false,
                           preparationEpoch: authorizationEpoch
                       )
                 else { return }
@@ -1270,13 +1401,20 @@ final class ComposerModel {
         }
     }
 
-    /// Returns the live gateway session of the current durable writable chat.
+    /// Returns the live gateway session of the current writable chat.
+    ///
+    /// A new chat can create that session. This is the same preparation as send.
     private func prepareRuntimeSession(expectedRoute: ComposerRouteToken) async throws -> PreparedSession {
-        try await prepareSession(expectedRoute: expectedRoute, requiresDurableIdentity: true)
+        try await prepareSession(expectedRoute: expectedRoute, requiresDurableIdentity: false)
     }
     /// Shares one in-flight preparation for each route token. The coordinator
     /// does not let a completed operation authorize a route that changed while
-    /// it was waiting.
+    /// it was waiting. A live session id is not a licence to skip the turn
+    /// router: the router rejects an unroutable chat, and a send that already
+    /// has a live id still has to share one preparation with inventory work.
+    ///
+    /// When no turn router is installed, the live session id is enough for
+    /// inventory. Tests use that path. Production always installs a turn.
     private func prepareSession(
         expectedRoute: ComposerRouteToken,
         requiresDurableIdentity: Bool
@@ -1289,13 +1427,7 @@ final class ComposerModel {
         let preparation: SessionPreparation
         if let existing = preparationTasks[expectedRoute] {
             preparation = existing
-        } else if let sessionID = route.liveSessionID {
-            return PreparedSession(
-                id: sessionID,
-                epoch: preparationEpoch(for: expectedRoute)
-            )
-        } else {
-            guard let turn else { throw ComposerOperationError.staleRoute }
+        } else if let turn {
             let epoch = preparationEpoch(for: expectedRoute)
             let task = Task { [turn] in
                 try await turn.prepareSession(expectedRoute: expectedRoute)
@@ -1303,6 +1435,13 @@ final class ComposerModel {
             let entry = SessionPreparation(epoch: epoch, task: task)
             preparationTasks[expectedRoute] = entry
             preparation = entry
+        } else if let sessionID = route.liveSessionID, !sessionID.isEmpty {
+            return PreparedSession(
+                id: sessionID,
+                epoch: preparationEpoch(for: expectedRoute)
+            )
+        } else {
+            throw ComposerOperationError.staleRoute
         }
 
         do {
@@ -1339,7 +1478,7 @@ final class ComposerModel {
         preparationEpoch expectedPreparationEpoch: UInt64? = nil
     ) -> Bool {
         !isUnmounted
-            && route.token == expectedRoute
+            && routeOwnsSend(expectedRoute)
             && !route.isReadOnly
             && (!requiresDurableIdentity || route.hasDurableIdentity)
             && (
@@ -1365,9 +1504,29 @@ final class ComposerModel {
 
     private func cancelRuntimeTasks() {
         cancelRouteRuntimeTasks()
-        sendTask?.cancel()
-        sendTask = nil
-        sendOperationID = nil
+        cancelSend(for: route.token)
+    }
+
+    /// Cancels the in-flight send for one route.
+    private func cancelSend(for token: ComposerRouteToken) {
+        let original = originSendToken(for: token)
+        sendTasks.removeValue(forKey: original)?.cancel()
+        if original != token {
+            sendTasks.removeValue(forKey: token)?.cancel()
+        }
+        if adoptedNewChatOrigin?.token == original || adoptedNewChatOrigin?.token == token {
+            adoptedNewChatOrigin = nil
+        }
+    }
+
+    /// Cancels every in-flight send.
+    private func cancelAllSends() {
+        let tasks = Array(sendTasks.values)
+        sendTasks.removeAll()
+        adoptedNewChatOrigin = nil
+        for task in tasks {
+            task.cancel()
+        }
     }
 
     private func cancelPreparationTasks() {
@@ -1380,12 +1539,114 @@ final class ComposerModel {
 
 
     private func currentModelCapabilities() -> ModelCapabilities? {
-        guard case let .loaded(inventory) = inventory, let model = route.runtime.model else {
-            return nil
-        }
-        let provider = inventory.providers.first { $0.slug == route.runtime.provider }
+        guard case let .loaded(inventory) = inventory else { return nil }
+        let model = pendingModel ?? route.runtime.model
+        guard let model else { return nil }
+        let providerSlug = pendingModelProvider ?? route.runtime.provider
+        let provider = inventory.providers.first { $0.slug == providerSlug }
             ?? inventory.providers.first { $0.isCurrent }
         return provider?.capabilities[model]
+    }
+
+    private func inventoryCacheKey(for route: ComposerRoute) -> String {
+        if let sessionID = route.liveSessionID, !sessionID.isEmpty {
+            return sessionID
+        }
+        return "identity:\(route.identity)"
+    }
+
+    private func isNewChatAdoption(from old: ComposerRoute, to new: ComposerRoute) -> Bool {
+        old.identity == "new"
+            && new.hasDurableIdentity
+            && old.liveSessionID != nil
+            && old.liveSessionID == new.liveSessionID
+    }
+
+    private func originSendToken(for routeToken: ComposerRouteToken) -> ComposerRouteToken {
+        if let adopted = adoptedNewChatOrigin,
+           route.liveSessionID == adopted.sessionID,
+           routeToken == route.token {
+            return adopted.token
+        }
+        return routeToken
+    }
+
+    private func routeOwnsSend(_ sendToken: ComposerRouteToken) -> Bool {
+        if route.token == sendToken { return true }
+        if let adopted = adoptedNewChatOrigin,
+           adopted.token == sendToken,
+           route.liveSessionID == adopted.sessionID {
+            return true
+        }
+        return false
+    }
+
+    private func draftIdentity(for routeIdentity: String) -> String {
+        if let adopted = adoptedNewChatOrigin,
+           adopted.token.identity == routeIdentity,
+           route.liveSessionID == adopted.sessionID {
+            return route.identity
+        }
+        return routeIdentity
+    }
+
+    private func adoptInventory(from oldIdentity: String, to newRoute: ComposerRoute) {
+        let oldKey = "identity:\(oldIdentity)"
+        let newKey = "identity:\(newRoute.identity)"
+        if let cached = inventoryBySession[oldKey] {
+            inventoryBySession[newKey] = cached
+            if let sessionID = newRoute.liveSessionID, !sessionID.isEmpty {
+                inventoryBySession[sessionID] = cached
+            }
+        } else {
+            rememberInventorySession(for: newRoute)
+            if let cached = inventoryBySession[inventoryCacheKey(for: newRoute)] {
+                inventoryBySession[newKey] = cached
+            }
+        }
+    }
+
+    private func rememberInventorySession(for route: ComposerRoute) {
+        guard let sessionID = route.liveSessionID, !sessionID.isEmpty else { return }
+        let identityKey = "identity:\(route.identity)"
+        if inventoryBySession[sessionID] == nil, let cached = inventoryBySession[identityKey] {
+            inventoryBySession[sessionID] = cached
+        }
+    }
+
+    @discardableResult
+    private func restoreInventoryFromCache() -> Bool {
+        guard let cached = inventoryBySession[inventoryCacheKey(for: route)] else {
+            return false
+        }
+        if inventory != .loaded(cached) {
+            inventory = .loaded(cached)
+        }
+        return true
+    }
+
+    private func rememberInventory(_ inventory: ModelInventory, sessionID: String, identity: String) {
+        if !sessionID.isEmpty {
+            inventoryBySession[sessionID] = inventory
+        }
+        inventoryBySession["identity:\(identity)"] = inventory
+    }
+
+    private func invalidateInventoryCache(for route: ComposerRoute) {
+        inventoryBySession.removeValue(forKey: inventoryCacheKey(for: route))
+        inventoryBySession.removeValue(forKey: "identity:\(route.identity)")
+        if let sessionID = route.liveSessionID {
+            inventoryBySession.removeValue(forKey: sessionID)
+        }
+    }
+
+    private func prefetchInventoryIfEligible() {
+        guard hasAppeared, !isUnmounted, canChangeRuntime else { return }
+        // Prefetch needs a turn router or a live session. Without either,
+        // the load cannot complete, so skip it.
+        guard turn != nil || (route.liveSessionID?.isEmpty == false) else { return }
+        if restoreInventoryFromCache() { return }
+        loadModels()
     }
 
     // MARK: - Dictation
@@ -1571,35 +1832,85 @@ final class ComposerModel {
         Task { await recorder.cancel() }
     }
 
-    /// Called when the view mounts again after an idempotent shutdown.
-    func activate() {
+    /// Records that a ComposerView is on screen.
+    ///
+    /// Each call issues a new token. A later unmount must present that
+    /// token, or the call is ignored.
+    @discardableResult
+    func mount() -> ComposerMountToken {
+        mountGeneration &+= 1
         isUnmounted = false
+        hasAppeared = true
+        restoreInventoryFromCache()
+        prefetchInventoryIfEligible()
+        return ComposerMountToken(id: mountGeneration)
     }
 
-    /// Idempotent teardown for the mounted view. Volatile sends and imports
-    /// must not survive an unmount, and microphone owners are always released.
+    /// Tears down the current mount when `token` still matches.
+    ///
+    /// A replaced ComposerView can disappear after the successor appears.
+    /// That late call holds a stale token, so it does not take the live
+    /// composer down.
+    func unmount(_ token: ComposerMountToken) {
+        guard token.id == mountGeneration, !isUnmounted else { return }
+        teardownMount()
+    }
+
+    /// Unconditional teardown. Sign-out and window close use this path.
+    ///
+    /// The mount generation advances so a late unmount from a dead view
+    /// cannot take a later mount down.
     func shutdown() {
+        mountGeneration &+= 1
+        teardownMount()
+    }
+
+    /// Stops work that must not survive the current mount.
+    private func teardownMount() {
         isUnmounted = true
+        hasAppeared = false
         importTask?.cancel()
         importTask = nil
         inventoryTask?.cancel()
         inventoryTask = nil
+        inventoryOperationID = nil
         runtimeTask?.cancel()
         runtimeTask = nil
-        sendTask?.cancel()
-        sendTask = nil
+        runtimeOperationID = nil
+        let sendToken = originSendToken(for: route.token)
+        cancelAllSends()
         cancelPreparationTasks()
-        if let outgoing = outgoingByRoute.removeValue(forKey: route.token) {
+        if let outgoing = outgoingByRoute.removeValue(forKey: sendToken)
+            ?? outgoingByRoute.removeValue(forKey: route.token) {
             files.discard(outgoing)
         }
+        progressByRoute.removeValue(forKey: sendToken)
         progressByRoute.removeValue(forKey: route.token)
+        submittingRoutes.remove(sendToken)
         submittingRoutes.remove(route.token)
         outgoing = []
         stagingProgress = nil
         isSubmitting = false
+        if case .loading = inventory, !restoreInventoryFromCache() {
+            inventory = .notLoaded
+        }
         cancelDictation()
         cancelRecording()
+    }
 
+    private func shouldRollbackPublishedTurn(
+        _ error: Error,
+        promptSubmissionBegan: Bool
+    ) -> Bool {
+        guard promptSubmissionBegan else { return true }
+        if (error as? GatewayError) == .outcomeUnknownAfterSend { return false }
+        return true
+    }
+
+    private func clearLoadingInventoryIfNeeded() {
+        if case .loading = inventory, !restoreInventoryFromCache() {
+            inventory = .notLoaded
+        }
     }
 
     // MARK: - Escape
@@ -1616,8 +1927,8 @@ final class ComposerModel {
             cancelDictation()
             return true
         }
-        if let sendTask {
-            sendTask.cancel()
+        if let task = sendTasks[originSendToken(for: route.token)] {
+            task.cancel()
             return true
         }
         if notice != nil {

@@ -22,16 +22,12 @@ struct ChatView: View {
     /// rather than taking first responder during every launch.
     @State private var composerFocusRequest = 0
     var body: some View {
-        transcript
-            // The archived transcript has no bottom editing surface.
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                if !isReadOnly {
-                    ComposerView(
-                        model: model.composerModel,
-                        focusRequest: composerFocusRequest
-                    )
-                }
-            }
+        // Keep the composer off the transcript `.id(session:generation)`.
+        // That identity changes on every route publication. If the composer
+        // is a modifier of that view, SwiftUI can call onDisappear of the
+        // old ComposerView after onAppear of the new one, on the same
+        // ComposerModel, and the late unmount leaves the live composer dead.
+        composerHost
         .onChange(of: model.findRequestGeneration) { _, _ in
             openFind()
         }
@@ -74,6 +70,21 @@ struct ChatView: View {
         }
         .onChange(of: findQuery) {
             activeFindIndex = 0
+        }
+    }
+
+    /// Stable host for the composer. The transcript identity lives inside.
+    private var composerHost: some View {
+        VStack(spacing: 0) {
+            transcript
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if !isReadOnly {
+                ComposerView(
+                    model: model.composerModel,
+                    focusRequest: composerFocusRequest
+                )
+            }
         }
     }
 

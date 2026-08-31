@@ -16,7 +16,10 @@ import Glibc
 /// WebSocket or gateway.
 public actor GatewayRuntimeAdapter: SessionRuntimeControlling, AttachmentStaging {
     private let gateway: GatewayClient
+    /// Last successful `model.options` payload, keyed by live session id.
     private var inventoryCache: [String: ModelInventory] = [:]
+    private var inventoryInFlight: [String: Task<ModelInventory, Error>] = [:]
+    private var inventoryInFlightIDs: [String: UUID] = [:]
 
     public init(gateway: GatewayClient) {
         self.gateway = gateway
@@ -29,15 +32,41 @@ public actor GatewayRuntimeAdapter: SessionRuntimeControlling, AttachmentStaging
         if !refresh, let cached = inventoryCache[cacheKey] {
             return cached
         }
+        if !refresh, let inflight = inventoryInFlight[cacheKey] {
+            return try await inflight.value
+        }
 
-        var params: [String: Any] = [:]
-        if let sessionID, !sessionID.isEmpty { params["session_id"] = sessionID }
-        if refresh { params["refresh"] = true }
-        let response = try await gateway.call("model.options", params: params)
-        let payload = Self.unwrapModelOptions(response)
-        let inventory = try ModelInventory.decode(payload)
-        inventoryCache[cacheKey] = inventory
-        return inventory
+        let requestID = UUID()
+        inventoryInFlightIDs[cacheKey] = requestID
+        let gateway = self.gateway
+        let task = Task<ModelInventory, Error> {
+            var params: [String: Any] = [:]
+            if let sessionID, !sessionID.isEmpty { params["session_id"] = sessionID }
+            if refresh { params["refresh"] = true }
+            let response = try await gateway.call("model.options", params: params)
+            let payload = Self.unwrapModelOptions(response)
+            return try ModelInventory.decode(payload)
+        }
+        inventoryInFlight[cacheKey] = task
+        do {
+            let inventory = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            if inventoryInFlightIDs[cacheKey] == requestID {
+                inventoryCache[cacheKey] = inventory
+                inventoryInFlight[cacheKey] = nil
+                inventoryInFlightIDs[cacheKey] = nil
+            }
+            return inventory
+        } catch {
+            if inventoryInFlightIDs[cacheKey] == requestID {
+                inventoryInFlight[cacheKey] = nil
+                inventoryInFlightIDs[cacheKey] = nil
+            }
+            throw error
+        }
     }
 
     public func setModel(
@@ -67,6 +96,9 @@ public actor GatewayRuntimeAdapter: SessionRuntimeControlling, AttachmentStaging
         let response = try await gateway.call("config.set", params: params)
         let outcome = try Self.decodeModelSwitchOutcome(response, requested: model)
         inventoryCache.removeValue(forKey: sessionID)
+        inventoryInFlight[sessionID]?.cancel()
+        inventoryInFlight.removeValue(forKey: sessionID)
+        inventoryInFlightIDs.removeValue(forKey: sessionID)
         return outcome
     }
 
