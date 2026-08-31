@@ -1000,8 +1000,14 @@ func sidebarSurfaceSuppressesTheSystemScrollEdgeEffect() async throws {
     )
     window.titlebarAppearsTransparent = true
     window.toolbar = NSToolbar()
+    window.isReleasedWhenClosed = false
+    window.animationBehavior = .none
     window.contentView = hosting
     window.makeKeyAndOrderFront(nil)
+    defer {
+        window.contentView = nil
+        window.close()
+    }
     hosting.layoutSubtreeIfNeeded()
     await Task.yield()
     hosting.needsLayout = true

@@ -72,8 +72,14 @@ func typingKeepsEditorIdentityFocusAndBoundedHeight() async throws {
         backing: .buffered,
         defer: false
     )
+    window.isReleasedWhenClosed = false
+    window.animationBehavior = .none
     window.contentView = hosting
     window.makeKeyAndOrderFront(nil)
+    defer {
+        window.contentView = nil
+        window.close()
+    }
     hosting.layoutSubtreeIfNeeded()
 
     let editor = try #require(firstTextView(in: hosting))
@@ -198,8 +204,14 @@ func editorWrapsAtTheColumnItOccupies() async throws {
         backing: .buffered,
         defer: false
     )
+    window.isReleasedWhenClosed = false
+    window.animationBehavior = .none
     window.contentView = hosting
     window.makeKeyAndOrderFront(nil)
+    defer {
+        window.contentView = nil
+        window.close()
+    }
     hosting.layoutSubtreeIfNeeded()
 
     // The measurements a host runs for its own constraints, ordered after the
@@ -231,3 +243,4 @@ private func firstTextView(in view: NSView) -> NSTextView? {
     }
     return nil
 }
+

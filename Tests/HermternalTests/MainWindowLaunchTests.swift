@@ -18,11 +18,13 @@ func mainWindowChromeSettlesBeforeContentAttachment() {
         backing: .buffered,
         defer: false
     )
+    window.isReleasedWhenClosed = false
 
     MainWindowStartupConfiguration.prepare(
         window,
         restoringFrameNamed: nil
     )
+    defer { window.close() }
     #expect(window.contentViewController == nil)
     #expect(window.animationBehavior == .none)
     #expect(window.title.isEmpty)
@@ -149,6 +151,7 @@ func mainWindowStaysResizableAfterContentAttachment() throws {
         backing: .buffered,
         defer: false
     )
+    window.isReleasedWhenClosed = false
     MainWindowStartupConfiguration.prepare(window, restoringFrameNamed: nil)
     // Stands in for a restored frame: the size the user left the window at,
     // which is what every launch after the first opens with. It differs from
@@ -246,6 +249,7 @@ func windowBackdropFollowsTheOpacityDial() async throws {
         backing: .buffered,
         defer: false
     )
+    window.isReleasedWhenClosed = false
     MainWindowStartupConfiguration.prepare(window, restoringFrameNamed: nil)
     MainWindowStartupConfiguration.attach(shell, to: window)
     defer { window.close() }
