@@ -231,6 +231,8 @@ private func makeSessionListClient(
     )
     try CredentialStore.save(credentials, account: server.absoluteString)
     let configuration = URLSessionConfiguration.ephemeral
+    configuration.waitsForConnectivity = false
+    configuration.timeoutIntervalForRequest = 5
     configuration.protocolClasses = [SessionListURLProtocol.self]
     let session = URLSession(configuration: configuration)
     let auth = AuthClient(server: server, urlSession: session)

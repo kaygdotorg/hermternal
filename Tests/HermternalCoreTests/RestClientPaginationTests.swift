@@ -92,8 +92,15 @@ func restPagingCancellationBetweenPages() async throws {
     let task = Task {
         try? await client.sessionMessages(durableID: fixture.id)
     }
+    let deadline = ContinuousClock.now + .seconds(15)
     while !fixture.isBlockedPageWaiting {
-        await Task.yield()
+        guard ContinuousClock.now < deadline else {
+            Issue.record("blocked page never started loading")
+            task.cancel()
+            fixture.releaseBlockedPage()
+            return
+        }
+        try await Task.sleep(for: .milliseconds(5))
     }
     task.cancel()
     fixture.releaseBlockedPage()
@@ -151,17 +158,21 @@ private struct PagingPage: Sendable {
     }
 }
 
+private struct PagingParkedLoad {
+    let proto: PagingURLProtocol
+    let client: URLProtocolClient
+    let offset: Int
+}
+
 private final class PagingFixture: @unchecked Sendable {
     let id: String
     private let pages: [PagingPage]
     private let blockedPage: Int?
     private let lock = NSLock()
-    private let releaseGate = DispatchSemaphore(value: 0)
     private var requests: [Int] = []
     private var nextPage = 0
-    private var blockedPageOffset: Int?
     private var blockedPageIsWaiting = false
-    private var blockedPageWasReleased = false
+    private var parkedLoad: PagingParkedLoad?
 
     init(pages: [PagingPage], blockedPage: Int? = nil) {
         self.id = UUID().uuidString
@@ -179,7 +190,16 @@ private final class PagingFixture: @unchecked Sendable {
         return blockedPageIsWaiting
     }
 
-    func response(for request: URLRequest) -> (Int, Data) {
+    enum StartResult {
+        case park
+        case complete(Int, Data)
+    }
+
+    func start(
+        _ proto: PagingURLProtocol,
+        client: URLProtocolClient,
+        request: URLRequest
+    ) -> StartResult {
         let offset = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
             .queryItems!.first { $0.name == "offset" }!.value!
         let parsedOffset = Int(offset)!
@@ -189,32 +209,17 @@ private final class PagingFixture: @unchecked Sendable {
         let page = pages[min(nextPage, pages.count - 1)]
         nextPage += 1
         if pageIndex == blockedPage {
-            blockedPageOffset = parsedOffset
             blockedPageIsWaiting = true
-            blockedPageWasReleased = false
+            parkedLoad = PagingParkedLoad(proto: proto, client: client, offset: parsedOffset)
+            lock.unlock()
+            return .park
         }
         lock.unlock()
-        if pageIndex == blockedPage {
-            releaseGate.wait()
-            lock.lock()
-            blockedPageIsWaiting = false
-            lock.unlock()
-        }
-
-        let payload: JSONValue = .object([
-            "messages": .array(page.rows),
-            "pagination": .object([
-                "limit": .integer(500),
-                "offset": .integer(Int64(parsedOffset)),
-                "order": .string("oldest"),
-                "returned": .integer(Int64(page.returned))
-            ])
-        ])
-        return (page.status, try! JSONEncoder().encode(payload))
+        return .complete(page.status, Self.payload(page: page, offset: parsedOffset))
     }
 
     func releaseBlockedPage() {
-        releaseBlockedPage(matching: nil)
+        failParkedLoad(matching: nil)
     }
 
     func releaseBlockedPage(for request: URLRequest) {
@@ -226,21 +231,35 @@ private final class PagingFixture: @unchecked Sendable {
         else {
             return
         }
-        releaseBlockedPage(matching: offset)
+        failParkedLoad(matching: offset)
     }
 
-    private func releaseBlockedPage(matching offset: Int?) {
+    private func failParkedLoad(matching offset: Int?) {
         lock.lock()
         guard blockedPageIsWaiting,
-              !blockedPageWasReleased,
-              offset == nil || blockedPageOffset == offset
+              let parked = parkedLoad,
+              offset == nil || parked.offset == offset
         else {
             lock.unlock()
             return
         }
-        blockedPageWasReleased = true
+        parkedLoad = nil
+        blockedPageIsWaiting = false
         lock.unlock()
-        releaseGate.signal()
+        parked.client.urlProtocol(parked.proto, didFailWithError: URLError(.cancelled))
+    }
+
+    private static func payload(page: PagingPage, offset: Int) -> Data {
+        let body: JSONValue = .object([
+            "messages": .array(page.rows),
+            "pagination": .object([
+                "limit": .integer(500),
+                "offset": .integer(Int64(offset)),
+                "order": .string("oldest"),
+                "returned": .integer(Int64(page.returned))
+            ])
+        ])
+        return try! JSONEncoder().encode(body)
     }
 }
 
@@ -274,20 +293,25 @@ private final class PagingURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        guard let protocolClient = client else { return }
         guard let fixture = PagingRegistry.shared.fixture(for: request) else {
-            client?.urlProtocol(self, didFailWithError: URLError(.fileDoesNotExist))
+            protocolClient.urlProtocol(self, didFailWithError: URLError(.fileDoesNotExist))
             return
         }
-        let (status, data) = fixture.response(for: request)
-        let response = HTTPURLResponse(
-            url: request.url!,
-            statusCode: status,
-            httpVersion: nil,
-            headerFields: ["Content-Type": "application/json"]
-        )!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: data)
-        client?.urlProtocolDidFinishLoading(self)
+        switch fixture.start(self, client: protocolClient, request: request) {
+        case .park:
+            return
+        case let .complete(status, data):
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: status,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            protocolClient.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            protocolClient.urlProtocol(self, didLoad: data)
+            protocolClient.urlProtocolDidFinishLoading(self)
+        }
     }
 
     override func stopLoading() {
@@ -311,6 +335,8 @@ private func makePagingClient(
     )
     try CredentialStore.save(credentials, account: server.absoluteString)
     let configuration = URLSessionConfiguration.ephemeral
+    configuration.waitsForConnectivity = false
+    configuration.timeoutIntervalForRequest = 5
     configuration.protocolClasses = [PagingURLProtocol.self]
     let session = URLSession(configuration: configuration)
     let auth = AuthClient(server: server, urlSession: session)

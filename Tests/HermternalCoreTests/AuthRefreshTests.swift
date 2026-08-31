@@ -165,6 +165,8 @@ private func makeRefreshClient(
         account: server.absoluteString
     )
     let configuration = URLSessionConfiguration.ephemeral
+    configuration.waitsForConnectivity = false
+    configuration.timeoutIntervalForRequest = 5
     configuration.protocolClasses = [RefreshURLProtocol.self]
     let session = URLSession(configuration: configuration)
     let auth = AuthClient(server: server, urlSession: session, credentialStore: store)
