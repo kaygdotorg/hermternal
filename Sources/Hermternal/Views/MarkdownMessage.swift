@@ -13,9 +13,37 @@ enum MessageTypography {
     static let markerGap: CGFloat = 4
     static let maxListDepth = 6
 
-    static let readingMeasure: CGFloat = 680
+    /// The readable measure: the widest a message may be, gutters excluded.
+    ///
+    /// 490pt is 0.72 of the 680pt band this transcript filled before. 680pt
+    /// holds about 100 characters of 13pt body text, which is a page measure,
+    /// not a message measure: the eye loses the line on the way back to the
+    /// start of the next one. 490pt holds about 70 characters, inside the band
+    /// a reader scans without effort, so a wide window widens the gutters and
+    /// never the text.
+    ///
+    /// Defended by rendererRowsKeepDocumentWidthThroughTableLayoutAndResize.
+    static let readingMeasure: CGFloat = 490
     static let transcriptInset: CGFloat = 20
-    static let hermesIndent: CGFloat = 20
+
+    /// The agent mark's side, in points.
+    ///
+    /// The mark is the app icon beside the answer, and it identifies the
+    /// speaker in the same way an avatar does in Messages. 28pt is the size
+    /// Messages gives that avatar, and it is the size that balances a 490pt
+    /// measure: a 14pt mark read as a stray glyph beside the text.
+    ///
+    /// Defended by markStandsBesideTheFirstLineOfAWrappedAnswer.
+    static let markSide: CGFloat = 28
+
+    /// The space between the mark and the text of the turn.
+    static let markGap: CGFloat = 8
+
+    /// The agent's gutter: the mark, and the gap to the text it marks.
+    ///
+    /// Derived, never stated twice. The mark stands in this gutter, so a change
+    /// of the mark's size moves the text of every agent turn with it.
+    static let hermesIndent: CGFloat = markSide + markGap
     static let internalBlockGap: CGFloat = 8
     static let turnGap: CGFloat = 24
     /// The height of a system row's role label band.
@@ -31,12 +59,44 @@ enum MessageTypography {
     static let minimumTurnHeight: CGFloat = 92
     static let codePadding: CGFloat = 14
 
-    /// The outgoing bubble's text measure: half the document measure.
+    /// The share of the content column an outgoing bubble may fill.
     ///
-    /// The step down is unmistakable at any window width. 340pt still holds
-    /// about 52 characters of 13pt body text, which is the right measure for a
-    /// prompt rather than for a document.
-    static let outgoingTextMeasure: CGFloat = readingMeasure / 2
+    /// 0.7, the share Messages.app leaves a bubble. The empty 30% on the
+    /// leading side is what states the speaker: a bubble that fills the column
+    /// reads as a document, and its trailing edge is then the only clue left
+    /// that the user wrote it. The share is taken from the column and not from
+    /// the window, so the proportion holds at every window width.
+    ///
+    /// Defended by longOutgoingMessageWrapsInsideTextCap and
+    /// narrowWindowKeepsRequiredTranscriptInsets.
+    static let outgoingBubbleShare: CGFloat = 0.7
+
+    /// The content column inside `availableWidth`.
+    ///
+    /// The column is the band both speakers share: centred, one gutter on each
+    /// side, and never wider than the readable measure. An agent answer fills
+    /// it after its own gutter. An outgoing bubble takes its share of it and
+    /// trails its trailing edge.
+    ///
+    /// Defended by outgoingRowTrailsGutterAndKeepsRowBands.
+    static func contentColumn(in availableWidth: CGFloat) -> CGFloat {
+        max(1, min(readingMeasure, availableWidth - 2 * transcriptInset))
+    }
+
+    /// The outgoing text measure inside a content column.
+    ///
+    /// The bubble's own box is its share of the column. The tail and both
+    /// paddings come off that box before the text gets any, so the box, and
+    /// not the text, is what holds the share.
+    static func outgoingTextMeasure(in column: CGFloat) -> CGFloat {
+        max(1, column * outgoingBubbleShare
+            - 2 * outgoingBubblePaddingH
+            - OutgoingBubbleGeometry.tailWidth)
+    }
+
+    /// The widest outgoing text the transcript can show: the measure inside a
+    /// full content column.
+    static let widestOutgoingText: CGFloat = outgoingTextMeasure(in: readingMeasure)
 
     /// The space between the bubble's side and its text.
     ///

@@ -143,7 +143,7 @@ func oneWordOutgoingMessageHugsItsText() {
         width: width
     )
 
-    #expect(width == MessageTypography.outgoingTextMeasure)
+    #expect(width == MessageTypography.widestOutgoingText)
     #expect(layout.textWidth > 0)
     #expect(layout.textWidth < 60)
     // The agent floor reserves a role band, a disclosure band, and a metadata
@@ -157,23 +157,30 @@ func longOutgoingMessageWrapsInsideTextCap() {
     let turn = TranscriptTurn(id: "long", speaker: .me, answer: answer)
     let document = MarkdownDocument.parse(answer).document
 
-    // 340 caps the text, never the bubble. The bubble's own width is derived:
-    // text 340 + padding 2x14 + tail 7 = 375.
-    #expect(MessageTypography.outgoingTextMeasure == 340)
+    // The bubble's box is its share of the content column, and the text is what
+    // is left inside the box: 490 x 0.7 = 343, less both paddings and the tail.
+    #expect(MessageTypography.widestOutgoingText == 308)
     #expect(
-        MessageTypography.outgoingTextMeasure
+        MessageTypography.widestOutgoingText
             + 2 * MessageTypography.outgoingBubblePaddingH
             + OutgoingBubbleGeometry.tailWidth
-            == 375
+            == MessageTypography.readingMeasure
+                * MessageTypography.outgoingBubbleShare
     )
+    // A window wider than the readable measure widens the gutters, never the
+    // bubble.
     #expect(
         TranscriptRendererTestSeam.effectiveWidth(for: turn, availableWidth: 4000)
-            == MessageTypography.outgoingTextMeasure
+            == MessageTypography.widestOutgoingText
     )
-    // A narrow window takes the gutters, the tail, and both paddings off first.
+    // The share is taken from the column, so a narrow window keeps the
+    // proportion instead of letting the bubble fill the width.
+    let narrowColumn = MessageTypography.contentColumn(in: 300)
+    #expect(narrowColumn == 300 - 2 * MessageTypography.transcriptInset)
     #expect(
         TranscriptRendererTestSeam.effectiveWidth(for: turn, availableWidth: 300)
-            == 300 - 40 - 2 * MessageTypography.outgoingBubblePaddingH
+            == narrowColumn * MessageTypography.outgoingBubbleShare
+                - 2 * MessageTypography.outgoingBubblePaddingH
                 - OutgoingBubbleGeometry.tailWidth
     )
 
@@ -182,10 +189,10 @@ func longOutgoingMessageWrapsInsideTextCap() {
     let wrapped = TranscriptRendererTestSeam.measuredLayout(
         for: turn,
         document: document,
-        width: MessageTypography.outgoingTextMeasure
+        width: MessageTypography.widestOutgoingText
     )
-    #expect(wrapped.textWidth <= MessageTypography.outgoingTextMeasure)
-    #expect(wrapped.textWidth > MessageTypography.outgoingTextMeasure / 2)
+    #expect(wrapped.textWidth <= MessageTypography.widestOutgoingText)
+    #expect(wrapped.textWidth > MessageTypography.widestOutgoingText / 2)
     #expect(wrapped.height > MessageTypography.outgoingMinimumTurnHeight)
 
     // One unbroken token has no break opportunity, so the typesetter fills each
@@ -196,10 +203,10 @@ func longOutgoingMessageWrapsInsideTextCap() {
     let tokenLayout = TranscriptRendererTestSeam.measuredLayout(
         for: tokenTurn,
         document: MarkdownDocument.parse(token).document,
-        width: MessageTypography.outgoingTextMeasure
+        width: MessageTypography.widestOutgoingText
     )
-    #expect(tokenLayout.textWidth <= MessageTypography.outgoingTextMeasure)
-    #expect(tokenLayout.textWidth > MessageTypography.outgoingTextMeasure - 20)
+    #expect(tokenLayout.textWidth <= MessageTypography.widestOutgoingText)
+    #expect(tokenLayout.textWidth > MessageTypography.widestOutgoingText - 20)
 }
 
 @Test("the outgoing row height is the constraint chain exactly")
@@ -288,6 +295,15 @@ func agentMeasurementKeepsItsBands() {
     )
 }
 
+/// The trailing edge of the content column inside a row of `rowWidth`.
+///
+/// The column is centred, so its trailing edge is the row's centre plus half
+/// the column. This is where an agent answer ends, and where an outgoing
+/// bubble's tail tip lands.
+private func columnTrailing(in rowWidth: CGFloat) -> CGFloat {
+    (rowWidth + MessageTypography.contentColumn(in: rowWidth)) / 2
+}
+
 @Test("an outgoing row trails the gutter and keeps the 12pt row bands")
 @MainActor
 func outgoingRowTrailsGutterAndKeepsRowBands() {
@@ -352,8 +368,9 @@ func outgoingRowTrailsGutterAndKeepsRowBands() {
 
     let bubble = row.bubbleForTesting.frame
     let band = MessageTypography.turnGap / 2
-    // The tail tip, not the text, lands on the transcript gutter.
-    #expect(abs(bubble.maxX - (rowWidth - MessageTypography.transcriptInset)) < 1)
+    // The tail tip, not the text, lands on the column's trailing edge, so the
+    // bubble ends where an agent answer ends and never at the window's edge.
+    #expect(abs(bubble.maxX - columnTrailing(in: rowWidth)) < 1)
     #expect(
         abs(
             bubble.width - (textWidth
@@ -376,7 +393,7 @@ func tinyOutgoingBubbleHugsItsTextAndMeetsTheGutter() {
     // the stack, and their content hugging is `defaultHigh`. The measured width
     // equality must outrank them, or the stack collapses to a hidden button's
     // intrinsic width and every bubble comes out the same wrong size.
-    for textWidth in [CGFloat(14), 30, 60, 120, 340] {
+    for textWidth in [CGFloat(14), 30, 60, 120, MessageTypography.widestOutgoingText] {
         let root = NSView(frame: NSRect(x: 0, y: 0, width: rowWidth, height: 400))
         let row = TranscriptTurnRowView(
             frame: NSRect(x: 0, y: 0, width: rowWidth, height: 140)
@@ -397,12 +414,9 @@ func tinyOutgoingBubbleHugsItsTextAndMeetsTheGutter() {
         row.layoutSubtreeIfNeeded()
 
         #expect(abs(row.answerViewForTesting.bounds.width - textWidth) < 1)
-        // Whatever the bubble's width, the tail tip lands on the gutter.
+        // Whatever the bubble's width, the tail tip lands on the column.
         #expect(
-            abs(
-                row.bubbleForTesting.frame.maxX
-                    - (rowWidth - MessageTypography.transcriptInset)
-            ) < 1
+            abs(row.bubbleForTesting.frame.maxX - columnTrailing(in: rowWidth)) < 1
         )
     }
 }
@@ -427,7 +441,7 @@ func narrowWindowKeepsRequiredTranscriptInsets() {
             toolsExpanded: false,
             showsMetadata: false,
             findQuery: "",
-            outgoingTextWidth: MessageTypography.outgoingTextMeasure,
+            outgoingTextWidth: MessageTypography.widestOutgoingText,
             onReasoning: { _ in },
             onTools: { _ in },
             onCopyCode: { _ in }
@@ -435,7 +449,13 @@ func narrowWindowKeepsRequiredTranscriptInsets() {
         row.layoutSubtreeIfNeeded()
 
         let answer = row.answerViewForTesting.bounds.width
-        #expect(answer <= MessageTypography.outgoingTextMeasure + 0.5)
+        // The share cap outranks the measured width, so the bubble holds its
+        // share of the column at every one of these widths.
+        #expect(
+            answer <= MessageTypography.outgoingTextMeasure(
+                in: MessageTypography.contentColumn(in: rowWidth)
+            ) + 0.5
+        )
         #expect(
             row.bubbleForTesting.frame.minX
                 >= MessageTypography.transcriptInset
@@ -450,10 +470,10 @@ func narrowWindowKeepsRequiredTranscriptInsets() {
 func rowReuseClearsEveryOutgoingProperty() {
     _ = NSApplication.shared
     let rowWidth: CGFloat = 780
-    // The row must sit in a superview. `measureWidthConstraint` relates the
-    // stack to the row's own `widthAnchor`, and a view with no superview has no
-    // layout engine to publish that width from its frame, so the solver would
-    // fall back to the required `stack.width >= 1`.
+    // The row must sit in a superview. The column guide relates to the row's own
+    // `widthAnchor`, and a view with no superview has no layout engine to
+    // publish that width from its frame, so the solver would fall back to the
+    // required `stack.width >= 1`.
     let root = NSView(frame: NSRect(x: 0, y: 0, width: rowWidth, height: 400))
     let row = TranscriptTurnRowView(
         frame: NSRect(x: 0, y: 0, width: rowWidth, height: 140)
@@ -751,7 +771,7 @@ func outgoingTextSitsInsideBubblePaddedBand() throws {
     _ = NSApplication.shared
     let rowWidth: CGFloat = 780
 
-    for textWidth in [CGFloat(30), 120, MessageTypography.outgoingTextMeasure] {
+    for textWidth in [CGFloat(30), 120, MessageTypography.widestOutgoingText] {
         let root = NSView(frame: NSRect(x: 0, y: 0, width: rowWidth, height: 400))
         let row = TranscriptTurnRowView(
             frame: NSRect(x: 0, y: 0, width: rowWidth, height: 140)
@@ -788,7 +808,7 @@ func outgoingTextSitsInsideBubblePaddedBand() throws {
 @Test("the padded text band is filled in both layout directions")
 func paddedTextBandIsFilledInBothLayoutDirections() {
     // The bubble at its widest: the text cap plus both paddings plus the tail.
-    let rect = CGRect(x: 0, y: 0, width: 375, height: 60)
+    let rect = CGRect(x: 0, y: 0, width: 343, height: 60)
     let padH = MessageTypography.outgoingBubblePaddingH
     let padV = MessageTypography.outgoingBubblePaddingV
     let tail = OutgoingBubbleGeometry.tailWidth
@@ -803,7 +823,7 @@ func paddedTextBandIsFilledInBothLayoutDirections() {
             width: rect.width - 2 * padH - tail,
             height: rect.height - 2 * padV
         )
-        #expect(band.width == MessageTypography.outgoingTextMeasure)
+        #expect(band.width == MessageTypography.widestOutgoingText)
 
         // Every corner of the text band is inside the fill, so the body radius
         // never crosses a glyph in either direction.

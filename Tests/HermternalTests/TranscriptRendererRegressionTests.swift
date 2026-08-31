@@ -512,29 +512,47 @@ func rendererRowsKeepDocumentWidthThroughTableLayoutAndResize() throws {
     #expect(initialTableWidth >= 700)
     #expect(abs(column.width - initialTableWidth) < 1)
     #expect(assistantRow.bounds.width >= initialTableWidth - 1)
-    #expect(initialAssistantTextWidth >= 600)
+    // A window wider than the readable measure fills the column, never the row.
+    // The agent text is the column less the gutter the mark stands in.
+    #expect(
+        abs(
+            initialAssistantTextWidth
+                - (MessageTypography.contentColumn(in: initialTableWidth)
+                    - MessageTypography.hermesIndent)
+        ) < 1
+    )
+    #expect(initialAssistantTextWidth < initialTableWidth - 200)
     // An outgoing row is no longer a full-measure column. It is capped at the
-    // bubble's text measure and, with no measurement yet, it renders at the cap.
+    // bubble's share of the column and, with no measurement yet, it renders at
+    // that cap.
     #expect(
         abs(
             userRow.answerViewForTesting.bounds.width
-                - MessageTypography.outgoingTextMeasure
+                - MessageTypography.widestOutgoingText
         ) < 1
     )
 
-    root.frame.size.width = 520
+    // A window narrower than the readable measure: the column is the window
+    // less its two gutters, so both speakers narrow with it.
+    root.frame.size.width = 360
     let resizedAssistantRow = try laidOutRow(0)
     let resizedUserRow = try laidOutRow(1)
     let resizedTableWidth = table.bounds.width
+    let resizedColumn = MessageTypography.contentColumn(in: resizedTableWidth)
 
-    #expect(resizedTableWidth < initialTableWidth - 100)
+    #expect(resizedTableWidth < initialTableWidth - 300)
     #expect(abs(column.width - resizedTableWidth) < 1)
     #expect(resizedAssistantRow.bounds.width >= resizedTableWidth - 1)
-    #expect(resizedAssistantRow.answerViewForTesting.bounds.width >= 400)
+    #expect(
+        abs(
+            resizedAssistantRow.answerViewForTesting.bounds.width
+                - (resizedColumn - MessageTypography.hermesIndent)
+        ) < 1
+    )
     #expect(
         abs(
             resizedUserRow.answerViewForTesting.bounds.width
-                - MessageTypography.outgoingTextMeasure
+                - MessageTypography.outgoingTextMeasure(in: resizedColumn)
         ) < 1
     )
     #expect(
@@ -1436,7 +1454,7 @@ private func clipOrigin(of table: NSTableView) -> CGFloat {
 
 /// One laid-out agent row, and the superview that publishes its width.
 ///
-/// `measureWidthConstraint` relates the stack to the row's own `widthAnchor`.
+/// The column guide relates the row's content to the row's own `widthAnchor`.
 /// A row with no superview has no layout engine to publish that width from its
 /// frame. The caller keeps the root alive for as long as it reads frames.
 @MainActor
@@ -1527,18 +1545,23 @@ func markStandsBesideTheFirstLineOfAWrappedAnswer() {
     // The mark stands in the gutter, and the text starts one indent to its
     // right.
     #expect(abs(mark.width - mark.height) < 0.5)
-    #expect(mark.width < MessageTypography.hermesIndent)
+    #expect(abs(mark.width - MessageTypography.markSide) < 0.5)
+    #expect(
+        MessageTypography.markSide + MessageTypography.markGap
+            == MessageTypography.hermesIndent
+    )
     #expect(mark.maxX <= answerBand.minX)
     #expect(abs((answerBand.minX - mark.minX) - MessageTypography.hermesIndent) < 0.5)
 
-    // The mark's box holds the cap height of the first line in its centre.
+    // The mark's box is taller than one line of body text, so the centred
+    // position would put it above the top of the band. The box starts at the
+    // top of the first band instead, as an avatar beside a message does, and it
+    // never rises out of the turn.
     let font = NSFont.preferredFont(forTextStyle: .body)
-    let capCentre = answerBand.maxY - (font.ascender - font.capHeight / 2)
-    #expect(abs(mark.midY - capCentre) <= 1)
-    // The whole mark stands inside the first line, not above it and not on the
-    // second one.
-    #expect(mark.maxY <= answerBand.maxY + 0.5)
-    #expect(mark.minY >= answerBand.maxY - (font.ascender - font.descender) - 0.5)
+    #expect(mark.height > font.ascender - font.descender)
+    #expect(abs(mark.maxY - answerBand.maxY) <= 1)
+    #expect(mark.maxY <= row.bounds.maxY)
+    #expect(mark.minY >= row.bounds.minY)
 
     // The mark's depth is the turn's, never the row's. A taller row holds the
     // same turn at the same depth.
@@ -1602,19 +1625,22 @@ func markStandsBesideTheFirstBandOfAChannelledTurn() {
     let band = MessageTypography.turnGap / 2
 
     // The premise. Two expanded channels stand between the top of the turn and
-    // its answer, and the row is tall.
+    // its answer, the row is tall, and the whole mark stands above the answer:
+    // a mark placed by the answer would stand bands away from the line the turn
+    // starts with.
     #expect(row.bounds.height > 300)
-    #expect(answerBand.maxY < mark.minY - 40)
+    #expect(answerBand.maxY < mark.minY)
     // The disclosure band is the first band of the turn, and it starts at the
     // row's top band.
     #expect(abs((row.bounds.maxY - reasoningBand.maxY) - band) < 0.5)
 
-    // The mark marks that band, not the middle of the row. The band is a
-    // borderless footnote button, 13pt tall, so the band is shorter than the
-    // 14pt mark. The mark therefore overhangs the band, and the contract is the
-    // optical centre and not containment. The residual is the half point an
-    // integral position costs, because the ideal inset here is -0.5pt.
-    #expect(abs(mark.midY - reasoningBand.midY) <= 1)
+    // The mark marks that band, not the middle of the row. The box starts at
+    // the top of the disclosure band. The box is taller than the band, which a
+    // borderless footnote button keeps to 13pt, so it reaches past it: the mark
+    // states the speaker of the whole turn, and the first band is where the
+    // turn starts.
+    #expect(abs(mark.maxY - reasoningBand.maxY) <= 1)
+    #expect(mark.height > reasoningBand.height)
     // The mark stays out of the gap between two turns.
     #expect(mark.maxY <= row.bounds.maxY - band + 0.5)
     #expect(
@@ -1638,9 +1664,9 @@ func markStandsBesideTheFirstBandOfAChannelledTurn() {
     )
 }
 
-@Test("a reused row moves the mark to the band the new turn shows")
+@Test("a reused row keeps the mark at the top of the band the new turn shows")
 @MainActor
-func reusedRowMovesTheMarkToTheBandTheNewTurnShows() {
+func reusedRowKeepsTheMarkAtTheTopOfTheBandTheNewTurnShows() {
     _ = NSApplication.shared
     let answer = "One assistant line."
     let document = MarkdownDocument.parse(answer).document
@@ -1665,8 +1691,8 @@ func reusedRowMovesTheMarkToTheBandTheNewTurnShows() {
     let row = laidOut.row
     let disclosureBand = bandRect(row.reasoningButtonForTesting, in: row)
     let markOnDisclosure = bandRect(row.markViewForTesting, in: row)
-    // The mark centres on the disclosure band it stands beside.
-    #expect(abs(markOnDisclosure.midY - disclosureBand.midY) <= 1)
+    // The mark stands at the top of the disclosure band it marks.
+    #expect(abs(markOnDisclosure.maxY - disclosureBand.maxY) <= 1)
 
     row.configure(
         turn: plain,
@@ -1682,21 +1708,15 @@ func reusedRowMovesTheMarkToTheBandTheNewTurnShows() {
     row.layoutSubtreeIfNeeded()
     let markOnAnswer = bandRect(row.markViewForTesting, in: row)
     let answerBand = bandRect(row.answerViewForTesting, in: row)
-    let font = NSFont.preferredFont(forTextStyle: .body)
 
-    // The mark centres on the first line of the answer it now stands beside.
-    #expect(
-        abs(
-            markOnAnswer.midY
-                - (answerBand.maxY - (font.ascender - font.capHeight / 2))
-        ) <= 1
-    )
-    // A disclosure band and a body line are two heights, so the two states
-    // resolve to two insets. The row must move the mark, or the row is stale.
-    // The test states the movement and not its direction. The direction is a
-    // property of the two fonts: the 13pt disclosure band holds the mark 1pt
-    // higher than the body line holds it.
-    #expect(abs(markOnAnswer.maxY - markOnDisclosure.maxY) >= 0.5)
+    // The reused row shows no disclosure, so the answer is now the first band
+    // and the mark stands at its top, beside the first line.
+    #expect(abs(markOnAnswer.maxY - answerBand.maxY) <= 1)
+    #expect(markOnAnswer.minY < answerBand.maxY)
+    // Every band starts at the top of the stack, so the mark's depth in the row
+    // is one value for every turn. This is what lets the row state the whole
+    // alignment in one constant and measure no band on reuse.
+    #expect(abs(markOnAnswer.maxY - markOnDisclosure.maxY) < 0.5)
 
     // The user's own turn shows no mark.
     row.configure(

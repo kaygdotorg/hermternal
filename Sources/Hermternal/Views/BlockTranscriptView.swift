@@ -1562,11 +1562,18 @@ final class TranscriptTurnRowView: NSTableCellView {
     private var onCopyCode: (String) -> Void = { _ in }
     private var bodyLeadingConstraints: [NSLayoutConstraint] = []
     private var bodyTrailingConstraints: [NSLayoutConstraint] = []
-    private var centeredConstraint: NSLayoutConstraint!
-    private var measureWidthConstraint: NSLayoutConstraint!
+    /// The transcript's content column: the band this row's turn lives in.
+    ///
+    /// Centred, one gutter on each side, and never wider than the readable
+    /// measure. Both speakers take their geometry from this one guide, so an
+    /// answer and the bubble under it cannot land in two different columns.
+    /// The agent stack fills the column. The outgoing bubble trails the
+    /// column's trailing edge and holds its share of the column's width.
+    private let column = NSLayoutGuide()
+    private var columnLeadingConstraint: NSLayoutConstraint!
+    private var columnTrailingConstraint: NSLayoutConstraint!
     private var stackTopConstraint: NSLayoutConstraint!
     private var stackBottomConstraint: NSLayoutConstraint!
-    private var markTopConstraint: NSLayoutConstraint!
     private var userTrailingConstraint: NSLayoutConstraint!
     private var userMaxWidthConstraint: NSLayoutConstraint!
     private var userTextWidthConstraint: NSLayoutConstraint!
@@ -1594,39 +1601,81 @@ final class TranscriptTurnRowView: NSTableCellView {
         stack.alignment = .leading
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
-        measureWidthConstraint = stack.widthAnchor.constraint(
+        addLayoutGuide(column)
+        let columnWidthConstraint = column.widthAnchor.constraint(
             equalTo: widthAnchor,
             constant: -2 * MessageTypography.transcriptInset
         )
-        measureWidthConstraint.priority = NSLayoutConstraint.Priority(999)
-        centeredConstraint = stack.centerXAnchor.constraint(equalTo: centerXAnchor)
-        // The tail tip, not the text, lands on the transcript gutter. The
-        // gutter, the tail, and the bubble's padding all sit outside the stack.
+        columnWidthConstraint.priority = NSLayoutConstraint.Priority(999)
+        NSLayoutConstraint.activate([
+            column.centerXAnchor.constraint(equalTo: centerXAnchor),
+            column.widthAnchor.constraint(
+                lessThanOrEqualToConstant: MessageTypography.readingMeasure
+            ),
+            column.widthAnchor.constraint(greaterThanOrEqualToConstant: 1),
+            columnWidthConstraint,
+            // A guide publishes no frame of its own. The two vertical pins
+            // cost the solver two constants and leave no axis undefined.
+            column.topAnchor.constraint(equalTo: topAnchor),
+            column.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        // An agent turn and a system turn fill the column. 999, not required:
+        // a window narrower than its two gutters resolves the column to its
+        // 1pt floor, and the stack must then shrink instead of breaking the
+        // required insets below.
+        columnLeadingConstraint = stack.leadingAnchor.constraint(
+            equalTo: column.leadingAnchor
+        )
+        columnLeadingConstraint.priority = NSLayoutConstraint.Priority(999)
+        columnTrailingConstraint = stack.trailingAnchor.constraint(
+            equalTo: column.trailingAnchor
+        )
+        columnTrailingConstraint.priority = NSLayoutConstraint.Priority(999)
+        // The tail tip, not the text, lands on the column's trailing edge, so
+        // a bubble ends exactly where an agent answer ends. The tail and the
+        // bubble's padding sit outside the stack.
         userTrailingConstraint = stack.trailingAnchor.constraint(
-            equalTo: trailingAnchor,
-            constant: -(MessageTypography.transcriptInset
-                + OutgoingBubbleGeometry.tailWidth
+            equalTo: column.trailingAnchor,
+            constant: -(OutgoingBubbleGeometry.tailWidth
                 + MessageTypography.outgoingBubblePaddingH)
         )
         userTrailingConstraint.isActive = false
+        // The bubble's box holds `outgoingBubbleShare` of the column at every
+        // window width, so the empty space on its leading side states the
+        // speaker. The share belongs to the box, so the tail and both paddings
+        // come off the stack's own width.
+        //
+        // 999, not required. A window narrower than two gutters resolves the
+        // column to its 1pt floor, where the share is a negative width, and a
+        // required cap would then fight the required `width >= 1` below. 999
+        // still outranks the measured width, which is all the cap has to beat.
         userMaxWidthConstraint = stack.widthAnchor.constraint(
-            lessThanOrEqualToConstant: MessageTypography.outgoingTextMeasure
+            lessThanOrEqualTo: column.widthAnchor,
+            multiplier: MessageTypography.outgoingBubbleShare,
+            constant: -(2 * MessageTypography.outgoingBubblePaddingH
+                + OutgoingBubbleGeometry.tailWidth)
         )
+        userMaxWidthConstraint.priority = NSLayoutConstraint.Priority(999)
         userMaxWidthConstraint.isActive = false
         // The measured fitting width, so a short bubble hugs its text.
         //
-        // 999, not `defaultHigh`. The answer view is an `NSTextView` whose
+        // 998, not `defaultHigh`. The answer view is an `NSTextView` whose
         // horizontal compression resistance is `defaultHigh`, so at 750 this
         // equality only tied with the text view's own intrinsic width and the
         // engine was free to satisfy either one. The stack then kept a width
-        // the measurement never asked for. 999 beats every optional constraint
+        // the measurement never asked for. 998 beats every optional constraint
         // the text view raises and still loses to the required leading inset,
         // so a window too narrow for the measured width shrinks the stack
         // instead of breaking the layout.
+        //
+        // One rank below the share cap, never level with it. The fallback
+        // constant is the measure of a full column, so on a narrower window the
+        // two disagree, and two constraints of one priority let the solver
+        // settle that disagreement wherever it likes.
         userTextWidthConstraint = stack.widthAnchor.constraint(
-            equalToConstant: MessageTypography.outgoingTextMeasure
+            equalToConstant: MessageTypography.widestOutgoingText
         )
-        userTextWidthConstraint.priority = NSLayoutConstraint.Priority(999)
+        userTextWidthConstraint.priority = NSLayoutConstraint.Priority(998)
         userTextWidthConstraint.isActive = false
         stackTopConstraint = stack.topAnchor.constraint(
             equalTo: topAnchor,
@@ -1636,13 +1685,14 @@ final class TranscriptTurnRowView: NSTableCellView {
             equalTo: bottomAnchor,
             constant: -MessageTypography.turnGap / 2
         )
+        // The column owns the readable measure, so the stack states no measure
+        // of its own. What stays required here is the gutter on each side and a
+        // width the solver cannot take to zero: both hold even at a width where
+        // the column's own optional constraints give way.
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: MessageTypography.transcriptInset),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -MessageTypography.transcriptInset),
-            centeredConstraint,
-            stack.widthAnchor.constraint(lessThanOrEqualToConstant: MessageTypography.readingMeasure),
             stackTopConstraint,
-            measureWidthConstraint,
             stack.widthAnchor.constraint(greaterThanOrEqualToConstant: 1),
             stackBottomConstraint
         ])
@@ -1673,27 +1723,30 @@ final class TranscriptTurnRowView: NSTableCellView {
                 constant: MessageTypography.outgoingBubblePaddingV
             )
         ])
-        // The mark stands in the gutter that `hermesIndent` opens, beside the
-        // first line of the turn. A band of its own would stand above the
+        // The mark stands in the gutter that `hermesIndent` opens, at the top
+        // of the turn's first band. A band of its own would stand above the
         // answer, and every band under it would then move it further from the
-        // line it marks.
+        // turn it marks.
+        //
+        // The box is an avatar beside a message: 28pt, taller than any line the
+        // renderer draws, so it takes the top of the first band and never the
+        // ink centre of a line. The stack pins its own top to the row and the
+        // first band the row shows stands at that top, whether that band is a
+        // disclosure, a copy button, or the answer. One constant therefore
+        // states the whole alignment, and no reuse has to measure a band.
         markView.imageScaling = .scaleProportionallyUpOrDown
         markView.setAccessibilityElement(false)
         markView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(markView)
-        markTopConstraint = markView.topAnchor.constraint(
-            equalTo: stack.topAnchor,
-            constant: MarkGeometry.topInset(
-                lineCenter: MarkGeometry.textLineCenter(
-                    font: NSFont.preferredFont(forTextStyle: .body)
-                )
-            )
-        )
         NSLayoutConstraint.activate([
             markView.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
-            markView.widthAnchor.constraint(equalToConstant: MarkGeometry.side),
-            markView.heightAnchor.constraint(equalToConstant: MarkGeometry.side),
-            markTopConstraint
+            markView.widthAnchor.constraint(
+                equalToConstant: MessageTypography.markSide
+            ),
+            markView.heightAnchor.constraint(
+                equalToConstant: MessageTypography.markSide
+            ),
+            markView.topAnchor.constraint(equalTo: stack.topAnchor)
         ])
         roleLabel.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
         roleLabel.textColor = .secondaryLabelColor
@@ -1807,11 +1860,11 @@ final class TranscriptTurnRowView: NSTableCellView {
         isOutgoing = false
         outgoingFindQuery = ""
         bubble.isHidden = true
-        centeredConstraint.isActive = true
+        columnLeadingConstraint.isActive = true
+        columnTrailingConstraint.isActive = true
         userTrailingConstraint.isActive = false
         userMaxWidthConstraint.isActive = false
         userTextWidthConstraint.isActive = false
-        measureWidthConstraint.isActive = true
         stackTopConstraint.constant = MessageTypography.turnGap / 2
         stackBottomConstraint.constant = -MessageTypography.turnGap / 2
         roleLabel.isHidden = true
@@ -1857,15 +1910,17 @@ final class TranscriptTurnRowView: NSTableCellView {
         roleLabel.isHidden = turn.speaker != .system
         isOutgoing = isUser
         outgoingFindQuery = isUser ? findQuery : ""
-        centeredConstraint.isActive = !isUser
+        columnLeadingConstraint.isActive = !isUser
+        columnTrailingConstraint.isActive = !isUser
         userTrailingConstraint.isActive = isUser
         userMaxWidthConstraint.isActive = isUser
-        // A full-row width equality at priority 999 holds an outgoing stack at
-        // its cap on any wide window, so a one-word bubble could never shrink.
-        measureWidthConstraint.isActive = !isUser
         userTextWidthConstraint.isActive = isUser
+        // The measured fitting width, or the widest text the column can hold
+        // until the measurement lands. Either value meets the share cap above,
+        // which is required and column-relative, so a wide window cannot widen
+        // a bubble past its share and a one-word bubble still hugs its text.
         userTextWidthConstraint.constant = outgoingTextWidth
-            ?? MessageTypography.outgoingTextMeasure
+            ?? MessageTypography.widestOutgoingText
         // The bubble's padding sits inside the same row band an agent row uses,
         // so both speakers keep one turn rhythm and consecutive bubbles stay
         // exactly `turnGap` apart.
@@ -1959,94 +2014,10 @@ final class TranscriptTurnRowView: NSTableCellView {
             metadataStack.isHidden = modelLabel.isHidden && reasoningLabel.isHidden
             metadataStack.alphaValue = metadataAlwaysVisible ? 1 : 0
         }
-        // The mark follows the bands, so the row aligns it after it sets which
-        // bands it shows.
-        if isHermes { alignMark() }
         // A row recycled from `configureLoading` keeps announcing "Loading
         // transcript row" until a configured row replaces the label.
         setAccessibilityLabel(turn.speaker.label)
         needsLayout = true
-    }
-
-    /// Puts the mark beside the first line of the turn's first band.
-    ///
-    /// The stack pins its own top to the row, and the first band the row shows
-    /// stands at that top. One constant therefore states the whole alignment.
-    /// A turn with reasoning or tools shows a disclosure band first. An answer
-    /// with code shows the copy band first. Every other turn shows the answer
-    /// band first. A constant costs one layout pass. A separate anchor for each
-    /// band would need constraint activation on every reuse.
-    private func alignMark() {
-        let lineCenter: CGFloat
-        if !reasoningButton.isHidden {
-            lineCenter = MarkGeometry.controlLineCenter(of: reasoningButton)
-        } else if !toolsButton.isHidden {
-            lineCenter = MarkGeometry.controlLineCenter(of: toolsButton)
-        } else if !copyButton.isHidden {
-            lineCenter = MarkGeometry.controlLineCenter(of: copyButton)
-        } else {
-            lineCenter = MarkGeometry.textLineCenter(font: firstAnswerFont())
-        }
-        let inset = MarkGeometry.topInset(lineCenter: lineCenter)
-        // A write to a constant invalidates the layout, and a row is
-        // reconfigured on every reuse during a scroll. Most rows resolve to the
-        // same inset, so the row writes only a changed value.
-        guard markTopConstraint.constant != inset else { return }
-        markTopConstraint.constant = inset
-    }
-
-    /// The font of the answer's first character.
-    ///
-    /// A turn can start with a heading, and a heading line is taller than a
-    /// body line. The attributed answer already carries the font, so the row
-    /// reads it instead of assuming the body font.
-    private func firstAnswerFont() -> NSFont {
-        let body = NSFont.preferredFont(forTextStyle: .body)
-        guard let storage = answerView.textStorage, storage.length > 0 else {
-            return body
-        }
-        return storage.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
-            ?? body
-    }
-
-    /// The mark's box beside one line of text.
-    ///
-    /// The mark is a drawing, so it carries no text baseline. A square drawing
-    /// looks aligned when its box holds the cap height of the line beside it in
-    /// the centre. The capital letters are the ink that states where the line
-    /// is. The row finds the centre of that ink. The row then puts the centre
-    /// of the mark on it. Every value comes from the current text metrics, so
-    /// the mark follows a text-size change with no new number.
-    @MainActor
-    private enum MarkGeometry {
-        /// The mark's side, in points.
-        ///
-        /// The side plus a 6pt gap fills `hermesIndent` exactly, so the mark
-        /// stands in the gutter and never under the text of the turn. The
-        /// gutter is a fixed width, so the side is a fixed width as well. A
-        /// larger text size moves the mark's centre, not its size, and the
-        /// mark keeps the gutter it was drawn for.
-        static let side: CGFloat = 14
-
-        /// The distance from the top of a text band to the centre of the cap
-        /// height of its first line.
-        static func textLineCenter(font: NSFont) -> CGFloat {
-            font.ascender - font.capHeight / 2
-        }
-
-        /// The distance from the top of a control band to the centre of its
-        /// title.
-        ///
-        /// A disclosure band and a copy band hold one line each, so the centre
-        /// of the title is half the height the control asks for.
-        static func controlLineCenter(of control: NSControl) -> CGFloat {
-            control.intrinsicContentSize.height / 2
-        }
-
-        /// The mark's top inset, measured down from the top of the first band.
-        static func topInset(lineCenter: CGFloat) -> CGFloat {
-            max(0, (lineCenter - side / 2).rounded())
-        }
     }
 
     /// Re-resolves the bubble's colours after a system colour, appearance, or
@@ -2325,26 +2296,25 @@ private enum TranscriptTurnTextRenderer {
         }
     }
 
+    /// The width the measurement pass lays one turn's text out in.
+    ///
+    /// The width is the constraint chain of the row, restated for a pass that
+    /// runs with no views. Both come from `MessageTypography.contentColumn`, so
+    /// a measured height and the height the row lays out cannot disagree.
     static func effectiveWidth(
         for turn: TranscriptTurn,
         availableWidth: CGFloat
     ) -> CGFloat {
-        let outer = max(1, min(MessageTypography.readingMeasure, availableWidth - 40))
+        let column = MessageTypography.contentColumn(in: availableWidth)
         switch turn.speaker {
         case .me:
-            // The tail and both bubble paddings come off the width before the
-            // text gets any. `outer` already removed both transcript insets, so
-            // the tail and the padding are all that remains to remove.
-            return max(1, min(
-                outer
-                    - 2 * MessageTypography.outgoingBubblePaddingH
-                    - OutgoingBubbleGeometry.tailWidth,
-                MessageTypography.outgoingTextMeasure
-            ))
+            // The bubble's box holds its share of the column. The tail and both
+            // paddings come off that box before the text gets any.
+            return MessageTypography.outgoingTextMeasure(in: column)
         case .hermes:
-            return max(1, outer - MessageTypography.hermesIndent)
+            return max(1, column - MessageTypography.hermesIndent)
         case .system:
-            return outer
+            return column
         }
     }
 
