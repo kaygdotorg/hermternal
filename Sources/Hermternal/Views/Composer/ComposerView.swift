@@ -285,13 +285,19 @@ struct ComposerView: View {
                     .accessibilityLabel("Source error: \(error.message)")
             }
         }
-        .animation(
-            reduceMotion
-                ? nil
-                : .easeInOut(
-                    duration: ComposerEditorInteractionPolicy.formattingRowTransitionDuration
-                ),
-            value: isEditorFocused
+        .animation(formattingRowAnimation, value: isEditorFocused)
+        .animation(formattingRowAnimation, value: isFormattingExpanded)
+    }
+
+    /// The Format row travels with focus and with explicit disclosure.
+    ///
+    /// Reduced motion keeps the same path at duration zero, matching
+    /// `TranscriptMotion.duration(reducesMotion:)`.
+    private var formattingRowAnimation: Animation {
+        .easeInOut(
+            duration: ComposerEditorInteractionPolicy.formattingRowAnimationDuration(
+                reducesMotion: reduceMotion
+            )
         )
     }
 

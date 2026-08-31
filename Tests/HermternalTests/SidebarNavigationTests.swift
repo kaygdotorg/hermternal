@@ -444,6 +444,23 @@ func nonPointerActivationIgnoresPriorPointerCycle() {
     #expect(opened == ["chat", "chat"])
 }
 
+@Test("Folder drops reject unrecognized external text")
+@MainActor
+func folderDropsRejectUnrecognizedExternalText() {
+    let foreign = NSItemProvider(object: "Notes text" as NSString)
+    #expect(!SidebarDragPayload.accepts([foreign]))
+    #expect(!SidebarDragPayload.isRecognized("Notes text"))
+    #expect(!SidebarDragPayload.isRecognized(""))
+    #expect(!SidebarDragPayload.isRecognized("hermternal-sidebar:v2:not-base64"))
+    #expect(!SidebarDragPayload.accepts([SidebarDragPayload.provider(sessionIDs: [])]))
+
+    let chats = SidebarDragPayload.provider(sessionIDs: ["chat-1", "chat-2"])
+    let folders = SidebarDragPayload.provider(folderIDs: ["work"])
+    #expect(SidebarDragPayload.accepts([chats]))
+    #expect(SidebarDragPayload.accepts([folders]))
+    #expect(SidebarDragPayload.accepts([foreign, chats]))
+}
+
 /// A transcript source that holds every authoritative stream open until the
 /// test cancels it.
 ///

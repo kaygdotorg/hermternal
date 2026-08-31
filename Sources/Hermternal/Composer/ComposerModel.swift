@@ -545,6 +545,22 @@ final class ComposerModel {
     /// One line that names work in flight. It is nil when nothing is running,
     /// so no indicator can claim progress that does not exist.
     var statusDescription: String? {
+        switch recordingStatus {
+        case .requestingPermission:
+            return "Preparing"
+        case .finishing:
+            return "Saving"
+        case .recording, .idle, .unavailable:
+            break
+        }
+        switch dictationStatus {
+        case .preparing:
+            return "Preparing"
+        case .installingModel(_):
+            return "Installing"
+        case .listening, .idle, .unavailable:
+            break
+        }
         switch activity {
         case .idle:
             return nil
@@ -603,16 +619,50 @@ final class ComposerModel {
 
     var canAttach: Bool { !route.isReadOnly && attachmentSlotsLeft > 0 }
 
+    /// True when the dictation control may start or stop listening.
+    ///
+    /// Preparing and model install are in-flight work owned by `dictationTask`.
+    /// The control stays disabled until that work settles. Defended by
+    /// dictationPreparingAndInstallDisableTheControl.
     var canDictate: Bool {
         guard dictation != nil, !route.isReadOnly else { return false }
-        if case .unavailable = dictationStatus { return false }
-        return recordingStatus == .idle || dictationStatus == .listening
+        switch dictationStatus {
+        case .listening:
+            return true
+        case .idle:
+            // Unavailable recording is not using the microphone.
+            switch recordingStatus {
+            case .idle, .unavailable:
+                return true
+            case .requestingPermission, .recording, .finishing:
+                return false
+            }
+        case .preparing, .installingModel(_), .unavailable:
+            return false
+        }
     }
 
+    /// True when the record control may start or stop capture.
+    ///
+    /// Permission request and save are in-flight work owned by `recordingTask`.
+    /// The control stays disabled until that work settles. Defended by
+    /// recordingPermissionAndSaveDisableTheControl.
     var canRecord: Bool {
         guard recorder != nil, !route.isReadOnly, attachmentSlotsLeft > 0 else { return false }
-        if case .unavailable = recordingStatus { return false }
-        return dictationStatus == .idle || recordingStatus == .recording
+        switch recordingStatus {
+        case .recording:
+            return true
+        case .idle:
+            // Unavailable dictation is not using the microphone.
+            switch dictationStatus {
+            case .idle, .unavailable:
+                return true
+            case .preparing, .installingModel(_), .listening:
+                return false
+            }
+        case .requestingPermission, .finishing, .unavailable:
+            return false
+        }
     }
 
     func submit() {
@@ -1710,9 +1760,7 @@ final class ComposerModel {
     private func runDictation(_ dictation: any SpeechDictating, target: ComposerRouteToken) async {
         defer {
             dictationTask = nil
-            if dictationStatus == .listening || dictationStatus == .preparing {
-                dictationStatus = .idle
-            }
+            resetInFlightDictationStatus()
         }
         dictationStatus = .preparing
         switch await dictation.availability() {
@@ -1754,10 +1802,19 @@ final class ComposerModel {
         guard let dictation, dictationTask != nil else { return }
         dictationTask?.cancel()
         dictationTask = nil
-        if dictationStatus == .listening || dictationStatus == .preparing {
-            dictationStatus = .idle
-        }
+        resetInFlightDictationStatus()
         Task { await dictation.cancel() }
+    }
+
+    /// Returns an in-flight dictation status to idle. Terminal unavailable
+    /// reasons stay, because they still name why the control is closed.
+    private func resetInFlightDictationStatus() {
+        switch dictationStatus {
+        case .listening, .preparing, .installingModel(_):
+            dictationStatus = .idle
+        case .idle, .unavailable:
+            break
+        }
     }
 
     // MARK: - Audio recording

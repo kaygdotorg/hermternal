@@ -175,5 +175,12 @@ struct ComposerEditorStateTests {
             hasSource: false
         ))
         #expect(ComposerEditorInteractionPolicy.formattingRowTransitionDuration == 0.12)
+        #expect(
+            ComposerEditorInteractionPolicy.formattingRowAnimationDuration(reducesMotion: true) == 0
+        )
+        #expect(
+            ComposerEditorInteractionPolicy.formattingRowAnimationDuration(reducesMotion: false)
+                == ComposerEditorInteractionPolicy.formattingRowTransitionDuration
+        )
     }
 }

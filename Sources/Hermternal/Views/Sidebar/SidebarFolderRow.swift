@@ -14,12 +14,20 @@ import HermternalCore
 ///
 /// The two prefixes are what keeps a folder id and a session id apart: they
 /// land on the same row and mean entirely different things. Any text without
-/// one of them parses to `nil` and changes nothing, which is also what any
-/// text dragged in from another application does.
+/// one of them parses to `nil`. A folder row therefore rejects that drop,
+/// including text dragged in from another application.
 enum SidebarDragPayload {
     /// `NSString` keeps the proven item-provider drag/drop route working in a
     /// sidebar List. The envelope is versioned and carries one typed batch.
     static let carrier = UTType.text
+
+    /// Marks an in-process provider as an app-owned sidebar envelope.
+    ///
+    /// The drop target still advertises plain text, because a custom `UTType`
+    /// has to live in Info.plist before AppKit will match it. This identifier
+    /// is registered only on providers this type creates, so a folder row can
+    /// refuse foreign text before it advertises acceptance.
+    static let recognizedIdentifier = "app.hermternal.sidebar-payload"
 
     private static let envelopePrefix = "hermternal-sidebar:v2:"
     private static let version = 2
@@ -67,12 +75,37 @@ enum SidebarDragPayload {
         ids(from: payload, kind: .folder)
     }
 
+    /// True when the string is an app-owned chat or folder envelope.
+    static func isRecognized(_ payload: String) -> Bool {
+        sessionIDs(from: payload) != nil || folderIDs(from: payload) != nil
+    }
+
+    /// True when a drop already holds a registered app-owned envelope.
+    ///
+    /// External text uses the same carrier type. The row must refuse it
+    /// before returning from `onDrop`, or macOS shows an accepted drop that
+    /// then changes nothing. Defended by folderDropsRejectUnrecognizedExternalText.
+    static func accepts(_ providers: [NSItemProvider]) -> Bool {
+        providers.contains { provider in
+            provider.hasItemConformingToTypeIdentifier(recognizedIdentifier)
+        }
+    }
+
     private static func provider(envelope: Envelope) -> NSItemProvider {
         guard !envelope.ids.isEmpty,
               let data = try? JSONEncoder().encode(envelope)
         else { return NSItemProvider(object: "" as NSString) }
         let payload = envelopePrefix + data.base64EncodedString()
-        return NSItemProvider(object: payload as NSString)
+        let provider = NSItemProvider(object: payload as NSString)
+        let payloadData = Data(payload.utf8)
+        provider.registerDataRepresentation(
+            forTypeIdentifier: recognizedIdentifier,
+            visibility: .ownProcess
+        ) { completion in
+            completion(payloadData, nil)
+            return nil
+        }
+        return provider
     }
 
     private static func ids(from payload: String, kind: Envelope.Kind) -> [String]? {
@@ -189,6 +222,7 @@ struct SidebarFolderRow: View {
             return SidebarDragPayload.provider(folderIDs: ids)
         }
         .onDrop(of: [SidebarDragPayload.carrier], isTargeted: $isTargeted) { providers in
+            guard SidebarDragPayload.accepts(providers) else { return false }
             let targetID = target.id
             Task {
                 let folderIDs = await sidebarDraggedIDs(

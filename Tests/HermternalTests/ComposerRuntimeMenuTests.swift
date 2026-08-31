@@ -1092,6 +1092,92 @@ func shutdownCancelsStartingRecorder() async {
     #expect(model.recordingStatus == .idle)
 }
 
+@Test("Dictation preparing and model install disable the control")
+@MainActor
+func dictationPreparingAndInstallDisableTheControl() async {
+    let preparing = MicrophoneTransitionDictationSpy(stall: .availability)
+    let preparingModel = makeRuntimeMenuModel(
+        route: ComposerRoute(identity: "dictate-preparing", generation: 1),
+        runtime: RuntimeMenuSpy(),
+        dictation: preparing
+    )
+    #expect(preparingModel.canDictate)
+    #expect(preparingModel.statusDescription == nil)
+
+    preparingModel.toggleDictation()
+    await preparing.waitUntilAvailability()
+    #expect(preparingModel.dictationStatus == .preparing)
+    #expect(!preparingModel.canDictate)
+    #expect(preparingModel.statusDescription == "Preparing")
+    preparingModel.toggleDictation()
+    #expect(preparingModel.dictationStatus == .preparing)
+    preparingModel.shutdown()
+    await preparing.waitUntilCancel()
+    #expect(preparingModel.dictationStatus == .idle)
+    #expect(preparingModel.statusDescription == nil)
+
+    let installing = MicrophoneTransitionDictationSpy(
+        stall: .prepare,
+        availability: .needsModelInstall(locale: "en-US")
+    )
+    let installingModel = makeRuntimeMenuModel(
+        route: ComposerRoute(identity: "dictate-install", generation: 1),
+        runtime: RuntimeMenuSpy(),
+        dictation: installing
+    )
+    installingModel.toggleDictation()
+    await installing.waitUntilPrepare()
+    #expect(installingModel.dictationStatus == .installingModel(locale: "en-US"))
+    #expect(!installingModel.canDictate)
+    #expect(installingModel.statusDescription == "Installing")
+    installingModel.shutdown()
+    await installing.waitUntilCancel()
+    #expect(installingModel.dictationStatus == .idle)
+}
+
+@Test("Recording permission and save disable the control")
+@MainActor
+func recordingPermissionAndSaveDisableTheControl() async throws {
+    let recorder = MicrophoneTransitionRecordingSpy()
+    let model = makeRuntimeMenuModel(
+        route: ComposerRoute(identity: "record-busy", generation: 1),
+        runtime: RuntimeMenuSpy(),
+        dictation: RuntimeMenuDictationSpy(),
+        recorder: recorder
+    )
+    #expect(model.canRecord)
+    #expect(model.statusDescription == nil)
+
+    model.toggleRecording()
+    await recorder.waitUntilPermission()
+    #expect(model.recordingStatus == .requestingPermission)
+    #expect(!model.canRecord)
+    #expect(model.statusDescription == "Preparing")
+    model.toggleRecording()
+    #expect(model.recordingStatus == .requestingPermission)
+
+    await recorder.releasePermission()
+    await recorder.waitUntilStart()
+    let isRecording = await waitForRuntimeMenuModel(model) { $0.recordingStatus == .recording }
+    #expect(isRecording)
+    #expect(model.canRecord)
+    #expect(model.statusDescription?.hasPrefix("Recording") == true)
+
+    model.toggleRecording()
+    await recorder.waitUntilStop()
+    #expect(model.recordingStatus == .finishing)
+    #expect(!model.canRecord)
+    #expect(model.statusDescription == "Saving")
+    model.toggleRecording()
+    #expect(model.recordingStatus == .finishing)
+
+    try await recorder.releaseStop()
+    await recorder.waitUntilStopReleased()
+    let isIdle = await waitForRuntimeMenuModel(model) { $0.recordingStatus == .idle }
+    #expect(isIdle)
+    #expect(model.canRecord)
+}
+
 @Test("An out-of-order unmount does not block submit")
 @MainActor
 func outOfOrderUnmountDoesNotBlockSubmit() async {
@@ -1202,6 +1288,19 @@ func routeChangesCancelRuntimeMenuWorkWithoutDisturbingReplacement() async {
     #expect(model.inventory == .loaded(runtimeMenuInventory))
     #expect(model.modelSelection.pending == "beta")
     #expect(model.canChangeRuntime)
+}
+
+@MainActor
+private func waitForRuntimeMenuModel(
+    _ model: ComposerModel,
+    holds: @MainActor (ComposerModel) -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now + .seconds(2)
+    while !holds(model) {
+        if ContinuousClock.now >= deadline { return false }
+        await Task.yield()
+    }
+    return true
 }
 
 @MainActor
@@ -1331,6 +1430,251 @@ private actor RuntimeMenuDictationSpy: SpeechDictating {
     func stop() async {}
 
     func cancel() async {}
+}
+
+private actor MicrophoneTransitionDictationSpy: SpeechDictating {
+    enum Stall: Sendable {
+        case availability
+        case prepare
+    }
+
+    private let stall: Stall
+    private let availabilityResult: DictationAvailability
+    private var availabilityStarted = false
+    private var availabilityWaiters: [CheckedContinuation<Void, Never>] = []
+    private var prepareStarted = false
+    private var prepareWaiters: [CheckedContinuation<Void, Never>] = []
+    private var cancelled = false
+    private var cancelWaiters: [CheckedContinuation<Void, Never>] = []
+    private var availabilityReleased = false
+    private var availabilityReleaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var prepareReleased = false
+    private var prepareReleaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(
+        stall: Stall,
+        availability: DictationAvailability = .available
+    ) {
+        self.stall = stall
+        self.availabilityResult = availability
+    }
+
+    func availability() async -> DictationAvailability {
+        availabilityStarted = true
+        resume(&availabilityWaiters)
+        if stall == .availability {
+            guard !availabilityReleased else { return availabilityResult }
+            await withCheckedContinuation { continuation in
+                if availabilityReleased {
+                    continuation.resume()
+                } else {
+                    availabilityReleaseWaiters.append(continuation)
+                }
+            }
+        }
+        return availabilityResult
+    }
+
+    func prepare() async throws {
+        prepareStarted = true
+        resume(&prepareWaiters)
+        if stall == .prepare {
+            guard !prepareReleased else { return }
+            await withCheckedContinuation { continuation in
+                if prepareReleased {
+                    continuation.resume()
+                } else {
+                    prepareReleaseWaiters.append(continuation)
+                }
+            }
+        }
+    }
+
+    func start() async throws -> AsyncThrowingStream<DictationUpdate, any Error> {
+        throw CancellationError()
+    }
+
+    func stop() async {}
+
+    func cancel() async {
+        cancelled = true
+        availabilityReleased = true
+        prepareReleased = true
+        resume(&availabilityReleaseWaiters)
+        resume(&prepareReleaseWaiters)
+        resume(&cancelWaiters)
+    }
+
+    func waitUntilAvailability() async {
+        guard !availabilityStarted else { return }
+        await withCheckedContinuation { continuation in
+            if availabilityStarted {
+                continuation.resume()
+            } else {
+                availabilityWaiters.append(continuation)
+            }
+        }
+    }
+
+    func waitUntilPrepare() async {
+        guard !prepareStarted else { return }
+        await withCheckedContinuation { continuation in
+            if prepareStarted {
+                continuation.resume()
+            } else {
+                prepareWaiters.append(continuation)
+            }
+        }
+    }
+
+    func waitUntilCancel() async {
+        guard !cancelled else { return }
+        await withCheckedContinuation { continuation in
+            if cancelled {
+                continuation.resume()
+            } else {
+                cancelWaiters.append(continuation)
+            }
+        }
+    }
+
+    private func resume(_ waiters: inout [CheckedContinuation<Void, Never>]) {
+        let activeWaiters = waiters
+        waiters.removeAll(keepingCapacity: true)
+        for waiter in activeWaiters {
+            waiter.resume()
+        }
+    }
+}
+
+private actor MicrophoneTransitionRecordingSpy: AudioRecording {
+    private var permissionStarted = false
+    private var permissionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var permissionReleased = false
+    private var permissionReleaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var started = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var stopStarted = false
+    private var stopWaiters: [CheckedContinuation<Void, Never>] = []
+    private var stopReleased = false
+    private var stopReleaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var stopFinished = false
+    private var stopFinishedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var stopResult: AudioRecordingResult?
+    private var cancelled = false
+
+    func requestPermission() async -> Bool {
+        permissionStarted = true
+        resume(&permissionWaiters)
+        guard !permissionReleased else { return !cancelled }
+        await withCheckedContinuation { continuation in
+            if permissionReleased {
+                continuation.resume()
+            } else {
+                permissionReleaseWaiters.append(continuation)
+            }
+        }
+        return !cancelled
+    }
+
+    func start(into _: URL) async throws {
+        started = true
+        resume(&startWaiters)
+    }
+
+    func stop() async throws -> AudioRecordingResult {
+        stopStarted = true
+        resume(&stopWaiters)
+        if !stopReleased {
+            await withCheckedContinuation { continuation in
+                if stopReleased {
+                    continuation.resume()
+                } else {
+                    stopReleaseWaiters.append(continuation)
+                }
+            }
+        }
+        stopFinished = true
+        resume(&stopFinishedWaiters)
+        guard let stopResult else {
+            throw CancellationError()
+        }
+        return stopResult
+    }
+
+    func cancel() async {
+        cancelled = true
+        permissionReleased = true
+        stopReleased = true
+        resume(&permissionReleaseWaiters)
+        resume(&stopReleaseWaiters)
+    }
+
+    func waitUntilPermission() async {
+        guard !permissionStarted else { return }
+        await withCheckedContinuation { continuation in
+            if permissionStarted {
+                continuation.resume()
+            } else {
+                permissionWaiters.append(continuation)
+            }
+        }
+    }
+
+    func waitUntilStart() async {
+        guard !started else { return }
+        await withCheckedContinuation { continuation in
+            if started {
+                continuation.resume()
+            } else {
+                startWaiters.append(continuation)
+            }
+        }
+    }
+
+    func waitUntilStop() async {
+        guard !stopStarted else { return }
+        await withCheckedContinuation { continuation in
+            if stopStarted {
+                continuation.resume()
+            } else {
+                stopWaiters.append(continuation)
+            }
+        }
+    }
+
+    func waitUntilStopReleased() async {
+        guard !stopFinished else { return }
+        await withCheckedContinuation { continuation in
+            if stopFinished {
+                continuation.resume()
+            } else {
+                stopFinishedWaiters.append(continuation)
+            }
+        }
+    }
+
+    func releasePermission() {
+        permissionReleased = true
+        resume(&permissionReleaseWaiters)
+    }
+
+    func releaseStop() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appending(path: "hermternal-mic-\(UUID().uuidString).m4a")
+        try Data([0]).write(to: url)
+        stopResult = AudioRecordingResult(fileURL: url, duration: .seconds(1), byteCount: 1)
+        stopReleased = true
+        resume(&stopReleaseWaiters)
+    }
+
+    private func resume(_ waiters: inout [CheckedContinuation<Void, Never>]) {
+        let activeWaiters = waiters
+        waiters.removeAll(keepingCapacity: true)
+        for waiter in activeWaiters {
+            waiter.resume()
+        }
+    }
 }
 
 private actor RuntimeMenuRecordingSpy: AudioRecording {

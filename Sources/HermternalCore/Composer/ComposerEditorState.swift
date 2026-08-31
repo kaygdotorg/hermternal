@@ -175,6 +175,14 @@ public enum ComposerEditorHeightPolicy {
 public enum ComposerEditorInteractionPolicy {
     public static let formattingRowTransitionDuration: Double = 0.12
 
+    /// Duration of the formatting-row reveal.
+    ///
+    /// Reduced motion drops the travel and keeps the same path, matching
+    /// `TranscriptMotion.duration(reducesMotion:)`.
+    public static func formattingRowAnimationDuration(reducesMotion: Bool) -> Double {
+        reducesMotion ? 0 : formattingRowTransitionDuration
+    }
+
     public static func formattingRowIsVisible(
         isEditorFocused: Bool,
         isExpanded: Bool,
