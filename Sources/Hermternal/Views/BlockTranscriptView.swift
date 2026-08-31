@@ -1,6 +1,7 @@
 import AppKit
 import CoreText
 import HermternalCore
+import QuartzCore
 import SwiftUI
 
 /// A full-width, centred transcript adapter for AppKit.
@@ -1080,10 +1081,7 @@ struct BlockTranscriptView: NSViewRepresentable {
                     }
                     if !indexes.isEmpty {
                         self.correctingHeights {
-                            self.table.reloadData(
-                                forRowIndexes: indexes,
-                                columnIndexes: IndexSet(integer: 0)
-                            )
+                            self.applyMeasuredLayouts(indexes)
                             self.table.noteHeightOfRows(withIndexesChanged: indexes)
                             self.container?.layoutTableDocument()
                         }
@@ -1096,25 +1094,132 @@ struct BlockTranscriptView: NSViewRepresentable {
             }
         }
 
+        /// Hands one landed measurement to the rows that are on screen.
+        ///
+        /// A measurement changes two things and no others. The height, which
+        /// the table asks the delegate for again, and the outgoing bubble's
+        /// fitting width, which lives in the row. The renderer therefore writes
+        /// that one number instead of reloading the row: a reload asks the
+        /// delegate for the view again, and the row that comes back rebuilds
+        /// the answer's attributed string and drops the reader's selection.
+        /// Measurements land for every visible row while an answer streams, so
+        /// that rebuild IS the refresh a reader reports.
+        ///
+        /// A row that is not materialised needs nothing: `viewFor` reads the
+        /// same cache when the row arrives.
+        private func applyMeasuredLayouts(_ indexes: IndexSet) {
+            let width = table.bounds.width
+            for ordinal in indexes {
+                guard let loaded = loadedTurns[ordinal],
+                      loaded.turn.speaker == .me,
+                      let row = table.view(
+                        atColumn: 0,
+                        row: ordinal,
+                        makeIfNecessary: false
+                      ) as? TranscriptTurnRowView
+                else { continue }
+                let effectiveWidth = TranscriptTurnTextRenderer.effectiveWidth(
+                    for: loaded.turn,
+                    availableWidth: width
+                )
+                guard let layout = measuredDocuments.layout(
+                    for: ordinal,
+                    turn: loaded.turn,
+                    effectiveWidth: effectiveWidth,
+                    disclosure: MeasuredDocumentCache.DisclosureState(
+                        reasoningExpanded: expandedReasoning.contains(loaded.turn.id),
+                        toolsExpanded: expandedTools.contains(loaded.turn.id)
+                    )
+                ) else { continue }
+                row.applyOutgoingTextWidth(layout.textWidth)
+            }
+        }
+
 
         private func toggleReasoning(_ id: String) {
             if expandedReasoning.contains(id) { expandedReasoning.remove(id) }
             else { expandedReasoning.insert(id) }
-            reloadTurn(id)
+            revealDisclosure(id)
         }
 
         private func toggleTools(_ id: String) {
             if expandedTools.contains(id) { expandedTools.remove(id) }
             else { expandedTools.insert(id) }
-            reloadTurn(id)
+            revealDisclosure(id)
         }
 
-        private func reloadTurn(_ id: String) {
-            guard let ordinal = loadedTurns.first(where: { entry in entry.value.turn.id == id })?.key else { return }
-            let indexes = IndexSet(integer: ordinal)
-            table.reloadData(forRowIndexes: indexes, columnIndexes: IndexSet(integer: 0))
-            table.noteHeightOfRows(withIndexesChanged: indexes)
-            container?.layoutTableDocument()
+        /// Applies one disclosure change to the row that carries it.
+        ///
+        /// Three things happen here, and each one removes a part of the refresh
+        /// a reader used to see.
+        ///
+        /// The row reconfigures IN PLACE. The renderer never reloads it: a
+        /// reload asks the delegate for the view again, and the row that comes
+        /// back rebuilds the answer's attributed string and drops the reader's
+        /// selection, for a change that is only a band becoming visible.
+        ///
+        /// The new height is measured BEFORE the table asks for it. The
+        /// disclosure state is part of the measurement key, so a toggle always
+        /// misses the cache, and `heightOfRow` would answer with
+        /// `provisionalHeight`. That estimate counts one line for every 24
+        /// points of measure and overshoots a real reasoning band several times
+        /// over, so the row would travel to a wrong height and snap back when
+        /// the detached pass lands: two height changes for one click. The
+        /// document is already parsed here, so the measurement is one
+        /// framesetter pass for one row.
+        ///
+        /// The height change then travels inside one animation, with the
+        /// clicked row's own top edge held. A row grows and shrinks downwards,
+        /// so that edge does not move and the anchor writes nothing; it is
+        /// stated because the reader's place is the contract, not the arithmetic
+        /// that happens to hold it.
+        private func revealDisclosure(_ id: String) {
+            guard let ordinal = loadedTurns.first(
+                where: { entry in entry.value.turn.id == id }
+            )?.key, let loaded = loadedTurns[ordinal] else { return }
+            let turn = loaded.turn
+            let disclosure = MeasuredDocumentCache.DisclosureState(
+                reasoningExpanded: expandedReasoning.contains(id),
+                toolsExpanded: expandedTools.contains(id)
+            )
+            let width = TranscriptTurnTextRenderer.effectiveWidth(
+                for: turn,
+                availableWidth: table.bounds.width
+            )
+            measuredDocuments.remeasureIfNeeded(
+                turn: turn,
+                ordinal: ordinal,
+                width: width,
+                disclosure: disclosure
+            ) { turn, document, width in
+                TranscriptTurnTextRenderer.measuredLayout(
+                    turn: turn,
+                    document: document,
+                    width: width,
+                    reasoningExpanded: disclosure.reasoningExpanded,
+                    toolsExpanded: disclosure.toolsExpanded
+                ).height
+            }
+            let row = table.view(
+                atColumn: 0,
+                row: ordinal,
+                makeIfNecessary: false
+            ) as? TranscriptTurnRowView
+            row?.applyDisclosure(
+                reasoningExpanded: disclosure.reasoningExpanded,
+                toolsExpanded: disclosure.toolsExpanded
+            )
+            let anchor = TranscriptViewportAnchoring.anchor(ofRow: ordinal, in: table)
+            TranscriptMotion.runRowHeightChange {
+                table.noteHeightOfRows(withIndexesChanged: IndexSet(integer: ordinal))
+                container?.layoutTableDocument()
+            }
+            if let anchor {
+                TranscriptViewportAnchoring.restore(anchor, in: table)
+            }
+            // The measurement above needs a parsed document. A row whose
+            // document has not landed keeps its estimate, and the detached pass
+            // corrects it under `correctingHeights` as it always has.
             scheduleVisibleMeasurements(at: table.bounds.width)
         }
 
@@ -1367,6 +1472,25 @@ enum TranscriptViewportAnchoring {
         )
     }
 
+    /// The place that ONE NAMED row holds now.
+    ///
+    /// A height change that the reader started has a place of its own: the row
+    /// the reader clicked. `anchor(in:)` holds the first row in the viewport,
+    /// which is the right answer for a correction that arrives on its own. A
+    /// click needs the clicked row, so the band under the pointer does not move
+    /// while the row grows. Every field means what it means in `anchor(in:)`.
+    static func anchor(ofRow ordinal: Int, in table: NSTableView) -> Anchor? {
+        guard ordinal >= 0,
+              ordinal < table.numberOfRows,
+              let clip = table.enclosingScrollView?.contentView
+        else { return nil }
+        return Anchor(
+            ordinal: ordinal,
+            rowOrigin: table.rect(ofRow: ordinal).minY,
+            documentOrigin: clip.bounds.origin.y
+        )
+    }
+
     /// Moves the viewport, so the anchor row keeps its intra-row offset.
     ///
     /// A corrected row above the anchor row moves the anchor row down. The Core
@@ -1478,6 +1602,61 @@ enum TranscriptViewportAnchoring {
         guard abs(target - clip.bounds.origin.y) > 0.5 else { return }
         clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: target))
         scrollView.reflectScrolledClipView(clip)
+    }
+}
+
+/// The animation vocabulary of the transcript surface.
+///
+/// One class of change lives here: a row that changes height under the
+/// reader's own click. The row keeps every view it has, so the change is a
+/// travel from one measured height to the next, and the rows below travel with
+/// it. That movement is what states where a new band came from; an instant
+/// re-tile states nothing and reads as a refresh of the whole transcript.
+///
+/// No curve here eases in, for the same reason the toast surface gives: an
+/// ease-in holds still through the first third of its duration, which is the
+/// moment the reader watches hardest after a click.
+@MainActor
+enum TranscriptMotion {
+    /// The response of one disclosure. Short enough that the reader's eye
+    /// stays on the band, long enough to read as a reveal.
+    static let disclosureResponse: TimeInterval = 0.22
+
+    /// The duration to run a row-height change in.
+    ///
+    /// Reduced motion drops the travel and keeps everything else: the row
+    /// still changes IN PLACE, with no reload and no rebuilt text, so a reader
+    /// who asked for less motion still never sees a flash. The policy is a
+    /// pure function of the flag, so a test can state both answers.
+    static func duration(reducesMotion: Bool) -> TimeInterval {
+        reducesMotion ? 0 : disclosureResponse
+    }
+
+    /// True when the reader asked the system for less motion.
+    static var reducesMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    /// Runs one row-height change as one animation.
+    ///
+    /// `noteHeightOfRows` re-tiles the table immediately. Inside an animation
+    /// grouping AppKit travels the row rectangles instead, which is measured
+    /// behaviour on macOS 26.6.2: the changed row and every row below it
+    /// interpolate over the duration of the grouping. A duration of zero is
+    /// the same call with the travel removed, so both readers take one code
+    /// path.
+    ///
+    /// The block must hold the height change alone. A scroll write inside an
+    /// animation grouping would animate the viewport as well.
+    static func runRowHeightChange(_ change: () -> Void) {
+        let travels = !reducesMotion
+        NSAnimationContext.beginGrouping()
+        let context = NSAnimationContext.current
+        context.duration = duration(reducesMotion: !travels)
+        context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        context.allowsImplicitAnimation = travels
+        change()
+        NSAnimationContext.endGrouping()
     }
 }
 
@@ -1766,6 +1945,21 @@ private final class TranscriptFittingTextView: NSTextView {
 final class TranscriptTurnRowView: NSTableCellView {
     static let identifier = NSUserInterfaceItemIdentifier("TranscriptTurnRow")
 
+    /// The row's own geometry runs top down, like the table's and the row
+    /// view's.
+    ///
+    /// Auto Layout states the bands from the top of the row, and the answer of
+    /// a turn starts at that top. The flag makes the LAYER agree with the
+    /// layout. A disclosure animates the row height, and AppKit travels the
+    /// row's layer bounds to the new height while the bands hold the position
+    /// the layout gave them. In an unflipped row those positions are measured
+    /// from the BOTTOM edge, so the whole turn hangs from the edge that moves:
+    /// measured on macOS 26.6.2, the band the reader clicked left the row for
+    /// the length of the travel and came back at the end. Top down, the bands
+    /// stand still and the row's bottom edge sweeps over them, which is the
+    /// reveal the click asked for.
+    override var isFlipped: Bool { true }
+
     private let stack = NSStackView()
     /// The product mark, in the gutter beside the first line of the turn.
     ///
@@ -1796,6 +1990,13 @@ final class TranscriptTurnRowView: NSTableCellView {
     private var onTools: (String) -> Void = { _ in }
     private var codeToCopy = ""
     private var onCopyCode: (String) -> Void = { _ in }
+    /// Whether the configured turn carries each channel.
+    ///
+    /// `configure` resolves both from the turn. A disclosure toggle then needs
+    /// no turn of its own: a row with no reasoning shows no reasoning band,
+    /// whatever the expanded state says.
+    private var hasReasoning = false
+    private var hasTools = false
     private var bodyLeadingConstraints: [NSLayoutConstraint] = []
     private var bodyTrailingConstraints: [NSLayoutConstraint] = []
     /// The transcript's content column: the band this row's turn lives in.
@@ -1829,6 +2030,7 @@ final class TranscriptTurnRowView: NSTableCellView {
     private(set) var mouseExitCountForTesting = 0
     private(set) var trackingAreaRebuildCountForTesting = 0
     private(set) var metadataAnimatorCountForTesting = 0
+    private(set) var disclosureCountForTesting = 0
 
     /// The outgoing bubble's fill, behind the answer text.
     private let bubble = OutgoingBubbleView(frame: .zero)
@@ -2195,6 +2397,9 @@ final class TranscriptTurnRowView: NSTableCellView {
         self.onReasoning = onReasoning
         self.onTools = onTools
         self.onCopyCode = onCopyCode
+        // An outgoing row shows no channel, whatever the turn carries.
+        hasReasoning = turn.speaker != .me && turn.reasoning != nil
+        hasTools = turn.speaker != .me && !turn.tools.isEmpty
         let isHermes = turn.speaker == .hermes
         let isUser = turn.speaker == .me
         if !isUser { resetOutgoing() }
@@ -2340,6 +2545,57 @@ final class TranscriptTurnRowView: NSTableCellView {
         answerView.invalidateIntrinsicContentSize()
         reasoningView.invalidateIntrinsicContentSize()
         toolsView.invalidateIntrinsicContentSize()
+        needsLayout = true
+    }
+
+    /// Shows or hides the two channel bands, with no reload.
+    ///
+    /// A disclosure is a visibility change and nothing else: `configure`
+    /// already wrote both band texts, whatever the expanded state was, so no
+    /// text is set here and the answer is not built again. That is the whole
+    /// reason this method exists. A reload of the row asks the delegate for
+    /// the view again, and the row that comes back rebuilds the answer's
+    /// attributed string, drops the reader's selection, and repaints the
+    /// turn — the "refresh" a reader sees instead of a band opening.
+    ///
+    /// The counter is for the tests, which cannot see a reload from outside.
+    func applyDisclosure(reasoningExpanded: Bool, toolsExpanded: Bool) {
+        guard !isOutgoing else { return }
+        disclosureCountForTesting += 1
+        reasoningView.isHidden = !hasReasoning || !reasoningExpanded
+        applyDisclosure(
+            title: reasoningExpanded
+                ? DisclosureBand.hideReasoning
+                : DisclosureBand.reasoning,
+            to: reasoningButton,
+            expanded: reasoningExpanded
+        )
+        toolsView.isHidden = !hasTools || !toolsExpanded
+        applyDisclosure(
+            title: toolsExpanded
+                ? DisclosureBand.hideTools
+                : DisclosureBand.tools,
+            to: toolsButton,
+            expanded: toolsExpanded
+        )
+        reasoningView.invalidateIntrinsicContentSize()
+        toolsView.invalidateIntrinsicContentSize()
+        needsLayout = true
+    }
+
+    /// Writes the measured fitting width of an outgoing bubble, in place.
+    ///
+    /// `configure` takes the same number from the same cache when a row is
+    /// built. A row that is already on screen needs only the number, so a
+    /// landed measurement costs one constraint write and one layout pass. The
+    /// tolerance is the cache's own: an unchanged write would dirty the layout
+    /// engine for every visible row on every measurement batch.
+    func applyOutgoingTextWidth(_ width: CGFloat) {
+        guard isOutgoing,
+              abs(userTextWidthConstraint.constant - width)
+                > BlockTranscriptView.Coordinator.MeasuredDocumentCache.widthTolerance
+        else { return }
+        userTextWidthConstraint.constant = width
         needsLayout = true
     }
 

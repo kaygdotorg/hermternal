@@ -374,6 +374,155 @@ func storeAttachKeepsPaintedPublishedTailRowsForTheSameSession() async throws {
     await store.releaseAllReads()
 }
 
+@Test("switching paint identity installs a new tail on the update turn")
+@MainActor
+func switchingPaintIdentityInstallsNewTailOnTheUpdateTurn() {
+    _ = NSApplication.shared
+    let first = (0..<4).map { index in
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: Int64(index))),
+            role: index.isMultiple(of: 2) ? .user : .assistant,
+            text: "first \(index)"
+        )
+    }
+    let second = (0..<3).map { index in
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: Int64(index + 10))),
+            role: .assistant,
+            text: "second \(index)"
+        )
+    }
+    let coordinator = BlockTranscriptView.Coordinator()
+    let container = coordinator.makeContainer()
+    coordinator.update(
+        container: container,
+        input: TranscriptRendererInput(
+            store: nil,
+            route: nil,
+            summary: nil,
+            revision: 0,
+            isReadOnly: false,
+            isStreaming: false,
+            findQuery: "",
+            pendingMessageID: nil,
+            findMessageID: nil,
+            showsMetadata: false,
+            publishedTail: first,
+            paintIdentity: "live:first",
+            onCopyCode: { _ in },
+            onPaint: { _ in }
+        )
+    )
+    let table = container.tableView
+    #expect(table.numberOfRows == 4)
+    coordinator.update(
+        container: container,
+        input: TranscriptRendererInput(
+            store: nil,
+            route: nil,
+            summary: nil,
+            revision: 1,
+            isReadOnly: false,
+            isStreaming: false,
+            findQuery: "",
+            pendingMessageID: nil,
+            findMessageID: nil,
+            showsMetadata: false,
+            publishedTail: second,
+            paintIdentity: "live:second",
+            onCopyCode: { _ in },
+            onPaint: { _ in }
+        )
+    )
+    #expect(table.numberOfRows == 3)
+    coordinator.dismantle(container: container)
+}
+
+@Test("store attach does not expand table rows on the update turn")
+@MainActor
+func storeAttachDoesNotExpandTableRowsOnTheUpdateTurn() async throws {
+    _ = NSApplication.shared
+    let directory = FileManager.default.temporaryDirectory.appending(
+        path: "btv-page-defer-\(UUID().uuidString)",
+        directoryHint: .isDirectory
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = PagedTranscriptStore(sessionID: "restored-chat", directory: directory)
+    try await store.load()
+    for index in 0..<80 {
+        _ = try await store.append(
+            WireMessageRecord(messageID: "m-\(index)", text: "row \(index)")
+        )
+    }
+    let route = try await store.currentRoute()
+    let messages = (0..<4).map { index in
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: Int64(index))),
+            role: index.isMultiple(of: 2) ? .user : .assistant,
+            text: "cached \(index)"
+        )
+    }
+    let coordinator = BlockTranscriptView.Coordinator()
+    let container = coordinator.makeContainer()
+    let root = attachedTranscriptRoot(container)
+    coordinator.update(
+        container: container,
+        input: TranscriptRendererInput(
+            store: nil,
+            route: nil,
+            summary: nil,
+            revision: 0,
+            isReadOnly: false,
+            isStreaming: false,
+            findQuery: "",
+            pendingMessageID: nil,
+            findMessageID: nil,
+            showsMetadata: false,
+            publishedTail: messages,
+            onCopyCode: { _ in },
+            onPaint: { _ in }
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    let table = container.tableView
+    let paintedRows = table.numberOfRows
+    #expect(paintedRows == 4)
+
+    coordinator.update(
+        container: container,
+        input: TranscriptRendererInput(
+            store: store,
+            route: route,
+            summary: TranscriptSummary(rowCount: 80, messageCount: 80),
+            revision: 1,
+            isReadOnly: false,
+            isStreaming: false,
+            findQuery: "",
+            pendingMessageID: nil,
+            findMessageID: nil,
+            showsMetadata: false,
+            publishedTail: messages,
+            onCopyCode: { _ in },
+            onPaint: { _ in }
+        )
+    )
+    #expect(table.numberOfRows == paintedRows)
+
+    var expanded = false
+    for _ in 0..<200 {
+        await drainMainQueueOnce()
+        if table.numberOfRows == 80 {
+            expanded = true
+            break
+        }
+        try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+    root.layoutSubtreeIfNeeded()
+    #expect(expanded)
+    #expect(table.numberOfRows == 80)
+    coordinator.dismantle(container: container)
+}
+
 @Test("renderer maps viewport inputs through the Core policy")
 func rendererMapsViewportInputsThroughCorePolicy() {
     #expect(
@@ -1658,11 +1807,21 @@ private func waitForStartedReads(
     _ store: HeldTranscriptPageStore,
     _ count: Int
 ) async -> Bool {
+    await drainMainQueueOnce()
     for _ in 0..<200 {
         if await store.startedReads() >= count { return true }
         try? await Task.sleep(nanoseconds: 5_000_000)
     }
     return await store.startedReads() >= count
+}
+
+@MainActor
+private func drainMainQueueOnce() async {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.main.async {
+            continuation.resume()
+        }
+    }
 }
 
 @MainActor
@@ -1930,7 +2089,7 @@ private func measuredAgentRowHeight(
     ).height
 }
 
-/// A row is not flipped, so the top of a band is the `maxY` of its frame.
+/// A row runs top down, so the top of a band is the `minY` of its frame.
 @MainActor
 private func bandRect(_ view: NSView, in row: TranscriptTurnRowView) -> NSRect {
     row.convert(view.bounds, from: view)
@@ -1964,7 +2123,7 @@ func markStandsBesideTheFirstLineOfAWrappedAnswer() {
     #expect(answerBand.height >= 3 * MessageTypography.bodyLineHeight)
     // The answer is the first band of the turn. The mark takes no band of its
     // own, so nothing stands between the row's top and the first line.
-    #expect(abs((row.bounds.maxY - answerBand.maxY) - band) < 0.5)
+    #expect(abs((answerBand.minY - row.bounds.minY) - band) < 0.5)
 
     // The mark stands in the gutter, and the text starts one indent to its
     // right.
@@ -1983,7 +2142,7 @@ func markStandsBesideTheFirstLineOfAWrappedAnswer() {
     // never rises out of the turn.
     let font = NSFont.preferredFont(forTextStyle: .body)
     #expect(mark.height > font.ascender - font.descender)
-    #expect(abs(mark.maxY - answerBand.maxY) <= 1)
+    #expect(abs(mark.minY - answerBand.minY) <= 1)
     #expect(mark.maxY <= row.bounds.maxY)
     #expect(mark.minY >= row.bounds.minY)
 
@@ -1996,7 +2155,7 @@ func markStandsBesideTheFirstLineOfAWrappedAnswer() {
     )
     let tallerMark = bandRect(taller.row.markViewForTesting, in: taller.row)
     #expect(
-        abs((taller.row.bounds.maxY - tallerMark.maxY) - (row.bounds.maxY - mark.maxY))
+        abs((tallerMark.minY - taller.row.bounds.minY) - (mark.minY - row.bounds.minY))
             < 0.5
     )
 }
@@ -2053,25 +2212,25 @@ func markStandsBesideTheFirstBandOfAChannelledTurn() {
     // a mark placed by the answer would stand bands away from the line the turn
     // starts with.
     #expect(row.bounds.height > 300)
-    #expect(answerBand.maxY < mark.minY)
+    #expect(answerBand.minY > mark.maxY)
     // The disclosure band is the first band of the turn, and it starts at the
     // row's top band.
-    #expect(abs((row.bounds.maxY - reasoningBand.maxY) - band) < 0.5)
+    #expect(abs((reasoningBand.minY - row.bounds.minY) - band) < 0.5)
 
     // The mark marks that band, not the middle of the row. The box starts at
     // the top of the disclosure band. The box is taller than the band, which a
     // 15pt semibold title keeps shorter than the 28pt mark, so the mark
     // reaches past it: the mark states the speaker of the whole turn, and the
     // first band is where the turn starts.
-    #expect(abs(mark.maxY - reasoningBand.maxY) <= 1)
+    #expect(abs(mark.minY - reasoningBand.minY) <= 1)
     #expect(mark.height > reasoningBand.height)
     // The mark stays out of the gap between two turns.
-    #expect(mark.maxY <= row.bounds.maxY - band + 0.5)
+    #expect(mark.minY >= row.bounds.minY + band - 0.5)
     #expect(
-        row.bounds.maxY - mark.maxY
+        mark.minY - row.bounds.minY
             <= band + MessageTypography.disclosureHeight
     )
-    #expect(mark.midY > row.bounds.midY)
+    #expect(mark.midY < row.bounds.midY)
 
     // The mark's depth is the turn's, never the row's.
     let taller = laidOutAgentRow(
@@ -2083,7 +2242,7 @@ func markStandsBesideTheFirstBandOfAChannelledTurn() {
     )
     let tallerMark = bandRect(taller.row.markViewForTesting, in: taller.row)
     #expect(
-        abs((taller.row.bounds.maxY - tallerMark.maxY) - (row.bounds.maxY - mark.maxY))
+        abs((tallerMark.minY - taller.row.bounds.minY) - (mark.minY - row.bounds.minY))
             < 0.5
     )
 }
@@ -2116,7 +2275,7 @@ func reusedRowKeepsTheMarkAtTheTopOfTheBandTheNewTurnShows() {
     let disclosureBand = bandRect(row.reasoningButtonForTesting, in: row)
     let markOnDisclosure = bandRect(row.markViewForTesting, in: row)
     // The mark stands at the top of the disclosure band it marks.
-    #expect(abs(markOnDisclosure.maxY - disclosureBand.maxY) <= 1)
+    #expect(abs(markOnDisclosure.minY - disclosureBand.minY) <= 1)
 
     row.configure(
         turn: plain,
@@ -2135,12 +2294,12 @@ func reusedRowKeepsTheMarkAtTheTopOfTheBandTheNewTurnShows() {
 
     // The reused row shows no disclosure, so the answer is now the first band
     // and the mark stands at its top, beside the first line.
-    #expect(abs(markOnAnswer.maxY - answerBand.maxY) <= 1)
-    #expect(markOnAnswer.minY < answerBand.maxY)
+    #expect(abs(markOnAnswer.minY - answerBand.minY) <= 1)
+    #expect(markOnAnswer.maxY > answerBand.minY)
     // Every band starts at the top of the stack, so the mark's depth in the row
     // is one value for every turn. This is what lets the row state the whole
     // alignment in one constant and measure no band on reuse.
-    #expect(abs(markOnAnswer.maxY - markOnDisclosure.maxY) < 0.5)
+    #expect(abs(markOnAnswer.minY - markOnDisclosure.minY) < 0.5)
 
     // The user's own turn shows no mark.
     row.configure(
@@ -2330,4 +2489,216 @@ func hoveringARowCountsEnterExitWithoutRedrawingTheAnswer() {
     #expect(row.mouseExitCountForTesting == 1)
     #expect(row.metadataAnimatorCountForTesting == 2)
     #expect(!answerView.needsDisplay)
+}
+
+@Test("a reasoning disclosure changes the row in place and travels to the measured height")
+@MainActor
+func reasoningDisclosureChangesTheRowInPlace() async throws {
+    _ = NSApplication.shared
+    let reasoning = String(
+        repeating: "A real line of model reasoning that wraps at the measure. ",
+        count: 12
+    )
+    let answer = String(
+        repeating: "The assistant answer stands under the disclosure band. ",
+        count: 8
+    )
+    let messages = [
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: 1)),
+            role: .assistant,
+            text: answer,
+            reasoning: reasoning
+        )
+    ]
+    // The turn the renderer projects from the same tail, so the heights below
+    // are the renderer's own numbers.
+    let turn = try #require(
+        CachedTranscript(
+            version: HistoryCache.version,
+            messages: messages,
+            snapshot: nil
+        ).turns.first
+    )
+    #expect(turn.reasoning != nil)
+
+    let coordinator = BlockTranscriptView.Coordinator()
+    let container = coordinator.makeContainer()
+    let root = attachedTranscriptRoot(container)
+    coordinator.update(
+        container: container,
+        input: TranscriptRendererInput(
+            store: nil,
+            route: nil,
+            summary: nil,
+            revision: 0,
+            isReadOnly: true,
+            isStreaming: false,
+            findQuery: "",
+            pendingMessageID: nil,
+            findMessageID: nil,
+            showsMetadata: false,
+            publishedTail: messages,
+            onCopyCode: { _ in },
+            onPaint: { _ in }
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    container.layoutTableDocument()
+    let table = container.tableView
+    #expect(table.numberOfRows == 1)
+
+    let document = MarkdownDocument.parse(turn.answer).document
+    let width = TranscriptRendererTestSeam.effectiveWidth(
+        for: turn,
+        availableWidth: table.bounds.width
+    )
+    let collapsedHeight = TranscriptRendererTestSeam.measuredLayout(
+        for: turn,
+        document: document,
+        width: width
+    ).height
+    let expandedHeight = TranscriptRendererTestSeam.measuredLayout(
+        for: turn,
+        document: document,
+        width: width,
+        reasoningExpanded: true
+    ).height
+    #expect(expandedHeight > collapsedHeight + MessageTypography.bodyLineHeight)
+    let landed = await waitForCondition {
+        abs(table.rect(ofRow: 0).height - collapsedHeight) < 1
+    }
+    #expect(landed)
+
+    root.layoutSubtreeIfNeeded()
+    let row = try #require(
+        table.view(atColumn: 0, row: 0, makeIfNecessary: true) as? TranscriptTurnRowView
+    )
+    row.layoutSubtreeIfNeeded()
+    // The row runs top down, so a band holds its place while the row height
+    // travels under it.
+    #expect(row.isFlipped)
+    #expect(!row.reasoningButtonForTesting.isHidden)
+    #expect(row.reasoningViewForTesting.isHidden)
+
+    // The reader's own selection, and the text the row already carries. A
+    // reload drops both.
+    let answerView = row.answerViewForTesting
+    answerView.setSelectedRange(NSRange(location: 0, length: 12))
+    let storage = try #require(answerView.textStorage)
+    let text = storage.string
+    let disclosures = row.disclosureCountForTesting
+    let rowTop = table.rect(ofRow: 0).minY
+    let clipOrigin = container.scrollViewForTesting.contentView.bounds.origin.y
+
+    row.reasoningButtonForTesting.performClick(nil)
+
+    // In place: the same view, the same text storage, the same selection.
+    #expect(
+        table.view(atColumn: 0, row: 0, makeIfNecessary: false) === row
+    )
+    #expect(row.disclosureCountForTesting == disclosures + 1)
+    #expect(answerView.textStorage === storage)
+    #expect(storage.string == text)
+    #expect(answerView.selectedRange() == NSRange(location: 0, length: 12))
+    #expect(!row.reasoningViewForTesting.isHidden)
+    #expect(row.reasoningButtonForTesting.attributedTitle.string == "Hide reasoning")
+
+    // One travel, to the height the measurement gives. The estimate the row
+    // would have used without the synchronous measurement is a different
+    // height altogether, and it would have to be corrected afterwards.
+    #expect(abs(table.rect(ofRow: 0).height - expandedHeight) < 1)
+    let estimate = TranscriptRendererTestSeam.provisionalHeight(
+        for: turn,
+        availableWidth: table.bounds.width,
+        reasoningExpanded: true,
+        toolsExpanded: false
+    )
+    #expect(estimate > expandedHeight + MessageTypography.bodyLineHeight)
+
+    // The reader's place is unchanged: a row grows downwards, so the top edge
+    // the reader clicked stays where it was, and nothing scrolls.
+    #expect(abs(table.rect(ofRow: 0).minY - rowTop) < 0.5)
+    #expect(
+        abs(container.scrollViewForTesting.contentView.bounds.origin.y - clipOrigin)
+            < 0.5
+    )
+
+    // The band closes the same way.
+    row.reasoningButtonForTesting.performClick(nil)
+    #expect(row.reasoningViewForTesting.isHidden)
+    #expect(row.reasoningButtonForTesting.attributedTitle.string == "Reasoning")
+    #expect(abs(table.rect(ofRow: 0).height - collapsedHeight) < 1)
+    #expect(answerView.textStorage === storage)
+
+    coordinator.dismantle(container: container)
+}
+
+@Test("the disclosure travel is dropped for a reader who asked for less motion")
+@MainActor
+func disclosureTravelIsDroppedForReducedMotion() {
+    #expect(TranscriptMotion.disclosureResponse > 0)
+    #expect(
+        TranscriptMotion.duration(reducesMotion: false)
+            == TranscriptMotion.disclosureResponse
+    )
+    #expect(TranscriptMotion.duration(reducesMotion: true) == 0)
+}
+
+@Test("a row height change runs inside one animation grouping")
+@MainActor
+func rowHeightChangeRunsInsideOneAnimationGrouping() {
+    _ = NSApplication.shared
+    var duration: TimeInterval = -1
+    var implicit = false
+    var ran = false
+    TranscriptMotion.runRowHeightChange {
+        ran = true
+        duration = NSAnimationContext.current.duration
+        implicit = NSAnimationContext.current.allowsImplicitAnimation
+    }
+
+    #expect(ran)
+    // The grouping states the policy's answer for this reader, and implicit
+    // animation is on for exactly the reader who takes the travel.
+    #expect(
+        duration == TranscriptMotion.duration(
+            reducesMotion: TranscriptMotion.reducesMotion
+        )
+    )
+    #expect(implicit == !TranscriptMotion.reducesMotion)
+}
+
+@Test("a landed measurement writes the outgoing hug width without rebuilding the answer")
+@MainActor
+func landedMeasurementWritesHugWidthInPlace() throws {
+    _ = NSApplication.shared
+    let root = NSView(frame: NSRect(x: 0, y: 0, width: 780, height: 400))
+    let row = TranscriptTurnRowView(frame: NSRect(x: 0, y: 0, width: 780, height: 140))
+    root.addSubview(row)
+    row.configure(
+        turn: TranscriptTurn(id: "outgoing", speaker: .me, answer: "a prompt"),
+        document: nil,
+        reasoningExpanded: false,
+        toolsExpanded: false,
+        showsMetadata: false,
+        findQuery: "",
+        outgoingTextWidth: 320,
+        onReasoning: { _ in },
+        onTools: { _ in },
+        onCopyCode: { _ in }
+    )
+    row.layoutSubtreeIfNeeded()
+    let answerView = row.answerViewForTesting
+    let storage = try #require(answerView.textStorage)
+    #expect(abs(answerView.bounds.width - 320) < 1)
+
+    row.applyOutgoingTextWidth(180)
+    row.layoutSubtreeIfNeeded()
+
+    // The measured width reached the bubble, and the answer was not built
+    // again for it.
+    #expect(abs(answerView.bounds.width - 180) < 1)
+    #expect(answerView.textStorage === storage)
+    #expect(answerView.string == "a prompt")
 }

@@ -20,6 +20,13 @@ and versions follow Semantic Versioning.
 - Both speakers share one text measure. A message the user wrote is no longer
   held to 70% of the column the answer below it fills.
 - Reload moved out of the toolbar into the View menu, on its standard ⌘R.
+- A reasoning or tools disclosure opens and closes in place. The row keeps its
+  views and travels once to its measured height, so the transcript does not
+  flash, the reader's text selection survives, and the viewport does not jump.
+  A reader who asks for less motion gets the same change without the travel.
+- A row measurement that lands writes only what it changed: the row height and
+  the outgoing bubble's width. A visible row no longer rebuilds its text for
+  every measurement that arrives while an answer streams.
 
 ## [v0.0.4] — 2026-08-23
 
