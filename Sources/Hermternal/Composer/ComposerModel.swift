@@ -28,6 +28,9 @@ struct ComposerRoute: Equatable, Sendable {
     /// Stable identity of the open chat. Draft text, attachment files, and the
     /// model menu are all scoped to this value.
     let identity: String
+    /// New chats use the non-durable `new` route until their first send.
+    var hasDurableIdentity: Bool { identity != "new" }
+
     /// Distinguishes mounts of the same chat identity.
     let generation: UInt64
     /// The gateway session id. It is nil until the gateway creates the chat.
@@ -220,23 +223,45 @@ final class ComposerModel {
     /// are dropped with their attachment copies, so disk use stays bounded.
     private static let retainedDraftCount = 12
 
+    private final class SessionPreparation {
+        let id = UUID()
+        let epoch: UInt64
+        let task: Task<String, Error>
+
+        init(epoch: UInt64, task: Task<String, Error>) {
+            self.epoch = epoch
+            self.task = task
+        }
+    }
+
+    private struct PreparedSession {
+        let id: String
+        let epoch: UInt64
+    }
+
     @ObservationIgnored private let runtime: any SessionRuntimeControlling
     @ObservationIgnored private let attachmentStaging: any AttachmentStaging
     @ObservationIgnored private let dictation: (any SpeechDictating)?
     @ObservationIgnored private let recorder: (any AudioRecording)?
     @ObservationIgnored private let files: ComposerDraftFiles
     @ObservationIgnored private weak var turn: (any ComposerTurnRouting)?
+    @ObservationIgnored private let operationDidFinish: (@MainActor () -> Void)?
     @ObservationIgnored private var sendTask: Task<Void, Never>?
+    @ObservationIgnored private var preparationTasks: [ComposerRouteToken: SessionPreparation] = [:]
+    @ObservationIgnored private var preparationEpochs: [ComposerRouteToken: UInt64] = [:]
     @ObservationIgnored private var importTask: Task<Void, Never>?
     @ObservationIgnored private var dictationTask: Task<Void, Never>?
     @ObservationIgnored private var recordingTask: Task<Void, Never>?
     @ObservationIgnored private var recordingTicker: Task<Void, Never>?
     @ObservationIgnored private var inventoryTask: Task<Void, Never>?
     @ObservationIgnored private var runtimeTask: Task<Void, Never>?
-    @ObservationIgnored private var startupSweepTask: Task<Void, Never>?
+    @ObservationIgnored private var sendOperationID: UUID?
+    @ObservationIgnored private var inventoryOperationID: UUID?
+    @ObservationIgnored private var runtimeOperationID: UUID?
     @ObservationIgnored private var isUnmounted = false
     @ObservationIgnored private var drafts: [String: ComposerDraft] = [:]
     @ObservationIgnored private var draftOrder: [String] = []
+    @ObservationIgnored private var sendReceiptIDs: [ComposerRouteToken: UUID] = [:]
     @ObservationIgnored private var outgoingByRoute: [ComposerRouteToken: [ComposerAttachment]] = [:]
     @ObservationIgnored private var progressByRoute: [ComposerRouteToken: ComposerStagingProgress] = [:]
     @ObservationIgnored private var submittingRoutes: Set<ComposerRouteToken> = []
@@ -265,6 +290,7 @@ final class ComposerModel {
         runtime: any SessionRuntimeControlling,
         attachmentStaging: any AttachmentStaging,
         turn: (any ComposerTurnRouting)?,
+        operationDidFinish: (@MainActor () -> Void)? = nil,
         dictation: (any SpeechDictating)? = nil,
         recorder: (any AudioRecording)? = nil,
         files: ComposerDraftFiles = ComposerDraftFiles()
@@ -273,6 +299,7 @@ final class ComposerModel {
         self.runtime = runtime
         self.attachmentStaging = attachmentStaging
         self.turn = turn
+        self.operationDidFinish = operationDidFinish
         self.dictation = dictation
         self.recorder = recorder
         self.files = files
@@ -282,10 +309,10 @@ final class ComposerModel {
         if recorder == nil {
             recordingStatus = .unavailable(reason: "Audio recording is not available in this build.")
         }
-        startupSweepTask = Task { [weak self] in
-            guard let self else { return }
-            let succeeded = await files.sweepNonPersistedDrafts()
-            guard !succeeded else { return }
+        let startupSweep = files.startStartupSweep()
+        Task { [weak self] in
+            let succeeded = await startupSweep.value
+            guard !succeeded, let self else { return }
             self.notice = ComposerNotice("Some temporary composer files could not be cleaned up.")
             Log.error("composer.lifecycle code=startup_sweep_failed")
         }
@@ -350,11 +377,21 @@ final class ComposerModel {
     /// Applies the current chat. A new chat identity swaps the draft, so text
     func update(route newRoute: ComposerRoute) {
         if newRoute.token != route.token {
+            cancelRouteRuntimeTasks()
+            cancelPreparationTasks()
             cancelDictation()
             cancelRecording()
+        } else if !route.isReadOnly, newRoute.isReadOnly {
+            cancelRuntimeTasks()
+            invalidatePreparation(for: newRoute.token)
+            inventory = .notLoaded
         }
         if newRoute.identity != route.identity {
-            store(draft, for: route.identity)
+            if let recovery = drafts[route.identity], !draft.isEmpty {
+                store(ComposerSendPolicy.restore(recovery, into: draft), for: route.identity)
+            } else if !draft.isEmpty || drafts[route.identity] == nil {
+                store(draft, for: route.identity)
+            }
             draft = takeDraft(for: newRoute.identity)
             editorMode = .wysiwyg
             editorError = nil
@@ -525,12 +562,16 @@ final class ComposerModel {
         notice = nil
         submittingRoutes.insert(target)
         isSubmitting = true
+        let operationID = UUID()
+        sendOperationID = operationID
+        sendReceiptIDs[target] = operationID
         sendTask = Task { [weak self] in
             await self?.performSend(
                 submission,
                 submitted: submitted,
                 target: target,
-                turn: turn
+                turn: turn,
+                operationID: operationID
             )
         }
     }
@@ -555,35 +596,62 @@ final class ComposerModel {
         _ submission: ComposerSubmission,
         submitted: ComposerDraft,
         target: ComposerRouteToken,
-        turn: any ComposerTurnRouting
+        turn: any ComposerTurnRouting,
+        operationID: UUID
     ) async {
         var transaction: (any AttachmentStagingTransaction)?
+        var submissionWasAccepted = false
         defer {
-            submittingRoutes.remove(target)
-            progressByRoute.removeValue(forKey: target)
-            outgoingByRoute.removeValue(forKey: target)
-            if route.token == target {
-                isSubmitting = false
-                stagingProgress = nil
-                outgoing = []
+            if sendReceiptIDs[target] == operationID {
+                submittingRoutes.remove(target)
+                progressByRoute.removeValue(forKey: target)
+                outgoingByRoute.removeValue(forKey: target)
+                if route.token == target {
+                    isSubmitting = false
+                    stagingProgress = nil
+                    outgoing = []
+                }
+                sendReceiptIDs.removeValue(forKey: target)
             }
-            sendTask = nil
+            if sendOperationID == operationID {
+                sendTask = nil
+                sendOperationID = nil
+            }
+            operationDidFinish?()
         }
         do {
-            let sessionID = try await turn.prepareSession(expectedRoute: target)
-            guard !isUnmounted, route.token == target else { throw ComposerOperationError.staleRoute }
+            let preparedSession = try await prepareSession(
+                expectedRoute: target,
+                requiresDurableIdentity: false
+            )
+            let sessionID = preparedSession.id
+            guard isCurrentWritableRoute(
+                target,
+                preparationEpoch: preparedSession.epoch
+            ) else { throw ComposerOperationError.staleRoute }
             try Task.checkCancellation()
             guard !submission.staging.isEmpty else {
-                guard route.token == target else { throw ComposerOperationError.staleRoute }
+                guard isCurrentWritableRoute(
+                    target,
+                    preparationEpoch: preparedSession.epoch
+                ) else { throw ComposerOperationError.staleRoute }
                 let text = ComposerSendPolicy.submissionText(
                     trimmed: submission.text,
                     fileReferences: []
                 )
                 try await turn.submit(text: text, sessionID: sessionID)
-                guard route.token == target else { throw ComposerOperationError.staleRoute }
+                submissionWasAccepted = true
+                await files.discardAndWait(submitted.attachments)
+                guard !isUnmounted, route.token == target, !Task.isCancelled else {
+                    return
+                }
                 return
             }
 
+            guard isCurrentWritableRoute(
+                target,
+                preparationEpoch: preparedSession.epoch
+            ) else { throw ComposerOperationError.staleRoute }
             let stagedTransaction = try await attachmentStaging.stageBatch(
                 submission.staging,
                 sessionID: sessionID,
@@ -601,7 +669,10 @@ final class ComposerModel {
                 }
             )
             transaction = stagedTransaction
-            guard route.token == target else { throw ComposerOperationError.staleRoute }
+            guard isCurrentWritableRoute(
+                target,
+                preparationEpoch: preparedSession.epoch
+            ) else { throw ComposerOperationError.staleRoute }
             let receipt = await stagedTransaction.snapshot()
             guard receipt.sessionID == sessionID, receipt.routeIdentity == target.identity else {
                 throw ComposerOperationError.invalidTransaction
@@ -637,62 +708,82 @@ final class ComposerModel {
                 trimmed: submission.text,
                 fileReferences: references
             )
-            guard !isUnmounted, route.token == target else { throw ComposerOperationError.staleRoute }
+            guard isCurrentWritableRoute(
+                target,
+                preparationEpoch: preparedSession.epoch
+            ) else { throw ComposerOperationError.staleRoute }
             try await turn.submit(text: text, sessionID: sessionID)
-            guard !isUnmounted, route.token == target else { throw ComposerOperationError.staleRoute }
+            submissionWasAccepted = true
+            let routeRemainsCurrent = !isUnmounted && route.token == target && !Task.isCancelled
+            transaction = nil
             let committed = try await stagedTransaction.commit()
             guard committed.state == .committed else {
                 throw ComposerOperationError.uncertainTransaction
             }
-            transaction = nil
-            files.discard(submitted.attachments)
-        } catch is CancellationError {
-            await compensate(transaction)
-            restore(submitted, routeIdentity: target.identity, notice: nil)
-        } catch ComposerOperationError.staleRoute {
-            await compensate(transaction)
-            restore(submitted, routeIdentity: target.identity, notice: nil)
-        } catch ComposerOperationError.uncertainTransaction {
-            await compensate(transaction)
-            Log.error("composer.send code=outcome_unknown")
-            restore(
-                submitted,
-                routeIdentity: target.identity,
-                notice: ComposerNotice("The message outcome could not be confirmed; it was not retried.")
-            )
-        } catch ComposerOperationError.invalidReference {
-            await compensate(transaction)
-            Log.error("composer.send code=invalid_reference")
-            restore(
-                submitted,
-                routeIdentity: target.identity,
-                notice: ComposerNotice("The message could not be sent because an attachment reference was invalid.")
-            )
-        } catch let error as AttachmentStagingBatchFailure {
-            switch error.reason {
-            case .outcomeUnknown, .residual:
-                Log.error("composer.send code=staging_uncertain")
+            await files.discardAndWait(submitted.attachments)
+            guard routeRemainsCurrent else { return }
+        } catch {
+            if submissionWasAccepted {
+                await files.discardAndWait(submitted.attachments)
+                return
+            }
+            switch error {
+            case is CancellationError:
+                await compensate(transaction)
+                if sendReceiptIDs[target] == operationID {
+                    restore(submitted, routeIdentity: target.identity, notice: nil)
+                } else {
+                    restoreSuperseded(submitted, routeIdentity: target.identity)
+                }
+            case ComposerOperationError.staleRoute:
+                await compensate(transaction)
+                if sendReceiptIDs[target] == operationID {
+                    restore(submitted, routeIdentity: target.identity, notice: nil)
+                } else {
+                    restoreSuperseded(submitted, routeIdentity: target.identity)
+                }
+            case ComposerOperationError.uncertainTransaction:
+                await compensate(transaction)
+                Log.error("composer.send code=outcome_unknown")
                 restore(
                     submitted,
                     routeIdentity: target.identity,
                     notice: ComposerNotice("The message outcome could not be confirmed; it was not retried.")
                 )
-            case .rejected:
-                Log.error("composer.send code=staging_rejected")
+            case ComposerOperationError.invalidReference:
+                await compensate(transaction)
+                Log.error("composer.send code=invalid_reference")
                 restore(
                     submitted,
                     routeIdentity: target.identity,
-                    notice: ComposerNotice("The attachment could not be sent.")
+                    notice: ComposerNotice("The message could not be sent because an attachment reference was invalid.")
+                )
+            case let failure as AttachmentStagingBatchFailure:
+                switch failure.reason {
+                case .outcomeUnknown, .residual:
+                    Log.error("composer.send code=staging_uncertain")
+                    restore(
+                        submitted,
+                        routeIdentity: target.identity,
+                        notice: ComposerNotice("The message outcome could not be confirmed; it was not retried.")
+                    )
+                case .rejected:
+                    Log.error("composer.send code=staging_rejected")
+                    restore(
+                        submitted,
+                        routeIdentity: target.identity,
+                        notice: ComposerNotice("The attachment could not be sent.")
+                    )
+                }
+            default:
+                await compensate(transaction)
+                Log.error("composer.send code=failed")
+                restore(
+                    submitted,
+                    routeIdentity: target.identity,
+                    notice: ComposerNotice("The message could not be sent.")
                 )
             }
-        } catch {
-            await compensate(transaction)
-            Log.error("composer.send code=failed")
-            restore(
-                submitted,
-                routeIdentity: target.identity,
-                notice: ComposerNotice("The message could not be sent.")
-            )
         }
     }
 
@@ -752,6 +843,12 @@ final class ComposerModel {
         if routeIdentity == route.identity, let failure { notice = failure }
     }
 
+    private func restoreSuperseded(_ submitted: ComposerDraft, routeIdentity: String) {
+        var saved = drafts[routeIdentity] ?? ComposerDraft()
+        saved = ComposerSendPolicy.restore(submitted, into: saved)
+        store(saved, for: routeIdentity)
+    }
+
     // MARK: - Attachments
 
     /// Copies each selection into the chat draft directory, then adds it to
@@ -759,11 +856,16 @@ final class ComposerModel {
     /// Adopts selections for the route captured before the picker opened.
     /// Imports never retarget to whatever route happens to be mounted after
     /// their asynchronous file operation completes.
-    func attach(_ sources: [ComposerAttachmentSource], target: ComposerRouteToken) {
-        guard !sources.isEmpty else { return }
+    /// Returns the import task when an import begins.
+    @discardableResult
+    func attach(
+        _ sources: [ComposerAttachmentSource],
+        target: ComposerRouteToken
+    ) -> Task<Void, Never>? {
+        guard !sources.isEmpty else { return nil }
         guard !isUnmounted else {
             discard(sources)
-            return
+            return nil
         }
         let capacity = attachmentSlotsLeft
         guard capacity > 0 else {
@@ -771,7 +873,7 @@ final class ComposerModel {
                 "The composer accepts at most \(ComposerAttachmentLimits.maximumItems) attachments."
             )
             discard(sources)
-            return
+            return nil
         }
         let accepted = Array(sources.prefix(capacity))
         if accepted.count < sources.count {
@@ -785,11 +887,13 @@ final class ComposerModel {
         // Cancel the old chain: unmount cancellation must stop every import.
         importTask?.cancel()
         let previous = importTask
-        importTask = Task { [weak self] in
+        let task = Task { [weak self] in
             _ = await previous?.value
             guard let self else { return }
             await self.ingest(accepted, target: target)
         }
+        importTask = task
+        return task
     }
 
     func removeAttachment(_ id: UUID) {
@@ -865,6 +969,7 @@ final class ComposerModel {
         return nil
     }
 
+
     private func discard(_ sources: [ComposerAttachmentSource]) {
         let temporary = sources.compactMap { source -> URL? in
             guard case let .temporary(url) = source else { return nil }
@@ -886,13 +991,13 @@ final class ComposerModel {
     }
 
     var canChangeRuntime: Bool {
-        route.liveSessionID != nil && !route.isReadOnly && runtimeTask == nil
+        route.hasDurableIdentity && !route.isReadOnly && runtimeTask == nil
     }
 
     /// The reason the model and reasoning menus cannot change a value.
     var runtimeDisabledReason: String? {
         if route.isReadOnly { return "This transcript is read only." }
-        if route.liveSessionID == nil { return "The model can change after the chat starts." }
+        if !route.hasDurableIdentity { return "The model can change after the chat starts." }
         if runtimeTask != nil { return "The last change is still going out." }
         return nil
     }
@@ -925,21 +1030,50 @@ final class ComposerModel {
     /// opens, so a chat that never opens the menu makes no gateway call.
     func loadModels(refresh: Bool = false) {
         if !refresh, inventory != .notLoaded { return }
-        guard !isUnmounted, inventoryTask == nil else { return }
-        let sessionID = route.liveSessionID
+        guard canChangeRuntime, !isUnmounted, inventoryTask == nil else { return }
         let routeToken = route.token
-        inventory = .loading
+        let authorizationEpoch = preparationEpoch(for: routeToken)
+        let operationID = UUID()
+        inventoryOperationID = operationID
         inventoryTask = Task { [weak self] in
-            defer { self?.inventoryTask = nil }
+            defer {
+                if self?.inventoryOperationID == operationID {
+                    self?.inventoryTask = nil
+                    self?.inventoryOperationID = nil
+                }
+                self?.operationDidFinish?()
+            }
             do {
-                let result = try await self?.runtime.modelInventory(
-                    sessionID: sessionID,
+                guard let self else { return }
+                let preparedSession = try await self.prepareRuntimeSession(expectedRoute: routeToken)
+                guard self.inventoryOperationID == operationID,
+                      self.isCurrentWritableRoute(
+                          routeToken,
+                          requiresDurableIdentity: true,
+                          preparationEpoch: preparedSession.epoch
+                      )
+                else { return }
+                let result = try await self.runtime.modelInventory(
+                    sessionID: preparedSession.id,
                     refresh: refresh
                 )
-                guard let self, self.route.token == routeToken, let result else { return }
+                guard self.inventoryOperationID == operationID,
+                      self.isCurrentWritableRoute(
+                          routeToken,
+                          requiresDurableIdentity: true,
+                          preparationEpoch: preparedSession.epoch
+                      )
+                else { return }
                 self.inventory = .loaded(result)
             } catch {
-                guard let self, self.route.token == routeToken else { return }
+                guard let self,
+                      self.inventoryOperationID == operationID,
+                      self.isCurrentWritableRoute(
+                          routeToken,
+                          requiresDurableIdentity: true,
+                          preparationEpoch: authorizationEpoch
+                      )
+                else { return }
                 Log.error("composer.models code=load_failed")
                 self.inventory = .failed("Models could not be loaded.")
             }
@@ -947,25 +1081,56 @@ final class ComposerModel {
     }
 
     func selectModel(_ name: String, provider: String?) {
-        guard let sessionID = route.liveSessionID, canChangeRuntime else { return }
+        guard canChangeRuntime else { return }
+        let routeToken = route.token
+        let authorizationEpoch = preparationEpoch(for: routeToken)
         pendingModel = name
         pendingModelProvider = provider
         pendingModelIsDeferred = false
-        let routeToken = route.token
+        let operationID = UUID()
+        runtimeOperationID = operationID
         runtimeTask = Task { [weak self] in
-            defer { self?.runtimeTask = nil }
+            defer {
+                if self?.runtimeOperationID == operationID {
+                    self?.runtimeTask = nil
+                    self?.runtimeOperationID = nil
+                }
+                self?.operationDidFinish?()
+            }
             do {
-                let outcome = try await self?.runtime.setModel(
+                guard let self else { return }
+                let preparedSession = try await self.prepareRuntimeSession(expectedRoute: routeToken)
+                guard self.runtimeOperationID == operationID,
+                      self.isCurrentWritableRoute(
+                          routeToken,
+                          requiresDurableIdentity: true,
+                          preparationEpoch: preparedSession.epoch
+                      )
+                else { return }
+                let outcome = try await self.runtime.setModel(
                     name,
                     provider: provider,
-                    sessionID: sessionID
+                    sessionID: preparedSession.id
                 )
-                guard let self, self.route.token == routeToken, let outcome else { return }
+                guard self.runtimeOperationID == operationID,
+                      self.isCurrentWritableRoute(
+                          routeToken,
+                          requiresDurableIdentity: true,
+                          preparationEpoch: preparedSession.epoch
+                      )
+                else { return }
                 self.pendingModel = outcome.appliedValue
                 self.pendingModelProvider = provider
                 self.pendingModelIsDeferred = outcome.isDeferredToNextTurn
             } catch {
-                guard let self, self.route.token == routeToken else { return }
+                guard let self,
+                      self.runtimeOperationID == operationID,
+                      self.isCurrentWritableRoute(
+                          routeToken,
+                          requiresDurableIdentity: true,
+                          preparationEpoch: authorizationEpoch
+                      )
+                else { return }
                 Log.error("composer.model code=change_failed")
                 self.pendingModel = nil
                 self.pendingModelProvider = nil
@@ -976,20 +1141,160 @@ final class ComposerModel {
     }
 
     func selectReasoning(_ setting: ReasoningSetting) {
-        guard let sessionID = route.liveSessionID, canChangeRuntime else { return }
-        pendingReasoning = setting
+        guard canChangeRuntime else { return }
         let routeToken = route.token
+        let authorizationEpoch = preparationEpoch(for: routeToken)
+        pendingReasoning = setting
+        let operationID = UUID()
+        runtimeOperationID = operationID
         runtimeTask = Task { [weak self] in
-            defer { self?.runtimeTask = nil }
+            defer {
+                if self?.runtimeOperationID == operationID {
+                    self?.runtimeTask = nil
+                    self?.runtimeOperationID = nil
+                }
+                self?.operationDidFinish?()
+            }
             do {
-                try await self?.runtime.setReasoning(setting, sessionID: sessionID)
+                guard let self else { return }
+                let preparedSession = try await self.prepareRuntimeSession(expectedRoute: routeToken)
+                guard self.runtimeOperationID == operationID,
+                      self.isCurrentWritableRoute(
+                          routeToken,
+                          requiresDurableIdentity: true,
+                          preparationEpoch: preparedSession.epoch
+                      )
+                else { return }
+                try await self.runtime.setReasoning(setting, sessionID: preparedSession.id)
+                guard self.runtimeOperationID == operationID,
+                      self.isCurrentWritableRoute(
+                          routeToken,
+                          requiresDurableIdentity: true,
+                          preparationEpoch: preparedSession.epoch
+                      )
+                else { return }
             } catch {
-                guard let self, self.route.token == routeToken else { return }
+                guard let self,
+                      self.runtimeOperationID == operationID,
+                      self.isCurrentWritableRoute(
+                          routeToken,
+                          requiresDurableIdentity: true,
+                          preparationEpoch: authorizationEpoch
+                      )
+                else { return }
                 Log.error("composer.reasoning code=change_failed")
                 self.pendingReasoning = nil
                 self.notice = ComposerNotice("Reasoning could not be changed.")
             }
         }
+    }
+
+    /// Returns the live gateway session of the current durable writable chat.
+    private func prepareRuntimeSession(expectedRoute: ComposerRouteToken) async throws -> PreparedSession {
+        try await prepareSession(expectedRoute: expectedRoute, requiresDurableIdentity: true)
+    }
+    /// Shares one in-flight preparation for each route token. The coordinator
+    /// does not let a completed operation authorize a route that changed while
+    /// it was waiting.
+    private func prepareSession(
+        expectedRoute: ComposerRouteToken,
+        requiresDurableIdentity: Bool
+    ) async throws -> PreparedSession {
+        guard isCurrentWritableRoute(
+            expectedRoute,
+            requiresDurableIdentity: requiresDurableIdentity
+        ) else { throw ComposerOperationError.staleRoute }
+
+        let preparation: SessionPreparation
+        if let existing = preparationTasks[expectedRoute] {
+            preparation = existing
+        } else if let sessionID = route.liveSessionID {
+            return PreparedSession(
+                id: sessionID,
+                epoch: preparationEpoch(for: expectedRoute)
+            )
+        } else {
+            guard let turn else { throw ComposerOperationError.staleRoute }
+            let epoch = preparationEpoch(for: expectedRoute)
+            let task = Task { [turn] in
+                try await turn.prepareSession(expectedRoute: expectedRoute)
+            }
+            let entry = SessionPreparation(epoch: epoch, task: task)
+            preparationTasks[expectedRoute] = entry
+            preparation = entry
+        }
+
+        do {
+            let sessionID = try await preparation.task.value
+            removePreparation(preparation, for: expectedRoute)
+            guard isCurrentWritableRoute(
+                expectedRoute,
+                requiresDurableIdentity: requiresDurableIdentity,
+                preparationEpoch: preparation.epoch
+            ) else { throw ComposerOperationError.staleRoute }
+            return PreparedSession(id: sessionID, epoch: preparation.epoch)
+        } catch {
+            removePreparation(preparation, for: expectedRoute)
+            throw error
+        }
+    }
+
+    private func removePreparation(
+        _ preparation: SessionPreparation,
+        for routeToken: ComposerRouteToken
+    ) {
+        guard preparationTasks[routeToken]?.id == preparation.id else { return }
+        preparationTasks.removeValue(forKey: routeToken)
+    }
+
+    private func preparationEpoch(for routeToken: ComposerRouteToken) -> UInt64 {
+        preparationEpochs[routeToken, default: 0]
+    }
+
+    /// Checks both the route identity and whether this action is still allowed.
+    private func isCurrentWritableRoute(
+        _ expectedRoute: ComposerRouteToken,
+        requiresDurableIdentity: Bool = false,
+        preparationEpoch expectedPreparationEpoch: UInt64? = nil
+    ) -> Bool {
+        !isUnmounted
+            && route.token == expectedRoute
+            && !route.isReadOnly
+            && (!requiresDurableIdentity || route.hasDurableIdentity)
+            && (
+                expectedPreparationEpoch == nil
+                    || expectedPreparationEpoch == preparationEpoch(for: expectedRoute)
+            )
+    }
+
+    private func invalidatePreparation(for routeToken: ComposerRouteToken) {
+        preparationEpochs[routeToken, default: 0] &+= 1
+        preparationTasks.removeValue(forKey: routeToken)?.task.cancel()
+    }
+
+    /// Cancels control work owned by the mounted route. Sends keep their captured route.
+    private func cancelRouteRuntimeTasks() {
+        inventoryTask?.cancel()
+        inventoryTask = nil
+        inventoryOperationID = nil
+        runtimeTask?.cancel()
+        runtimeTask = nil
+        runtimeOperationID = nil
+    }
+
+    private func cancelRuntimeTasks() {
+        cancelRouteRuntimeTasks()
+        sendTask?.cancel()
+        sendTask = nil
+        sendOperationID = nil
+    }
+
+    private func cancelPreparationTasks() {
+        for (routeToken, preparation) in preparationTasks {
+            preparationEpochs[routeToken, default: 0] &+= 1
+            preparation.task.cancel()
+        }
+        preparationTasks.removeAll()
     }
 
 
@@ -1202,6 +1507,7 @@ final class ComposerModel {
         runtimeTask = nil
         sendTask?.cancel()
         sendTask = nil
+        cancelPreparationTasks()
         if let outgoing = outgoingByRoute.removeValue(forKey: route.token) {
             files.discard(outgoing)
         }
@@ -1212,8 +1518,6 @@ final class ComposerModel {
         isSubmitting = false
         cancelDictation()
         cancelRecording()
-        startupSweepTask?.cancel()
-        startupSweepTask = nil
 
     }
 
@@ -1312,16 +1616,133 @@ private final class StagingProgressReporter: Sendable {
     }
 }
 
+private final class ComposerDraftSweepState: @unchecked Sendable {
+    typealias Operation = @Sendable (URL) async -> Bool
+
+    private struct State {
+        var task: Task<Bool, Never>?
+        var isFinished = false
+        var leaseCount = 0
+    }
+
+    private let root: URL
+    private let key: String
+    private let operation: Operation
+    private let stateLock = OSAllocatedUnfairLock(initialState: State())
+
+    init(root: URL, key: String, operation: @escaping Operation) {
+        self.root = root
+        self.key = key
+        self.operation = operation
+    }
+
+    func start() -> Task<Bool, Never> {
+        stateLock.withLock { state in
+            if let task = state.task { return task }
+            let root = root
+            let operation = operation
+            let task = Task.detached(priority: .utility) { [self] in
+                let result = await operation(root)
+                self.finish()
+                return result
+            }
+            state.task = task
+            return task
+        }
+    }
+
+    func value() async -> Bool {
+        await start().value
+    }
+
+    func acquireLease() {
+        stateLock.withLock { $0.leaseCount += 1 }
+    }
+
+    func releaseLease() {
+        let becameEvictable = stateLock.withLock { state -> Bool in
+            state.leaseCount -= 1
+            return state.leaseCount == 0 && (state.task == nil || state.isFinished)
+        }
+        guard becameEvictable else { return }
+        ComposerDraftFiles.markStartupSweepEvictable(self, for: key)
+    }
+
+    var isEvictable: Bool {
+        stateLock.withLock { state in
+            state.leaseCount == 0 && (state.task == nil || state.isFinished)
+        }
+    }
+
+    private func finish() {
+        let becameEvictable = stateLock.withLock { state -> Bool in
+            state.isFinished = true
+            return state.leaseCount == 0
+        }
+        guard becameEvictable else { return }
+        ComposerDraftFiles.markStartupSweepEvictable(self, for: key)
+    }
+}
+
+private final class ComposerDraftSweepLease: @unchecked Sendable {
+    private let state: ComposerDraftSweepState
+
+    init(_ state: ComposerDraftSweepState) {
+        self.state = state
+        state.acquireLease()
+    }
+
+    deinit {
+        state.releaseLease()
+    }
+}
+
+private struct ComposerDraftSweepHandle: Sendable {
+    let state: ComposerDraftSweepState
+    let lease: ComposerDraftSweepLease
+}
+
+private struct ComposerDraftSweepRegistry {
+    var states: [String: ComposerDraftSweepState] = [:]
+    var evictableKeys: [String] = []
+}
+
 /// On-disk home for composer attachments.
 ///
 /// Every selection is admitted from an already-open descriptor and copied to
 /// an exclusive 0600 partial before an atomic rename. No source path is
 /// trusted after admission.
 struct ComposerDraftFiles: Sendable {
+    private static let startupSweepCacheLimit = 16
+    private static let startupSweepStates = OSAllocatedUnfairLock(
+        initialState: ComposerDraftSweepRegistry()
+    )
+
     let root: URL
+    private let startupSweep: ComposerDraftSweepState
+    private let startupSweepLease: ComposerDraftSweepLease
 
     init(root: URL = ComposerDraftFiles.defaultRoot()) {
+        let root = Self.canonicalRoot(root)
+        let handle = Self.sharedStartupSweep(for: root) {
+            { root in await Self.sweepRoot(at: root) }
+        }
         self.root = root
+        self.startupSweep = handle.state
+        self.startupSweepLease = handle.lease
+    }
+
+    init(
+        root: URL,
+        startupSweepOperation: @escaping @Sendable (URL) async -> Bool
+    ) {
+        let root = Self.canonicalRoot(root)
+        let handle = Self.sharedStartupSweep(for: root) {
+            startupSweepOperation
+        }
+        self.root = root
+        self.startupSweep = handle.state
+        self.startupSweepLease = handle.lease
     }
 
     static func defaultRoot(fileManager: FileManager = .default) -> URL {
@@ -1333,7 +1754,12 @@ struct ComposerDraftFiles: Sendable {
         )
     }
 
+    func startStartupSweep() -> Task<Bool, Never> {
+        startupSweep.start()
+    }
+
     func directory(for routeIdentity: String) async throws -> URL {
+        _ = await startupSweep.value()
         let root = self.root
         return try await Task.detached(priority: .userInitiated) {
             try Self.makeDirectory(root: root, routeIdentity: routeIdentity)
@@ -1345,6 +1771,7 @@ struct ComposerDraftFiles: Sendable {
         target: ComposerRouteToken,
         maximumBytes: Int
     ) async throws -> ComposerAttachment {
+        _ = await startupSweep.value()
         let root = self.root
         return try await Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
@@ -1455,52 +1882,119 @@ struct ComposerDraftFiles: Sendable {
         discardFiles(attachments.map(\.fileURL))
     }
 
+    /// Removes attachment copies before the caller reports completion.
+    ///
+    /// An accepted send uses this path, so its receipt is not observable while
+    /// the staged local files still exist.
+    func discardAndWait(_ attachments: [ComposerAttachment]) async {
+        await discardFilesAndWait(attachments.map(\.fileURL))
+    }
+
     func discardFiles(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
+        let startupSweep = startupSweep
         Task.detached(priority: .utility) {
-            let manager = FileManager.default
-            for url in urls {
-                let parent = url.deletingLastPathComponent()
-                let isItemFolder = UUID(uuidString: parent.lastPathComponent) != nil
-                try? manager.removeItem(at: isItemFolder ? parent : url)
+            _ = await startupSweep.value()
+            Self.removeStagedFiles(at: urls)
+        }
+    }
+
+    private func discardFilesAndWait(_ urls: [URL]) async {
+        guard !urls.isEmpty else { return }
+        let startupSweep = startupSweep
+        await Task.detached(priority: .utility) {
+            _ = await startupSweep.value()
+            Self.removeStagedFiles(at: urls)
+        }.value
+    }
+
+    private static func removeStagedFiles(at urls: [URL]) {
+        let manager = FileManager.default
+        for url in urls {
+            let parent = url.deletingLastPathComponent()
+            let isItemFolder = UUID(uuidString: parent.lastPathComponent) != nil
+            try? manager.removeItem(at: isItemFolder ? parent : url)
+        }
+    }
+
+
+    private static func canonicalRoot(_ root: URL) -> URL {
+        root.standardizedFileURL.resolvingSymlinksInPath()
+    }
+
+    private static func sharedStartupSweep(
+        for root: URL,
+        makeOperation: @Sendable () -> ComposerDraftSweepState.Operation
+    ) -> ComposerDraftSweepHandle {
+        let key = root.path
+        return startupSweepStates.withLock { registry in
+            let state: ComposerDraftSweepState
+            if let existing = registry.states[key] {
+                state = existing
+            } else {
+                state = ComposerDraftSweepState(
+                    root: root,
+                    key: key,
+                    operation: makeOperation()
+                )
+                registry.states[key] = state
+            }
+            return ComposerDraftSweepHandle(
+                state: state,
+                lease: ComposerDraftSweepLease(state)
+            )
+        }
+    }
+
+    fileprivate static func markStartupSweepEvictable(
+        _ state: ComposerDraftSweepState,
+        for key: String
+    ) {
+        startupSweepStates.withLock { registry in
+            guard registry.states[key] === state, state.isEvictable else { return }
+            registry.evictableKeys.removeAll { $0 == key }
+            registry.evictableKeys.append(key)
+            while registry.evictableKeys.count > startupSweepCacheLimit {
+                let oldest = registry.evictableKeys.removeFirst()
+                guard let candidate = registry.states[oldest], candidate.isEvictable else {
+                    continue
+                }
+                registry.states.removeValue(forKey: oldest)
             }
         }
     }
 
-    func sweepNonPersistedDrafts() async -> Bool {
-        let root = self.root
-        return await Task.detached(priority: .utility) {
-            do {
-                let manager = FileManager.default
-                try manager.createDirectory(
-                    at: root,
-                    withIntermediateDirectories: true,
-                    attributes: [.posixPermissions: 0o700]
-                )
-                var rootStat = stat()
-                guard root.path.withCString({ lstat($0, &rootStat) }) == 0,
-                      (rootStat.st_mode & S_IFMT) != S_IFLNK else {
-                    return false
-                }
-                let attributes = try manager.attributesOfItem(atPath: root.path)
-                guard let owner = attributes[.ownerAccountID] as? NSNumber,
-                      owner.uint32Value == geteuid() else {
-                    return false
-                }
-                guard chmod(root.path, mode_t(0o700)) == 0 else { return false }
-                let entries = try manager.contentsOfDirectory(
-                    at: root,
-                    includingPropertiesForKeys: [.isSymbolicLinkKey],
-                    options: []
-                )
-                for entry in entries where !Self.isBackup(entry) {
-                    try manager.removeItem(at: entry)
-                }
-                return true
-            } catch {
+    private static func sweepRoot(at root: URL) async -> Bool {
+        do {
+            let manager = FileManager.default
+            try manager.createDirectory(
+                at: root,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            var rootStat = stat()
+            guard root.path.withCString({ lstat($0, &rootStat) }) == 0,
+                  (rootStat.st_mode & S_IFMT) != S_IFLNK else {
                 return false
             }
-        }.value
+            let attributes = try manager.attributesOfItem(atPath: root.path)
+            guard let owner = attributes[.ownerAccountID] as? NSNumber,
+                  owner.uint32Value == geteuid() else {
+                return false
+            }
+            guard chmod(root.path, mode_t(0o700)) == 0 else { return false }
+            let entries = try manager.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: [.isSymbolicLinkKey],
+                options: []
+            )
+            for entry in entries where !Self.isBackup(entry) {
+                try manager.removeItem(at: entry)
+            }
+            return true
+        } catch {
+            return false
+        }
     }
 
     private static func isBackup(_ url: URL) -> Bool {
