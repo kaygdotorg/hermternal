@@ -169,6 +169,7 @@ public enum GatewayError: LocalizedError, Equatable {
 
 /// One-line send failure text. RPC errors include the gateway code and
 /// message. The prompt text is never in this value.
+/// Every submit rejection logs one reason line that uses this text.
 public func composerSendFailureDetail(_ error: Error) -> String {
     if case let GatewayError.rpc(code, message) = error {
         return "Gateway error \(code): \(message)"

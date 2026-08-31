@@ -25,3 +25,7 @@
 - The `dev` branch carries all work. The `main` branch carries stable released builds only. Feature work never lands on `main` directly. Advance `main` only when a release is cut.
 - Never stage broadly while any subagent is running: `git add -A` and `git add .` are prohibited because concurrent agents share one working tree with unrelated in-flight work. Stage explicit paths only; before committing, verify `git diff --cached --stat` and that no file outside the intended change is staged.
 - If a commit contains unrelated work, revert it in a separate commit rather than rewriting pushed history, and say plainly in the message what was swept in and why.
+- Host the composer outside any view that carries `.id(session:generation)`. SwiftUI can call a successor's onAppear before the predecessor's onDisappear, and a late unmount of the predecessor takes the live composer down.
+- Never set `preferredContentSize` on the main window shell. `NSWindow` holds that size as fixed and refuses accessibility resizes from tiling window managers.
+- Suppress system scroll pockets on scroll views that reach the titlebar. Set `allowedPocketEdges` to 0 so the app can draw its own top dissolve from the window edge.
+- The shell must not write `isOpaque` or `backgroundColor`. `WindowBackdropView` owns them. Read appearance settings inside a SwiftUI `body` so the opacity dial is observed.

@@ -1415,6 +1415,7 @@ final class BlockTranscriptContainerView: NSView {
     ///
     /// Re-asserted on every window change, because the pocket is created for
     /// the titlebar the scroll view lands under, not once for the view.
+    /// Defended by transcriptSurfaceSuppressesTheSystemScrollEdgeEffect.
     private func suppressSystemScrollEdgeEffect() {
         guard scrollView.responds(to: Self.allowedPocketEdgesSetter) else { return }
         scrollView.setValue(0, forKey: Self.allowedPocketEdgesKey)

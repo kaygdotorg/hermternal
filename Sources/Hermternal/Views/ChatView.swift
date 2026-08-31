@@ -27,6 +27,7 @@ struct ChatView: View {
         // is a modifier of that view, SwiftUI can call onDisappear of the
         // old ComposerView after onAppear of the new one, on the same
         // ComposerModel, and the late unmount leaves the live composer dead.
+        // Defended by outOfOrderUnmountDoesNotBlockSubmit.
         composerHost
         .onChange(of: model.findRequestGeneration) { _, _ in
             openFind()
@@ -74,6 +75,9 @@ struct ChatView: View {
     }
 
     /// Stable host for the composer. The transcript identity lives inside.
+    ///
+    /// Host ComposerView beside the transcript, not on the `.id` identity.
+    /// Defended by outOfOrderUnmountDoesNotBlockSubmit.
     private var composerHost: some View {
         VStack(spacing: 0) {
             transcript
@@ -364,6 +368,7 @@ enum ChatTranscriptTopEdge {
     /// empty band back over the titlebar. The stops carry fractions rather
     /// than points because the curve is a smoothstep sampled at eighths, and
     /// eighths keep it a smoothstep if the reach ever moves.
+    /// Defended by transcriptTopEdgeDissolvesFromTheWindowTop.
     static var ramp: Gradient {
         Gradient(stops: [
             .init(color: .clear, location: 0),

@@ -25,6 +25,7 @@ struct ComposerView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.hermternalAccentColor) private var accentColor
 
+    /// Token for this view instance. Pass it to unmount so a late disappear is a no-op.
     @State private var mountToken: ComposerMountToken?
     @State private var handledFocusRequest = 0
     @State private var isFileImporterPresented = false
@@ -84,9 +85,12 @@ struct ComposerView: View {
             handledFocusRequest = request
         }
         .onAppear {
+            // Issue a mount token for this view. An unmount without it is a no-op.
+            // Defended by outOfOrderUnmountDoesNotBlockSubmit.
             mountToken = model.mount()
         }
         .onDisappear {
+            // SwiftUI can fire this after the successor appears. Pass the token.
             if let mountToken {
                 model.unmount(mountToken)
             }

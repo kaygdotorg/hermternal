@@ -23,8 +23,9 @@ struct ComposerRouteToken: Equatable, Hashable, Sendable {
 /// Token for one on-screen ComposerView of this model.
 ///
 /// SwiftUI can call onDisappear of a replaced view after onAppear of the
-/// live view. The live view holds the current token, so a late unmount
-/// from the replaced view does not take the composer down.
+/// live view. An unmount without a matching token is a no-op. A late
+/// unmount from the replaced view then cannot take the live composer down.
+/// Defended by outOfOrderUnmountDoesNotBlockSubmit.
 struct ComposerMountToken: Equatable, Hashable, Sendable {
     let id: UInt64
 }
@@ -87,6 +88,7 @@ protocol ComposerTurnRouting: AnyObject {
     /// Publishes the user turn on this route before session preparation.
     ///
     /// Call this on the send press. Do not wait for the network.
+    /// Defended by sendPublishesUserTurnBeforePreparation.
     func publishUserTurn(text: String, route: ComposerRouteToken)
     /// Submits one prompt, including any gateway file references.
     ///
@@ -95,6 +97,7 @@ protocol ComposerTurnRouting: AnyObject {
     /// Removes the optimistic user turn when send fails before acceptance.
     ///
     /// Ignore the call when `route` is no longer the published transcript.
+    /// Defended by sendRollsBackPublishedTurnOnPreparationFailure.
     func rollbackUserTurn(route: ComposerRouteToken)
     /// Interrupts the running turn.
     func stop() async
@@ -267,6 +270,8 @@ final class ComposerModel {
     @ObservationIgnored private let operationDidFinish: (@MainActor () -> Void)?
     /// Send work in progress, keyed by route token.
     /// A send on one route does not block a send on a different route.
+    /// A single shared send task refuses every other route.
+    /// Defended by adoptingNewChatKeepsInFlightSend.
     @ObservationIgnored private var sendTasks: [ComposerRouteToken: Task<Void, Never>] = [:]
     @ObservationIgnored private var preparationTasks: [ComposerRouteToken: SessionPreparation] = [:]
     @ObservationIgnored private var preparationEpochs: [ComposerRouteToken: UInt64] = [:]
@@ -409,7 +414,11 @@ final class ComposerModel {
 
     // MARK: - Route
 
-    /// Applies the current chat. A new chat identity swaps the draft, so text
+    /// Applies the current chat.
+    ///
+    /// A new chat identity swaps the draft, so text stays with that chat.
+    /// Adoption of the live session is not a route change. It keeps send work
+    /// and inventory. Defended by adoptingNewChatKeepsInFlightSend.
     func update(route newRoute: ComposerRoute) {
         let isAdoption = isNewChatAdoption(from: route, to: newRoute)
         let previousToken = route.token
@@ -646,6 +655,7 @@ final class ComposerModel {
         isSubmitting = true
         let operationID = UUID()
         sendReceiptIDs[target] = operationID
+        // Echo the prompt before any RPC. Defended by sendPublishesUserTurnBeforePreparation.
         turn.publishUserTurn(text: submission.text, route: target)
         sendTasks[target] = Task { [weak self] in
             await self?.performSend(
@@ -665,7 +675,7 @@ final class ComposerModel {
 
     /// Shows a refused send only when the composer does not show the reason
     /// already. An empty draft and a running reply are both visible states.
-    /// Every refusal writes one diagnostic line.
+    /// Every refusal writes one diagnostic line through `logSendRejection`.
     private func report(_ rejection: ComposerSendRejection) {
         logSendRejection(rejection)
         switch rejection {
@@ -678,6 +688,7 @@ final class ComposerModel {
 
     /// One-line send refusal. The line has the reason and route context.
     /// Empty-draft logs the editor source length, not the prompt text.
+    /// Every submit rejection writes one of these lines.
     private func logSendRejection(_ rejection: ComposerSendRejection) {
         let identity = route.identity
         let generation = route.generation
@@ -1415,6 +1426,8 @@ final class ComposerModel {
     ///
     /// When no turn router is installed, the live session id is enough for
     /// inventory. Tests use that path. Production always installs a turn.
+    /// Every branch returns or throws, so the caller always gets a result.
+    /// Defended by concurrentInventoryModelAndSendSharePreparation.
     private func prepareSession(
         expectedRoute: ComposerRouteToken,
         requiresDurableIdentity: Bool
@@ -1555,6 +1568,10 @@ final class ComposerModel {
         return "identity:\(route.identity)"
     }
 
+    /// True when the sidebar binds a durable id to the same live session.
+    ///
+    /// A full route change would cancel send work and reset inventory.
+    /// Defended by adoptingNewChatKeepsInFlightSend.
     private func isNewChatAdoption(from old: ComposerRoute, to new: ComposerRoute) -> Bool {
         old.identity == "new"
             && new.hasDurableIdentity
@@ -1643,7 +1660,8 @@ final class ComposerModel {
     private func prefetchInventoryIfEligible() {
         guard hasAppeared, !isUnmounted, canChangeRuntime else { return }
         // Prefetch needs a turn router or a live session. Without either,
-        // the load cannot complete, so skip it.
+        // the load cannot complete, so skip it. Do not start a parked wait.
+        // Defended by mountPrefetchesAndCachesInventory.
         guard turn != nil || (route.liveSessionID?.isEmpty == false) else { return }
         if restoreInventoryFromCache() { return }
         loadModels()
@@ -1836,6 +1854,7 @@ final class ComposerModel {
     ///
     /// Each call issues a new token. A later unmount must present that
     /// token, or the call is ignored.
+    /// Defended by outOfOrderUnmountDoesNotBlockSubmit.
     @discardableResult
     func mount() -> ComposerMountToken {
         mountGeneration &+= 1
@@ -1850,7 +1869,7 @@ final class ComposerModel {
     ///
     /// A replaced ComposerView can disappear after the successor appears.
     /// That late call holds a stale token, so it does not take the live
-    /// composer down.
+    /// composer down. Defended by outOfOrderUnmountDoesNotBlockSubmit.
     func unmount(_ token: ComposerMountToken) {
         guard token.id == mountGeneration, !isUnmounted else { return }
         teardownMount()

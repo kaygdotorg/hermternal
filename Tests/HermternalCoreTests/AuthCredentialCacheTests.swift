@@ -130,6 +130,7 @@ func authCredentialCacheCoversNormalLaunchWork() async throws {
     let server = URL(string: "https://gateway.example/cache-normal")!
     try store.save(cachedCredentials(), account: server.absoluteString)
     let configuration = URLSessionConfiguration.ephemeral
+    // A fixture session must not wait for a network path. The default wait hung the suite.
     configuration.waitsForConnectivity = false
     configuration.timeoutIntervalForRequest = 5
     configuration.protocolClasses = [CredentialCacheURLProtocol.self]
@@ -172,6 +173,7 @@ func refreshDoesOneAuthoritativeCredentialRead() async throws {
     let server = URL(string: "https://gateway.example/cache-refresh")!
     try store.save(cachedCredentials(), account: server.absoluteString)
     let configuration = URLSessionConfiguration.ephemeral
+    // A fixture session must not wait for a network path. The default wait hung the suite.
     configuration.waitsForConnectivity = false
     configuration.timeoutIntervalForRequest = 5
     configuration.protocolClasses = [CredentialCacheURLProtocol.self]
@@ -209,6 +211,7 @@ func credentialLoadFailureStopsAuthenticatedWork() async throws {
     let store = FailingCredentialStore()
     let server = URL(string: "https://gateway.example/cache-failure")!
     let configuration = URLSessionConfiguration.ephemeral
+    // A fixture session must not wait for a network path. The default wait hung the suite.
     configuration.waitsForConnectivity = false
     configuration.timeoutIntervalForRequest = 5
     configuration.protocolClasses = [NoRequestURLProtocol.self]

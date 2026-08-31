@@ -54,6 +54,7 @@ private struct MainOverlayRoot: View {
 /// and an appearance change reached no code that pushed them again — the
 /// Appearance pane moved its own readout and the window kept its launch
 /// values. Nothing observes for us here; the read is the subscription.
+/// Defended by windowBackdropFollowsTheOpacityDial.
 private struct WindowBackdropRoot: View {
     let appearance: AppearanceSettings
 
@@ -314,6 +315,7 @@ final class MainShellViewController: NSViewController {
         // overwrote the backdrop's answer: an opacity of 100% asks for an
         // opaque window, and the hairline-alpha fill the backdrop chooses for
         // the translucent case is deliberately not `.clear`.
+        // Defended by windowBackdropFollowsTheOpacityDial.
         //
         // Initial chrome is settled before the content host attaches.
         // Re-applying it here makes AppKit lay out the titlebar and toolbar
@@ -771,6 +773,7 @@ enum MainWindowStartupConfiguration {
     /// the window must hold rather than one to open at: it discarded the
     /// restored frame every launch and then refused every wider frame,
     /// including the accessibility resizes a tiling window manager makes.
+    /// Defended by mainWindowStaysResizableAfterContentAttachment.
     static func attach(_ contentHost: NSViewController, to window: NSWindow) {
         let preparedFrame = window.frame
         window.contentViewController = contentHost
@@ -860,6 +863,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self.shellController = shellController
             // The shell carries no `preferredContentSize`; see
             // `MainWindowStartupConfiguration.attach` for what that cost.
+            // Defended by mainWindowStaysResizableAfterContentAttachment.
             let window = NSWindow(
                 contentRect: NSRect(
                     origin: .zero,

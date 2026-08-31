@@ -158,6 +158,10 @@ private struct PagingPage: Sendable {
     }
 }
 
+/// Holds a blocked URLProtocol load until the test cancels it.
+///
+/// A DispatchSemaphore wait parked the protocol thread and hung the suite.
+/// Defended by restPagingCancellationBetweenPages.
 private struct PagingParkedLoad {
     let proto: PagingURLProtocol
     let client: URLProtocolClient
@@ -300,6 +304,7 @@ private final class PagingURLProtocol: URLProtocol, @unchecked Sendable {
         }
         switch fixture.start(self, client: protocolClient, request: request) {
         case .park:
+            // Return without a semaphore wait. Defended by restPagingCancellationBetweenPages.
             return
         case let .complete(status, data):
             let response = HTTPURLResponse(
@@ -335,6 +340,8 @@ private func makePagingClient(
     )
     try CredentialStore.save(credentials, account: server.absoluteString)
     let configuration = URLSessionConfiguration.ephemeral
+    // A fixture session must not wait for a network path. The default wait hung the suite.
+    // Defended by restPagingCancellationBetweenPages.
     configuration.waitsForConnectivity = false
     configuration.timeoutIntervalForRequest = 5
     configuration.protocolClasses = [PagingURLProtocol.self]

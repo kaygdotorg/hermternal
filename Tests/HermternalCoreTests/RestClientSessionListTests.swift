@@ -231,6 +231,7 @@ private func makeSessionListClient(
     )
     try CredentialStore.save(credentials, account: server.absoluteString)
     let configuration = URLSessionConfiguration.ephemeral
+    // A fixture session must not wait for a network path. The default wait hung the suite.
     configuration.waitsForConnectivity = false
     configuration.timeoutIntervalForRequest = 5
     configuration.protocolClasses = [SessionListURLProtocol.self]

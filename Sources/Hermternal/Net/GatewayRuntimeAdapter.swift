@@ -18,6 +18,7 @@ public actor GatewayRuntimeAdapter: SessionRuntimeControlling, AttachmentStaging
     private let gateway: GatewayClient
     /// Last successful `model.options` payload, keyed by live session id.
     private var inventoryCache: [String: ModelInventory] = [:]
+    /// In-flight inventory loads. Cancel must drop the parked task.
     private var inventoryInFlight: [String: Task<ModelInventory, Error>] = [:]
     private var inventoryInFlightIDs: [String: UUID] = [:]
 
@@ -49,6 +50,7 @@ public actor GatewayRuntimeAdapter: SessionRuntimeControlling, AttachmentStaging
         }
         inventoryInFlight[cacheKey] = task
         do {
+            // Honour cancellation so a parked inventory load does not hold the next caller.
             let inventory = try await withTaskCancellationHandler {
                 try await task.value
             } onCancel: {

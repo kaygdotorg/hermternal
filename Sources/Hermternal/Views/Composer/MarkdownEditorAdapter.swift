@@ -20,6 +20,7 @@ import SwiftUI
 /// measurement, which is where a probe width gets written. Every assignment is
 /// guarded on a real change, so a pass that changes nothing costs no text
 /// relayout.
+/// Defended by editorWrapsAtTheColumnItOccupies.
 @MainActor
 final class ComposerEditorScrollView: NSScrollView {
     /// Makes the text view exactly as wide as the visible column.
@@ -38,6 +39,8 @@ final class ComposerEditorScrollView: NSScrollView {
 
     override func layout() {
         super.layout()
+        // Re-sync after sizeThatFits probe widths leak onto the live text view.
+        // Defended by editorWrapsAtTheColumnItOccupies.
         synchronizeColumn()
     }
 }
@@ -137,6 +140,7 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
         // only asked about. Most of the widths one pass proposes are probes,
         // and the one SwiftUI applies arrives afterwards through the scroll
         // view's own layout.
+        // Defended by editorWrapsAtTheColumnItOccupies.
         nsView.synchronizeColumn()
         return CGSize(width: width, height: height)
     }

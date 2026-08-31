@@ -1184,6 +1184,7 @@ final class AppModel: ComposerTurnRouting {
                sessions.contains(where: { candidate in candidate.id == liveSessionID }) {
                 // Bind the new durable row to the live session. A full open
                 // would reset the reducer and drop the first turn.
+                // Defended by adoptingNewChatKeepsInFlightSend.
                 setSelectedSessionID(
                     liveSessionID,
                     event: "selectedSessionID.liveBecameDurable",
@@ -2489,6 +2490,7 @@ final class AppModel: ComposerTurnRouting {
 
     /// True when the installed route belongs to the selected chat, or to the
     /// live new-chat session when no sidebar row exists yet.
+    /// Defended by newChatPersistWritesWithoutDurableSelection.
     private static func transcriptRouteMatchesSelection(
         _ route: TranscriptRoute,
         selectedSessionID: String?,
@@ -2512,6 +2514,7 @@ final class AppModel: ComposerTurnRouting {
         else { return }
         // A new chat has no sidebar selection until the first prompt
         // creates a durable row. Persist into the installed live store.
+        // Defended by newChatPersistWritesWithoutDurableSelection.
         guard Self.transcriptRouteMatchesSelection(
             route,
             selectedSessionID: selectedSessionID,
@@ -2687,6 +2690,7 @@ final class AppModel: ComposerTurnRouting {
     /// Installs the paged store for the live session. A new chat has no
     /// durable sidebar row until the first prompt, but the transcript reads
     /// this store for the optimistic turn and the stream.
+    /// Defended by newChatPersistWritesWithoutDurableSelection.
     private func ensureLiveTranscriptStore() async {
         guard let liveSessionID, !liveSessionID.isEmpty else { return }
         if activeTranscriptStore != nil,
@@ -2730,6 +2734,10 @@ final class AppModel: ComposerTurnRouting {
         }
     }
 
+    /// Echoes the prompt onto the live store before the gateway accepts it.
+    ///
+    /// Waiting for the RPC leaves the transcript empty until acceptance.
+    /// Defended by sendPublishesUserTurnBeforePreparation.
     func publishUserTurn(text: String, route: ComposerRouteToken) {
         guard composerRoute.token == route, !isViewingArchivedTranscript else { return }
         streamingReducer.appendUser(text)
@@ -2746,6 +2754,8 @@ final class AppModel: ComposerTurnRouting {
         }
     }
 
+    /// Removes the optimistic user turn when send fails before acceptance.
+    /// Defended by sendRollsBackPublishedTurnOnPreparationFailure.
     func rollbackUserTurn(route: ComposerRouteToken) {
         guard composerRoute.token == route else { return }
         var removedIDs: [String] = []
@@ -3166,6 +3176,7 @@ final class AppModel: ComposerTurnRouting {
         // The first prompt makes the live session durable. Adopting that
         // row must not reset the reducer or the store; those already hold
         // the optimistic turn and the in-flight stream.
+        // Defended by adoptingNewChatKeepsInFlightSend.
         if selectedSessionID == nil,
            liveSessionID == session.id,
            activeTranscriptRoute?.sessionID == session.id,
@@ -3847,6 +3858,7 @@ final class AppModel: ComposerTurnRouting {
         // Stream events name the live session. The durable sidebar id
         // appears only after the first prompt. Route by live id or
         // selection, not by the missing row.
+        // Defended by foreignSessionEventsDoNotReduceOpenChat.
         if let eventSessionID = event.sessionID,
            liveSessionID != nil || selectedSessionID != nil {
             let isActive =
