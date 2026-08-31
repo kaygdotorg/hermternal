@@ -603,16 +603,6 @@ final class AppModel: ComposerTurnRouting {
     var isAwaitingReply = false
     /// True while an explicit open is preparing a replacement transcript.
     var isPreparingTranscriptOpen: Bool { isPreparingOpen }
-    func isPreparingTranscriptOpen(for sessionID: String) -> Bool {
-        isPreparingOpen
-            && TranscriptSwitchWorkPolicy.shouldCoalescePendingOpen(
-                sessionID: sessionID,
-                activeSessionID: activeOpenSessionID,
-                hasPublishedFirstFrame: activeOpenDidPublish
-            )
-            && activeOpenTask?.isCancelled == false
-            && activeOpenHandle?.isTerminated == false
-    }
     /// Reserved for the read-only archived transcript route. It remains nil
     /// until the transcript host can gate the composer and send actions.
     var viewingArchivedSessionID: String?
@@ -760,9 +750,6 @@ final class AppModel: ComposerTurnRouting {
     /// starts. Its handle clears producer-owned transcript state synchronously.
     private var activeOpenTask: Task<Void, Never>?
     private var activeOpenHandle: TranscriptOpenHandle?
-    private var activeOpenSessionID: String?
-    private var activeOpenDidPublish = false
-    private var pendingNavigationSession: ChatSession?
     private var externalRouteTask: Task<Void, Never>?
     private let openGenerations = OpenGenerationController()
     private var streamingReducer = StreamingEventReducer()
@@ -2784,7 +2771,6 @@ final class AppModel: ComposerTurnRouting {
     /// Routes a validated external destination after session authority exists.
     /// A route received during restore replaces any older queued destination.
     func route(_ destination: MessageDeepLink.Destination) {
-        pendingNavigationSession = nil
         cancelActiveOpen()
         let generation = openGenerations.begin()
         pendingMessageRoute = nil
@@ -2809,10 +2795,8 @@ final class AppModel: ComposerTurnRouting {
         )
     }
 
-    /// Invalidates a queued external route when the user starts navigation.
-    /// This runs before the delayed transcript open can begin.
+    /// Invalidates a queued external route when user navigation opens a new route.
     func userNavigationDidBegin() {
-        pendingNavigationSession = nil
         cancelActiveOpen()
         pendingExternalRoute.clearPending()
         _ = openGenerations.begin()
@@ -2840,7 +2824,6 @@ final class AppModel: ComposerTurnRouting {
             )
             return
         }
-        pendingNavigationSession = nil
         cancelActiveOpen()
         let generation = openGenerations.begin()
         dispatchExternalRoute(
@@ -2885,8 +2868,6 @@ final class AppModel: ComposerTurnRouting {
         activeOpenTask?.cancel()
         activeOpenHandle = nil
         activeOpenTask = nil
-        activeOpenSessionID = nil
-        activeOpenDidPublish = false
         guard pendingExternalRoute.isCurrent(routeGeneration),
               openGenerations.isCurrent(generation)
         else {
@@ -2905,12 +2886,6 @@ final class AppModel: ComposerTurnRouting {
             await open(at: location, generation: generation)
         }
     }
-    /// Starts the trailing open after a held-arrow burst ends.
-    func flushPendingNavigationOpen() {
-        guard let session = pendingNavigationSession else { return }
-        pendingNavigationSession = nil
-        _ = requestOpen(session)
-    }
     private func cancelActiveOpen() {
         externalRouteTask?.cancel()
         externalRouteTask = nil
@@ -2918,14 +2893,11 @@ final class AppModel: ComposerTurnRouting {
         activeOpenTask?.cancel()
         activeOpenHandle = nil
         activeOpenTask = nil
-        activeOpenSessionID = nil
-        activeOpenDidPublish = false
         isPreparingOpen = false
         preparingOpenGeneration = nil
     }
-    /// Cancels a pending sidebar open when its hosting view disappears.
+    /// Cancels a sidebar open when its hosting view disappears.
     func cancelOpenPreparation() {
-        pendingNavigationSession = nil
         guard isPreparingOpen
             || activeOpenTask != nil
             || activeOpenHandle != nil
@@ -2947,8 +2919,6 @@ final class AppModel: ComposerTurnRouting {
         activeOpenTask?.cancel()
         activeOpenHandle = nil
         activeOpenTask = nil
-        activeOpenSessionID = nil
-        activeOpenDidPublish = false
     }
     private func finishOpenPreparation(generation: Int, sessionID: String) {
         guard preparingOpenGeneration == generation else {
@@ -2965,8 +2935,6 @@ final class AppModel: ComposerTurnRouting {
         preparingOpenGeneration = nil
         activeOpenTask = nil
         activeOpenHandle = nil
-        activeOpenSessionID = nil
-        activeOpenDidPublish = false
         HermternalSwitchTrace.selectionGuard(
             "requestOpen.preparingOpen.clear",
             id: sessionID,
@@ -3003,7 +2971,6 @@ final class AppModel: ComposerTurnRouting {
                     continuation.resume(returning: false)
                     return
                 }
-                self.activeOpenDidPublish = true
                 self.transcriptRouteIdentity = "live:\(session.id)"
                 self.transcriptRouteGeneration = generation
                 self.streamingReducer.reset(messages: initialMessages)
@@ -3040,52 +3007,8 @@ final class AppModel: ComposerTurnRouting {
     /// mutates `messages`. The generation guard remains on that assignment.
     @discardableResult
     func requestOpen(
-        _ session: ChatSession,
-        deferStart: Bool = false
+        _ session: ChatSession
     ) -> Task<Void, Never> {
-        if deferStart {
-            cancelActiveOpen()
-            pendingExternalRoute.clearPending()
-            let generation = openGenerations.begin()
-            pendingMessageRoute = nil
-            viewingArchivedSessionID = nil
-            liveSessionID = nil
-            streamingReducer.reset()
-            setSelectedSessionID(
-                session.id,
-                event: "selectedSessionID.mutation",
-                generation: generation,
-                preserveDisplayedTranscript: true
-            )
-            HermternalSwitchTrace.session(
-                "selection.publish",
-                id: session.id,
-                generation: generation,
-                messages: messages.count,
-                detail: "navigation.pending"
-            )
-            pendingNavigationSession = session
-            return Task {}
-        }
-        pendingNavigationSession = nil
-        if isPreparingOpen,
-           TranscriptSwitchWorkPolicy.shouldCoalescePendingOpen(
-               sessionID: session.id,
-               activeSessionID: activeOpenSessionID,
-               hasPublishedFirstFrame: activeOpenDidPublish
-           ),
-           let activeOpenTask,
-           !activeOpenTask.isCancelled,
-           activeOpenHandle?.isTerminated == false {
-            HermternalSwitchTrace.selectionGuard(
-                "requestOpen.coalesced",
-                id: session.id,
-                generation: preparingOpenGeneration,
-                messages: messages.count,
-                reason: "sameRouteStillPreparing"
-            )
-            return activeOpenTask
-        }
         cancelActiveOpen()
         pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
@@ -3093,10 +3016,8 @@ final class AppModel: ComposerTurnRouting {
             sessionID: session.id,
             generation: generation
         )
-        activeOpenDidPublish = false
         let handle = TranscriptOpenHandle()
         activeOpenHandle = handle
-        activeOpenSessionID = session.id
         pendingMessageRoute = nil
         viewingArchivedSessionID = nil
         liveSessionID = nil

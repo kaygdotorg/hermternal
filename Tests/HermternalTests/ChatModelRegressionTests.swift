@@ -68,6 +68,56 @@ func olderDeepLinkUsesPagedStoreInsteadOfVisibleTail() async throws {
     #expect(model.pendingMessageLocation == target)
 }
 
+@Test("Browsing a chat does not prepare a live session")
+@MainActor
+func browsingChatDoesNotPrepareLiveSession() async throws {
+    let directory = try chatModelTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let source = BrowseOnlyTranscriptSource(rows: [transcriptRow(
+        id: 1,
+        text: "Existing",
+        turnID: "turn-existing"
+    )])
+    let model = AppModel(cache: HistoryCache(directory: directory), transcriptSource: source)
+    let session = chatSession(id: "chat", messageCount: 1)
+    model.sessions = [session]
+    model.cacheEnabled = true
+
+    #expect(await model.open(session))
+    #expect(await source.resumeCalls == 0)
+}
+
+private actor BrowseOnlyTranscriptSource: TranscriptSource {
+    let rows: [JSONValue]
+    private(set) var resumeCalls = 0
+
+    init(rows: [JSONValue]) {
+        self.rows = rows
+    }
+
+    func fetchAuthoritative(sessionID: String) async throws -> AuthoritativeTranscript {
+        AuthoritativeTranscript(rows: rows, serverTotal: rows.count)
+    }
+
+    func resume(sessionID: String) async throws -> ResumedTranscript {
+        resumeCalls += 1
+        return ResumedTranscript(liveSessionID: nil, rows: [])
+    }
+
+    func streamAuthoritative(
+        sessionID: String,
+        onPage: @escaping TranscriptMessagePageConsumer
+    ) async throws -> AuthoritativeTranscriptMetadata {
+        try await onPage(TranscriptMessagePage(
+            messages: rows,
+            offset: 0,
+            serverTotal: rows.count
+        ))
+        return AuthoritativeTranscriptMetadata(messageCount: rows.count, serverTotal: rows.count)
+    }
+}
+
 private struct TranscriptFixtureSource: TranscriptSource {
     let rows: [JSONValue]
 

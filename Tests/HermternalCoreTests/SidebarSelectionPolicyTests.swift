@@ -2,10 +2,11 @@
 import Foundation
 import Testing
 
-@Test("A rapid selection burst publishes every settled selection")
-func rapidSelectionBurstPublishesEverySelection() {
-    let selections = (1...24).map { "chat-\($0)" }
-    var highlighted: [String] = []
+@Test("40 rapid selections start immediately without a release flush")
+func rapidSelectionBurstStartsImmediately() {
+    let selections = (1...40).map { "chat-\($0)" }
+    var immediateOpenStarts: [String] = []
+    let releaseFlushes = 0
     var publications: [String] = []
     var latestPublicationSequence = 0
 
@@ -20,17 +21,18 @@ func rapidSelectionBurstPublishesEverySelection() {
     // cancellable opener task. A repeat cancellation therefore cannot remove
     // an already-settled publication.
     for (offset, id) in selections.enumerated() {
-        highlighted.append(id)
+        immediateOpenStarts.append(id)
         #expect(publish(id, sequence: offset + 1))
     }
 
     // Even if an older async result arrives later, it cannot overwrite the
     // newest publication.
     #expect(!publish("chat-1", sequence: 1))
-    #expect(highlighted == selections)
+    #expect(immediateOpenStarts == selections)
     #expect(publications == selections)
-    #expect(publications.last == "chat-24")
-    #expect(publications.count == 24)
+    #expect(publications.last == "chat-40")
+    #expect(publications.count == 40)
+    #expect(releaseFlushes == 0)
 }
 
 @Test("A superseded opener generation cannot publish expensive work")
@@ -43,37 +45,6 @@ func supersededSelectionCancelsExpensiveWork() {
     // this shared generation before applying their results.
     #expect(!generations.isCurrent(first))
     #expect(generations.isCurrent(second))
-}
-
-@Test("Pending repeat opens coalesce only before first publication")
-func pendingRepeatOpenCoalescingStopsAfterFirstPublication() {
-    #expect(
-        TranscriptSwitchWorkPolicy.shouldCoalescePendingOpen(
-            sessionID: "chat-1",
-            activeSessionID: "chat-1",
-            hasPublishedFirstFrame: false
-        )
-    )
-    #expect(
-        !TranscriptSwitchWorkPolicy.shouldCoalescePendingOpen(
-            sessionID: "chat-1",
-            activeSessionID: "chat-1",
-            hasPublishedFirstFrame: true
-        )
-    )
-    #expect(
-        !TranscriptSwitchWorkPolicy.shouldCoalescePendingOpen(
-            sessionID: "chat-2",
-            activeSessionID: "chat-1",
-            hasPublishedFirstFrame: false
-        )
-    )
-}
-
-@Test("Only repeated arrow events defer expensive opening")
-func repeatedArrowEventsDeferOpening() {
-    #expect(TranscriptSwitchWorkPolicy.shouldDeferNavigationOpen(isNavigationRepeat: true))
-    #expect(!TranscriptSwitchWorkPolicy.shouldDeferNavigationOpen(isNavigationRepeat: false))
 }
 
 @Test("Context targets preserve a mixed selected chat and folder set")

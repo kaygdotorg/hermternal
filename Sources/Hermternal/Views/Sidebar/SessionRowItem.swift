@@ -53,7 +53,6 @@ struct SessionRowItem: View {
     let session: ChatSession
     let folders: [Folder]
     let menu: SidebarSessionMenuDerivation
-    let isSelected: Bool
     let onOpen: (ChatSession) -> Void
     let onPin: ([ChatSession], Bool) -> Void
     let onArchive: ([ChatSession]) -> Void
@@ -72,35 +71,61 @@ extension SessionRowItem {
 
     var body: some View {
         let _ = HermternalSelectionOccupancyTrace.sessionRowBodyEvaluated()
-        return SessionRow(session: session)
-            .accessibilityLabel(session.displayTitle)
-            .accessibilityValue(sessionRowDetail(session))
-            .accessibilityIdentifier("session-row-\(session.id)")
-            .accessibilityAction {
-                HermternalSwitchTrace.session(
-                    "selection.observed.accessibility",
-                    id: session.id,
-                    messages: session.messageCount
-                )
-                onOpen(session)
-            }
-            // An unselected row must not attach a recognizer because it can consume the click before native List selection.
-            .modifier(
-                SessionRowTapModifier(
-                    session: session,
-                    isSelected: isSelected,
-                    onOpen: onOpen
-                )
+        // A row activation is a real control. One Button owns every activation it has.
+        // A primary pointer click runs this closure. VoiceOver runs this closure by default.
+        // Full keyboard access runs this closure. Accessibility publishes the Button itself.
+        //
+        // AXPress runs the same action. A synthetic title action is not required.
+        //
+        // A control is also necessary for the click to arrive at all. The list carries onDrag.
+        // An AppKit drag source tracks the mouse from its down event inside the row content shape.
+        // A label alone gives that press to the drag source. List receives no selection change.
+        // A click on the title is lost. A click on blank space beside the title is lost.
+        //
+        // Only the system row insets above and below the title still reached List.
+        // The Button is inside the drag source, so it receives the press first.
+        // A press without movement becomes an activation. A moved press becomes the drag.
+        return Button {
+            // The framework has already resolved this sequence as a click.
+            // The monitor's drag bit is therefore not read here. Only a
+            // context click or a modified click is non-primary.
+            let pointerCycle = SidebarSelectionEventAdapter.pointerCycleForButtonActivation()
+                        guard SidebarSelectionEventAdapter.allowsCompletedTapActivation(
+                            for: pointerCycle
+                        ) else {
+                            HermternalSwitchTrace.selectionGuard(
+                                "sessionRow.activation",
+                                id: session.id,
+                                messages: session.messageCount,
+                                reason: "contextOrModifiedClick"
+                            )
+                            return
+                        }
+            HermternalSwitchTrace.session(
+                "selection.observed.rowButton",
+                id: session.id,
+                messages: session.messageCount
             )
-            .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                pinButton
-            }
-            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                archiveButton
-            }
-            .contextMenu {
-                contextMenu
-            }
+            onOpen(session)
+        } label: {
+            SessionRow(session: session)
+        }
+        // This style draws nothing of its own. The List keeps its selection
+        // plate and its content colour. The row gains no background, no
+        // border, no tint and no shape.
+        .buttonStyle(.plain)
+        .accessibilityLabel(session.displayTitle)
+        .accessibilityValue(sessionRowDetail(session))
+        .accessibilityIdentifier("session-row-\(session.id)")
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            pinButton
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            archiveButton
+        }
+        .contextMenu {
+            contextMenu
+        }
     }
 
 
@@ -224,50 +249,6 @@ extension SessionRowItem {
 
 }
 
-/// Adds the only pointer recognizer a session row needs. `List` owns clicks
-/// that change selection; this seam is intentionally absent on unselected rows
-/// so their click cannot be consumed before `List` sees it.
-private struct SessionRowTapModifier: ViewModifier {
-    let session: ChatSession
-    let isSelected: Bool
-    let onOpen: (ChatSession) -> Void
-
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if isSelected {
-            content.simultaneousGesture(
-                TapGesture(count: 1)
-                    .onEnded {
-                        let allowed = SidebarSelectionEventAdapter.allowsPrimaryActivation()
-                        HermternalSwitchTrace.session(
-                            "selection.tapGate",
-                            id: session.id,
-                            messages: session.messageCount,
-                            detail: allowed ? "allowed" : "blocked"
-                        )
-                        guard allowed else {
-                            HermternalSwitchTrace.selectionGuard(
-                                "sessionRow.tapGate",
-                                id: session.id,
-                                messages: session.messageCount,
-                                reason: "eventAdapterRejectedPrimaryActivation"
-                            )
-                            return
-                        }
-                        HermternalSwitchTrace.session(
-                            "selection.observed.pointer",
-                            id: session.id,
-                            messages: session.messageCount
-                        )
-                        onOpen(session)
-                    }
-            )
-        } else {
-            content
-        }
-    }
-}
-
 private struct SessionRow: View {
     let session: ChatSession
 
@@ -298,6 +279,13 @@ private struct SessionRow: View {
             Image(systemName: sessionSourceGlyphs[session.source] ?? sessionFallbackGlyph)
                 .symbolRenderingMode(.monochrome)
         }
+        // The enclosing Button owns this hit target. Both lines are required and not cosmetic.
+        // The frame claims the full content width that the List gives a row.
+        // That width measures 218pt inside a 230pt cell. The system reserves 6pt on each side.
+        // The rect shape includes blank space beside a short title in the control.
+        // The glyph and text are the only click targets without this shape.
+        //
+        // Nothing here proposes a height. The List row metrics do not change.
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(.rect)
         .font(.body)

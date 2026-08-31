@@ -40,22 +40,5 @@ public enum TranscriptSwitchWorkPolicy {
         InitialPlan(totalMessageCount: totalMessageCount)
     }
 
-    /// Returns whether a repeated request can reuse an in-flight opener.
-    ///
-    /// Reuse is limited to the interval before the opener publishes its first
-    /// useful frame. A repeated request after publication must keep reopen
-    /// semantics for the selected row.
-    public static func shouldCoalescePendingOpen(
-        sessionID: String,
-        activeSessionID: String?,
-        hasPublishedFirstFrame: Bool
-    ) -> Bool {
-        !hasPublishedFirstFrame
-            && activeSessionID == sessionID
-    }
 
-    /// Repeat arrow events defer expensive opening until key-up.
-    public static func shouldDeferNavigationOpen(isNavigationRepeat: Bool) -> Bool {
-        isNavigationRepeat
-    }
 }

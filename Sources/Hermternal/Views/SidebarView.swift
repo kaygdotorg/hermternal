@@ -3,58 +3,183 @@ import SwiftUI
 import AppKit
 import HermternalCore
 
-struct SidebarNavigationRepeatTracker {
-    private var repeatedArrowKeyCode: UInt16?
-
-    var isNavigationRepeat: Bool { repeatedArrowKeyCode != nil }
-
-    mutating func recordKeyDown(keyCode: UInt16, isRepeat: Bool) {
-        guard isRepeat,
-              keyCode == 123 || keyCode == 124
-                || keyCode == 125 || keyCode == 126
-        else { return }
-        repeatedArrowKeyCode = keyCode
-    }
-
-    mutating func recordKeyUp(keyCode: UInt16) -> Bool {
-        guard repeatedArrowKeyCode == keyCode else { return false }
-        repeatedArrowKeyCode = nil
-        return true
-    }
-
-    mutating func reset() -> Bool {
-        let wasNavigationRepeat = isNavigationRepeat
-        repeatedArrowKeyCode = nil
-        return wasNavigationRepeat
-    }
-}
-
 /// SwiftUI's `List(selection:)` reports only the resulting Set. The local
 /// monitor classifies the initiating event, so modified or context clicks
 /// cannot be mistaken for ordinary singleton selection later.
 ///
 /// The adapter is a classifier, not a consumable event queue. Selection
 /// observation and row gestures can inspect the same physical click.
+struct SidebarPointerCycle: Equatable {
+    let serial: Int
+}
+
+struct SidebarPointerActivation: Equatable {
+    let cycle: SidebarPointerCycle
+    let sessionID: String
+}
+
+/// One AppKit event, reduced to the facts the classifier reads.
+///
+/// The classifier holds no `NSEvent`. It therefore runs wherever the events
+/// come from, including a harness with no event loop.
+struct SidebarPointerEvent {
+    enum Kind {
+        case down
+        case dragged
+        case up
+        case key
+        case other
+    }
+
+    let kind: Kind
+    /// AppKit's mouse-event number. It is zero for a non-mouse kind.
+    let eventNumber: Int
+    /// The mouse location in window coordinates. It is zero for a non-mouse
+    /// kind.
+    let location: NSPoint
+    /// True for a secondary mouse button.
+    let isContextButton: Bool
+    let modifiers: NSEvent.ModifierFlags
+
+    init(
+        kind: Kind,
+        eventNumber: Int = 0,
+        location: NSPoint = .zero,
+        isContextButton: Bool = false,
+        modifiers: NSEvent.ModifierFlags = []
+    ) {
+        self.kind = kind
+        self.eventNumber = eventNumber
+        self.location = location
+        self.isContextButton = isContextButton
+        self.modifiers = modifiers
+    }
+}
+
+extension SidebarPointerEvent {
+    /// The modifiers that make a click non-primary.
+    private static let trackedModifiers: NSEvent.ModifierFlags = [.command, .shift, .control]
+
+    /// Reduces an AppKit event.
+    ///
+    /// Read `eventNumber`, `locationInWindow` and `modifierFlags` from a
+    /// mouse event only. AppKit raises when another event type supplies them.
+    init(_ event: NSEvent) {
+        let mouseKind: Kind?
+        switch event.type {
+        case .leftMouseDown, .rightMouseDown:
+            mouseKind = .down
+        case .leftMouseDragged, .rightMouseDragged:
+            mouseKind = .dragged
+        case .leftMouseUp, .rightMouseUp:
+            mouseKind = .up
+        default:
+            mouseKind = nil
+        }
+        guard let mouseKind else {
+            self.init(kind: event.type == .keyDown ? .key : .other)
+            return
+        }
+        self.init(
+            kind: mouseKind,
+            eventNumber: event.eventNumber,
+            location: event.locationInWindow,
+            isContextButton: event.type == .rightMouseDown
+                || event.type == .rightMouseDragged
+                || event.type == .rightMouseUp,
+            modifiers: event.modifierFlags.intersection(Self.trackedModifiers)
+        )
+    }
+}
+
+/// Classifies pointer input for the sidebar.
+///
+/// One physical click reaches the sidebar twice. The row `Button` fires while
+/// AppKit dispatches the mouse-up. SwiftUI reports the matching `List`
+/// selection in the same turn or in a later one, and a later turn dispatches
+/// no event at all. The classifier therefore keeps the finished cycle past
+/// mouse-up as one token.
+///
+/// The token is bounded. The first delayed selection arrival consumes it. A
+/// new pointer cycle replaces it. A key press, application deactivation or
+/// `stop()` discards it. A finished cycle that no arrival consumes expires
+/// on its own after `retainedCycleLifetime`: a context click on the
+/// already-selected row changes no selection, so SwiftUI reports no arrival
+/// to spend the token on. Nothing else reads it, so a later keyboard or
+/// VoiceOver selection never inherits a stale click.
 @MainActor
 enum SidebarSelectionEventAdapter {
-    private struct Event {
+    private struct Cycle {
+        let cycle: SidebarPointerCycle
+        let mouseDownEventNumber: Int
         let isContextClick: Bool
         let isModified: Bool
         let isDrag: Bool
     }
 
+    /// The event AppKit dispatches now, read through one seam. Production
+    /// keeps the AppKit binding. A harness with no event loop substitutes the
+    /// event it simulates.
+    static var dispatchingEvent: @MainActor () -> SidebarPointerEvent? = {
+        guard let event = NSApp.currentEvent else { return nil }
+        return SidebarPointerEvent(event)
+    }
+
+    /// How long a finished pointer cycle stays readable.
+    ///
+    /// The two harms here are not symmetric. Expiring before SwiftUI reports
+    /// the matching selection lets one click open a row twice, which the user
+    /// sees. Expiring late costs one dropped arrival, and only for an
+    /// eventless accessibility selection, since a key press, a new click,
+    /// deactivation and `stop()` all close the window first.
+    ///
+    /// So the window is set far wider than the delivery it has to survive.
+    /// That delivery is the mouse-up's own turn or a later one, and the open
+    /// work a click starts can hold the main actor for a good part of a
+    /// turn, which is exactly when a tight window would misfire.
+    static let retainedCycleLifetime = Duration.seconds(1)
+
+    /// The cancellation of one scheduled expiry.
+    typealias ExpiryCancellation = @MainActor () -> Void
+
+    /// Delays one expiry of the retained token and hands back the
+    /// cancellation for that delay, read through one seam. Production
+    /// replaces a single main-actor task. A harness with no clock
+    /// substitutes a hand it fires itself.
+    ///
+    /// The expiry outlives the call in both: production hands it to a task
+    /// and the harness holds it until the scenario fires it. It is therefore
+    /// escaping, and the type says so.
+    static var scheduleRetainedCycleExpiry: @MainActor (
+        _ expire: @escaping @MainActor () -> Void
+    ) -> ExpiryCancellation = { expire in
+        let task = Task { @MainActor in
+            try? await Task.sleep(
+                for: SidebarSelectionEventAdapter.retainedCycleLifetime
+            )
+            guard !Task.isCancelled else { return }
+            expire()
+        }
+        return { task.cancel() }
+    }
+
     private static let dragThresholdSquared: CGFloat = 16
     private static var mouseDownLocation: NSPoint?
-    private static var navigationRepeatTracker = SidebarNavigationRepeatTracker()
-    private static var navigationEndHandler: (@MainActor () -> Void)?
     private static var monitor: Any?
     private static var didResignActiveObserver: NSObjectProtocol?
-    private static var pending: Event?
+    private static var pending: Cycle?
+    private static var completed: Cycle?
+    private static var completedMouseUpEventNumber: Int?
+    /// The one cycle that a selection arrival outside event dispatch can
+    /// still claim.
+    private static var retainedArrivalCycle: SidebarPointerCycle?
+    /// The cancellation of the outstanding expiry. At most one delay is
+    /// outstanding: every site that replaces, spends or discards the token
+    /// ends the delay first, so no schedule accumulates.
+    private static var expiryCancellation: ExpiryCancellation?
     private static var serial = 0
-    private static var expiryTask: Task<Void, Never>?
 
-    static func start(onNavigationEnd: (@MainActor () -> Void)? = nil) {
-        navigationEndHandler = onNavigationEnd
+    static func start() {
         guard monitor == nil else {
             HermternalSwitchTrace.selectionGuard(
                 "eventAdapter.start",
@@ -70,57 +195,10 @@ enum SidebarSelectionEventAdapter {
                 .rightMouseDown,
                 .rightMouseDragged,
                 .rightMouseUp,
-                .keyDown,
-                .keyUp
+                .keyDown
             ]
         ) { event in
-            switch event.type {
-            case .leftMouseDown:
-                let modifiers = event.modifierFlags.intersection([.command, .shift, .control])
-                let isControlClick = modifiers.contains(.control)
-                mouseDownLocation = event.locationInWindow
-                _ = navigationRepeatTracker.reset()
-                pending = Event(
-                    isContextClick: isControlClick,
-                    isModified: !modifiers.isEmpty,
-                    isDrag: false
-                )
-                serial &+= 1
-                scheduleExpiry(for: serial)
-            case .leftMouseDragged:
-                guard let pending,
-                      let start = mouseDownLocation
-                else { break }
-                let delta = event.locationInWindow
-                let dx = delta.x - start.x
-                let dy = delta.y - start.y
-                guard dx * dx + dy * dy >= dragThresholdSquared else { break }
-                self.pending = Event(
-                    isContextClick: pending.isContextClick,
-                    isModified: pending.isModified,
-                    isDrag: true
-                )
-            case .rightMouseDown:
-                _ = navigationRepeatTracker.reset()
-                pending = Event(isContextClick: true, isModified: true, isDrag: false)
-                serial &+= 1
-                scheduleExpiry(for: serial)
-            case .rightMouseDragged:
-                pending = Event(isContextClick: true, isModified: true, isDrag: true)
-            case .leftMouseUp, .rightMouseUp:
-                scheduleExpiry(for: serial)
-            case .keyDown:
-                Self.recordKeyDown(
-                    keyCode: event.keyCode,
-                    isRepeat: event.isARepeat
-                )
-            case .keyUp:
-                if navigationRepeatTracker.recordKeyUp(keyCode: event.keyCode) {
-                    navigationEndHandler?()
-                }
-            default:
-                break
-            }
+            Self.ingest(SidebarPointerEvent(event))
             return event
         }
 
@@ -130,27 +208,56 @@ enum SidebarSelectionEventAdapter {
             queue: .main
         ) { _ in
             MainActor.assumeIsolated {
-                if Self.navigationRepeatTracker.reset() {
-                    Self.navigationEndHandler?()
-                }
+                Self.clearPointerClassification()
             }
         }
     }
 
-    static func recordKeyDown(keyCode: UInt16, isRepeat: Bool) {
-        expiryTask?.cancel()
-        expiryTask = nil
-        pending = nil
-        navigationRepeatTracker.recordKeyDown(keyCode: keyCode, isRepeat: isRepeat)
-    }
-
-    private static func scheduleExpiry(for eventSerial: Int) {
-        expiryTask?.cancel()
-        expiryTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            guard !Task.isCancelled, serial == eventSerial else { return }
-            pending = nil
-            expiryTask = nil
+    /// Advances the classifier by one event. The local monitor is the
+    /// production caller.
+    static func ingest(_ event: SidebarPointerEvent) {
+        switch event.kind {
+        case .down:
+            // The new cycle replaces the retained token, so the delay that
+            // guarded the old one ends here rather than clearing this one.
+            endRetainedCycleExpiry()
+            let isContextClick = event.isContextButton
+                || event.modifiers.contains(.control)
+            mouseDownLocation = event.location
+            serial &+= 1
+            let cycle = SidebarPointerCycle(serial: serial)
+            pending = Cycle(
+                cycle: cycle,
+                mouseDownEventNumber: event.eventNumber,
+                isContextClick: isContextClick,
+                isModified: !event.modifiers.isEmpty,
+                isDrag: false
+            )
+            completed = nil
+            completedMouseUpEventNumber = nil
+            retainedArrivalCycle = cycle
+        case .dragged:
+            guard let pending, let start = mouseDownLocation else { break }
+            let dx = event.location.x - start.x
+            let dy = event.location.y - start.y
+            guard dx * dx + dy * dy >= dragThresholdSquared else { break }
+            self.pending = Cycle(
+                cycle: pending.cycle,
+                mouseDownEventNumber: pending.mouseDownEventNumber,
+                isContextClick: pending.isContextClick,
+                isModified: pending.isModified,
+                isDrag: true
+            )
+        case .up:
+            completed = pending
+            completedMouseUpEventNumber = event.eventNumber
+            // The cycle is finished and still readable. Bound it: the
+            // arrival that would spend it may never come.
+            if retainedArrivalCycle != nil { beginRetainedCycleExpiry() }
+        case .key:
+            clearPointerClassification()
+        case .other:
+            break
         }
     }
 
@@ -159,44 +266,48 @@ enum SidebarSelectionEventAdapter {
         isModified: Bool,
         isDrag: Bool
     )? {
-        guard let pending else {
-            HermternalSwitchTrace.selectionGuard(
-                "eventAdapter.current",
-                reason: "pendingEventMissing"
-            )
-            return nil
-        }
-        return (pending.isContextClick, pending.isModified, pending.isDrag)
+        guard let event = currentPointerEvent() else { return nil }
+        return (event.isContextClick, event.isModified, event.isDrag)
     }
-    static var isNavigationRepeat: Bool {
-        navigationRepeatTracker.isNavigationRepeat
+
+    /// The cycle that owns this selection arrival, or `nil` when the arrival
+    /// has no pointer origin.
+    ///
+    /// This call consumes the retained token. One physical click therefore
+    /// suppresses one delayed arrival, and no later arrival.
+    static func consumePointerCycleForSelectionArrival() -> SidebarPointerCycle? {
+        defer {
+            retainedArrivalCycle = nil
+            // The token is spent. Nothing is left for the delay to expire.
+            endRetainedCycleExpiry()
+        }
+        return currentPointerEvent()?.cycle
+    }
+
+    static func pointerCycleForButtonActivation() -> SidebarPointerCycle? {
+        guard let applicationEvent = dispatchingEvent(),
+              applicationEvent.kind == .up,
+              !applicationEvent.isContextButton,
+              applicationEvent.eventNumber == completedMouseUpEventNumber
+        else { return nil }
+        return completed?.cycle
     }
 
     static func allowsPrimaryActivation() -> Bool {
-        // Missing evidence means the user click may still be deliberate.
-        // Default to activation instead of turning a missed monitor event
-        // into a silent no-op.
-        guard let event = current() else {
-            HermternalSwitchTrace.selectionGuard(
-                "eventAdapter.allowsPrimaryActivation",
-                reason: "pendingEventMissing;defaultAllowed"
-            )
-            return true
-        }
+        guard let event = currentPointerEvent() else { return true }
         return !event.isContextClick && !event.isModified && !event.isDrag
     }
 
-    /// A SwiftUI `TapGesture` has already resolved the pointer sequence as a
-    /// tap. The local event monitor can still see a sub-pixel
-    /// `leftMouseDragged` while the press is over a draggable title and mark
-    /// the same sequence as a drag. Rejecting that bit here loses a gesture the
-    /// framework has already accepted, which is why title clicks missed while
-    /// surrounding whitespace worked. Context and modified clicks remain
-    /// non-primary; the drag bit is relevant only before gesture recognition.
-    static func allowsCompletedTapActivation() -> Bool {
-        guard let event = current() else { return true }
+    static func allowsCompletedTapActivation(
+        for pointerCycle: SidebarPointerCycle? = pointerCycleForButtonActivation()
+    ) -> Bool {
+        guard let pointerCycle,
+              let event = completed,
+              event.cycle == pointerCycle
+        else { return true }
         return !event.isContextClick && !event.isModified
     }
+
     static func stop() {
         if let monitor {
             NSEvent.removeMonitor(monitor)
@@ -206,12 +317,60 @@ enum SidebarSelectionEventAdapter {
             NotificationCenter.default.removeObserver(didResignActiveObserver)
             self.didResignActiveObserver = nil
         }
-        expiryTask?.cancel()
-        expiryTask = nil
+        clearPointerClassification()
+    }
+
+    private static func clearPointerClassification() {
+        endRetainedCycleExpiry()
         pending = nil
+        completed = nil
+        completedMouseUpEventNumber = nil
         mouseDownLocation = nil
-        _ = navigationRepeatTracker.reset()
-        navigationEndHandler = nil
+        retainedArrivalCycle = nil
+    }
+
+    /// Replaces the outstanding delay with a new one.
+    private static func beginRetainedCycleExpiry() {
+        endRetainedCycleExpiry()
+        expiryCancellation = scheduleRetainedCycleExpiry {
+            Self.clearPointerClassification()
+        }
+    }
+
+    private static func endRetainedCycleExpiry() {
+        expiryCancellation?()
+        expiryCancellation = nil
+    }
+
+    /// The cycle that a selection arrival outside event dispatch inherits.
+    ///
+    /// A cycle in progress supplies its own classification. A cycle that
+    /// mouse-up finished supplies the same classification while the token
+    /// survives.
+    private static func retainedPointerEvent() -> Cycle? {
+        guard let retainedArrivalCycle else { return nil }
+        if let completed, completed.cycle == retainedArrivalCycle { return completed }
+        if let pending, pending.cycle == retainedArrivalCycle { return pending }
+        return nil
+    }
+
+    private static func currentPointerEvent() -> Cycle? {
+        guard let applicationEvent = dispatchingEvent() else {
+            return retainedPointerEvent()
+        }
+        switch applicationEvent.kind {
+        case .down:
+            guard let pending,
+                  applicationEvent.eventNumber == pending.mouseDownEventNumber
+            else { return nil }
+            return pending
+        case .up:
+            guard applicationEvent.eventNumber == completedMouseUpEventNumber
+            else { return nil }
+            return completed
+        case .dragged, .key, .other:
+            return retainedPointerEvent()
+        }
     }
 }
 /// Opt-in aggregate accounting for the synchronous work observed during one
@@ -362,7 +521,7 @@ struct SidebarView: View {
     let accountID: String?
     @State private var pendingOpenTask: Task<Void, Never>?
     @State private var sidebarSelection: Set<SidebarSelectionID> = []
-    @State private var pointerActivatedID: String?
+    @State private var pointerActivation: SidebarPointerActivation?
     @State private var programmaticSelectionID: String?
     @State private var programmaticArchivedSelectionID: String?
     @State private var archivedSelection: Set<String> = []
@@ -842,9 +1001,7 @@ struct SidebarView: View {
                 pruneSelection(validFolderIDs: Set(folders.map(\.id)))
             }
             .onAppear {
-                SidebarSelectionEventAdapter.start {
-                    model.flushPendingNavigationOpen()
-                }
+                SidebarSelectionEventAdapter.start()
                 synchronizeModelSelection()
             }
             .onDisappear {
@@ -883,7 +1040,7 @@ struct SidebarView: View {
             )
             pendingOpenTask?.cancel()
             pendingOpenTask = nil
-            pointerActivatedID = nil
+            pointerActivation = nil
             programmaticArchivedSelectionID = nil
             return
         }
@@ -906,7 +1063,7 @@ struct SidebarView: View {
             )
             pendingOpenTask?.cancel()
             pendingOpenTask = nil
-            pointerActivatedID = nil
+            pointerActivation = nil
             return
         }
         // A missing event is an unclassified selection, not proof that it
@@ -954,7 +1111,7 @@ struct SidebarView: View {
             model.sidebarContentMode = .archived
             clearSidebarSelection("sidebarSelection.modelSynchronization.archived")
             programmaticSelectionID = nil
-            pointerActivatedID = nil
+            pointerActivation = nil
             let selection = model.archivedSessions.contains(where: { $0.id == archivedID })
                 ? [archivedID]
                 : []
@@ -991,7 +1148,7 @@ struct SidebarView: View {
             )
             clearSidebarSelection("sidebarSelection.modelSynchronization.empty")
             programmaticSelectionID = nil
-            pointerActivatedID = nil
+            pointerActivation = nil
             return
         }
 
@@ -1004,7 +1161,7 @@ struct SidebarView: View {
             )
             clearSidebarSelection("sidebarSelection.modelSynchronization.mode")
             programmaticSelectionID = nil
-            pointerActivatedID = nil
+            pointerActivation = nil
             return
         }
 
@@ -1021,94 +1178,107 @@ struct SidebarView: View {
         }
         programmaticSelectionID = liveID
         setSidebarSelection(selection, event: "sidebarSelection.modelSynchronization.live")
-        pointerActivatedID = nil
+        pointerActivation = nil
     }
 
     private func handleSidebarSelectionChange(
-        _ selection: Set<SidebarSelectionID>
-    ) {
-        HermternalSelectionOccupancyTrace.beginIfNeeded(
-            selection: selection,
-            messages: model.messages.count
-        )
-        HermternalSwitchTrace.selection(
-            "sidebarSelection.onChange",
-            selection: selection,
-            messages: model.messages.count
-        )
-        let event = SidebarSelectionEventAdapter.current()
-        guard selection.count == 1,
-              let item = selection.first,
-              case let .chat(id) = item,
-              let session = sidebarDerivationCache.session(for: id)
-                    ?? model.sessions.first(where: { $0.id == id })
-        else {
-            HermternalSwitchTrace.selectionGuard(
-                "sidebarSelection.validation",
+            _ selection: Set<SidebarSelectionID>
+        ) {
+            HermternalSelectionOccupancyTrace.beginIfNeeded(
+                selection: selection,
+                messages: model.messages.count
+            )
+            HermternalSwitchTrace.selection(
+                "sidebarSelection.onChange",
+                selection: selection,
+                messages: model.messages.count
+            )
+            guard selection.count == 1,
+                  let item = selection.first,
+                  case let .chat(id) = item,
+                  let session = sidebarDerivationCache.session(for: id)
+                        ?? model.sessions.first(where: { candidate in candidate.id == id })
+            else {
+                HermternalSwitchTrace.selectionGuard(
+                    "sidebarSelection.validation",
+                    selection: selection,
+                    messages: model.messages.count,
+                    reason: "count=\(selection.count) nonChatOrMissingRow"
+                )
+                pendingOpenTask?.cancel()
+                pendingOpenTask = nil
+                pointerActivation = nil
+                programmaticSelectionID = nil
+                return
+            }
+            if programmaticSelectionID == id {
+                HermternalSwitchTrace.selectionGuard(
+                    "sidebarSelection.programmatic",
+                    selection: selection,
+                    id: id,
+                    messages: model.messages.count,
+                    reason: "programmaticSelection"
+                )
+                programmaticSelectionID = nil
+                pointerActivation = nil
+                return
+            }
+            // Read the classifier after the drops. A dropped arrival must
+            // not consume the retained pointer cycle.
+            let event = SidebarSelectionEventAdapter.current()
+            let pointerCycle = SidebarSelectionEventAdapter
+                .consumePointerCycleForSelectionArrival()
+            sidebarSelectionArrival(
+                sessionID: id,
+                pointerCycle: pointerCycle,
+                pointerActivation: pointerActivation
+            ) { _, activationPointerCycle in
+                openFromSelectionArrival(
+                    session,
+                    selection: selection,
+                    event: event,
+                    pointerCycle: activationPointerCycle
+                )
+            }
+        }
+
+    /// The rest of a selection arrival that the seam did not drop.
+    ///
+    /// A missing event is an unclassified selection. It is not proof of a
+    /// programmatic change. The programmatic id check owns that distinction,
+    /// so every remaining selection opens.
+    private func openFromSelectionArrival(
+            _ session: ChatSession,
+            selection: Set<SidebarSelectionID>,
+            event: (isContextClick: Bool, isModified: Bool, isDrag: Bool)?,
+            pointerCycle: SidebarPointerCycle?
+        ) {
+            if let event, event.isContextClick || event.isModified || event.isDrag {
+                HermternalSwitchTrace.selectionGuard(
+                    "sidebarSelection.pointerGate",
+                    selection: selection,
+                    id: session.id,
+                    messages: model.messages.count,
+                    reason: "contextOrModifiedClickOrDrag"
+                )
+                pendingOpenTask?.cancel()
+                pendingOpenTask = nil
+                pointerActivation = nil
+                programmaticSelectionID = nil
+                return
+            }
+            HermternalSwitchTrace.selection(
+                "sidebarSelection.activation",
                 selection: selection,
                 messages: model.messages.count,
-                reason: "count=\(selection.count) nonChatOrMissingRow"
+                detail: "id=\(session.id)"
             )
-            pendingOpenTask?.cancel()
-            pendingOpenTask = nil
-            pointerActivatedID = nil
-            programmaticSelectionID = nil
-            return
+            activateSession(
+                session,
+                event: "open.requested.selection",
+                pointerCycle: pointerCycle
+            )
         }
-        if programmaticSelectionID == id {
-            HermternalSwitchTrace.selectionGuard(
-                "sidebarSelection.programmatic",
-                selection: selection,
-                id: id,
-                messages: model.messages.count,
-                reason: "programmaticSelection"
-            )
-            programmaticSelectionID = nil
-            pointerActivatedID = nil
-            return
-        }
-        if pointerActivatedID == id {
-            HermternalSwitchTrace.selectionGuard(
-                "sidebarSelection.pointerDeduplication",
-                selection: selection,
-                id: id,
-                messages: model.messages.count,
-                reason: "pointerAlreadyActivated"
-            )
-            pointerActivatedID = nil
-            return
-        }
-        if let event, event.isContextClick || event.isModified || event.isDrag {
-            HermternalSwitchTrace.selectionGuard(
-                "sidebarSelection.pointerGate",
-                selection: selection,
-                id: id,
-                messages: model.messages.count,
-                reason: "contextOrModifiedClickOrDrag"
-            )
-            pendingOpenTask?.cancel()
-            pendingOpenTask = nil
-            pointerActivatedID = nil
-            programmaticSelectionID = nil
-            return
-        }
-        // A missing event is an unclassified selection, not proof that it
-        // was programmatic. The explicit programmatic id check above owns
-        // that distinction, so every remaining selection opens.
-        HermternalSwitchTrace.selection(
-            "sidebarSelection.activation",
-            selection: selection,
-            messages: model.messages.count,
-            detail: "id=\(id)"
-        )
-        activateSession(
-            session,
-            event: "open.requested.selection",
-            deferStart: TranscriptSwitchWorkPolicy.shouldDeferNavigationOpen(
-                isNavigationRepeat: SidebarSelectionEventAdapter.isNavigationRepeat
-            )
-        )
-    }
 
     /// Archived rows can arrive after the read-only route. Restore only that
     /// route's row here; live-chat selection remains untouched for ordinary
@@ -1376,35 +1546,34 @@ struct SidebarView: View {
     /// Every live-chat entry point uses this opener. The selection observer
     /// also calls it, so a lost row gesture cannot lose a deliberate click.
     private func activateSession(
-        _ session: ChatSession,
-        event: String,
-        deferStart: Bool = false
-    ) {
-        HermternalSwitchTrace.session(
-            event,
-            id: session.id,
-            messages: model.messages.count
-        )
-        let samePendingOpen = model.isPreparingTranscriptOpen(for: session.id)
-        if !samePendingOpen {
-            model.userNavigationDidBegin()
-        } else {
-            HermternalSwitchTrace.selectionGuard(
-                "activateSession.coalesced",
-                id: session.id,
-                messages: model.messages.count,
-                reason: "sameRouteStillPreparing"
+            _ session: ChatSession,
+            event: String,
+            pointerCycle: SidebarPointerCycle? = nil
+        ) {
+            sidebarActivateSession(
+                session,
+                pointerCycle: pointerCycle,
+                pointerActivation: &pointerActivation
+            ) { session in
+                HermternalSwitchTrace.session(
+                    event,
+                    id: session.id,
+                    messages: model.messages.count
+                )
+                pendingOpenTask = model.requestOpen(session)
+            }
+        }
+
+    /// The row Button's action and native List selection both arrive here.
+    /// VoiceOver's default action is the Button's own now, so it arrives by
+    /// the same route rather than through a synthetic one.
+    private func openImmediately(_ session: ChatSession) {
+            activateSession(
+                session,
+                event: "open.requested.pointer",
+                pointerCycle: SidebarSelectionEventAdapter.pointerCycleForButtonActivation()
             )
         }
-        pointerActivatedID = session.id
-        pendingOpenTask = model.requestOpen(session, deferStart: deferStart)
-    }
-
-    /// Explicit activation, including VoiceOver, uses the same opener as
-    /// native List selection and keyboard navigation.
-    private func openImmediately(_ session: ChatSession) {
-        activateSession(session, event: "open.requested.pointer")
-    }
 
     /// Explicit archived activation shares cancellation with native singleton
     /// selection, while the list remains the owner of its row surface.
@@ -1452,8 +1621,56 @@ struct SidebarView: View {
         }
         activateSession(session, event: "open.requested.keyboard")
     }
+}
 
+/// Opens a session unless the same pointer cycle already opened it.
+@MainActor
+func sidebarActivateSession(
+    _ session: ChatSession,
+    pointerCycle: SidebarPointerCycle?,
+    pointerActivation: inout SidebarPointerActivation?,
+    open: (ChatSession) -> Void
+) {
+    let activation = pointerCycle.map { cycle in
+        SidebarPointerActivation(cycle: cycle, sessionID: session.id)
+    }
+    if pointerActivation == activation, activation != nil {
+        HermternalSwitchTrace.selectionGuard(
+            "activateSession.duplicateArrival",
+            id: session.id,
+            reason: "onePointerCycleAlreadyOpenedThisRow"
+        )
+        return
+    }
+    pointerActivation = activation
+    open(session)
+}
 
+/// Drops a selection arrival that the Button activation already opened.
+///
+/// The classifier supplies the cycle. An arrival outside event dispatch gets
+/// the retained cycle. The drop therefore never depends on the order of the
+/// two arrivals.
+@MainActor
+func sidebarSelectionArrival(
+    sessionID: String,
+    pointerCycle: SidebarPointerCycle?,
+    pointerActivation: SidebarPointerActivation?,
+    open: (String, SidebarPointerCycle?) -> Void
+) {
+    if let pointerCycle,
+       pointerActivation == SidebarPointerActivation(
+           cycle: pointerCycle,
+           sessionID: sessionID
+       ) {
+        HermternalSwitchTrace.selectionGuard(
+            "sidebarSelection.pointerDeduplication",
+            id: sessionID,
+            reason: "pointerCycleAlreadyActivated"
+        )
+        return
+    }
+    open(sessionID, pointerCycle)
 }
 
 /// The member order is intentional: row maps first, then shared drag inputs.

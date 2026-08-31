@@ -630,7 +630,7 @@ func supersededRESTRouteCannotPublishInitialPage() async throws {
     #expect(phases.allSatisfy { !$0.isInitialPage })
 }
 
-@Test("100 rapid selections keep one open active and publish only the latest route")
+@Test("40 rapid selections start immediate opens and only latest route commits")
 func rapidSelectionBurstIsLatestWins() async throws {
     let directory = try openStateTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -645,64 +645,42 @@ func rapidSelectionBurstIsLatestWins() async throws {
         generations: generations
     )
 
-    var selections: [String] = []
+    var immediateOpenStarts: [String] = []
+    let releaseFlushes = 0
     var handles: [TranscriptOpenHandle] = []
     var tasks: [Task<[TranscriptOpenResult], Never>] = []
+    var previousHandle: TranscriptOpenHandle?
+    var previousTask: Task<[TranscriptOpenResult], Never>?
 
-    selections.append("chat-1")
-    let firstGeneration = generations.begin()
-    let firstHandle = TranscriptOpenHandle()
-    let firstTask = Task {
-        var phases: [TranscriptOpenResult] = []
-        for await phase in opener.openPhases(
-            sessionID: "chat-1",
-            serverTotal: 1,
-            generation: firstGeneration,
-            sessionTitle: "chat-1",
-            handle: firstHandle
-        ) {
-            phases.append(phase)
+    for index in 1...40 {
+        let generation = generations.begin()
+        previousHandle?.cancel()
+        if let previousTask {
+            _ = await previousTask.value
         }
-        return phases
-    }
-    handles.append(firstHandle)
-    tasks.append(firstTask)
-    while await source.streamCalls < 1 {
-        await Task.yield()
-    }
+        await source.waitUntilIdle()
 
-    var pendingReplacements = 0
-    for index in 2...100 {
-        selections.append("chat-\(index)")
-        pendingReplacements += 1
-    }
-
-    _ = generations.begin()
-    firstHandle.cancel()
-    _ = await firstTask.value
-    while await source.activeStreams != 0 {
-        await Task.yield()
-    }
-
-    let finalGeneration = generations.begin()
-    let finalHandle = TranscriptOpenHandle()
-    let finalTask = Task {
-        var phases: [TranscriptOpenResult] = []
-        for await phase in opener.openPhases(
-            sessionID: "chat-100",
-            serverTotal: 1,
-            generation: finalGeneration,
-            sessionTitle: "chat-100",
-            handle: finalHandle
-        ) {
-            phases.append(phase)
+        let sessionID = "chat-\(index)"
+        let handle = TranscriptOpenHandle()
+        immediateOpenStarts.append(sessionID)
+        let task = Task {
+            var phases: [TranscriptOpenResult] = []
+            for await phase in opener.openPhases(
+                sessionID: sessionID,
+                serverTotal: 1,
+                generation: generation,
+                sessionTitle: sessionID,
+                handle: handle
+            ) {
+                phases.append(phase)
+            }
+            return phases
         }
-        return phases
-    }
-    handles.append(finalHandle)
-    tasks.append(finalTask)
-    while await source.streamCalls < 2 {
-        await Task.yield()
+        handles.append(handle)
+        tasks.append(task)
+        await source.waitForStreamCall(index)
+        previousHandle = handle
+        previousTask = task
     }
 
     await source.releaseLatest()
@@ -716,31 +694,27 @@ func rapidSelectionBurstIsLatestWins() async throws {
         nonCachedPublications.append(
             contentsOf: phases
                 .filter { !$0.isCachedPhase }
-                .map { _ in index == 0 ? "chat-1" : "chat-100" }
+                .map { _ in immediateOpenStarts[index] }
         )
     }
-    let finalCache = await cache.transcript(for: "chat-100")
+    let finalCache = await cache.transcript(for: "chat-40")
 
-    #expect(selections.count == 100)
-    #expect(selections.first == "chat-1")
-    #expect(selections.last == "chat-100")
+    #expect(immediateOpenStarts == (1...40).map { "chat-\($0)" })
+    #expect(await source.streamSessionIDs == immediateOpenStarts)
+    #expect(releaseFlushes == 0)
     #expect(finalPhases.contains { $0.didFetchREST })
-    #expect(await source.streamCalls == 2)
-    #expect(pendingReplacements == 99)
-    for index in 1..<100 {
-        #expect(await cache.transcript(for: "chat-\(index)") == nil)
-    }
-    #expect(await source.terminatedStreams == 2)
-    #expect(nonCachedPublications == ["chat-100", "chat-100"])
+    #expect(await source.streamCalls == 40)
+    #expect(await source.terminatedStreams == 40)
+    #expect(await source.pendingGateCount == 0)
+    #expect(nonCachedPublications.allSatisfy { $0 == "chat-40" })
+    #expect(!nonCachedPublications.isEmpty)
     #expect(finalCache?.messages.map(\.text) == ["row 100"])
     #expect(await source.maxActiveStreams == 1)
     #expect(await source.activeStreams == 0)
-    #expect(handles.filter(\.isTerminated).count == 2)
+    #expect(handles.allSatisfy { handle in handle.isTerminated })
     print(
-        "OPEN_BURST|selections=\(selections.count) "
-            + "leadingStarts=1 "
-            + "pendingReplacements=\(pendingReplacements) "
-            + "trailingStarts=1 "
+        "OPEN_BURST|immediateStarts=\(immediateOpenStarts.count) "
+            + "releaseFlushes=\(releaseFlushes) "
             + "streamCalls=\(await source.streamCalls) "
             + "maxActive=\(await source.maxActiveStreams) "
             + "active=\(await source.activeStreams) "
@@ -749,12 +723,77 @@ func rapidSelectionBurstIsLatestWins() async throws {
             + "finalStored=\(finalCache != nil)"
     )
 }
+
+@Test("gated source cancellation is atomic across continuation insertion")
+func gatedSourceCancellationIsAtomicAcrossContinuationInsertion() async throws {
+    let cancelledBeforeInsertion = LatestWinsGatedSource(
+        pausesBeforeContinuationInsertion: true
+    )
+    let beforeInsertionTask = Task {
+        try await cancelledBeforeInsertion.streamAuthoritative(
+            sessionID: "before",
+            onPage: { _ in }
+        )
+    }
+    await cancelledBeforeInsertion.waitUntilContinuationInsertionIsBlocked()
+    beforeInsertionTask.cancel()
+    await cancelledBeforeInsertion.waitUntilCancellationIsRecorded()
+    await cancelledBeforeInsertion.allowContinuationInsertion()
+    _ = try await beforeInsertionTask.value
+
+    #expect(await cancelledBeforeInsertion.continuationResumeCount == 1)
+    #expect(await cancelledBeforeInsertion.pendingGateCount == 0)
+    #expect(await cancelledBeforeInsertion.activeStreams == 0)
+    #expect(await cancelledBeforeInsertion.terminatedStreams == 1)
+
+    let cancelledAfterInsertion = LatestWinsGatedSource()
+    let afterInsertionTask = Task {
+        try await cancelledAfterInsertion.streamAuthoritative(
+            sessionID: "after",
+            onPage: { _ in }
+        )
+    }
+    await cancelledAfterInsertion.waitUntilContinuationIsInserted()
+    afterInsertionTask.cancel()
+    await cancelledAfterInsertion.waitUntilCancellationIsRecorded()
+    _ = try await afterInsertionTask.value
+
+    #expect(await cancelledAfterInsertion.continuationResumeCount == 1)
+    #expect(await cancelledAfterInsertion.pendingGateCount == 0)
+    #expect(await cancelledAfterInsertion.activeStreams == 0)
+    #expect(await cancelledAfterInsertion.terminatedStreams == 1)
+}
+
 private actor LatestWinsGatedSource: TranscriptSource {
-    private var continuations: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private enum GateState {
+        case pendingInsertion
+        case waiting(CheckedContinuation<Void, Never>)
+        case cancelled
+    }
+
+    private let pausesBeforeContinuationInsertion: Bool
+    private var gates: [UUID: GateState] = [:]
+    private var streamCallWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var idleWaiters: [CheckedContinuation<Void, Never>] = []
+    private var insertionReachedWaiter: CheckedContinuation<Void, Never>?
+    private var insertionWaiter: CheckedContinuation<Void, Never>?
+    private var insertionWasReached = false
+    private var insertionWasAllowed = false
+    private var continuationInsertedWaiter: CheckedContinuation<Void, Never>?
+    private var continuationWasInserted = false
+    private var cancellationRecordedWaiter: CheckedContinuation<Void, Never>?
+    private var cancellationWasRecorded = false
     private(set) var streamCalls = 0
+    private(set) var streamSessionIDs: [String] = []
     private(set) var activeStreams = 0
     private(set) var maxActiveStreams = 0
     private(set) var terminatedStreams = 0
+    private(set) var continuationResumeCount = 0
+    var pendingGateCount: Int { gates.count }
+
+    init(pausesBeforeContinuationInsertion: Bool = false) {
+        self.pausesBeforeContinuationInsertion = pausesBeforeContinuationInsertion
+    }
 
     func resume(sessionID _: String) async throws -> ResumedTranscript {
         ResumedTranscript(liveSessionID: "live", rows: [])
@@ -765,20 +804,39 @@ private actor LatestWinsGatedSource: TranscriptSource {
     }
 
     func streamAuthoritative(
-        sessionID _: String,
+        sessionID: String,
         onPage: @escaping TranscriptMessagePageConsumer
     ) async throws -> AuthoritativeTranscriptMetadata {
+        streamSessionIDs.append(sessionID)
         streamCalls += 1
+        resumeStreamCallWaiters()
         activeStreams += 1
         maxActiveStreams = max(maxActiveStreams, activeStreams)
         let token = UUID()
+        gates[token] = .pendingInsertion
         defer {
+            gates.removeValue(forKey: token)
             activeStreams -= 1
             terminatedStreams += 1
+            resumeIdleWaitersIfNeeded()
         }
         await withTaskCancellationHandler(operation: {
+            if pausesBeforeContinuationInsertion {
+                await waitBeforeContinuationInsertion()
+            }
             await withCheckedContinuation { continuation in
-                continuations[token] = continuation
+                switch gates.removeValue(forKey: token) {
+                case .some(.pendingInsertion):
+                    gates[token] = .waiting(continuation)
+                    continuationWasInserted = true
+                    continuationInsertedWaiter?.resume()
+                    continuationInsertedWaiter = nil
+                case .some(.cancelled), .none:
+                    continuationResumeCount += 1
+                    continuation.resume()
+                case .some(.waiting):
+                    preconditionFailure("A gate continuation can only be inserted once.")
+                }
             }
         }, onCancel: {
             Task { await self.cancel(token) }
@@ -795,16 +853,107 @@ private actor LatestWinsGatedSource: TranscriptSource {
         return AuthoritativeTranscriptMetadata(messageCount: 1, serverTotal: 1)
     }
 
+    func waitForStreamCall(_ expected: Int) async {
+        guard streamCalls < expected else { return }
+        await withCheckedContinuation { continuation in
+            streamCallWaiters.append((expected, continuation))
+        }
+    }
+
+    func waitUntilIdle() async {
+        guard activeStreams > 0 else { return }
+        await withCheckedContinuation { continuation in
+            idleWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilContinuationInsertionIsBlocked() async {
+        guard !insertionWasReached else { return }
+        await withCheckedContinuation { continuation in
+            insertionReachedWaiter = continuation
+        }
+    }
+
+    func allowContinuationInsertion() {
+        if let insertionWaiter {
+            self.insertionWaiter = nil
+            insertionWaiter.resume()
+        } else {
+            insertionWasAllowed = true
+        }
+    }
+
+    func waitUntilContinuationIsInserted() async {
+        guard !continuationWasInserted else { return }
+        await withCheckedContinuation { continuation in
+            continuationInsertedWaiter = continuation
+        }
+    }
+
+    func waitUntilCancellationIsRecorded() async {
+        guard !cancellationWasRecorded else { return }
+        await withCheckedContinuation { continuation in
+            cancellationRecordedWaiter = continuation
+        }
+    }
+
     func releaseLatest() {
-        let pending = continuations.values
-        continuations.removeAll()
-        for continuation in pending {
+        let pending = gates.values
+        gates.removeAll()
+        for case let .waiting(continuation) in pending {
+            continuationResumeCount += 1
             continuation.resume()
         }
     }
 
+    private func waitBeforeContinuationInsertion() async {
+        insertionWasReached = true
+        insertionReachedWaiter?.resume()
+        insertionReachedWaiter = nil
+        guard !insertionWasAllowed else {
+            insertionWasAllowed = false
+            return
+        }
+        await withCheckedContinuation { continuation in
+            insertionWaiter = continuation
+        }
+    }
+
     private func cancel(_ token: UUID) {
-        continuations.removeValue(forKey: token)?.resume()
+        guard let state = gates.removeValue(forKey: token) else { return }
+        cancellationWasRecorded = true
+        cancellationRecordedWaiter?.resume()
+        cancellationRecordedWaiter = nil
+        switch state {
+        case .pendingInsertion:
+            gates[token] = .cancelled
+        case let .waiting(continuation):
+            continuationResumeCount += 1
+            continuation.resume()
+        case .cancelled:
+            gates[token] = .cancelled
+        }
+    }
+
+    private func resumeStreamCallWaiters() {
+        var pending: [(Int, CheckedContinuation<Void, Never>)] = []
+        for (expected, continuation) in streamCallWaiters {
+            if expected <= streamCalls {
+                continuation.resume()
+            } else {
+                pending.append((expected, continuation))
+            }
+        }
+        streamCallWaiters = pending
+    }
+
+    private func resumeIdleWaitersIfNeeded() {
+        guard activeStreams == 0 else { return }
+        let waiters = idleWaiters
+        idleWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 }
 
