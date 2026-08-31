@@ -246,6 +246,47 @@ func coordinatorCoalescesRepeatedPendingPage() async {
     coordinator.dismantle(container: container)
 }
 
+@Test("cached published tail paints turns without a Loading placeholder")
+@MainActor
+func cachedPublishedTailPaintsWithoutLoadingPlaceholder() {
+    _ = NSApplication.shared
+    let messages = (0..<12).map { index in
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: Int64(index))),
+            role: index.isMultiple(of: 2) ? .user : .assistant,
+            text: "cached \(index)"
+        )
+    }
+    let coordinator = BlockTranscriptView.Coordinator()
+    let container = coordinator.makeContainer()
+    let root = attachedTranscriptRoot(container)
+    coordinator.update(
+        container: container,
+        input: TranscriptRendererInput(
+            store: nil,
+            route: nil,
+            summary: nil,
+            revision: 0,
+            isReadOnly: false,
+            isStreaming: false,
+            findQuery: "",
+            pendingMessageID: nil,
+            findMessageID: nil,
+            showsMetadata: false,
+            publishedTail: messages,
+            onCopyCode: { _ in },
+            onPaint: { _ in }
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    let table = container.tableView
+    #expect(table.numberOfRows > 0)
+    let view = table.view(atColumn: 0, row: 0, makeIfNecessary: true) as? TranscriptTurnRowView
+    #expect(view != nil)
+    #expect(view?.accessibilityLabel() != "Loading transcript row")
+    coordinator.dismantle(container: container)
+}
+
 @Test("renderer maps viewport inputs through the Core policy")
 func rendererMapsViewportInputsThroughCorePolicy() {
     #expect(

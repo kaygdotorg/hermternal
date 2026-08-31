@@ -306,6 +306,9 @@ public actor HistoryCache: TranscriptPersisting {
     private let directory: URL?
     private let fileSystem: any CacheFileSystem
     private let codec: any CacheCodec
+    /// Bounded visible-tail sidecar. A full v3 reload was measured at
+    /// 27-57 ms and is not used on the selection turn.
+    nonisolated(unsafe) private let visibleTailAccess: HistoryCacheVisibleTailAccess
     // Ordinary opens retain a small byte-bounded LRU so repeated navigation
     // stays fast without allowing a corpus-sized decoded cache. REST warming
     // uses storeForWarming and bypasses this dictionary entirely.
@@ -444,6 +447,11 @@ public actor HistoryCache: TranscriptPersisting {
         self.directory = (directory ?? Self.defaultDirectory())?.resolvingSymlinksInPath()
         self.fileSystem = fileSystem
         self.codec = codec
+        self.visibleTailAccess = HistoryCacheVisibleTailAccess(
+            directory: self.directory,
+            fileSystem: fileSystem,
+            codec: codec
+        )
         if let directory = self.directory {
             try? fileSystem.createDirectory(at: directory)
         }
@@ -487,7 +495,22 @@ public actor HistoryCache: TranscriptPersisting {
     ) -> [ChatMessage] {
         let messages = readForWarming(for: id).transcript?.messages ?? []
         guard count > 0 else { return [] }
-        return Array(messages.suffix(count))
+        let tail = Array(messages.suffix(count))
+        visibleTailAccess.store(messages: tail, snapshot: nil, for: id)
+        return tail
+    }
+
+    /// Returns the bounded visible tail without hopping to the cache actor.
+    ///
+    /// The preferred keypress path is `TranscriptWarmStore`. This sidecar is
+    /// the fallback when a cache-resident chat is not in the warm store. A
+    /// full HistoryCache reload was measured at 27-57 ms and is not used
+    /// here.
+    public nonisolated func residentVisibleTail(
+        for id: String,
+        count: Int = TranscriptPublicationPolicy.initialMessageCount
+    ) -> [ChatMessage] {
+        visibleTailAccess.tail(for: id, count: count)
     }
 
     /// Returns the disk-backed store for a session. A v3 flat cache entry is
@@ -1181,6 +1204,11 @@ public actor HistoryCache: TranscriptPersisting {
             } else {
                 forget(id)
             }
+            visibleTailAccess.store(
+                messages: payload.messages,
+                snapshot: payload.snapshot,
+                for: id
+            )
             return CacheStoreResult(addedEntry: false, byteDelta: 0)
         }
         let oldSize = oldData.map { Int64($0.count) } ?? fileSystem.fileSize(at: target) ?? 0
@@ -1194,6 +1222,11 @@ public actor HistoryCache: TranscriptPersisting {
         } else {
             forget(id)
         }
+        visibleTailAccess.store(
+            messages: payload.messages,
+            snapshot: payload.snapshot,
+            for: id
+        )
         return CacheStoreResult(
             addedEntry: !existed,
             byteDelta: Int64(data.count) - oldSize
@@ -1203,9 +1236,15 @@ public actor HistoryCache: TranscriptPersisting {
     @discardableResult
     public func remove(sessionID: String) -> SessionLocalCleanupResult {
         forget(sessionID)
+        visibleTailAccess.remove(sessionID)
         pagedStores.removeValue(forKey: sessionID)
         pagedStoreFlights.removeValue(forKey: sessionID)
-        let targets = [url(for: sessionID), legacyURL(for: sessionID), pagedDirectory(for: sessionID)]
+        let targets = [
+            url(for: sessionID),
+            legacyURL(for: sessionID),
+            pagedDirectory(for: sessionID),
+            visibleTailAccess.sidecarURL(for: sessionID)
+        ]
             .compactMap { $0 }
             .reduce(into: [String: URL]()) { result, target in
                 result[target.path] = target
@@ -1262,9 +1301,18 @@ public actor HistoryCache: TranscriptPersisting {
             directory: directory,
             validIDs: validIDs
         )
+        let validSidecarNames = Set(validIDs.map { id in
+            "tail-\(Self.encodedFilename(for: id)).json"
+        })
         var bytes: Int64 = 0
         var count = 0
         for file in files where file.pathExtension == "json" {
+            if file.lastPathComponent.hasPrefix("tail-") {
+                if !validSidecarNames.contains(file.lastPathComponent) {
+                    try? fileSystem.removeItem(at: file)
+                }
+                continue
+            }
             let kind = reconciliationIndex.classify(filePath: Self.pathIdentity(file))
             let id: String
             let isLegacy: Bool
@@ -1320,6 +1368,7 @@ public actor HistoryCache: TranscriptPersisting {
             memory.removeAll()
             memoryOrder.removeAll()
             memoryBytes = 0
+            visibleTailAccess.removeAll()
             try fileSystem.createDirectory(at: directory)
             return true
         } catch {
@@ -1328,4 +1377,103 @@ public actor HistoryCache: TranscriptPersisting {
     }
 
 
+}
+
+
+/// Synchronous visible-tail cache for the selection turn.
+///
+/// The actor writes the bounded sidecar when a transcript is stored. The
+/// selection path reads it without hopping to the actor. A full v3 reload
+/// was measured at 27-57 ms and is not used here.
+final class HistoryCacheVisibleTailAccess: @unchecked Sendable {
+    private let lock = NSLock()
+    private var memory: [String: [ChatMessage]] = [:]
+    private let directory: URL?
+    private let fileSystem: any CacheFileSystem
+    private let codec: any CacheCodec
+
+    init(
+        directory: URL?,
+        fileSystem: any CacheFileSystem,
+        codec: any CacheCodec
+    ) {
+        self.directory = directory
+        self.fileSystem = fileSystem
+        self.codec = codec
+    }
+
+    func tail(
+        for id: String,
+        count: Int
+    ) -> [ChatMessage] {
+        guard count > 0 else { return [] }
+        lock.lock()
+        if let cached = memory[id] {
+            lock.unlock()
+            return Array(cached.suffix(count))
+        }
+        lock.unlock()
+        guard let url = sidecarURL(for: id),
+              fileSystem.fileExists(at: url),
+              let data = try? fileSystem.data(at: url),
+              let stored = try? codec.decode(data)
+        else {
+            return []
+        }
+        let messages = stored.messages
+        lock.lock()
+        memory[id] = messages
+        lock.unlock()
+        return Array(messages.suffix(count))
+    }
+
+    func store(
+        messages: [ChatMessage],
+        snapshot: AuthoritativeTranscriptSnapshot?,
+        for id: String
+    ) {
+        let tail = Array(messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
+        lock.lock()
+        memory[id] = tail
+        lock.unlock()
+        guard let url = sidecarURL(for: id) else { return }
+        let payload = CachedTranscript(
+            version: HistoryCache.version,
+            messages: tail,
+            snapshot: snapshot
+        )
+        guard let data = try? codec.encode(payload) else { return }
+        if let existing = try? fileSystem.data(at: url), existing == data {
+            return
+        }
+        _ = try? fileSystem.write(data, to: url)
+    }
+
+    func remove(_ id: String) {
+        lock.lock()
+        memory.removeValue(forKey: id)
+        lock.unlock()
+        guard let url = sidecarURL(for: id), fileSystem.fileExists(at: url) else { return }
+        try? fileSystem.removeItem(at: url)
+    }
+
+    func removeAll() {
+        lock.lock()
+        memory.removeAll()
+        lock.unlock()
+    }
+
+    func sidecarURL(for id: String) -> URL? {
+        guard let directory, !id.isEmpty else { return nil }
+        let encoded = id.utf8.reduce(into: "") { result, byte in
+            if (byte >= 48 && byte <= 57)
+                || (byte >= 65 && byte <= 90)
+                || (byte >= 97 && byte <= 122) {
+                result.append(Character(UnicodeScalar(byte)))
+            } else {
+                result += String(format: "%%%02X", byte)
+            }
+        }
+        return directory.appendingPathComponent("tail-\(encoded).json")
+    }
 }

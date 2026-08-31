@@ -344,6 +344,7 @@ struct BlockTranscriptView: NSViewRepresentable {
         private var store: (any TranscriptTurnPageLocating)?
         private var route: TranscriptRoute?
         private var summary: TranscriptSummary?
+        private var publishedTail: [ChatMessage] = []
         private var loadedTurns: [Int: LoadedTurn] = [:]
         private var loadedOrder: [Int] = []
         private var measuredDocuments = MeasuredDocumentCache()
@@ -418,6 +419,7 @@ struct BlockTranscriptView: NSViewRepresentable {
             self.store = input.store
             self.route = input.route
             self.summary = input.summary
+            self.publishedTail = input.publishedTail
             self.isReadOnly = input.isReadOnly
             self.findQuery = input.findQuery
             self.findMessageID = input.findMessageID
@@ -470,6 +472,9 @@ struct BlockTranscriptView: NSViewRepresentable {
                 loadingStarts.removeAll(keepingCapacity: true)
             }
 
+            if store == nil {
+                installPublishedTail(publishedTail)
+            }
             let count = rowCount
             if routeChanged {
                 table.noteNumberOfRowsChanged()
@@ -599,6 +604,27 @@ struct BlockTranscriptView: NSViewRepresentable {
         }
 
 
+
+        /// Installs the synchronously published cache tail when the paged
+        /// store is not yet on the route. Disk-resident pages replace this
+        /// once the store is installed.
+        private func installPublishedTail(_ messages: [ChatMessage]) {
+            guard store == nil else { return }
+            let turns = CachedTranscript(
+                version: HistoryCache.version,
+                messages: messages,
+                snapshot: nil
+            ).turns
+            totalTurnCount = turns.count
+            loadedTurns.removeAll(keepingCapacity: true)
+            loadedOrder.removeAll(keepingCapacity: true)
+            for (ordinal, turn) in turns.enumerated() {
+                loadedTurns[ordinal] = LoadedTurn(ordinal: ordinal, turn: turn)
+                loadedOrder.append(ordinal)
+            }
+            table.noteNumberOfRowsChanged()
+        }
+
         private func requestVisiblePages() {
             let visible = table.rows(in: table.visibleRect)
             if visible.location == NSNotFound || visible.length == 0 {
@@ -637,6 +663,12 @@ struct BlockTranscriptView: NSViewRepresentable {
                 expectedGeneration: route.generation,
                 expectedEpoch: route.epoch
             )
+            if let paged = store as? PagedTranscriptStore,
+               let page = paged.residentTurnPage(request) {
+                loadingStarts.remove(start)
+                accept(page)
+                return
+            }
             let task = Task { [weak self, store] in
                 do {
                     let page = try await store.turnPage(request)

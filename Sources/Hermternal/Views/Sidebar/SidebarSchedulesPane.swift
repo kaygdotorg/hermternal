@@ -17,7 +17,7 @@ struct SidebarSchedulesPane: View {
 
     let rows: [SidebarRow]
     let folders: [Folder]
-    let rowMenuDerivations: SidebarRowMenuDerivations
+    let menuSource: SidebarMenuSource
     @Binding var selection: Set<SidebarSelectionID>
     let onOpen: (ChatSession) -> Void
     let onPin: ([ChatSession], Bool) -> Void
@@ -53,9 +53,7 @@ struct SidebarSchedulesPane: View {
                     SessionRowItem(
                         session: row.session,
                         folders: folders,
-                        menu: rowMenuDerivations.sessionByItem[
-                            .chat(row.sessionID)
-                        ]!,
+                        makeMenu: { menuSource.sessionMenu(for: row.sessionID) },
                         onOpen: onOpen,
                         onPin: onPin,
                         onArchive: onArchive,

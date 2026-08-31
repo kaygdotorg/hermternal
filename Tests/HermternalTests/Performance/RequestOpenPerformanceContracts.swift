@@ -110,6 +110,60 @@ func performanceMigratedRequestOpenFirstPaintContract() async throws {
     )
 }
 
+@Test("performance contract: warm keypress requestOpen publishes tail on the same turn")
+@MainActor
+func performanceWarmKeypressRequestOpenPublishesOnTheSameTurn() async throws {
+    let samples = 5
+    var walls: [Double] = []
+    walls.reserveCapacity(samples)
+    for _ in 0..<samples {
+        let directory = try requestOpenPerformanceDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = HistoryCache(directory: directory)
+        let fixture = requestOpenPerformanceFixture(sessionID: "warm-keypress")
+        _ = await cache.store(
+            fixture.messages,
+            snapshot: fixture.snapshot,
+            for: fixture.session.id
+        )
+        let warmStore = TranscriptWarmStore()
+        #expect(warmStore.publish(
+            messages: fixture.messages,
+            snapshot: fixture.snapshot,
+            for: fixture.session.id,
+            minimumServerTotal: fixture.session.messageCount
+        ))
+        let model = AppModel(
+            cache: cache,
+            transcriptSource: RequestOpenPerformanceSource(),
+            warmStore: warmStore
+        )
+        model.sessions = [fixture.session]
+        model.cacheEnabled = true
+
+        await drainMainQueueOnce()
+        let start = ContinuousClock.now
+        let task = model.requestOpen(fixture.session)
+        let elapsed = start.duration(to: .now)
+        #expect(model.transcriptRouteIdentity == "live:\(fixture.session.id)")
+        #expect(model.messages.count == TranscriptPublicationPolicy.initialMessageCount)
+        #expect(model.messages.map(\.text) == Array(fixture.messages.suffix(12).map(\.text)))
+        model.cancelOpenPreparation()
+        _ = task
+        walls.append(durationMilliseconds(elapsed))
+    }
+    let p95 = performancePercentile(walls, percentile: 95)
+    let gate = Double(TranscriptPublicationPolicy.keypressPaintBudgetMilliseconds)
+    #expect(p95 <= gate)
+    print(
+        "PERF|warm keypress requestOpen|"
+            + "p95Ms=\(formatRequestOpenMilliseconds(p95)) "
+            + "samples=\(samples) "
+            + "gate<=\(TranscriptPublicationPolicy.keypressPaintBudgetMilliseconds) "
+            + "firstCount=\(TranscriptPublicationPolicy.initialMessageCount)"
+    )
+}
+
 private struct RequestOpenPerformanceSource: TranscriptSource {
     func fetchAuthoritative(sessionID _: String) async throws -> AuthoritativeTranscript {
         AuthoritativeTranscript(rows: [], serverTotal: 0)

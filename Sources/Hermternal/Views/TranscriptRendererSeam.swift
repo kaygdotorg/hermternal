@@ -16,8 +16,39 @@ struct TranscriptRendererInput {
     let pendingMessageID: String?
     let findMessageID: String?
     let showsMetadata: Bool
+    let publishedTail: [ChatMessage]
     let onCopyCode: (String) -> Void
     let onPaint: (UInt64) -> Void
+
+    init(
+        store: (any TranscriptTurnPageLocating)?,
+        route: TranscriptRoute?,
+        summary: TranscriptSummary?,
+        revision: UInt64,
+        isReadOnly: Bool,
+        isStreaming: Bool,
+        findQuery: String,
+        pendingMessageID: String?,
+        findMessageID: String?,
+        showsMetadata: Bool,
+        publishedTail: [ChatMessage] = [],
+        onCopyCode: @escaping (String) -> Void,
+        onPaint: @escaping (UInt64) -> Void
+    ) {
+        self.store = store
+        self.route = route
+        self.summary = summary
+        self.revision = revision
+        self.isReadOnly = isReadOnly
+        self.isStreaming = isStreaming
+        self.findQuery = findQuery
+        self.pendingMessageID = pendingMessageID
+        self.findMessageID = findMessageID
+        self.showsMetadata = showsMetadata
+        self.publishedTail = publishedTail
+        self.onCopyCode = onCopyCode
+        self.onPaint = onPaint
+    }
 }
 
 extension TranscriptRendererInput {

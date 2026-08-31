@@ -52,7 +52,7 @@ struct SidebarSessionMenuDerivation {
 struct SessionRowItem: View {
     let session: ChatSession
     let folders: [Folder]
-    let menu: SidebarSessionMenuDerivation
+    let makeMenu: () -> SidebarSessionMenuDerivation
     let onOpen: (ChatSession) -> Void
     let onPin: ([ChatSession], Bool) -> Void
     let onArchive: ([ChatSession]) -> Void
@@ -124,14 +124,15 @@ extension SessionRowItem {
             archiveButton
         }
         .contextMenu {
-            contextMenu
+            let menu = makeMenu()
+            sessionContextMenu(menu)
         }
     }
 
 
 
     @ViewBuilder
-    private var contextMenu: some View {
+    private func sessionContextMenu(_ menu: SidebarSessionMenuDerivation) -> some View {
         let chats = menu.chats
         let folderIDs = menu.folderIDs
         let chatNoun = chats.count == 1 ? "Chat" : "Chats"
@@ -190,7 +191,7 @@ extension SessionRowItem {
             .help(purgeAvailable ? "Permanently delete \(chats.count) \(chatNoun)" : purgeUnavailableReason)
         }
         if !menu.moveChats.isEmpty {
-            moveMenu(menu.moveChats, folderCount: folderIDs.count)
+            moveMenu(menu, folderCount: folderIDs.count)
         }
         Divider()
         Button("Rename", systemImage: "pencil") {
@@ -199,7 +200,8 @@ extension SessionRowItem {
         .disabled(chats.count != 1)
     }
     @ViewBuilder
-    private func moveMenu(_ chats: [ChatSession], folderCount: Int) -> some View {
+    private func moveMenu(_ menu: SidebarSessionMenuDerivation, folderCount: Int) -> some View {
+        let chats = menu.moveChats
         let noun = chats.count == 1 ? "Chat" : "Chats"
         let folderPhrase: String? = if folderCount == 0 {
             nil

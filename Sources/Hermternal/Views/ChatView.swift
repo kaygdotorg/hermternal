@@ -224,6 +224,7 @@ struct ChatView: View {
                 ? findMatches[activeFindIndex].descriptor.messageID
                 : nil,
             showsMetadata: alwaysShowsChatMetadata,
+            publishedTail: model.messages,
             onCopyCode: { code in
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(code, forType: .string)

@@ -78,14 +78,7 @@ func fortySidebarSelectionsStartCachedOpensImmediately() async throws {
     for (index, session) in sessions.enumerated() {
         immediateOpenStarts.append(session.id)
         finalOpenTask = model.requestOpen(session)
-
-        guard await sidebarWait(
-            until: "selection \(index + 1) routes the transcript to live:\(session.id)",
-            holds: { model.transcriptRouteIdentity == "live:\(session.id)" }
-        ) else {
-            openedEverySession = false
-            break
-        }
+        #expect(model.transcriptRouteIdentity == "live:\(session.id)")
         #expect(model.messages.map(\.text) == ["cached \(index + 1)"])
 
         guard await sidebarWait(

@@ -294,11 +294,8 @@ func requestOpenPublishesCacheTailBeforePagedStoreInstall() async throws {
     model.cacheEnabled = true
 
     let task = model.requestOpen(session)
-    let painted = await chatOpenWait(
-        until: "first paint publishes 12 cached messages",
-        holds: { model.messages.count == TranscriptPublicationPolicy.initialMessageCount }
-    )
-    #expect(painted)
+    #expect(model.transcriptRouteIdentity == "live:\(session.id)")
+    #expect(model.messages.count == TranscriptPublicationPolicy.initialMessageCount)
     #expect(model.messages.map(\.text) == Array(messages.suffix(12).map(\.text)))
     #expect(await cache.existingPagedStore(for: session.id) == nil)
     model.cancelOpenPreparation()

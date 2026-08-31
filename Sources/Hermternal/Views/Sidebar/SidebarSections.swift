@@ -71,7 +71,7 @@ struct SidebarSections: View {
     let selection: Set<SidebarSelectionID>
     let visibleOrder: [SidebarSelectionID]
     let folderVisibleOrder: [SidebarSelectionID]
-    let rowMenuDerivations: SidebarRowMenuDerivations
+    let menuSource: SidebarMenuSource
     let onOpen: (ChatSession) -> Void
     let onPin: ([ChatSession], Bool) -> Void
     let onArchive: ([ChatSession]) -> Void
@@ -137,9 +137,7 @@ struct SidebarSections: View {
                         isExpanded: folderExpansion(for: run.target.id),
                         selection: selection,
                         visibleOrder: folderVisibleOrder,
-                        menu: rowMenuDerivations.folderByItem[
-                            .folder(run.target.id)
-                        ]!,
+                        makeMenu: { menuSource.folderMenu(for: run.target.id) },
                         onRename: onRenameFolder,
                         onSelect: onSelectFolder,
                         onPin: onPin,
@@ -243,9 +241,7 @@ struct SidebarSections: View {
             SessionRowItem(
                 session: row.session,
                 folders: folders,
-                menu: rowMenuDerivations.sessionByItem[
-                    .chat(row.sessionID)
-                ]!,
+                makeMenu: { menuSource.sessionMenu(for: row.sessionID) },
                 onOpen: onOpen,
                 onPin: onPin,
                 onArchive: onArchive,
@@ -283,7 +279,7 @@ struct SidebarSections: View {
         )
         .compactMap { item in
             guard case let .chat(id) = item,
-                  !rowMenuDerivations.scheduledIDs.contains(id)
+                  !menuSource.scheduledIDs.contains(id)
             else {
                 return nil
             }

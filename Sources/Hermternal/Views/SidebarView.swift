@@ -594,7 +594,7 @@ struct SidebarView: View {
         let scheduleRows = derived.scheduleRows
         let visibleOrder = derived.visibleOrder
         let folderVisibleOrder = derived.folderVisibleOrder
-        let rowMenuDerivations = derived.rowMenuDerivations
+        let menuSource = derived.menuSource
         let content = columnChrome(
             Group {
                 if model.sidebarContentMode == .chats {
@@ -603,11 +603,11 @@ struct SidebarView: View {
                             sections,
                             visibleOrder: visibleOrder,
                             folderVisibleOrder: folderVisibleOrder,
-                            rowMenuDerivations: rowMenuDerivations
+                            menuSource: menuSource
                         )
                         floatingLayer(
                             scheduleRows,
-                            rowMenuDerivations: rowMenuDerivations
+                            menuSource: menuSource
                         )
                     }
                 } else {
@@ -671,14 +671,14 @@ struct SidebarView: View {
         _ sections: [SidebarSection],
         visibleOrder: [SidebarSelectionID],
         folderVisibleOrder: [SidebarSelectionID],
-        rowMenuDerivations: SidebarRowMenuDerivations
+        menuSource: SidebarMenuSource
     ) -> some View {
         List(selection: $sidebarSelection) {
             sessionSections(
                 sections,
                 visibleOrder: visibleOrder,
                 folderVisibleOrder: folderVisibleOrder,
-                rowMenuDerivations: rowMenuDerivations
+                menuSource: menuSource
             )
         }
         .listStyle(.sidebar)
@@ -752,7 +752,7 @@ struct SidebarView: View {
         _ sections: [SidebarSection],
         visibleOrder: [SidebarSelectionID],
         folderVisibleOrder: [SidebarSelectionID],
-        rowMenuDerivations: SidebarRowMenuDerivations
+        menuSource: SidebarMenuSource
     ) -> SidebarSections {
         SidebarSections(
             sections: sections,
@@ -761,7 +761,7 @@ struct SidebarView: View {
             selection: sidebarSelection,
             visibleOrder: visibleOrder,
             folderVisibleOrder: folderVisibleOrder,
-            rowMenuDerivations: rowMenuDerivations,
+            menuSource: menuSource,
             onOpen: { session in openImmediately(session) },
             onPin: { sessions, pinned in
                 Task { await model.setPinned(sessions, pinned: pinned) }
@@ -813,13 +813,13 @@ struct SidebarView: View {
     /// and a user cannot create a schedule from here, so absence hides it.
     private func floatingLayer(
         _ scheduleRows: [SidebarRow],
-        rowMenuDerivations: SidebarRowMenuDerivations
+        menuSource: SidebarMenuSource
     ) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             if !scheduleRows.isEmpty {
                 schedulesPane(
                     scheduleRows,
-                    rowMenuDerivations: rowMenuDerivations
+                    menuSource: menuSource
                 )
             }
             Divider()
@@ -846,12 +846,12 @@ struct SidebarView: View {
 
     private func schedulesPane(
         _ scheduleRows: [SidebarRow],
-        rowMenuDerivations: SidebarRowMenuDerivations
+        menuSource: SidebarMenuSource
     ) -> SidebarSchedulesPane {
         return SidebarSchedulesPane(
             rows: scheduleRows,
             folders: model.folders,
-            rowMenuDerivations: rowMenuDerivations,
+            menuSource: menuSource,
             selection: $sidebarSelection,
             onOpen: { session in openImmediately(session) },
             onPin: { sessions, pinned in
@@ -1606,23 +1606,6 @@ struct SidebarView: View {
         }
     }
 
-    /// Native selection and scrolling update immediately. Keyboard and
-    /// pointer selections share the same cancellation and publication path.
-    private func scheduleOpen(for id: String?) {
-        guard let id,
-              let session = sidebarDerivationCache.session(for: id)
-                    ?? model.sessions.first(where: { $0.id == id })
-        else {
-            HermternalSwitchTrace.selectionGuard(
-                "scheduleOpen.sessionLookup",
-                id: id,
-                messages: model.messages.count,
-                reason: "missingIDOrLiveRow"
-            )
-            return
-        }
-        activateSession(session, event: "open.requested.keyboard")
-    }
 }
 
 /// Opens a session unless the same pointer cycle already opened it.
@@ -1675,17 +1658,11 @@ func sidebarSelectionArrival(
     open(sessionID, pointerCycle)
 }
 
-/// The member order is intentional: row maps first, then shared drag inputs.
-struct SidebarRowMenuDerivations {
-    let sessionByItem: [SidebarSelectionID: SidebarSessionMenuDerivation]
-    let folderByItem: [SidebarSelectionID: SidebarFolderMenuDerivation]
-    let scheduledIDs: Set<String>
-}
-
 /// Values shared by every selection-dependent sidebar projection.
 ///
 /// This base is stable while only the native List selection changes.
-private struct SidebarStableBase {
+/// Internal because SidebarMenuSource holds it.
+struct SidebarStableBase {
     let orderedSessionIDs: [String]
     let sections: [SidebarSection]
     let scheduleRows: [SidebarRow]
@@ -1696,13 +1673,97 @@ private struct SidebarStableBase {
     let pinnedByID: [String: Bool]
     let foldersByID: [String: SidebarFolderTarget]
     let expandedChatsByItem: [SidebarSelectionID: [ChatSession]]
+    let membership: [String: String]
+}
+
+
+/// Derives one context menu when that menu opens. Selection changes do
+/// not walk every sidebar row.
+struct SidebarMenuSource {
+    fileprivate let base: SidebarStableBase
+    let selection: Set<SidebarSelectionID>
+    let membership: [String: String]
+
+    var scheduledIDs: Set<String> { base.scheduledIDs }
+
+    func sessionMenu(for sessionID: String) -> SidebarSessionMenuDerivation {
+        derivation(for: .chat(sessionID))
+    }
+
+    func folderMenu(for folderID: String) -> SidebarFolderMenuDerivation {
+        folderDerivation(for: .folder(folderID))
+    }
+
+    private func chats(for item: SidebarSelectionID) -> [ChatSession] {
+        if selection.contains(item) {
+            let ids = SidebarSelectionPolicy.expandedChatIDs(
+                selection: selection,
+                orderedSessionIDs: base.orderedSessionIDs,
+                scheduledSessionIDs: base.scheduledIDs,
+                folderMembership: membership
+            )
+            return ids.compactMap { base.sessionsByID[$0] }
+        }
+        return base.expandedChatsByItem[item] ?? []
+    }
+
+    private func derivation(for item: SidebarSelectionID) -> SidebarSessionMenuDerivation {
+        let contextSelection = SidebarSelectionPolicy.contextTargets(
+            clicked: item,
+            selected: selection
+        )
+        let contextChats = chats(for: item)
+        let moveChats = contextChats.filter {
+            !base.scheduledIDs.contains($0.id)
+        }
+        let folderIDs = contextSelection.compactMap { item -> String? in
+            guard case let .folder(id) = item else { return nil }
+            return id
+        }
+        var disabledFolderIDs = Set<String>()
+        if let commonFolderID = moveChats.first.flatMap({ membership[$0.id] }),
+           moveChats.allSatisfy({ membership[$0.id] == commonFolderID }) {
+            disabledFolderIDs.insert(commonFolderID)
+        }
+        return SidebarSessionMenuDerivation(
+            chats: contextChats,
+            moveChats: moveChats,
+            folderIDs: folderIDs,
+            pinAction: SidebarSelectionPolicy.convergingPinAction(
+                for: contextChats.compactMap { base.pinnedByID[$0.id] }
+            ),
+            disabledFolderIDs: disabledFolderIDs,
+            hasFolderMembership: moveChats.contains {
+                membership[$0.id] != nil
+            }
+        )
+    }
+
+    private func folderDerivation(for item: SidebarSelectionID) -> SidebarFolderMenuDerivation {
+        let selectedFolderTargets = base.folderVisibleOrder.compactMap { item -> SidebarFolderTarget? in
+            guard case let .folder(id) = item else { return nil }
+            return base.foldersByID[id]
+        }
+        guard case let .folder(id) = item,
+              let target = base.foldersByID[id]
+        else {
+            return SidebarFolderMenuDerivation(targets: [], chats: [], pinAction: nil)
+        }
+        let targets = selection.contains(item) ? selectedFolderTargets : [target]
+        let contextChats = chats(for: item)
+        return SidebarFolderMenuDerivation(
+            targets: targets,
+            chats: contextChats,
+            pinAction: SidebarSelectionPolicy.convergingPinAction(
+                for: contextChats.compactMap { base.pinnedByID[$0.id] }
+            )
+        )
+    }
 }
 
 /// The small projection that changes when the native List selection changes.
 private struct SidebarSelectionProjection {
     let selection: Set<SidebarSelectionID>
-    let expandedChats: [ChatSession]
-    let rowMenuDerivations: SidebarRowMenuDerivations
 }
 
 /// The body-level values derived from stable ordering and current selection.
@@ -1720,12 +1781,15 @@ private struct SidebarDerivedData {
     var sessionsByID: [String: ChatSession] { base.sessionsByID }
     var pinnedByID: [String: Bool] { base.pinnedByID }
     var foldersByID: [String: SidebarFolderTarget] { base.foldersByID }
-    var expandedChats: [ChatSession] { selectionProjection.expandedChats }
     var expandedChatsByItem: [SidebarSelectionID: [ChatSession]] {
         base.expandedChatsByItem
     }
-    var rowMenuDerivations: SidebarRowMenuDerivations {
-        selectionProjection.rowMenuDerivations
+    var menuSource: SidebarMenuSource {
+        SidebarMenuSource(
+            base: base,
+            selection: selection,
+            membership: base.membership
+        )
     }
 }
 
@@ -1748,49 +1812,18 @@ private func sidebarSessionsBytes(_ sessions: [ChatSession]) -> Int {
     sessions.reduce(0) { sidebarAdd($0, sidebarSessionBytes($1)) }
 }
 
-private extension SidebarRowMenuDerivations {
-    var estimatedByteCount: Int {
-        let sessions = sessionByItem.values.reduce(0) {
-            sidebarAdd($0, sidebarAdd(sidebarSessionsBytes($1.chats), sidebarSessionsBytes($1.moveChats)))
-        }
-        let folders = folderByItem.values.reduce(0) { total, menu in
-            sidebarAdd(
-                total,
-                sidebarAdd(
-                    sidebarSessionsBytes(menu.chats),
-                    menu.targets.reduce(0) { subtotal, target in
-                        sidebarAdd(subtotal, target.id.utf8.count + target.name.utf8.count)
-                    }
-                )
-            )
-        }
-        let ids = scheduledIDs.reduce(0) { sidebarAdd($0, $1.utf8.count) }
-        return sidebarAdd(
-            MemoryLayout<Self>.stride,
-            sidebarAdd(sessions, sidebarAdd(folders, ids))
-        )
-    }
-}
-
-
 private extension SidebarSelectionProjection {
     var estimatedByteCount: Int {
         let selectionBytes = selection.reduce(0) { partial, _ in
             sidebarAdd(partial, MemoryLayout<SidebarSelectionID>.stride)
         }
-        return sidebarAdd(
-            MemoryLayout<Self>.stride,
-            sidebarAdd(
-                selectionBytes,
-                sidebarAdd(sidebarSessionsBytes(expandedChats), rowMenuDerivations.estimatedByteCount)
-            )
-        )
+        return sidebarAdd(MemoryLayout<Self>.stride, selectionBytes)
     }
 }
 
 /// Keeps ordering and selection projections resident across SwiftUI body
-/// passes. Ordering inputs rebuild the stable base; selection changes rebuild
-/// only the aggregate and menu projection.
+/// passes. Ordering inputs rebuild the stable base; selection changes store
+/// only the selection set.
 private final class SidebarDerivationCache {
     private static let sidebarBudget = AppMemoryProfile.mac440MiB.limit(for: .sidebar)
     // Ordering and selection each have a bounded half. Together they preserve
@@ -1869,7 +1902,8 @@ private final class SidebarDerivationCache {
                     uniqueKeysWithValues: sessionsByID.map { ($0.key, $0.value.pinned) }
                 ),
                 foldersByID: foldersByID,
-                expandedChatsByItem: expandedChatsByItem
+                expandedChatsByItem: expandedChatsByItem,
+                membership: membership
             )
             baseRebuildCount = orderingMemo.rebuildCount
         }
@@ -1885,32 +1919,13 @@ private final class SidebarDerivationCache {
             return SidebarDerivedData(base: base, selectionProjection: cached)
         }
 
-        let expandedIDs = SidebarSelectionPolicy.expandedChatIDs(
-            selection: selection,
-            orderedSessionIDs: base.orderedSessionIDs,
-            scheduledSessionIDs: base.scheduledIDs,
-            folderMembership: membership
-        )
-        let aggregateChats = expandedIDs.compactMap { base.sessionsByID[$0] }
-        let candidate = SidebarSelectionProjection(
-            selection: selection,
-            expandedChats: aggregateChats,
-            rowMenuDerivations: menuDerivations(
-                base: base,
-                selection: selection,
-                aggregateChats: aggregateChats,
-                membership: membership
-            )
-        )
-        // Estimate once for this changed selection. The local also prevents
-        // admission from traversing every menu array a second time.
+        let candidate = SidebarSelectionProjection(selection: selection)
         let candidateBytes = candidate.estimatedByteCount
         if candidateBytes <= Self.sidebarBudget / 2,
            let admission = memoryRegistry.admit(
                category: .sidebar,
                bytes: candidateBytes
            ) {
-            // Admit first. A failed replacement must not evict the old menu.
             if let previous = selectionAdmission {
                 memoryRegistry.evict(previous)
             }
@@ -1928,87 +1943,8 @@ private final class SidebarDerivationCache {
     func session(for id: String) -> ChatSession? {
         base?.sessionsByID[id]
     }
-
-    private func menuDerivations(
-        base: SidebarStableBase,
-        selection: Set<SidebarSelectionID>,
-        aggregateChats: [ChatSession],
-        membership: [String: String]
-    ) -> SidebarRowMenuDerivations {
-        func chats(for item: SidebarSelectionID) -> [ChatSession] {
-            selection.contains(item)
-                ? aggregateChats
-                : base.expandedChatsByItem[item] ?? []
-        }
-        let sessionByItem = Dictionary(
-            uniqueKeysWithValues: base.visibleOrder.compactMap { item
-                -> (SidebarSelectionID, SidebarSessionMenuDerivation)? in
-                guard case .chat(_) = item else { return nil }
-                let contextSelection = SidebarSelectionPolicy.contextTargets(
-                    clicked: item,
-                    selected: selection
-                )
-                let contextChats = chats(for: item)
-                let moveChats = contextChats.filter {
-                    !base.scheduledIDs.contains($0.id)
-                }
-                let folderIDs = contextSelection.compactMap { item -> String? in
-                    guard case let .folder(id) = item else { return nil }
-                    return id
-                }
-                var disabledFolderIDs = Set<String>()
-                if let commonFolderID = moveChats.first.flatMap({ membership[$0.id] }),
-                   moveChats.allSatisfy({ membership[$0.id] == commonFolderID }) {
-                    disabledFolderIDs.insert(commonFolderID)
-                }
-                let derivation = SidebarSessionMenuDerivation(
-                    chats: contextChats,
-                    moveChats: moveChats,
-                    folderIDs: folderIDs,
-                    pinAction: SidebarSelectionPolicy.convergingPinAction(
-                        for: contextChats.compactMap { base.pinnedByID[$0.id] }
-                    ),
-                    disabledFolderIDs: disabledFolderIDs,
-                    hasFolderMembership: moveChats.contains {
-                        membership[$0.id] != nil
-                    }
-                )
-                return (item, derivation)
-            }
-        )
-        let selectedFolderTargets = base.folderVisibleOrder.compactMap { item -> SidebarFolderTarget? in
-            guard case let .folder(id) = item else { return nil }
-            return base.foldersByID[id]
-        }
-        let folderByItem = Dictionary(
-            uniqueKeysWithValues: base.folderVisibleOrder.compactMap { item
-                -> (SidebarSelectionID, SidebarFolderMenuDerivation)? in
-                guard case let .folder(id) = item,
-                      let target = base.foldersByID[id]
-                else { return nil }
-                let targets = selection.contains(item)
-                    ? selectedFolderTargets
-                    : [target]
-                let contextChats = chats(for: item)
-                return (
-                    item,
-                    SidebarFolderMenuDerivation(
-                        targets: targets,
-                        chats: contextChats,
-                        pinAction: SidebarSelectionPolicy.convergingPinAction(
-                            for: contextChats.compactMap { base.pinnedByID[$0.id] }
-                        )
-                    )
-                )
-            }
-        )
-        return SidebarRowMenuDerivations(
-            sessionByItem: sessionByItem,
-            folderByItem: folderByItem,
-            scheduledIDs: base.scheduledIDs
-        )
-    }
 }
+
 
 private struct SidebarPurgeTarget: Identifiable {
     let plan: SessionPurgePlan

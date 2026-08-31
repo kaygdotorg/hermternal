@@ -584,8 +584,8 @@ final class AppModel: ComposerTurnRouting {
     var selectedSessionID: String?
     /// Route identity installed with the transcript snapshot.
     ///
-    /// Selection changes publish first. The opener changes this identity
-    /// together with `messages` after the selection transaction commits.
+    /// A cached open publishes this identity together with `messages` on
+    /// the selection turn.
     var transcriptRouteIdentity = "live:none"
     private(set) var transcriptRouteGeneration = 0
     /// The chat whose transcript has actually been painted, as distinct from
@@ -3257,68 +3257,55 @@ final class AppModel: ComposerTurnRouting {
             reason: "firstPaintPublished"
         )
     }
-    /// Publishes the first transcript snapshot after the selection turn.
+    /// Publishes the cached tail on the caller's MainActor turn.
     ///
-    /// The main-queue hop runs after the current run-loop transaction commits.
-    /// The generation check guards the route and content install together.
+    /// Warm projection and the bounded disk sidecar are synchronous. Network
+    /// and REST work stay in the opener task. The generation guard remains
+    /// on this assignment.
     @MainActor
-    private func publishTranscriptAfterSelectionTurn(
+    private func publishCachedTranscript(
         _ initialMessages: [ChatMessage],
         session: ChatSession,
         generation: Int,
         warm: WarmTranscriptProjection?
-    ) async -> Bool {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.main.async { [weak self] in
-                guard let self else {
-                    continuation.resume(returning: false)
-                    return
-                }
-                guard self.openGenerations.isCurrent(generation) else {
-                    HermternalSwitchTrace.selectionGuard(
-                        "requestOpen.afterSelectionTurn",
-                        id: session.id,
-                        generation: generation,
-                        messages: self.messages.count,
-                        reason: "generationSuperseded"
-                    )
-                    continuation.resume(returning: false)
-                    return
-                }
-                self.transcriptRouteIdentity = "live:\(session.id)"
-                self.transcriptRouteGeneration = generation
-                self.streamingReducer.reset(messages: initialMessages)
-                self.messages = initialMessages
-                self.isAwaitingReply = self.streamingReducer.isAwaitingReply
-                HermternalSwitchTrace.session(
-                    "transcript.publish",
-                    id: session.id,
-                    generation: generation,
-                    messages: initialMessages.count,
-                    detail: warm == nil ? "route.publish" : "warm.tail.publish"
-                )
-                ContentionTrace.snapshotAndReset(phase: "first-publish")
-                HermternalSwitchTrace.session(
-                    warm == nil ? "route.publish" : "warm.tail.publish",
-                    id: session.id,
-                    generation: generation,
-                    messages: initialMessages.count
-                )
-                continuation.resume(returning: true)
-            }
+    ) -> Bool {
+        guard openGenerations.isCurrent(generation) else {
+            HermternalSwitchTrace.selectionGuard(
+                "requestOpen.publishCached",
+                id: session.id,
+                generation: generation,
+                messages: messages.count,
+                reason: "generationSuperseded"
+            )
+            return false
         }
+        transcriptRouteIdentity = "live:\(session.id)"
+        transcriptRouteGeneration = generation
+        streamingReducer.reset(messages: initialMessages)
+        messages = initialMessages
+        isAwaitingReply = streamingReducer.isAwaitingReply
+        HermternalSwitchTrace.session(
+            "transcript.publish",
+            id: session.id,
+            generation: generation,
+            messages: initialMessages.count,
+            detail: warm == nil ? "route.publish" : "warm.tail.publish"
+        )
+        ContentionTrace.snapshotAndReset(phase: "first-publish")
+        HermternalSwitchTrace.session(
+            warm == nil ? "route.publish" : "warm.tail.publish",
+            id: session.id,
+            generation: generation,
+            messages: initialMessages.count
+        )
+        return true
     }
 
 
-    /// Publishes the durable selection identity synchronously. Warm-cache
-    /// projection and transcript publication begin only after the first actor
-    /// suspension, so SwiftUI's List can commit the real selection highlight
-    /// before transcript observation invalidates the chat view. The selection
-    /// mutation invalidates both SidebarView and ChatView in one SwiftUI
-    /// transaction. A later actor yield alone does not end that transaction.
-    ///
-    /// Transcript publication therefore crosses a run-loop turn before it
-    /// mutates `messages`. The generation guard remains on that assignment.
+    /// Publishes the durable selection identity synchronously. When a warm
+    /// projection or a bounded disk tail exists, the transcript tail is
+    /// published on the same MainActor turn. Network and REST work stay in
+    /// the opener task. The generation guard remains on the assignment.
     @discardableResult
     func requestOpen(
         _ session: ChatSession
@@ -3353,8 +3340,9 @@ final class AppModel: ComposerTurnRouting {
         liveSessionID = nil
         isPreparingOpen = true
         preparingOpenGeneration = generation
-        // Invalidate the previous stream before yielding. Event handling is
-        // also gated below until this open has installed its transcript.
+        // Invalidate the previous stream before the cached publish. Event
+        // handling is also gated below until this open has installed its
+        // transcript.
         clearActiveTranscriptStore()
         streamingReducer.reset()
         ContentionTrace.reset()
@@ -3381,21 +3369,38 @@ final class AppModel: ComposerTurnRouting {
             messages: messages.count,
             detail: "route.selection"
         )
-        let warmStoreForOpen = warmStore
-        let cacheEnabledForOpen = cacheEnabled
-        let generationsForOpen = openGenerations
-        let historyCacheForOpen = historyCache
-        // Overlap the v3 tail read with the selection-transaction yield.
-        // This task never starts a paged migration.
-        let prefetchVisibleTail: Task<[ChatMessage], Never>?
+        var warm: WarmTranscriptProjection?
         if cacheEnabled {
-            let sessionID = session.id
-            prefetchVisibleTail = Task {
-                await historyCacheForOpen.visibleTail(for: sessionID)
-            }
-        } else {
-            prefetchVisibleTail = nil
+            warm = warmStore.projection(
+                for: session.id,
+                minimumServerTotal: session.messageCount
+            )
         }
+        var initialMessages = warm.map {
+            Array($0.messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
+        } ?? []
+        // Prefer the warm projection. The sidecar is the cache-resident
+        // fallback. A full HistoryCache reload was measured at 27-57 ms
+        // and is not used on this turn.
+        if initialMessages.isEmpty, cacheEnabled {
+            initialMessages = historyCache.residentVisibleTail(for: session.id)
+        }
+        SelectionLatencySignposts.markWarmProjection(
+            warm != nil,
+            sessionID: session.id,
+            generation: generation
+        )
+        // The first-frame tail is bounded. Publish it on this turn, and
+        // never after a v3-to-paged migration. A later store swap keeps
+        // this tail.
+        _ = publishCachedTranscript(
+            initialMessages,
+            session: session,
+            generation: generation,
+            warm: warm
+        )
+        releaseOpenEventGate(generation: generation, sessionID: session.id)
+        let publishedWarm = warm
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
@@ -3409,13 +3414,9 @@ final class AppModel: ComposerTurnRouting {
                     sessionID: session.id
                 )
             }
-            // The first yield keeps warm lookup off the selection turn.
-            // Transcript publication below also crosses the commit boundary;
-            // a yield before lookup alone does not provide that guarantee.
-            await Task.yield()
             guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
                 HermternalSwitchTrace.selectionGuard(
-                    "requestOpen.afterFirstYield",
+                    "requestOpen.afterCachedPublish",
                     id: session.id,
                     generation: generation,
                     messages: self.messages.count,
@@ -3425,51 +3426,27 @@ final class AppModel: ComposerTurnRouting {
                 )
                 return
             }
-            var warm: WarmTranscriptProjection?
-            if cacheEnabledForOpen, generationsForOpen.isCurrent(generation) {
-                warm = warmStoreForOpen.projection(
-                    for: session.id,
-                    minimumServerTotal: session.messageCount
-                )
-            }
-            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
-                HermternalSwitchTrace.selectionGuard(
-                    "requestOpen.afterWarmLookup",
-                    id: session.id,
-                    generation: generation,
-                    messages: self.messages.count,
-                    reason: self.openGenerations.isCurrent(generation)
-                        ? "taskCancelled"
-                        : "generationSuperseded"
-                )
-                return
-            }
-            var initialMessages = warm.map {
-                Array($0.messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
-            } ?? []
-            if initialMessages.isEmpty, let prefetchVisibleTail {
-                initialMessages = await prefetchVisibleTail.value
+            if self.messages.isEmpty, self.cacheEnabled {
+                let diskTail = await self.historyCache.visibleTail(for: session.id)
+                guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                    return
+                }
+                if !diskTail.isEmpty {
+                    _ = self.publishCachedTranscript(
+                        diskTail,
+                        session: session,
+                        generation: generation,
+                        warm: nil
+                    )
+                    self.releaseOpenEventGate(
+                        generation: generation,
+                        sessionID: session.id
+                    )
+                }
             }
             guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
                 return
             }
-            SelectionLatencySignposts.markWarmProjection(
-                warm != nil,
-                sessionID: session.id,
-                generation: generation
-            )
-            // The first-frame tail is bounded. Publish it after the
-            // selection transaction has completed, and never after a
-            // v3-to-paged migration. A later store swap keeps this tail.
-            guard await self.publishTranscriptAfterSelectionTurn(
-                initialMessages,
-                session: session,
-                generation: generation,
-                warm: warm
-            ) else {
-                return
-            }
-            self.releaseOpenEventGate(generation: generation, sessionID: session.id)
             await self.prepareActiveTranscriptStore(
                 sessionID: session.id,
                 appGeneration: generation
@@ -3478,10 +3455,23 @@ final class AppModel: ComposerTurnRouting {
                 return
             }
             await self.persistTranscriptTail(self.messages)
+            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                return
+            }
+            if self.transcriptSource(for: session) == nil {
+                HermternalSwitchTrace.selectionGuard(
+                    "requestOpen.skipNetwork",
+                    id: session.id,
+                    generation: generation,
+                    messages: self.messages.count,
+                    reason: "cachedPublishWithoutTranscriptSource"
+                )
+                return
+            }
             _ = await self.open(
                 session,
                 generation: generation,
-                skipWarmProjection: warm,
+                skipWarmProjection: publishedWarm,
                 selectionAlreadyPublished: true,
                 handle: handle
             )
@@ -3528,6 +3518,9 @@ final class AppModel: ComposerTurnRouting {
             return true
         }
         guard let source = transcriptSource(for: session) else {
+            if selectionAlreadyPublished {
+                return true
+            }
             HermternalSwitchTrace.selectionGuard(
                 "open.transcriptSource",
                 id: session.id,

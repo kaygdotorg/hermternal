@@ -22,7 +22,10 @@ func punctuatedSessionIDsDoNotCollide() async throws {
     ).map(\.lastPathComponent)
     #expect(filenames.contains("room%2Eone.json"))
     #expect(filenames.contains("room%2Fone.json"))
-    #expect(filenames.count == 2)
+    let sessionFiles = filenames.filter { !$0.hasPrefix("tail-") }
+    #expect(sessionFiles.count == 2)
+    #expect(filenames.contains("tail-room%2Eone.json"))
+    #expect(filenames.contains("tail-room%2Fone.json"))
 }
 
 @Test("legacy cache files are adopted and removed")
@@ -230,6 +233,7 @@ func reconcileStatisticsAvoidTranscriptDecoding() async throws {
         includingPropertiesForKeys: [.fileSizeKey]
     )
     let expectedBytes = files.reduce(into: Int64(0)) { total, file in
+        guard !file.lastPathComponent.hasPrefix("tail-") else { return }
         total += (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
     }
     #expect(statistics.entryCount == 2)
@@ -415,6 +419,29 @@ func visibleTailDoesNotStartPagedMigration() async throws {
     let tail = await cache.visibleTail(for: "session")
     #expect(tail.map(\.text) == messages.suffix(12).map(\.text))
     #expect(await cache.existingPagedStore(for: "session") == nil)
+}
+
+@Test("resident visible tail reads the sidecar without hopping to the cache actor")
+func residentVisibleTailReadsSidecarWithoutActorHop() async throws {
+    let directory = try historyCacheTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let writer = HistoryCache(directory: directory)
+    let messages = (0..<20).map { index in
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: Int64(index))),
+            role: index.isMultiple(of: 2) ? .user : .assistant,
+            text: "sidecar \(index)"
+        )
+    }
+    _ = await writer.store(messages, for: "session")
+    let memoryTail = writer.residentVisibleTail(for: "session")
+    #expect(memoryTail.map(\.text) == Array(messages.suffix(12).map(\.text)))
+    #expect(await writer.existingPagedStore(for: "session") == nil)
+
+    let reader = HistoryCache(directory: directory)
+    let diskTail = reader.residentVisibleTail(for: "session")
+    #expect(diskTail.map(\.text) == Array(messages.suffix(12).map(\.text)))
+    #expect(await reader.existingPagedStore(for: "session") == nil)
 }
 
 @Test("concurrent pagedStore callers share one v3 migration")

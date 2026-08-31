@@ -207,6 +207,7 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
 
     private let directory: URL
     private let fileSystem: any TranscriptFileSystem
+    nonisolated(unsafe) private let residentPages: TranscriptResidentPageSource
     public let route: TranscriptRoute
     public let memoryBudget: TranscriptMemoryBudget
     private var generation: UInt64
@@ -247,9 +248,31 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
         self.route = route
         self.directory = directory
         self.fileSystem = fileSystem
+        self.residentPages = TranscriptResidentPageSource(
+            directory: directory,
+            fileSystem: fileSystem
+        )
         self.memoryBudget = memoryBudget
         self.generation = route.generation
         self.epoch = route.epoch
+    }
+
+    /// Returns a page from local record files without hopping to this actor.
+    public nonisolated func residentTurnPage(
+        _ request: TranscriptTurnPageRequest
+    ) -> TranscriptTurnPage? {
+        residentPages.turnPage(request)
+    }
+
+    private func publishResidentSnapshot() {
+        residentPages.publish(
+            loaded: loaded,
+            generation: generation,
+            epoch: epoch,
+            order: order,
+            turnIndex: turnIndex,
+            modelSwitchIndex: modelSwitchIndex
+        )
     }
 
     public init(
@@ -314,6 +337,7 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
             try persistIndex()
         }
         loaded = true
+        publishResidentSnapshot()
     }
 
     public func summary() throws -> TranscriptSummary {
@@ -1165,6 +1189,7 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
         try fileSystem.move(indexTemp, to: indexURL)
         try fileSystem.move(manifestTemp, to: manifestURL)
         diskWrites += 2
+        publishResidentSnapshot()
     }
 
     private func currentRowCount() throws -> Int {

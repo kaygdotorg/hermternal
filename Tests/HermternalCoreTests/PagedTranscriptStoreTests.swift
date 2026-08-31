@@ -551,6 +551,43 @@ final class PagedTranscriptStoreTests: XCTestCase {
         )
     }
 
+    func testResidentTurnPageReturnsDiskTurnsWithoutAnActorHop() async throws {
+        let store = makeStore()
+        try await store.append(WireMessageRecord(messageID: "one", text: "one"))
+        try await store.append(WireMessageRecord(messageID: "two", text: "two"))
+        let route = try await store.currentRoute()
+        let page = store.residentTurnPage(
+            TranscriptTurnPageRequest(
+                startOrdinal: 0,
+                maximumRows: 8,
+                maximumBytes: 64 * 1024,
+                expectedGeneration: route.generation,
+                expectedEpoch: route.epoch
+            )
+        )
+        XCTAssertEqual(page?.turns.map(\.answer), ["one", "two"])
+        XCTAssertEqual(page?.totalTurnCount, 2)
+    }
+
+    func testResidentTurnPageReturnsNilWhenARecordFileIsMissing() async throws {
+        let fs = InMemoryTranscriptFileSystem()
+        let store = makeStore(fs)
+        try await store.append(WireMessageRecord(messageID: "one", text: "one"))
+        let url = TranscriptResidentPageSource.recordURL(
+            directory: URL(fileURLWithPath: "/transcript"),
+            messageID: "one"
+        )
+        try fs.remove(url)
+        let route = try await store.currentRoute()
+        let page = store.residentTurnPage(
+            TranscriptTurnPageRequest(
+                expectedGeneration: route.generation,
+                expectedEpoch: route.epoch
+            )
+        )
+        XCTAssertNil(page)
+    }
+
     func testDurableMergePreservesEqualAndNonnumericSourceOrder() {
         XCTAssertEqual(
             TranscriptWireOrder.merged(

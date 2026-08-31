@@ -147,7 +147,7 @@ struct SidebarFolderRow: View {
     @Binding var isExpanded: Bool
     let selection: Set<SidebarSelectionID>
     let visibleOrder: [SidebarSelectionID]
-    let menu: SidebarFolderMenuDerivation
+    let makeMenu: () -> SidebarFolderMenuDerivation
     let onRename: (SidebarFolderTarget) -> Void
     /// Selects this folder without opening a transcript.
     let onSelect: (String) -> Void
@@ -249,6 +249,7 @@ struct SidebarFolderRow: View {
 
     @ViewBuilder
     private var folderContextMenu: some View {
+        let menu = makeMenu()
         let targets = menu.targets
         let chats = menu.chats
         let chatNoun = chats.count == 1 ? "Chat" : "Chats"
