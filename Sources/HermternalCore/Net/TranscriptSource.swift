@@ -337,6 +337,15 @@ public struct StreamingEventReducer: Sendable {
         isAwaitingReply = true
     }
 
+    /// Removes the unpublished user turn when send fails before acceptance.
+    public mutating func rollbackUser() -> StreamingReduction {
+        if isAwaitingReply, messages.last?.role == .user {
+            messages.removeLast()
+        }
+        finishStreaming()
+        return reduction()
+    }
+
     public mutating func cancel() -> StreamingReduction {
         finishStreaming()
         return reduction()

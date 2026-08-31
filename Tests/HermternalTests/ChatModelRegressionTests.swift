@@ -204,3 +204,59 @@ func emptyTerminalReconciliationRetainsLiveRows() async throws {
 
     #expect(model.messages.map(\.text) == ["Live answer"])
 }
+
+@Test("New-chat persist writes the optimistic turn without a durable selection")
+@MainActor
+func newChatPersistWritesWithoutDurableSelection() async throws {
+    let directory = try chatModelTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let model = AppModel(
+        cache: HistoryCache(directory: directory),
+        transcriptSource: TranscriptFixtureSource(rows: [])
+    )
+    let session = chatSession(id: "chat", messageCount: 0)
+    model.sessions = [session]
+    model.cacheEnabled = true
+    #expect(await model.open(session))
+
+    model.selectedSessionID = nil
+    let messageID = UUID()
+    model.messages = [
+        ChatMessage(
+            id: .provisional(messageID),
+            role: .user,
+            text: "First prompt"
+        )
+    ]
+    await model.persistTranscriptTail(model.messages)
+
+    let store = try #require(model.activeTranscriptStore)
+    #expect(try await store.locate(messageID: messageID.uuidString) != nil)
+    #expect((model.transcriptSummary?.rowCount ?? 0) > 0)
+}
+
+@Test("Gateway stream events for another session do not reduce the open chat")
+@MainActor
+func foreignSessionEventsDoNotReduceOpenChat() async throws {
+    let directory = try chatModelTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let model = AppModel(
+        cache: HistoryCache(directory: directory),
+        transcriptSource: TranscriptFixtureSource(rows: [])
+    )
+    let session = chatSession(id: "chat", messageCount: 0)
+    model.sessions = [session]
+    model.cacheEnabled = true
+    #expect(await model.open(session))
+    model.messages = [ChatMessage(role: .user, text: "Keep")]
+
+    await model.handle(GatewayEvent(
+        type: "message.start",
+        sessionID: "other",
+        payload: .object(["text": .string("")])
+    ))
+
+    #expect(model.messages.map(\.text) == ["Keep"])
+}

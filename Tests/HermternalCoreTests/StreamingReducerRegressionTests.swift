@@ -159,3 +159,12 @@ private func event(
         payload: fields.isEmpty ? nil : .object(fields)
     )
 }
+
+@Test("rollbackUser removes the unpublished user turn")
+func rollbackUserRemovesUnpublishedUserTurn() {
+    var reducer = StreamingEventReducer()
+    reducer.appendUser("question")
+    let result = reducer.rollbackUser()
+    #expect(result.messages.isEmpty)
+    #expect(!result.isAwaitingReply)
+}

@@ -753,6 +753,9 @@ final class AppModel: ComposerTurnRouting {
     private var externalRouteTask: Task<Void, Never>?
     private let openGenerations = OpenGenerationController()
     private var streamingReducer = StreamingEventReducer()
+    /// Invalidates in-flight optimistic persist work when the user turn is
+    /// rolled back before the gateway accepts it.
+    private var transcriptPersistGeneration = 0
     /// Suppresses gateway deltas while a newly selected transcript is being
     /// prepared. Selection changes invalidate the previous live stream before
     /// the first actor yield; without this guard an event arriving in that
@@ -791,16 +794,14 @@ final class AppModel: ComposerTurnRouting {
         self.historyCache = cache
         self.warmStore = warmStore
         HermternalSwitchTrace.configure(capability: debugModules)
-        guard let historyDirectory = HistoryCache.defaultDirectory() else {
+        guard let historyDirectory = cache.storageDirectory else {
             self.cache = cache
             self.searchQuerying = nil
             self.searchUnavailableReason = "The system cache directory is unavailable."
             return
         }
 
-        let indexURL = historyDirectory
-            .deletingLastPathComponent()
-            .appendingPathComponent("search.sqlite", isDirectory: false)
+        let indexURL = Self.searchIndexURL(forHistoryDirectory: historyDirectory)
         do {
             let index = try SearchIndex(url: indexURL)
             self.cache = SearchIndexReconciliation(cache: cache, index: index)
@@ -812,6 +813,18 @@ final class AppModel: ComposerTurnRouting {
             self.searchUnavailableReason = error.localizedDescription
             Log.error("Search index unavailable; using transcript cache only: \(error)")
         }
+    }
+
+    /// Search lives beside the default history directory, and inside any
+    /// injected temporary directory so tests never open the user cache.
+    private static func searchIndexURL(forHistoryDirectory historyDirectory: URL) -> URL {
+        if let defaultDirectory = HistoryCache.defaultDirectory(),
+           historyDirectory.resolvingSymlinksInPath() == defaultDirectory.resolvingSymlinksInPath() {
+            return historyDirectory
+                .deletingLastPathComponent()
+                .appendingPathComponent("search.sqlite", isDirectory: false)
+        }
+        return historyDirectory.appendingPathComponent("search.sqlite", isDirectory: false)
     }
 
     // MARK: - Lifecycle
@@ -1166,8 +1179,19 @@ final class AppModel: ComposerTurnRouting {
             cancelPrefetch()
             sessions.sort(by: Self.sessionComesBefore)
             if viewingArchivedSessionID == nil,
+               selectedSessionID == nil,
+               let liveSessionID,
+               sessions.contains(where: { candidate in candidate.id == liveSessionID }) {
+                // Bind the new durable row to the live session. A full open
+                // would reset the reducer and drop the first turn.
+                setSelectedSessionID(
+                    liveSessionID,
+                    event: "selectedSessionID.liveBecameDurable",
+                    preserveDisplayedTranscript: true
+                )
+            } else if viewingArchivedSessionID == nil,
                let selectedSessionID,
-               !sessions.contains(where: { $0.id == selectedSessionID }) {
+               !sessions.contains(where: { candidate in candidate.id == selectedSessionID }) {
                 clearActiveTranscriptIfNeeded(selectedSessionID)
             }
             sessionsLoadedCompletely = true
@@ -2463,14 +2487,36 @@ final class AppModel: ComposerTurnRouting {
         )
     }
 
+    /// True when the installed route belongs to the selected chat, or to the
+    /// live new-chat session when no sidebar row exists yet.
+    private static func transcriptRouteMatchesSelection(
+        _ route: TranscriptRoute,
+        selectedSessionID: String?,
+        liveSessionID: String?
+    ) -> Bool {
+        if let selectedSessionID {
+            return selectedSessionID == route.sessionID
+        }
+        if let liveSessionID {
+            return liveSessionID == route.sessionID
+        }
+        return true
+    }
+
     /// Persists only the currently published tail. The complete transcript is
     /// already represented by the paged store's disk records.
     func persistTranscriptTail(_ values: [ChatMessage]) async {
         guard let store = activeTranscriptStore,
               let route = activeTranscriptRoute,
-              let value = values.last,
-              selectedSessionID == route.sessionID
+              let value = values.last
         else { return }
+        // A new chat has no sidebar selection until the first prompt
+        // creates a durable row. Persist into the installed live store.
+        guard Self.transcriptRouteMatchesSelection(
+            route,
+            selectedSessionID: selectedSessionID,
+            liveSessionID: liveSessionID
+        ) else { return }
         // Live rows without a turn id remain durable provisional rows until
         // an authoritative terminal transcript can replace them.
         do {
@@ -2480,7 +2526,11 @@ final class AppModel: ComposerTurnRouting {
                 expectedEpoch: route.epoch
             )
             guard activeTranscriptStore === store,
-                  selectedSessionID == route.sessionID,
+                  Self.transcriptRouteMatchesSelection(
+                    route,
+                    selectedSessionID: selectedSessionID,
+                    liveSessionID: liveSessionID
+                  ),
                   activeTranscriptRoute?.generation == route.generation,
                   activeTranscriptRoute?.epoch == route.epoch
             else { return }
@@ -2634,6 +2684,21 @@ final class AppModel: ComposerTurnRouting {
         composerModel.shutdown()
         composerRuntime = nil
     }
+    /// Installs the paged store for the live session. A new chat has no
+    /// durable sidebar row until the first prompt, but the transcript reads
+    /// this store for the optimistic turn and the stream.
+    private func ensureLiveTranscriptStore() async {
+        guard let liveSessionID, !liveSessionID.isEmpty else { return }
+        if activeTranscriptStore != nil,
+           activeTranscriptRoute?.sessionID == liveSessionID {
+            return
+        }
+        await prepareActiveTranscriptStore(
+            sessionID: liveSessionID,
+            appGeneration: openGenerations.current()
+        )
+    }
+
     func prepareSession(expectedRoute: ComposerRouteToken) async throws -> String {
         guard composerRoute.token == expectedRoute,
               !isViewingArchivedTranscript,
@@ -2659,8 +2724,81 @@ final class AppModel: ComposerTurnRouting {
             }
             liveSessionID = id
             composerRuntimeSnapshot = GatewayRuntimeAdapter.decodeRuntimeSnapshot(from: created)
+            await ensureLiveTranscriptStore()
             updateComposerRoute()
             return id
+        }
+    }
+
+    func publishUserTurn(text: String, route: ComposerRouteToken) {
+        guard composerRoute.token == route, !isViewingArchivedTranscript else { return }
+        streamingReducer.appendUser(text)
+        messages = streamingReducer.messages
+        isAwaitingReply = streamingReducer.isAwaitingReply
+        updateComposerRoute()
+        transcriptPersistGeneration &+= 1
+        let persistGeneration = transcriptPersistGeneration
+        Task { @MainActor [weak self] in
+            guard let self, self.composerRoute.token == route else { return }
+            await self.ensureLiveTranscriptStore()
+            guard self.transcriptPersistGeneration == persistGeneration else { return }
+            await self.persistTranscriptTail(self.streamingReducer.messages)
+        }
+    }
+
+    func rollbackUserTurn(route: ComposerRouteToken) {
+        guard composerRoute.token == route else { return }
+        var removedIDs: [String] = []
+        if streamingReducer.isAwaitingReply,
+           let last = streamingReducer.messages.last,
+           last.role == .user {
+            switch last.id {
+            case .server(let id): removedIDs = [String(id.rawValue)]
+            case .provisional(let id): removedIDs = [id.uuidString]
+            }
+        }
+        transcriptPersistGeneration &+= 1
+        let reduction = streamingReducer.rollbackUser()
+        messages = reduction.messages
+        isAwaitingReply = reduction.isAwaitingReply
+        updateComposerRoute()
+        guard !removedIDs.isEmpty else { return }
+        Task { @MainActor [weak self] in
+            await self?.removeTranscriptMessageIDs(removedIDs)
+        }
+    }
+
+    private func removeTranscriptMessageIDs(_ messageIDs: [String]) async {
+        guard let store = activeTranscriptStore,
+              let route = activeTranscriptRoute,
+              Self.transcriptRouteMatchesSelection(
+                route,
+                selectedSessionID: selectedSessionID,
+                liveSessionID: liveSessionID
+              )
+        else { return }
+        do {
+            let result = try await store.apply(
+                .removeMany(messageIDs: messageIDs),
+                expectedGeneration: route.generation,
+                expectedEpoch: route.epoch
+            )
+            guard activeTranscriptStore === store,
+                  Self.transcriptRouteMatchesSelection(
+                    route,
+                    selectedSessionID: selectedSessionID,
+                    liveSessionID: liveSessionID
+                  )
+            else { return }
+            transcriptSummary = result.summary
+            activeTranscriptRoute = TranscriptRoute(
+                sessionID: route.sessionID,
+                generation: result.generation,
+                epoch: result.epoch
+            )
+            transcriptRevision &+= 1
+        } catch {
+            Log.error("transcript store rollback write failed: " + error.localizedDescription)
         }
     }
 
@@ -2672,27 +2810,39 @@ final class AppModel: ComposerTurnRouting {
         else { throw GatewayError.unroutableFrame("Composer session is no longer active.") }
         let expectedRoute = composerRoute.token
         let generation = openGenerations.current()
-        _ = try await gateway.call(
-            "prompt.submit",
-            params: ["session_id": sessionID, "text": text]
-        )
-        guard openGenerations.isCurrent(generation),
-              composerRoute.token == expectedRoute,
-              !Task.isCancelled
-        else {
-            Log.error("composer.send code=confirmed_stale")
-            return
-        }
+        await ensureLiveTranscriptStore()
         composerText = ""
-        streamingReducer.appendUser(text)
-        let reduction = StreamingReduction(
-            messages: streamingReducer.messages,
-            isAwaitingReply: streamingReducer.isAwaitingReply
-        )
-        messages = reduction.messages
-        isAwaitingReply = reduction.isAwaitingReply
-        await persistTranscriptTail(reduction.messages)
+        await persistTranscriptTail(streamingReducer.messages)
         updateComposerRoute()
+
+        do {
+            _ = try await gateway.call(
+                "prompt.submit",
+                params: ["session_id": sessionID, "text": text]
+            )
+            guard openGenerations.isCurrent(generation),
+                  composerRoute.token == expectedRoute,
+                  !Task.isCancelled
+            else {
+                Log.error("composer.send code=confirmed_stale")
+                return
+            }
+        } catch {
+            let routeIsCurrent = openGenerations.isCurrent(generation)
+                && composerRoute.token == expectedRoute
+            if !(error is CancellationError) {
+                Log.error(
+                    "composer.send code=failed session=\(sessionID) length=\(text.count) error=\(composerSendFailureDetail(error))"
+                )
+            }
+            if routeIsCurrent {
+                rollbackUserTurn(route: expectedRoute)
+                if !(error is CancellationError) {
+                    postError("Send failed", detail: error.localizedDescription)
+                }
+            }
+            throw error
+        }
     }
 
     func stop() async {
@@ -2715,6 +2865,7 @@ final class AppModel: ComposerTurnRouting {
             transcriptRouteGeneration = openGenerations.current()
             messages = []
             isAwaitingReply = streamingReducer.isAwaitingReply
+            await ensureLiveTranscriptStore()
             updateComposerRoute()
             // `session.create` does not persist a row until the first
             // prompt, so there is nothing to select in the sidebar yet.
@@ -3012,6 +3163,21 @@ final class AppModel: ComposerTurnRouting {
     func requestOpen(
         _ session: ChatSession
     ) -> Task<Void, Never> {
+        // The first prompt makes the live session durable. Adopting that
+        // row must not reset the reducer or the store; those already hold
+        // the optimistic turn and the in-flight stream.
+        if selectedSessionID == nil,
+           liveSessionID == session.id,
+           activeTranscriptRoute?.sessionID == session.id,
+           activeTranscriptStore != nil {
+            setSelectedSessionID(
+                session.id,
+                event: "selectedSessionID.adoptLive",
+                preserveDisplayedTranscript: true
+            )
+            transcriptRouteIdentity = "live:" + session.id
+            return Task { }
+        }
         cancelActiveOpen()
         pendingExternalRoute.clearPending()
         let generation = openGenerations.begin()
@@ -3619,45 +3785,6 @@ final class AppModel: ComposerTurnRouting {
         return established
     }
 
-    func send() async {
-        guard !isViewingArchivedTranscript else { return }
-        let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isAwaitingReply, let gateway else { return }
-
-        // A first message with no session yet needs one created first.
-        if liveSessionID == nil {
-            if selectedSessionID != nil {
-                guard await establishLiveSessionForInteraction() else { return }
-            } else {
-                await newChat()
-                guard !Task.isCancelled else { return }
-            }
-        }
-        guard let sessionID = liveSessionID else { return }
-        composerText = ""
-        // A new turn supersedes any terminal reconciliation still awaiting
-        // REST. Its result must not replace this turn or clear its state.
-        let generation = openGenerations.begin()
-        streamingReducer.appendUser(text)
-        messages = streamingReducer.messages
-        isAwaitingReply = streamingReducer.isAwaitingReply
-        await persistTranscriptTail(streamingReducer.messages)
-        updateComposerRoute()
-
-        do {
-            _ = try await gateway.call(
-                "prompt.submit",
-                params: ["session_id": sessionID, "text": text]
-            )
-            guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
-        } catch {
-            guard openGenerations.isCurrent(generation), !Task.isCancelled else { return }
-            let reduction = streamingReducer.cancel()
-            messages = reduction.messages
-            isAwaitingReply = reduction.isAwaitingReply
-            postError("Send failed", detail: error.localizedDescription)
-        }
-    }
     func interrupt() async {
         guard !isViewingArchivedTranscript else { return }
         guard let gateway else { return }
@@ -3715,6 +3842,25 @@ final class AppModel: ComposerTurnRouting {
                 reason: "malformedFrame"
             )
             return
+        }
+
+        // Stream events name the live session. The durable sidebar id
+        // appears only after the first prompt. Route by live id or
+        // selection, not by the missing row.
+        if let eventSessionID = event.sessionID,
+           liveSessionID != nil || selectedSessionID != nil {
+            let isActive =
+                eventSessionID == liveSessionID
+                || eventSessionID == selectedSessionID
+            if !isActive {
+                HermternalSwitchTrace.selectionGuard(
+                    "gatewayEvent.foreignSession",
+                    id: selectedSessionID,
+                    messages: messages.count,
+                    reason: "session=" + eventSessionID
+                )
+                return
+            }
         }
 
         if event.type == "session.info",

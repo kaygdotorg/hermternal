@@ -446,6 +446,12 @@ public actor HistoryCache: TranscriptPersisting {
         }
     }
 
+    /// On-disk directory owned by this cache.
+    ///
+    /// A test that supplies a temporary directory keeps history files inside
+    /// that tree. The default cache keeps the platform history location.
+    public nonisolated var storageDirectory: URL? { directory }
+
     private struct PagedFileSystemAdapter: TranscriptFileSystem {
         let base: any CacheFileSystem
 
