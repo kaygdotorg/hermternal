@@ -6,6 +6,8 @@ struct FindBar: View {
     @Binding var query: String
     let matchCount: Int
     let selectedMatchNumber: Int?
+    let isTruncated: Bool
+    let focusRequest: Int
     let next: () -> Void
     let previous: () -> Void
     let close: () -> Void
@@ -41,7 +43,7 @@ struct FindBar: View {
             Text(countLabel)
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
-                .frame(minWidth: 58, alignment: .trailing)
+                .frame(minWidth: 72, alignment: .trailing)
                 .accessibilityLabel(countLabel)
 
             Button(action: previous) {
@@ -76,15 +78,33 @@ struct FindBar: View {
             // No entrance animation: ⌘F must be ready for the next keystroke.
             fieldFocused = true
         }
+        .onChange(of: focusRequest) { _, _ in
+            fieldFocused = true
+        }
     }
 
     private var countLabel: String {
+        Self.countLabel(
+            query: query,
+            matchCount: matchCount,
+            selectedMatchNumber: selectedMatchNumber,
+            isTruncated: isTruncated
+        )
+    }
+
+    static func countLabel(
+        query: String,
+        matchCount: Int,
+        selectedMatchNumber: Int?,
+        isTruncated: Bool
+    ) -> String {
+        let total = isTruncated ? "\(matchCount)+" : "\(matchCount)"
         guard matchCount > 0, let selectedMatchNumber else {
             return matchCount == 0 && !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "0 matches"
                 : ""
         }
-        return "\(selectedMatchNumber) of \(matchCount)"
+        return "\(selectedMatchNumber) of \(total)"
     }
 }
 

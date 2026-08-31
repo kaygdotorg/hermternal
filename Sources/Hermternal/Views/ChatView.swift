@@ -11,6 +11,7 @@ struct ChatView: View {
     @State private var findQuery = ""
     @State private var activeFindIndex = 0
     @State private var findMatches: [TranscriptFindMatch] = []
+    @State private var findMatchesAreTruncated = false
     /// The selection generation captured at publication. A later stream
     /// update may advance `openGeneration`, but it must not turn an old row
     /// paint into a second visibility event for this selection.
@@ -162,6 +163,7 @@ struct ChatView: View {
         isFindPresented = false
         findQuery = ""
         activeFindIndex = 0
+        findMatchesAreTruncated = false
     }
 
     private func advanceFind(by delta: Int) {
@@ -175,19 +177,19 @@ struct ChatView: View {
               let cursor = await model.makeTranscriptFindCursor(query: query)
         else {
             findMatches = []
+            findMatchesAreTruncated = false
             activeFindIndex = 0
             return
         }
-        var matches: [TranscriptFindMatch] = []
-        matches.reserveCapacity(64)
-        while matches.count < 256, !Task.isCancelled {
-            guard let page = try? await cursor.next(maximumResults: 64),
-                  !page.isEmpty
-            else { break }
-            matches.append(contentsOf: page)
+        guard let collection = try? await cursor.collect() else {
+            findMatches = []
+            findMatchesAreTruncated = false
+            activeFindIndex = 0
+            return
         }
-        findMatches = matches
-        activeFindIndex = matches.isEmpty ? 0 : min(activeFindIndex, matches.count - 1)
+        findMatches = collection.matches
+        findMatchesAreTruncated = collection.isTruncated
+        activeFindIndex = collection.matches.isEmpty ? 0 : min(activeFindIndex, collection.matches.count - 1)
     }
 
     /// Whether the pane has nothing at all to draw, and so shows the product
@@ -283,6 +285,8 @@ struct ChatView: View {
                     selectedMatchNumber: findMatches.indices.contains(activeFindIndex)
                         ? activeFindIndex + 1
                         : nil,
+                    isTruncated: findMatchesAreTruncated,
+                    focusRequest: model.findRequestGeneration,
                     next: { advanceFind(by: 1) },
                     previous: { advanceFind(by: -1) },
                     close: closeFind

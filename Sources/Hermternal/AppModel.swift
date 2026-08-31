@@ -1406,6 +1406,13 @@ final class AppModel: ComposerTurnRouting {
         findRequestGeneration &+= 1
     }
 
+    /// Dismisses search before the route opens. A second call is a no-op.
+    func activateSearchResult(_ location: MessageLocation) {
+        guard isSearchPresented else { return }
+        isSearchPresented = false
+        Task { await open(at: location) }
+    }
+
     func requestComposerFocus() {
         composerFocusRequestGeneration &+= 1
     }

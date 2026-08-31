@@ -16,10 +16,7 @@ private struct MainOverlayRoot: View {
                 SearchPanel(
                     querying: querying,
                     activate: { location in
-                        Task {
-                            await model.open(at: location)
-                            model.isSearchPresented = false
-                        }
+                        model.activateSearchResult(location)
                     },
                     dismiss: { model.isSearchPresented = false }
                 )
@@ -167,6 +164,12 @@ private final class MainOverlayHostingView: NSHostingView<MainOverlayRoot> {
         }
         guard appKitRegion.contains(point) else { return nil }
         return super.hitTest(point)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard let window else { return }
+        model.toastPresenter.observeOcclusion(of: window)
     }
 }
 
@@ -1042,6 +1045,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             didOrderFrontThisTurn = true
         }
         if let window {
+            model.toastPresenter.observeOcclusion(of: window)
             if !didOrderFrontThisTurn {
                 window.makeKeyAndOrderFront(nil)
             }

@@ -487,10 +487,10 @@ private struct ResultsSearchState: View {
     private static let fallbackPillTop: CGFloat = 15
 
     var body: some View {
-        ScrollView {
+        ScrollViewReader { proxy in
+            ScrollView {
             LazyVStack(alignment: .leading, spacing: 2) {
-                ForEach(results.hits.indices, id: \.self) { index in
-                    let hit = results.hits[index]
+                ForEach(Array(results.hits.enumerated()), id: \.element.location) { index, hit in
                     SearchResultRow(
                         hit: hit,
                         index: index,
@@ -498,6 +498,7 @@ private struct ResultsSearchState: View {
                         isSelected: selectedIndex == index,
                         activate: { activate(hit.location) }
                     )
+                    .id(hit.location)
                 }
             }
             // The list owns its 12pt row inset; the pill owns only the
@@ -588,6 +589,11 @@ private struct ResultsSearchState: View {
         .accessibilityValue(
             selectedIndex.map { "Selected result \($0 + 1) of \(results.hits.count)" } ?? "No result selected"
         )
+        .onChange(of: selectedIndex) { _, index in
+            guard let index, results.hits.indices.contains(index) else { return }
+            proxy.scrollTo(results.hits[index].location)
+        }
+        }
     }
 }
 

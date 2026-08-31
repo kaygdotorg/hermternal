@@ -157,6 +157,29 @@ final class PagedTranscriptStoreTests: XCTestCase {
         XCTAssertEqual(matches.count, 3)
         XCTAssertLessThanOrEqual(matches.count, 3)
     }
+
+    func testFindCollectMarksACappedScanAsTruncated() async throws {
+        let store = makeStore()
+        for index in 0..<300 {
+            try await store.append(WireMessageRecord(messageID: "c\(index)", text: "needle \(index)"))
+        }
+        let cursor = try await store.find(FindQuery(text: "needle"))
+        let collection = try await cursor.collect(limit: 256, pageSize: 64)
+        XCTAssertEqual(collection.matches.count, 256)
+        XCTAssertTrue(collection.isTruncated)
+    }
+
+    func testFindCollectDoesNotMarkAnExactCapAsTruncated() async throws {
+        let store = makeStore()
+        for index in 0..<256 {
+            try await store.append(WireMessageRecord(messageID: "e\(index)", text: "needle \(index)"))
+        }
+        let cursor = try await store.find(FindQuery(text: "needle"))
+        let collection = try await cursor.collect(limit: 256, pageSize: 64)
+        XCTAssertEqual(collection.matches.count, 256)
+        XCTAssertFalse(collection.isTruncated)
+    }
+
     func testPageCacheEvictsAndCancellationStopsRead() async throws {
         let store = makeStore()
         for index in 0..<10 {

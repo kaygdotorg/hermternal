@@ -18,6 +18,7 @@ final class ToastPresenter {
     @ObservationIgnored private var dragging = false
     @ObservationIgnored private var suppressed = false
     @ObservationIgnored private var announcedIDs: Set<ToastID> = []
+    @ObservationIgnored private var occlusionToken: NSObjectProtocol?
     init(policy: ToastPolicy = .default) {
         queue = ToastQueue(policy: policy)
         installObservers()
@@ -91,6 +92,10 @@ final class ToastPresenter {
         suppressed
     }
 
+    var isWindowVisible: Bool {
+        windowVisible
+    }
+
     func performAction(for id: ToastID) {
         guard let action = actions[id] else { return }
         dismiss(id)
@@ -148,18 +153,30 @@ final class ToastPresenter {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in self?.setAppActive(true) }
         })
-        observers.add(center.addObserver(
+    }
+
+    /// Observes occlusion for the main window only.
+    ///
+    /// A Settings window must not pause or resume these toasts.
+    func observeOcclusion(of window: NSWindow) {
+        if let occlusionToken {
+            observers.remove(occlusionToken)
+            self.occlusionToken = nil
+        }
+        weak var observed = window
+        let token = NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeOcclusionStateNotification,
-            object: nil,
+            object: window,
             queue: .main
-        ) { [weak self] notification in
-            // The notification names the window that changed. `NSApp.keyWindow`
-            // samples a different window, and with no key window at all its
-            // fallback kept expiring toasts behind a window nobody could see.
-            guard let visible = (notification.object as? NSWindow)?
-                .occlusionState.contains(.visible) else { return }
-            Task { @MainActor [weak self] in self?.setWindowVisible(visible) }
-        })
+        ) { [weak self] _ in
+            Task { @MainActor [weak self, weak observed] in
+                guard let window = observed else { return }
+                self?.setWindowVisible(window.occlusionState.contains(.visible))
+            }
+        }
+        occlusionToken = token
+        observers.add(token)
+        setWindowVisible(window.occlusionState.contains(.visible))
     }
 
     private func rescheduleExpiry() {
@@ -193,6 +210,11 @@ private final class ToastObservers: @unchecked Sendable {
 
     func add(_ token: NSObjectProtocol) {
         tokens.append(token)
+    }
+
+    func remove(_ token: NSObjectProtocol) {
+        NotificationCenter.default.removeObserver(token)
+        tokens.removeAll { $0 === token }
     }
 
     func removeAll() {
