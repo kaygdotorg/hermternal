@@ -126,8 +126,10 @@ public enum ComposerEditorFormatter {
 
 /// Height limits for the native editor.
 ///
-/// The adapter measures content and sends this policy's bounded result to
-/// SwiftUI. The frame never participates in the measurement.
+/// The adapter measures content and returns this policy's bounded result to
+/// SwiftUI from `sizeThatFits`, so one layout pass settles the height and
+/// nothing is written back into view state. The frame never participates in
+/// the measurement.
 public enum ComposerEditorHeightPolicy {
     public static let minimum: Double = 38
     public static let maximum: Double = 168
@@ -151,8 +153,21 @@ public enum ComposerEditorHeightPolicy {
         return abs(candidate - currentHeight) > measurementEpsilon ? candidate : nil
     }
 
-    public static func isEquivalent(_ lhs: Double, _ rhs: Double) -> Bool {
-        abs(lhs - rhs) <= measurementEpsilon
+    /// True when a proposed width names the column the editor will occupy.
+    ///
+    /// SwiftUI probes a leaf view with a zero width and an infinite width to
+    /// learn how flexible it is, and it proposes an unspecified width to ask
+    /// for an ideal size. None of those is a column the editor ever has, and
+    /// measuring wrapped text against one is not a smaller answer but a
+    /// different one: at zero width the text breaks after every glyph and
+    /// reaches `maximum`, and at an infinite width it reports a single line.
+    /// Only a real column may become the editor's height, so a probe is
+    /// answered from the last real measurement instead.
+    ///
+    /// Empty text measures the same at every width, which is why only a
+    /// non-empty draft could see the two answers disagree.
+    public static func isLayoutWidth(_ proposedWidth: Double) -> Bool {
+        proposedWidth.isFinite && proposedWidth > 1
     }
 }
 

@@ -115,6 +115,34 @@ struct ComposerEditorStateTests {
         #expect(ComposerEditorHeightPolicy.height(for: -20) == ComposerEditorHeightPolicy.minimum)
     }
 
+    @Test("only a real column width may become the editor height")
+    func onlyRealColumnWidthsMeasureTheEditor() {
+        // The proposals SwiftUI uses to learn how flexible a leaf view is,
+        // and the unspecified proposal the adapter maps to none of these.
+        #expect(!ComposerEditorHeightPolicy.isLayoutWidth(0))
+        #expect(!ComposerEditorHeightPolicy.isLayoutWidth(1))
+        #expect(!ComposerEditorHeightPolicy.isLayoutWidth(.infinity))
+        #expect(!ComposerEditorHeightPolicy.isLayoutWidth(.nan))
+        #expect(!ComposerEditorHeightPolicy.isLayoutWidth(-360))
+        // A column the composer gives the message field.
+        #expect(ComposerEditorHeightPolicy.isLayoutWidth(360))
+
+        // Why a probe may not be measured: the same one line of text answers
+        // with the two ends of the range. A zero width breaks the line after
+        // every glyph and reaches the cap, an infinite width reports one line,
+        // and accepting either as the height alternated the composer between
+        // them for as long as the draft held text.
+        let oneLine: Double = 16
+        #expect(
+            ComposerEditorHeightPolicy.height(for: oneLine * 24)
+                == ComposerEditorHeightPolicy.maximum
+        )
+        #expect(
+            ComposerEditorHeightPolicy.height(for: oneLine)
+                == ComposerEditorHeightPolicy.minimum
+        )
+    }
+
     @Test("formatting controls require explicit disclosure and active source")
     func formattingRowInteractionPolicy() {
         #expect(!ComposerEditorInteractionPolicy.formattingRowIsVisible(

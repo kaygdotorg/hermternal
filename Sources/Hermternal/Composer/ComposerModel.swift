@@ -326,9 +326,17 @@ final class ComposerModel {
     }
 
     /// Updates source while retaining the current editing representation.
+    ///
+    /// Source mode is the only representation that reports a parse
+    /// diagnostic. The assignment happens only on a real change, because an
+    /// observable write notifies every reader even when it stores the value
+    /// already there, and the message row reads this on every keystroke.
     func updateEditorSource(_ source: String) {
         draft.text = source
-        editorError = editorMode == .source ? MarkdownDocument.parse(source).error : nil
+        let parseError = editorMode == .source
+            ? MarkdownDocument.parse(source).error
+            : nil
+        if parseError != editorError { editorError = parseError }
     }
 
     /// Changes between WYSIWYG and exact Source representations.
@@ -402,10 +410,19 @@ final class ComposerModel {
             pendingReasoning = nil
             notice = nil
         }
-        route = newRoute
-        outgoing = outgoingByRoute[newRoute.token] ?? []
-        stagingProgress = progressByRoute[newRoute.token]
-        isSubmitting = submittingRoutes.contains(newRoute.token)
+        // Every gateway event republishes the route, and most of them carry
+        // the same values. Each assignment happens only on a real change,
+        // because an observable write notifies every reader even when it
+        // stores the value already there: an unguarded write here re-evaluated
+        // the whole composer, and re-laid out the message field, once per
+        // streamed token while the user was typing the next message.
+        if newRoute != route { route = newRoute }
+        let routeOutgoing = outgoingByRoute[newRoute.token] ?? []
+        if routeOutgoing != outgoing { outgoing = routeOutgoing }
+        let routeProgress = progressByRoute[newRoute.token]
+        if routeProgress != stagingProgress { stagingProgress = routeProgress }
+        let routeIsSubmitting = submittingRoutes.contains(newRoute.token)
+        if routeIsSubmitting != isSubmitting { isSubmitting = routeIsSubmitting }
         // The gateway is the authority. A reported value retires the request
         // only when the provider+model pair is the same identity.
         if let pendingModel,

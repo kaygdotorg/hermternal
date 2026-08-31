@@ -9,7 +9,6 @@ import SwiftUI
 struct ComposerMarkdownEditor: NSViewRepresentable {
     @Binding var source: String
     @Binding var mode: ComposerEditorMode
-    @Binding var measuredHeight: CGFloat
     @Binding var isFocused: Bool
     let isEditable: Bool
     let focusRequest: Int
@@ -50,6 +49,22 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
         return scrollView
     }
 
+    /// Reports the editor's height for one proposed column.
+    ///
+    /// This is the only place the height is decided. SwiftUI applies the size
+    /// returned here in the same layout pass, so no view state is written back
+    /// and no frame re-imposes a height one pass later.
+    ///
+    /// A layout pass asks more than once. The enclosing `HStack` proposes a
+    /// zero width and an infinite width to learn how flexible this leaf is,
+    /// and only one proposal names the column the editor actually occupies.
+    /// Measuring the live text against a probe width both reflows the visible
+    /// glyphs and answers with the height of a column that never exists: a
+    /// zero width breaks the text after every glyph and reaches the eight line
+    /// cap, while an infinite width reports a single line. Answering probes
+    /// made the composer alternate between those two heights for as long as
+    /// the draft held text, so a probe is answered from the last real
+    /// measurement and changes nothing.
     @MainActor
     func sizeThatFits(
         _ proposal: ProposedViewSize,
@@ -61,18 +76,28 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
               let layoutManager = textView.layoutManager else {
             return nil
         }
-        let width = max(1, proposal.width ?? 320)
-        textView.frame.size.width = width
-        textContainer.containerSize.width = width
+        guard let width = proposal.width,
+              ComposerEditorHeightPolicy.isLayoutWidth(Double(width)) else {
+            return CGSize(
+                width: proposal.width ?? context.coordinator.layoutWidth,
+                height: context.coordinator.editorHeight
+            )
+        }
+        // The container tracks the text view, so this one assignment gives the
+        // measurement and the visible line breaks the same width. It is the
+        // width SwiftUI is about to apply, which is why measuring here cannot
+        // disagree with what the editor then draws.
+        if textView.frame.width != width {
+            textView.frame.size.width = width
+        }
         layoutManager.ensureLayout(for: textContainer)
-        let measured = layoutManager.usedRect(for: textContainer).height
-        let height = CGFloat(ComposerEditorHeightPolicy.height(for: Double(measured)))
-        context.coordinator.publishHeight(height, to: $measuredHeight)
         return CGSize(
-            width: proposal.width ?? width,
-            height: height
+            width: width,
+            height: context.coordinator.recordMeasurement(
+                contentHeight: Double(layoutManager.usedRect(for: textContainer).height),
+                layoutWidth: width
+            )
         )
-
     }
 
     @MainActor
@@ -135,11 +160,15 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat(ComposerEditorHeightPolicy.maximum))
         textView.textContainerInset = NSSize(width: 0, height: 7)
         textView.textContainer?.containerSize = NSSize(
-            width: CGFloat.greatestFiniteMagnitude,
+            width: 0,
             height: CGFloat.greatestFiniteMagnitude
         )
         textView.drawsBackground = false
-        textView.textContainer?.widthTracksTextView = false
+        // AppKit keeps the container width equal to the text view width, and
+        // the text view follows the clip view, so the visible line breaks are
+        // always the ones the measured column produced. Measurement therefore
+        // sets the text view width and nothing sets the container width.
+        textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.heightTracksTextView = false
         textView.usesFindBar = true
         textView.writingToolsBehavior = .complete
@@ -161,45 +190,29 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
         var lastSource = ""
         var lastMode: ComposerEditorMode = .wysiwyg
         var focus: Binding<Bool> = .constant(false)
-        private var lastPublishedHeight: CGFloat?
-        private var pendingHeight: CGFloat?
-        private var heightGeneration = 0
+        /// The last column the editor was measured for, and the height it
+        /// reported for that column. A probe proposal is answered from these,
+        /// so every proposal in one layout pass gets one height.
+        private(set) var layoutWidth: CGFloat = 320
+        private(set) var editorHeight = CGFloat(ComposerEditorHeightPolicy.minimum)
         private var lastPublishedFocus = false
         private var pendingFocus: Bool?
         private var focusGeneration = 0
 
-        func publishHeight(_ height: CGFloat, to binding: Binding<CGFloat>) {
-            let current = binding.wrappedValue
-            guard ComposerEditorHeightPolicy.nextHeight(
-                measuredContentHeight: Double(height) - ComposerEditorHeightPolicy.verticalInset,
-                currentHeight: Double(current)
-            ) != nil else {
-                return
+        /// Records one real measurement and returns the height to report.
+        ///
+        /// The policy holds the reported height until the measurement leaves
+        /// its band, so a sub-point layout difference cannot propose a new
+        /// size and no measurement can retarget an animation in flight.
+        func recordMeasurement(contentHeight: Double, layoutWidth width: CGFloat) -> CGFloat {
+            layoutWidth = width
+            if let next = ComposerEditorHeightPolicy.nextHeight(
+                measuredContentHeight: contentHeight,
+                currentHeight: Double(editorHeight)
+            ) {
+                editorHeight = CGFloat(next)
             }
-            if let pendingHeight,
-               ComposerEditorHeightPolicy.isEquivalent(Double(pendingHeight), Double(height)) {
-                return
-            }
-            if let lastPublishedHeight,
-               ComposerEditorHeightPolicy.isEquivalent(Double(lastPublishedHeight), Double(height)) {
-                return
-            }
-            heightGeneration += 1
-            let generation = heightGeneration
-            pendingHeight = height
-            Task { @MainActor [weak self] in
-                guard let self, self.heightGeneration == generation else { return }
-                self.pendingHeight = nil
-                guard !ComposerEditorHeightPolicy.isEquivalent(
-                    Double(binding.wrappedValue),
-                    Double(height)
-                ) else {
-                    self.lastPublishedHeight = height
-                    return
-                }
-                binding.wrappedValue = height
-                self.lastPublishedHeight = height
-            }
+            return editorHeight
         }
 
         func publishFocus(_ focused: Bool) {

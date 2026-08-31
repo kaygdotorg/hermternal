@@ -32,7 +32,6 @@ struct ComposerView: View {
     @State private var photoPickerTarget: ComposerRouteToken?
     @State private var quickLookURL: URL?
     @State private var formatRequest: ComposerEditorFormat?
-    @State private var editorHeight = CGFloat(ComposerEditorHeightPolicy.minimum)
     @State private var isFormattingExpanded = false
     @State private var localFocusRequest = 0
     @State private var isEditorFocused = false
@@ -231,7 +230,6 @@ struct ComposerView: View {
                             get: { model.editorMode },
                             set: { _ = model.setEditorMode($0) }
                         ),
-                        measuredHeight: $editorHeight,
                         isFocused: $isEditorFocused,
                         isEditable: !model.route.isReadOnly,
                         focusRequest: focusRequest + localFocusRequest,
@@ -240,15 +238,17 @@ struct ComposerView: View {
                         onEscape: { model.handleEscape() },
                         onFormatHandled: { formatRequest = nil }
                     )
-                    .frame(height: editorHeight)
-                    if model.text.isEmpty {
-                        Text("Message Hermes…")
-                            .foregroundStyle(.secondary)
-                            .padding(.leading, 4)
-                            .padding(.top, 7)
-                            .allowsHitTesting(false)
-                            .accessibilityHint("Message Hermes…")
-                    }
+                    // The placeholder is always in the tree, and always the
+                    // same size, so the first character removes no view and
+                    // moves no line. The field states the prompt as its own
+                    // accessibility hint below, so this copy is decoration.
+                    Text("Message Hermes…")
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 4)
+                        .padding(.top, 7)
+                        .opacity(model.text.isEmpty ? 1 : 0)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityLabel("Message")
