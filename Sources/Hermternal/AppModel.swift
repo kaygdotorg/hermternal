@@ -738,10 +738,12 @@ final class AppModel: ComposerTurnRouting {
     /// connection; production builds construct the gateway/rest adapter.
     private let injectedTranscriptSource: (any TranscriptSource)?
     private var eventTask: Task<Void, Never>?
-    private let cache: any TranscriptPersisting
+    private var cache: any TranscriptPersisting
     /// Kept separately because the search decorator intentionally hides the
     /// paged-store seam; both layers still share the same on-disk directory.
     private let historyCache: HistoryCache
+    private var searchIndexURL: URL?
+    private var didAttachSearchIndex = false
     private let warmStore: TranscriptWarmStore
     private var accountIdentity: AccountIdentity?
     private var discoveredProvider: AuthProvider?
@@ -814,27 +816,21 @@ final class AppModel: ComposerTurnRouting {
         self.historyCache = cache
         self.warmStore = warmStore
         HermternalSwitchTrace.configure(capability: debugModules)
-        guard let historyDirectory = cache.storageDirectory else {
-            self.cache = cache
-            self.searchQuerying = nil
-            self.searchUnavailableReason = "The system cache directory is unavailable."
-            installCachedSessionList()
-            return
+        LaunchClock.captureProcessStart()
+        LaunchClock.mark("appModel.init.begin")
+        self.cache = cache
+        self.searchQuerying = nil
+        if let historyDirectory = cache.storageDirectory {
+            searchIndexURL = Self.searchIndexURL(forHistoryDirectory: historyDirectory)
+            searchUnavailableReason = "The local search index is still opening."
+        } else {
+            searchIndexURL = nil
+            searchUnavailableReason = "The system cache directory is unavailable."
         }
-
-        let indexURL = Self.searchIndexURL(forHistoryDirectory: historyDirectory)
-        do {
-            let index = try SearchIndex(url: indexURL)
-            self.cache = SearchIndexReconciliation(cache: cache, index: index)
-            self.searchQuerying = index
-            self.searchUnavailableReason = nil
-        } catch {
-            self.cache = cache
-            self.searchQuerying = nil
-            self.searchUnavailableReason = error.localizedDescription
-            Log.error("Search index unavailable; using transcript cache only: \(error)")
-        }
+        LaunchClock.mark("sessionList.cache.begin")
         installCachedSessionList()
+        LaunchClock.mark("sessionList.cache.end")
+        LaunchClock.mark("appModel.init.end")
     }
 
     /// Search lives beside the default history directory, and inside any
@@ -849,10 +845,33 @@ final class AppModel: ComposerTurnRouting {
         return historyDirectory.appendingPathComponent("search.sqlite", isDirectory: false)
     }
 
+    /// Opens the search index after first paint. Nothing on the restored
+    /// chat path reads it.
+    func attachSearchIndexIfNeeded() async {
+        guard !didAttachSearchIndex else { return }
+        didAttachSearchIndex = true
+        guard let url = searchIndexURL else { return }
+        LaunchClock.mark("searchIndex.open.begin")
+        let opened = await Task.detached(priority: .utility) {
+            Result { try SearchIndex(url: url) }
+        }.value
+        LaunchClock.mark("searchIndex.open.end")
+        switch opened {
+        case .success(let index):
+            cache = SearchIndexReconciliation(cache: historyCache, index: index)
+            searchQuerying = index
+            searchUnavailableReason = nil
+        case .failure(let error):
+            searchUnavailableReason = error.localizedDescription
+            Log.error("Search index unavailable; using transcript cache only: \(error)")
+        }
+    }
+
     // MARK: - Lifecycle
     /// Restore the last chat from disk so a relaunch paints the workspace
     /// before any network work starts.
     func restoreOrPromptSignIn() async {
+        Task { await attachSearchIndexIfNeeded() }
         await loadOrganizationIfNeeded()
         // Cache disablement is a privacy/storage promise and must not depend
         // on auth or network success. Recover an interrupted purge before
@@ -921,9 +940,9 @@ final class AppModel: ComposerTurnRouting {
 
     /// Publishes the restored chat from disk before authentication starts.
     ///
-    /// The call stays on the current MainActor turn. `requestOpen` publishes
-    /// the cache-resident tail. Launch then strips in-flight flags so the
-    /// first paint is static.
+    /// The call stays on the current MainActor turn. The cache-resident tail
+    /// is assigned here. Network work stays in the later reconcile pass, so
+    /// the window can order front without a store reinstall.
     func publishRestoredTranscript() {
         guard cacheEnabled, phase == .restoring else { return }
         guard !didPublishRestoredTranscript else { return }
@@ -931,8 +950,30 @@ final class AppModel: ComposerTurnRouting {
               let session = sessions.first(where: { candidate in candidate.id == sessionID })
         else { return }
         didPublishRestoredTranscript = true
-        _ = requestOpen(session)
+        LaunchClock.mark("restoredTranscript.publish.begin")
+        var initialMessages: [ChatMessage] = []
+        if let warm = warmStore.projection(
+            for: session.id,
+            minimumServerTotal: session.messageCount
+        ) {
+            initialMessages = Array(
+                warm.messages.suffix(TranscriptPublicationPolicy.initialMessageCount)
+            )
+        }
+        if initialMessages.isEmpty {
+            LaunchClock.mark("residentVisibleTail.begin")
+            initialMessages = historyCache.residentVisibleTail(for: session.id)
+            LaunchClock.mark("residentVisibleTail.end")
+        }
+        initialMessages = CachedTranscriptScrubbing.scrub(initialMessages)
+        _ = publishCachedTranscript(
+            initialMessages,
+            session: session,
+            generation: openGenerations.current(),
+            warm: nil
+        )
         applyScrubbedRestoredSnapshot()
+        LaunchClock.mark("restoredTranscript.published")
     }
 
     /// Strips launch-time streaming flags from the snapshot that `requestOpen`
@@ -1232,6 +1273,7 @@ final class AppModel: ComposerTurnRouting {
             sessionPurgeUnavailableReason = snapshot.unavailableReason
                 ?? "Complete deletion is unavailable on this gateway."
             observeEvents(on: gateway)
+            await attachSearchIndexIfNeeded()
             phase = .ready
             sessionExpiredBanner = false
             await loadComposerDefaults()
@@ -1267,7 +1309,7 @@ final class AppModel: ComposerTurnRouting {
         return false
     }
 
-    private func reconcileRestoredSessionIfNeeded() async {
+    func reconcileRestoredSessionIfNeeded() async {
         guard let selectedSessionID,
               let session = sessions.first(where: { candidate in candidate.id == selectedSessionID })
         else { return }
@@ -2577,8 +2619,9 @@ final class AppModel: ComposerTurnRouting {
         guard openGenerations.isCurrent(appGeneration), !Task.isCancelled else {
             return
         }
-        if activeStoreAppGeneration == appGeneration,
-           activeTranscriptRoute?.sessionID == sessionID {
+        if activeTranscriptRoute?.sessionID == sessionID,
+           activeTranscriptStore != nil {
+            activeStoreAppGeneration = appGeneration
             return
         }
         do {
@@ -2586,7 +2629,10 @@ final class AppModel: ComposerTurnRouting {
             guard openGenerations.isCurrent(appGeneration), !Task.isCancelled else {
                 return
             }
-            let route = try await store.beginGeneration()
+            let keepPaintedRevision = selectedSessionID == sessionID && !messages.isEmpty
+            let route = keepPaintedRevision
+                ? (try await store.currentRoute())
+                : (try await store.beginGeneration())
             guard openGenerations.isCurrent(appGeneration), !Task.isCancelled else {
                 return
             }
@@ -2599,7 +2645,9 @@ final class AppModel: ComposerTurnRouting {
             transcriptSummary = summary
             activeTranscriptFindCursor = nil
             activeStoreAppGeneration = appGeneration
-            transcriptRevision &+= 1
+            if !keepPaintedRevision {
+                transcriptRevision &+= 1
+            }
         } catch {
             guard openGenerations.isCurrent(appGeneration), !Task.isCancelled else {
                 return
@@ -2705,7 +2753,17 @@ final class AppModel: ComposerTurnRouting {
                   activeTranscriptRoute?.sessionID == route.sessionID,
                   appGeneration.map({ openGenerations.isCurrent($0) }) ?? true
             else { return }
+            if transcriptSummary == summary,
+               activeTranscriptRoute == currentRoute {
+                return
+            }
             transcriptSummary = summary
+            if activeTranscriptRoute?.sessionID == currentRoute.sessionID,
+               selectedSessionID == currentRoute.sessionID,
+               !messages.isEmpty {
+                activeTranscriptRoute = currentRoute
+                return
+            }
             activeTranscriptRoute = currentRoute
             transcriptRevision &+= 1
         } catch {
@@ -3640,14 +3698,28 @@ final class AppModel: ComposerTurnRouting {
             if !preservesLiveReductions,
                !rejectsCacheDerivedDowngrade,
                (!sameWarmProjection || warmTailNeedsExpansion) {
-                streamingReducer.reset(
-                    messages: Array(result.messages.suffix(TranscriptPublicationPolicy.initialMessageCount))
+                let next = Array(
+                    result.messages.suffix(TranscriptPublicationPolicy.initialMessageCount)
                 )
-                transcriptRouteIdentity = "live:\(session.id)"
-                transcriptRouteGeneration = generation
-                messages = result.messages
-                isAwaitingReply = streamingReducer.isAwaitingReply
-                updateComposerRoute()
+                if Self.shouldSkipVisibleTranscriptRepublish(
+                    displayed: messages,
+                    incoming: next
+                ) {
+                    Log.info(
+                        "open \(session.id): unchanged visible transcript; skip republish"
+                    )
+                } else {
+                    streamingReducer.reset(messages: next)
+                    transcriptRouteIdentity = "live:\(session.id)"
+                    transcriptRouteGeneration = generation
+                    messages = next
+                    isAwaitingReply = streamingReducer.isAwaitingReply
+                    updateComposerRoute()
+                    Log.info(
+                        "open \(session.id): \(next.count) messages"
+                            + (result.didFetchREST ? " from REST" : " from cache")
+                    )
+                }
             }
             if result.didFetchREST, !result.isInitialPage {
                 await hydratePagedTranscriptStore(
@@ -3680,10 +3752,6 @@ final class AppModel: ComposerTurnRouting {
                let cacheStore = result.cacheStore {
                 applyCacheStore(cacheStore)
             }
-            Log.info(
-                "open \(session.id): \(result.messages.count) messages"
-                    + (result.didFetchREST ? " from REST" : " from cache")
-            )
         }
         return true
     }
@@ -3697,6 +3765,40 @@ final class AppModel: ComposerTurnRouting {
             && lhs.projectedMessages == rhs.projectedMessages
             && lhs.truncated == rhs.truncated
             && lhs.fetchedAt == rhs.fetchedAt
+    }
+    /// Cached snapshots can still carry launch-time streaming flags after
+    /// the restored tail has been scrubbed for paint. Do not flash those
+    /// flags back. A real content change, or a painted streaming row that
+    /// the opener has finished, still republishes.
+    private static func shouldSkipVisibleTranscriptRepublish(
+        displayed: [ChatMessage],
+        incoming: [ChatMessage]
+    ) -> Bool {
+        if displayedTranscriptMatches(displayed, incoming) {
+            return true
+        }
+        guard displayed.allSatisfy({ !$0.isStreaming }) else { return false }
+        return displayedTranscriptMatches(
+            displayed,
+            CachedTranscriptScrubbing.scrub(incoming)
+        )
+    }
+
+    private static func displayedTranscriptMatches(
+        _ lhs: [ChatMessage],
+        _ rhs: [ChatMessage]
+    ) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        for (left, right) in zip(lhs, rhs) {
+            guard left.id == right.id,
+                  left.role == right.role,
+                  left.text == right.text,
+                  left.reasoning == right.reasoning,
+                  left.isStreaming == right.isStreaming,
+                  left.turnID == right.turnID
+            else { return false }
+        }
+        return true
     }
     /// Opens an archived transcript from cache, then refreshes it from REST.
     /// This path never resumes a live gateway session.

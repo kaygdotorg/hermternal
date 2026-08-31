@@ -878,6 +878,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         debugModules: any DebugModuleCapability,
         onModelStateChanged: @escaping @MainActor () -> Void
     ) {
+        LaunchClock.mark("window.show.begin")
         self.model = model
         self.appearance = appearance
         self.registry = registry
@@ -930,6 +931,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         if let window {
             window.makeKeyAndOrderFront(nil)
+            LaunchClock.mark("window.orderedFront")
+            LaunchClock.reportBreakdown()
             Task { @MainActor [weak self] in
                 await Task.yield()
                 self?.toolbarController?.setVisibilityBridge(
@@ -1016,6 +1019,7 @@ final class HermternalApplicationDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         didFinishLaunching = true
+        LaunchClock.mark("applicationDidFinishLaunching")
         launchIfNeeded()
         #if DEBUG
         emitLaunchWindowProbeIfRequested()

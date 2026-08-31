@@ -246,7 +246,7 @@ struct ChatView: View {
         )
 
         BlockTranscriptView(input: rendererInput)
-            .id(route.map { "\($0.sessionID):\($0.generation)" } ?? "none")
+            .id(transcriptIdentity)
             // Rows travel to the window's own top edge, so the CONTENT
             // dissolves before it reaches it. A `Material` behind the toolbar
             // controls could not do this: it is behind-window vibrancy and

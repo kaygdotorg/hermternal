@@ -3,6 +3,7 @@ import Foundation
 @testable import HermternalCore
 import Testing
 import os
+import AppKit
 
 @Test("An empty cache launches signed out")
 @MainActor
@@ -154,6 +155,138 @@ func warmTranscriptCachePaintsWithoutNetwork() async throws {
     model.cancelOpenPreparation()
 }
 
+@Test("AppModel init does not open the search index before first paint")
+@MainActor
+func appModelInitDoesNotOpenSearchIndex() async throws {
+    let directory = try launchRestoreTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let searchURL = directory.appendingPathComponent("search.sqlite")
+    let model = AppModel(cache: HistoryCache(directory: directory))
+
+    #expect(model.searchQuerying == nil)
+    #expect(!FileManager.default.fileExists(atPath: searchURL.path))
+
+    await model.attachSearchIndexIfNeeded()
+
+    #expect(model.searchQuerying != nil)
+    #expect(FileManager.default.fileExists(atPath: searchURL.path))
+}
+
+@Test("Unchanged network reconcile does not republish or rebuild painted rows")
+@MainActor
+func unchangedNetworkReconcileDoesNotRepublishOrRebuildRows() async throws {
+    _ = NSApplication.shared
+    let directory = try launchRestoreTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let session = ChatSession(
+        id: "restored-chat",
+        title: "Restored",
+        lastActive: Date(timeIntervalSince1970: 1_700_000_000),
+        messageCount: 4
+    )
+    let messages = [
+        ChatMessage(id: .server(ServerMessageID(rawValue: 1)), role: .user, text: "Hello"),
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: 2)),
+            role: .assistant,
+            text: "Hi",
+            isStreaming: true
+        )
+    ]
+    let snapshot = AuthoritativeTranscriptSnapshot(
+        sessionID: session.id,
+        serverTotal: 2,
+        fetchedRows: 2,
+        projectedMessages: 2,
+        truncated: false,
+        fetchedAt: Date(timeIntervalSince1970: 0)
+    )
+    let history = HistoryCache(directory: directory)
+    _ = await history.store(messages, snapshot: snapshot, for: session.id)
+    let list = SessionListCache(directory: directory)
+    #expect(list.saveSessions([session]))
+    #expect(list.saveSelectedSessionID(session.id))
+    let rows = [
+        launchRestoreTranscriptRow(id: 1, role: "user", text: "Hello"),
+        launchRestoreTranscriptRow(id: 2, role: "assistant", text: "Hi")
+    ]
+    let source = LaunchRestoreMatchingSource(rows: rows)
+    let model = AppModel(
+        cache: history,
+        transcriptSource: source,
+        warmStore: TranscriptWarmStore()
+    )
+    model.cacheEnabled = true
+    model.publishRestoredTranscript()
+
+    #expect(model.messages.map(\.text) == ["Hello", "Hi"])
+    #expect(model.messages.allSatisfy { !$0.isStreaming })
+    let revision = model.transcriptRevision
+    let identities = model.messages.map(\.id)
+
+    let coordinator = BlockTranscriptView.Coordinator()
+    let container = coordinator.makeContainer()
+    let root = launchRestoreAttachedTranscriptRoot(container)
+    coordinator.update(
+        container: container,
+        input: TranscriptRendererInput(
+            store: nil,
+            route: nil,
+            summary: nil,
+            revision: revision,
+            isReadOnly: false,
+            isStreaming: false,
+            findQuery: "",
+            pendingMessageID: nil,
+            findMessageID: nil,
+            showsMetadata: false,
+            publishedTail: model.messages,
+            onCopyCode: { _ in },
+            onPaint: { _ in }
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    let table = container.tableView
+    #expect(table.numberOfRows > 0)
+    let painted = try #require(
+        table.view(atColumn: 0, row: 0, makeIfNecessary: true) as? TranscriptTurnRowView
+    )
+
+    model.phase = .ready
+    await model.reconcileRestoredSessionIfNeeded()
+
+    #expect(model.transcriptRevision == revision)
+    #expect(model.messages.map(\.id) == identities)
+    #expect(model.messages.map(\.text) == ["Hello", "Hi"])
+    #expect(model.selectedSessionID == session.id)
+
+    coordinator.update(
+        container: container,
+        input: TranscriptRendererInput(
+            store: model.activeTranscriptStore,
+            route: model.activeTranscriptRoute,
+            summary: model.transcriptSummary,
+            revision: model.transcriptRevision,
+            isReadOnly: false,
+            isStreaming: false,
+            findQuery: "",
+            pendingMessageID: nil,
+            findMessageID: nil,
+            showsMetadata: false,
+            publishedTail: model.messages,
+            onCopyCode: { _ in },
+            onPaint: { _ in }
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    table.layoutSubtreeIfNeeded()
+    let attached = try #require(
+        table.view(atColumn: 0, row: 0, makeIfNecessary: false) as? TranscriptTurnRowView
+    )
+    #expect(attached === painted)
+    coordinator.dismantle(container: container)
+}
+
 @Test("Selecting a chat persists the id for the next launch")
 @MainActor
 func selectingAChatPersistsForNextLaunch() async throws {
@@ -201,6 +334,42 @@ private final class LaunchRestoreProbeSource: TranscriptSource, @unchecked Senda
         touches.withLock { $0 += 1 }
         return ResumedTranscript(liveSessionID: nil, rows: [])
     }
+}
+
+private struct LaunchRestoreMatchingSource: TranscriptSource {
+    let rows: [JSONValue]
+
+    func fetchAuthoritative(sessionID _: String) async throws -> AuthoritativeTranscript {
+        AuthoritativeTranscript(rows: rows, serverTotal: rows.count)
+    }
+
+    func resume(sessionID _: String) async throws -> ResumedTranscript {
+        ResumedTranscript(liveSessionID: nil, rows: rows, messageCount: rows.count)
+    }
+}
+
+private func launchRestoreTranscriptRow(id: Int64, role: String, text: String) -> JSONValue {
+    .object([
+        "id": .integer(id),
+        "role": .string(role),
+        "text": .string(text)
+    ])
+}
+
+@MainActor
+private func launchRestoreAttachedTranscriptRoot(
+    _ container: BlockTranscriptContainerView
+) -> NSView {
+    let root = NSView(frame: NSRect(x: 0, y: 0, width: 760, height: 420))
+    root.addSubview(container)
+    NSLayoutConstraint.activate([
+        container.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+        container.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+        container.topAnchor.constraint(equalTo: root.topAnchor),
+        container.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+    ])
+    root.layoutSubtreeIfNeeded()
+    return root
 }
 
 private func launchRestoreTemporaryDirectory() throws -> URL {

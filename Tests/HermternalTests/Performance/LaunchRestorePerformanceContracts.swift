@@ -75,6 +75,13 @@ func performanceLaunchCachedFirstPaintContract() async throws {
             + "networkTouches=\(networkTouches) "
             + "gate<=\(TranscriptPublicationPolicy.firstPaintBudgetMilliseconds)"
     )
+    print(
+        "PERF|launch wall breakdown|"
+            + "modelLayerP95Ms=\(formatLaunchPaintMilliseconds(p95)) "
+            + "searchIndexDeferred=1 "
+            + "fileLog=PERF|launch wall breakdown "
+            + "gate=report-only"
+    )
 }
 
 private final class LaunchNetworkProbeSource: TranscriptSource, @unchecked Sendable {

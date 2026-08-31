@@ -24,6 +24,7 @@ struct HermternalApp: App {
 
 
     init() {
+        LaunchClock.captureProcessStart()
         // The app's only reads of the instrumentation environment. Composition
         // owns both decisions and hands them down as Bools, so no view and no
         // hot path consults the environment.
@@ -124,6 +125,25 @@ struct HermternalApp: App {
         }
         _registry = State(initialValue: registry)
         let capabilityRefresh: @MainActor () -> Void = { [model, registry] in
+            let searchState: CapabilityState = if model.searchQuerying != nil {
+                .available
+            } else {
+                .unavailable(
+                    reason: model.searchUnavailableReason
+                        ?? "The local search index could not be opened."
+                )
+            }
+            do {
+                try registry.replace(CapabilityDescriptor(
+                    id: CapabilityID("search"),
+                    name: "Transcript Search",
+                    purpose: "Search persisted conversation transcripts.",
+                    state: searchState,
+                    implementationSource: .builtIn
+                ))
+            } catch {
+                Log.error("Built-in search capability update failed: \(error)")
+            }
             let state: CapabilityState
             if model.canPurgeSessions {
                 state = .available
@@ -163,6 +183,7 @@ struct HermternalApp: App {
             fixtureMode: fixtureMode,
             capabilityRefresh: capabilityRefresh
         )
+        LaunchClock.mark("hermternalApp.init.end")
     }
 
 
