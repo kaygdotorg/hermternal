@@ -261,6 +261,46 @@ func foreignSessionEventsDoNotReduceOpenChat() async throws {
     #expect(model.messages.map(\.text) == ["Keep"])
 }
 
+
+@Test("Gateway stream events without a session id do not reduce the open chat")
+@MainActor
+func unnamedSessionEventsDoNotReduceOpenChat() async throws {
+    let directory = try chatModelTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let model = AppModel(
+        cache: HistoryCache(directory: directory),
+        transcriptSource: TranscriptFixtureSource(rows: [])
+    )
+    let session = chatSession(id: "chat", messageCount: 0)
+    model.phase = .ready
+    model.sessions = [session]
+    model.cacheEnabled = true
+    #expect(await model.open(session))
+    model.messages = [ChatMessage(role: .user, text: "Keep")]
+
+    await model.handle(GatewayEvent(
+        type: "message.start",
+        sessionID: nil,
+        payload: .object(["text": .string("")])
+    ))
+    await model.handle(GatewayEvent(
+        type: "message.delta",
+        sessionID: nil,
+        payload: .object(["text": .string("unnamed")])
+    ))
+    await model.handle(GatewayEvent(
+        type: "message.delta",
+        sessionID: "",
+        payload: .object(["text": .string("empty-id")])
+    ))
+
+    #expect(model.messages.map(\.text) == ["Keep"])
+    #expect(!model.messages.contains { $0.text.contains("unnamed") })
+}
+
+@Test("requestOpen of the displayed session keeps the in-flight stream")
+@MainActor
 @Test("requestOpen publishes the cache tail before paged store install")
 @MainActor
 func requestOpenPublishesCacheTailBeforePagedStoreInstall() async throws {

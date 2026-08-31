@@ -661,7 +661,10 @@ struct SidebarView: View {
             SidebarAccountRow(
                 gateway: accountName,
                 account: accountDetail,
-                accountID: accountID
+                accountID: accountID,
+                isSigningOut: model.isSigningOut,
+                canSignOut: model.canSignOut,
+                onSignOut: { Task { await model.signOutCommand() } }
             )
             .padding(.horizontal, 14)
         }
@@ -829,7 +832,10 @@ struct SidebarView: View {
             SidebarAccountRow(
                 gateway: accountName,
                 account: accountDetail,
-                accountID: accountID
+                accountID: accountID,
+                isSigningOut: model.isSigningOut,
+                canSignOut: model.canSignOut,
+                onSignOut: { Task { await model.signOutCommand() } }
             )
             .padding(.horizontal, 14)
             .padding(.vertical, 10)

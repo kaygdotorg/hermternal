@@ -523,6 +523,20 @@ final class AppModel: ComposerTurnRouting {
     var phase: Phase = .restoring
     /// True after a refresh rejection. The cached workspace stays on screen.
     var sessionExpiredBanner = false
+    /// True while a sign-in PKCE flow is in flight. Repeated clicks join it.
+    var isSigningIn: Bool { signInTask != nil }
+    /// True while sign-out teardown is in flight.
+    var isSigningOut: Bool { signOutTask != nil }
+    /// Sign Out is a ready-workspace command. It is off while signed out or busy.
+    var canSignOut: Bool {
+        if isSigningIn || isSigningOut { return false }
+        switch phase {
+        case .signedOut: return false
+        case .restoring, .connecting, .ready, .failed: return true
+        }
+    }
+    /// Sign-in controls join the in-flight task. They do not start a second flow.
+    var canSignIn: Bool { !isSigningIn && !isSigningOut }
     var sessions: [ChatSession] = []
     var sortMode: SortMode = .lastActivity
     var groupByDate = true
@@ -749,10 +763,20 @@ final class AppModel: ComposerTurnRouting {
     func testingSetSessionListComplete(_ value: Bool) {
         sessionsLoadedCompletely = value
     }
+    /// Counts AuthClient constructions so tests can prove single-flight sign-in.
+    @ObservationIgnored
+    private(set) var testingAuthClientCount = 0
+    /// Replaces the browser PKCE step. Production leaves this nil.
+    @ObservationIgnored
+    var testingInteractiveSignIn: (@MainActor () async throws -> Void)?
     /// Injectable seam for exercising cache-first opening without a live app
     /// connection; production builds construct the gateway/rest adapter.
     private let injectedTranscriptSource: (any TranscriptSource)?
     private var eventTask: Task<Void, Never>?
+    private var signInTask: Task<Void, Never>?
+    private var signInGeneration = 0
+    private var signOutTask: Task<Void, Never>?
+    private var signOutGeneration = 0
     private var cache: any TranscriptPersisting
     /// Kept separately because the search decorator intentionally hides the
     /// paged-store seam; both layers still share the same on-disk directory.
@@ -909,11 +933,7 @@ final class AppModel: ComposerTurnRouting {
             phase = .failed(AuthError.badServerURL.localizedDescription)
             return
         }
-        let auth = AuthClient(
-            server: url,
-            openURL: { NSWorkspace.shared.open($0) },
-            credentialStore: credentialStore
-        )
+        let auth = makeAuthClient(server: url)
         self.auth = auth
         do {
             guard try await auth.loadStoredCredentials() != nil else {
@@ -1052,6 +1072,51 @@ final class AppModel: ComposerTurnRouting {
     }
 
     func signIn() async {
+        if let signInTask {
+            await signInTask.value
+            return
+        }
+        signInGeneration += 1
+        let generation = signInGeneration
+        let task = Task { @MainActor in
+            await self.performSignIn()
+        }
+        signInTask = task
+        await task.value
+        if signInGeneration == generation {
+            signInTask = nil
+        }
+    }
+
+    /// Sign Out from the app menu or the account row.
+    /// A signed-out idle session is a no-op. An in-flight sign-out joins.
+    func signOutCommand() async {
+        if isSigningOut {
+            await signOut()
+            return
+        }
+        guard canSignOut else { return }
+        await signOut()
+    }
+
+    func signOut() async {
+        if let signOutTask {
+            await signOutTask.value
+            return
+        }
+        signOutGeneration += 1
+        let generation = signOutGeneration
+        let task = Task { @MainActor in
+            await self.performSignOut()
+        }
+        signOutTask = task
+        await task.value
+        if signOutGeneration == generation {
+            signOutTask = nil
+        }
+    }
+
+    private func performSignIn() async {
         accountGeneration += 1
         await loadOrganizationIfNeeded()
         guard let url = serverURL else {
@@ -1059,16 +1124,17 @@ final class AppModel: ComposerTurnRouting {
             return
         }
         UserDefaults.standard.set(serverText, forKey: Self.serverKey)
-        let auth = AuthClient(
-            server: url,
-            openURL: { NSWorkspace.shared.open($0) },
-            credentialStore: credentialStore
-        )
+        let auth = makeAuthClient(server: url)
         self.auth = auth
-        await refreshGatewayDiscovery(using: auth)
 
         do {
             Log.info("signIn: starting native PKCE flow against \(url.absoluteString)")
+            if let testingInteractiveSignIn {
+                try await testingInteractiveSignIn()
+                sessionExpiredBanner = false
+                return
+            }
+            await refreshGatewayDiscovery(using: auth)
             _ = try await auth.signIn()
             accountIdentity = await auth.fetchAccountIdentity()
             Log.info("signIn: token exchange succeeded")
@@ -1083,7 +1149,7 @@ final class AppModel: ComposerTurnRouting {
         }
     }
 
-    func signOut() async {
+    private func performSignOut() async {
         pendingExternalRoute.clearPending()
         _ = openGenerations.begin()
         accountGeneration += 1
@@ -1097,6 +1163,8 @@ final class AppModel: ComposerTurnRouting {
         sessions = []
         archivedSessions = []
         setSelectedSessionID(nil, event: "selectedSessionID.signOut")
+        liveSessionID = nil
+        cancelActiveOpen()
         viewingArchivedSessionID = nil
         sessionExpiredBanner = false
         didPublishRestoredTranscript = false
@@ -1144,6 +1212,16 @@ final class AppModel: ComposerTurnRouting {
         sessionPurgeCapability = nil
         sessionPurgeUnavailableReason = "Complete deletion is unavailable on this gateway."
     }
+
+    private func makeAuthClient(server: URL) -> AuthClient {
+        testingAuthClientCount += 1
+        return AuthClient(
+            server: server,
+            openURL: { NSWorkspace.shared.open($0) },
+            credentialStore: credentialStore
+        )
+    }
+
     private func refreshGatewayDiscovery(using auth: AuthClient) async {
         guard let providers = await auth.discoverProviders() else {
             discoveredProvider = nil
@@ -2967,6 +3045,12 @@ final class AppModel: ComposerTurnRouting {
     /// Waiting for the RPC leaves the transcript empty until acceptance.
     /// Defended by sendPublishesUserTurnBeforePreparation.
     func publishUserTurn(text: String, route: ComposerRouteToken) {
+        switch phase {
+        case .signedOut, .failed:
+            return
+        case .restoring, .connecting, .ready:
+            break
+        }
         guard composerRoute.token == route, !isViewingArchivedTranscript else { return }
         streamingReducer.appendUser(text)
         messages = streamingReducer.messages
@@ -4150,6 +4234,24 @@ final class AppModel: ComposerTurnRouting {
             )
             return
         }
+        if phase == .signedOut {
+            switch event.kind {
+            case .error, .messageError:
+                postError(
+                    "The gateway reported an error",
+                    detail: event.text ?? "The agent reported an error."
+                )
+            default:
+                break
+            }
+            HermternalSwitchTrace.selectionGuard(
+                "gatewayEvent.signedOut",
+                id: selectedSessionID,
+                messages: messages.count,
+                reason: "signedOutIsolatesReducer"
+            )
+            return
+        }
         if event.type == "transport.closed" {
             phase = .failed(event.text ?? "The gateway connection closed.")
             let reduction = streamingReducer.cancel()
@@ -4162,6 +4264,15 @@ final class AppModel: ComposerTurnRouting {
                 id: selectedSessionID,
                 messages: messages.count,
                 reason: "transportClosed;cancelledReducer"
+            )
+            return
+        }
+        if case .failed = phase {
+            HermternalSwitchTrace.selectionGuard(
+                "gatewayEvent.failedConnection",
+                id: selectedSessionID,
+                messages: messages.count,
+                reason: "failedConnectionIsolatesReducer"
             )
             return
         }
@@ -4181,10 +4292,29 @@ final class AppModel: ComposerTurnRouting {
 
         // Stream events name the live session. The durable sidebar id
         // appears only after the first prompt. Route by live id or
-        // selection, not by the missing row.
-        // Defended by foreignSessionEventsDoNotReduceOpenChat.
-        if let eventSessionID = event.sessionID,
-           liveSessionID != nil || selectedSessionID != nil {
+        // selection, not by the missing row. An unnamed event is not
+        // for the open chat.
+        // Defended by foreignSessionEventsDoNotReduceOpenChat and
+        // unnamedSessionEventsDoNotReduceOpenChat.
+        if liveSessionID != nil || selectedSessionID != nil {
+            guard let eventSessionID = event.sessionID, !eventSessionID.isEmpty else {
+                switch event.kind {
+                case .error, .messageError:
+                    postError(
+                        "The gateway reported an error",
+                        detail: event.text ?? "The agent reported an error."
+                    )
+                default:
+                    break
+                }
+                HermternalSwitchTrace.selectionGuard(
+                    "gatewayEvent.unnamedSession",
+                    id: selectedSessionID,
+                    messages: messages.count,
+                    reason: "missingSessionID"
+                )
+                return
+            }
             let isActive =
                 eventSessionID == liveSessionID
                 || eventSessionID == selectedSessionID

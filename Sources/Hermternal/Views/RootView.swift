@@ -29,9 +29,10 @@ struct RootView: View {
         }
         .overlay(alignment: .top) {
             if model.sessionExpiredBanner, model.phase.presentsWorkspace {
-                SessionExpiredBanner {
+                SessionExpiredBanner(isSigningIn: model.isSigningIn) {
                     Task { await model.signIn() }
                 }
+                .disabled(!model.canSignIn)
             }
         }
         .onChange(of: model.isSearchPresented) { _, presented in
@@ -183,6 +184,7 @@ struct MainSplitRoot: View {
 /// Names the expired session and offers one Sign In action. It does not
 /// block the cached workspace.
 private struct SessionExpiredBanner: View {
+    let isSigningIn: Bool
     let onSignIn: () -> Void
 
     var body: some View {
@@ -190,9 +192,18 @@ private struct SessionExpiredBanner: View {
             Text("Session expired. Sign in again.")
                 .font(.callout)
             Spacer(minLength: 8)
-            Button("Sign In", action: onSignIn)
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
+            Button(action: onSignIn) {
+                HStack(spacing: 6) {
+                    if isSigningIn {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Text(isSigningIn ? "Signing In…" : "Sign In")
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .disabled(isSigningIn)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -224,9 +235,31 @@ private struct FailureView: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: 420)
             HStack {
-                Button("Try Again") { Task { await model.signIn() } }
-                    .buttonStyle(.borderedProminent)
-                Button("Sign Out") { Task { await model.signOut() } }
+                Button {
+                    Task { await model.signIn() }
+                } label: {
+                    HStack(spacing: 6) {
+                        if model.isSigningIn {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Text(model.isSigningIn ? "Signing In…" : "Try Again")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!model.canSignIn)
+                Button {
+                    Task { await model.signOutCommand() }
+                } label: {
+                    HStack(spacing: 6) {
+                        if model.isSigningOut {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Text(model.isSigningOut ? "Signing Out…" : "Sign Out")
+                    }
+                }
+                .disabled(!model.canSignOut)
             }
             .padding(.top, 4)
         }

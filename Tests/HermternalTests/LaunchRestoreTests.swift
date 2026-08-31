@@ -109,6 +109,178 @@ func restoreWithoutCredentialsPresentsSignIn() async throws {
     #expect(!model.sessionExpiredBanner)
 }
 
+@Test("Sign Out is reachable from the ready workspace")
+@MainActor
+func signOutCommandIsReachableFromReadyWorkspace() async throws {
+    let directory = try launchRestoreTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let list = SessionListCache(directory: directory)
+    #expect(list.saveSessions([ChatSession(id: "chat-1", title: "Cached")]))
+    let model = AppModel(cache: HistoryCache(directory: directory))
+    model.phase = .ready
+
+    #expect(model.canSignOut)
+    #expect(!model.isSigningOut)
+
+    await model.signOutCommand()
+
+    #expect(model.phase == .signedOut)
+    #expect(model.sessions.isEmpty)
+    #expect(!model.canSignOut)
+    #expect(!model.isSigningOut)
+}
+
+@Test("a signed-out session has no Sign Out command")
+@MainActor
+func signedOutSessionHasNoSignOutCommand() async throws {
+    let directory = try launchRestoreTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let model = AppModel(cache: HistoryCache(directory: directory))
+
+    #expect(model.phase == .signedOut)
+    #expect(!model.canSignOut)
+    await model.signOutCommand()
+    #expect(model.phase == .signedOut)
+}
+
+@Test("Sign Out isolates later gateway stream events")
+@MainActor
+func signOutIsolatesLaterGatewayStreamEvents() async throws {
+    let directory = try launchRestoreTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let model = AppModel(cache: HistoryCache(directory: directory))
+    model.phase = .ready
+    model.selectedSessionID = "chat-s1"
+
+    await model.handle(GatewayEvent(
+        type: "message.start",
+        sessionID: "chat-s1",
+        payload: .object(["text": .string("")])
+    ))
+    await model.handle(GatewayEvent(
+        type: "message.delta",
+        sessionID: "chat-s1",
+        payload: .object(["text": .string("before sign-out")])
+    ))
+    #expect(model.messages.contains { $0.text.contains("before sign-out") })
+
+    await model.signOut()
+
+    await model.handle(GatewayEvent(
+        type: "message.delta",
+        sessionID: "chat-s1",
+        payload: .object(["text": .string(" after sign-out")])
+    ))
+    await model.handle(GatewayEvent(
+        type: "message.start",
+        sessionID: "chat-s1",
+        payload: .object(["text": .string("")])
+    ))
+    await model.handle(GatewayEvent(
+        type: "message.complete",
+        sessionID: "chat-s1",
+        payload: .object(["text": .string("should not land")])
+    ))
+
+    #expect(model.phase == .signedOut)
+    #expect(model.messages.isEmpty)
+    #expect(model.selectedSessionID == nil)
+
+    let token = model.composerModel.route.token
+    model.publishUserTurn(text: "ghost", route: token)
+    #expect(model.messages.isEmpty)
+    #expect(!model.isAwaitingReply)
+}
+
+@Test("requestOpen after Sign Out does not restore a selection")
+@MainActor
+func requestOpenAfterSignOutDoesNotRestoreSelection() async throws {
+    let directory = try launchRestoreTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let session = ChatSession(id: "chat-s8", title: "S8", messageCount: 1)
+    let model = AppModel(cache: HistoryCache(directory: directory))
+    model.phase = .ready
+    model.sessions = [session]
+    model.selectedSessionID = session.id
+
+    await model.signOut()
+    #expect(model.phase == .signedOut)
+    #expect(model.selectedSessionID == nil)
+
+    _ = model.requestOpen(session)
+    #expect(model.phase == .signedOut)
+    #expect(model.selectedSessionID == nil)
+    #expect(model.messages.isEmpty)
+}
+
+@Test("A closed transport does not keep reducing stream events")
+@MainActor
+func closedTransportDoesNotReduceLaterStreamEvents() async throws {
+    let directory = try launchRestoreTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let model = AppModel(cache: HistoryCache(directory: directory))
+    model.phase = .ready
+    model.selectedSessionID = "chat-s1"
+
+    await model.handle(GatewayEvent(
+        type: "message.start",
+        sessionID: "chat-s1",
+        payload: .object(["text": .string("")])
+    ))
+    await model.handle(GatewayEvent(
+        type: "transport.closed",
+        sessionID: "chat-s1",
+        payload: .object(["text": .string("The gateway connection closed.")])
+    ))
+    #expect(model.phase == .failed("The gateway connection closed."))
+    #expect(!model.isAwaitingReply)
+
+    await model.handle(GatewayEvent(
+        type: "message.delta",
+        sessionID: "chat-s1",
+        payload: .object(["text": .string(" after-close")])
+    ))
+    #expect(!model.messages.contains { $0.text.contains("after-close") })
+}
+
+@Test("a second sign-in click joins the first AuthClient")
+@MainActor
+func secondSignInClickJoinsTheFirstAuthClient() async throws {
+    let directory = try launchRestoreTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let model = AppModel(cache: HistoryCache(directory: directory))
+    model.serverText = "https://launch-restore-test.example"
+    let hold = LaunchRestoreSignInHold()
+    model.testingInteractiveSignIn = { try await hold.wait() }
+
+    let first = Task { await model.signIn() }
+    var spins = 0
+    while model.testingAuthClientCount == 0 {
+        spins += 1
+        if spins > 10_000 {
+            Issue.record("sign-in never constructed AuthClient")
+            hold.finish()
+            await first.value
+            return
+        }
+        await Task.yield()
+    }
+
+    #expect(model.isSigningIn)
+    #expect(!model.canSignIn)
+    #expect(model.testingAuthClientCount == 1)
+
+    let second = Task { await model.signIn() }
+    await Task.yield()
+    #expect(model.testingAuthClientCount == 1)
+
+    hold.finish()
+    await first.value
+    await second.value
+    #expect(!model.isSigningIn)
+    #expect(model.testingAuthClientCount == 1)
+}
+
 @Test("A warm transcript cache paints a static restored chat without network")
 @MainActor
 func warmTranscriptCachePaintsWithoutNetwork() async throws {
@@ -370,6 +542,30 @@ private func launchRestoreAttachedTranscriptRoot(
     ])
     root.layoutSubtreeIfNeeded()
     return root
+}
+
+
+@MainActor
+private final class LaunchRestoreSignInHold {
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var finished = false
+
+    func wait() async throws {
+        if finished { return }
+        try await withCheckedThrowingContinuation { continuation in
+            if finished {
+                continuation.resume()
+            } else {
+                self.continuation = continuation
+            }
+        }
+    }
+
+    func finish() {
+        finished = true
+        continuation?.resume()
+        continuation = nil
+    }
 }
 
 private func launchRestoreTemporaryDirectory() throws -> URL {

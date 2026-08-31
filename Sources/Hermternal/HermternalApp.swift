@@ -246,6 +246,13 @@ struct HermternalApp: App {
                 }
                 .keyboardShortcut(",", modifiers: .command)
             }
+            CommandGroup(after: .appSettings) {
+                Button(model.isSigningOut ? "Signing Out…" : "Sign Out") {
+                    _ = applicationDelegate.showMainWindowIfReady()
+                    Task { await model.signOutCommand() }
+                }
+                .disabled(!model.canSignOut)
+            }
         }
     }
 }

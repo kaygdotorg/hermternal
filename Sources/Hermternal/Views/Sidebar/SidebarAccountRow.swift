@@ -1,19 +1,40 @@
 import SwiftUI
 
-/// A non-interactive identity line supplied by the composition root.
+/// Identity for the signed-in gateway, with an optional Sign Out command.
 ///
 /// `gateway` is the primary line. `account` is the human-readable account
 /// name, if the gateway supplies one. `accountID` goes to the tooltip and to
 /// VoiceOver only. `accountID` never takes a visible line, because an opaque
-/// identifier is not a name.
+/// identifier is not a name. Sign Out sits under the identity so a connected
+/// user can leave the account from the ready workspace.
 struct SidebarAccountRow: View {
     let gateway: String
     let account: String?
     let accountID: String?
+    var isSigningOut: Bool = false
+    var canSignOut: Bool = true
+    var onSignOut: (() -> Void)? = nil
     var body: some View {
-        base
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(accessibilityLabel)
+        VStack(alignment: .leading, spacing: 6) {
+            base
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(accessibilityLabel)
+            if let onSignOut {
+                Button(action: onSignOut) {
+                    HStack(spacing: 6) {
+                        if isSigningOut {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Text(isSigningOut ? "Signing Out…" : "Sign Out")
+                    }
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .disabled(!canSignOut)
+                .accessibilityLabel(isSigningOut ? "Signing Out" : "Sign Out")
+            }
+        }
     }
 
     private var accessibilityLabel: Text {
