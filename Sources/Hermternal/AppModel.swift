@@ -560,6 +560,8 @@ final class AppModel: ComposerTurnRouting {
     private(set) var activeTranscriptRoute: TranscriptRoute?
     private(set) var transcriptSummary: TranscriptSummary?
     private(set) var transcriptRevision: UInt64 = 0
+    /// Uptime when the current selection's bounded tail was published.
+    private(set) var transcriptPublishUptimeNanoseconds: UInt64 = 0
     private var activeStoreAppGeneration: Int?
     private(set) var activeTranscriptFindCursor: TranscriptFindCursor?
 
@@ -931,6 +933,16 @@ final class AppModel: ComposerTurnRouting {
         await connect()
     }
 
+    /// Decodes sidecar tails off the MainActor so keypress hits memory.
+    private func prefetchResidentVisibleTails() {
+        let ids = sessions.map(\.id)
+        guard !ids.isEmpty else { return }
+        let cache = historyCache
+        Task.detached(priority: .utility) {
+            cache.prefetchResidentVisibleTails(ids)
+        }
+    }
+
     /// Loads the cached sidebar and last selection with no network work.
     private func installCachedSessionList() {
         let cached = sessionListCache.loadSessions()
@@ -949,6 +961,7 @@ final class AppModel: ComposerTurnRouting {
         if storedID != restored.id {
             sessionListCache.saveSelectedSessionID(restored.id)
         }
+        prefetchResidentVisibleTails()
     }
 
     /// Publishes the restored chat from disk before authentication starts.
@@ -1387,6 +1400,7 @@ final class AppModel: ComposerTurnRouting {
             warmStore.retain(sessionIDs: Set(sessions.map(\.id)))
             cacheTotalCount = sessions.count
             Log.info("REST session list returned \(sessions.count) sessions")
+            prefetchResidentVisibleTails()
             let expectedAccountGeneration = accountGeneration
             // GCD hop, not Task: unstructured tasks inherit Observation's
             // AccessList from this mutation. Detached follow-up work never
@@ -3358,6 +3372,7 @@ final class AppModel: ComposerTurnRouting {
         }
         transcriptRouteIdentity = "live:\(session.id)"
         transcriptRouteGeneration = generation
+        transcriptPublishUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
         streamingReducer.reset(messages: initialMessages)
         messages = initialMessages
         isAwaitingReply = streamingReducer.isAwaitingReply
@@ -3459,8 +3474,14 @@ final class AppModel: ComposerTurnRouting {
         // Prefer the warm projection. The sidecar is the cache-resident
         // fallback. A full HistoryCache reload was measured at 27-57 ms
         // and is not used on this turn.
+        let syncStart = DispatchTime.now().uptimeNanoseconds
         if initialMessages.isEmpty, cacheEnabled {
+            let tailStart = DispatchTime.now().uptimeNanoseconds
             initialMessages = historyCache.residentVisibleTail(for: session.id)
+            let tailUs = (DispatchTime.now().uptimeNanoseconds &- tailStart) / 1_000
+            Log.info(
+                "PERF|sidebar residentTail|us=\(tailUs) count=\(initialMessages.count)"
+            )
         }
         SelectionLatencySignposts.markWarmProjection(
             warm != nil,
@@ -3475,6 +3496,10 @@ final class AppModel: ComposerTurnRouting {
             session: session,
             generation: generation,
             warm: warm
+        )
+        let syncUs = (DispatchTime.now().uptimeNanoseconds &- syncStart) / 1_000
+        Log.info(
+            "PERF|sidebar requestOpen.sync|us=\(syncUs) warm=\(warm != nil) count=\(initialMessages.count)"
         )
         releaseOpenEventGate(generation: generation, sessionID: session.id)
         let publishedWarm = warm
@@ -3520,6 +3545,13 @@ final class AppModel: ComposerTurnRouting {
                         sessionID: session.id
                     )
                 }
+            }
+            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                return
+            }
+            let settle = TranscriptPublicationPolicy.storeAttachSettleNanoseconds
+            if settle > 0 {
+                try? await Task.sleep(nanoseconds: settle)
             }
             guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
                 return

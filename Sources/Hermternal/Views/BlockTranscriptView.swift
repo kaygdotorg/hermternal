@@ -354,6 +354,11 @@ struct BlockTranscriptView: NSViewRepresentable {
         private var totalTurnCount: Int?
         private var loadingStarts = Set<Int>()
         private var pageTasks: [Int: Task<Void, Never>] = [:]
+        /// Page starts collected during layout. `update` and `viewFor` enqueue
+        /// here. The next run-loop turn reads disk and mutates the table.
+        private var pendingPageStarts: Set<Int> = []
+        private var pageFlushScheduled = false
+        private var tableReloadPending = false
         private var locateTask: Task<Void, Never>?
         private var generation = 0
         /// Session identity for the painted transcript. Generation is not part
@@ -417,7 +422,6 @@ struct BlockTranscriptView: NSViewRepresentable {
             let findTargetChanged = findMessageID != input.findMessageID
             let wasNearBottom = isNearBottom()
             container.onPaint = input.onPaint
-            container.resetPaint()
             let previousStore = store
             self.store = input.store
             self.route = input.route
@@ -431,7 +435,9 @@ struct BlockTranscriptView: NSViewRepresentable {
             self.onCopyCode = input.onCopyCode
             self.showsMetadata = input.showsMetadata
 
-            let nextRouteKey = input.route?.sessionID ?? "none"
+            let nextRouteKey = input.paintIdentity.isEmpty
+                ? (input.route?.sessionID ?? "none")
+                : input.paintIdentity
             // Keep painted published-tail rows when the paged store arrives
             // for this same session. Generation is not identity.
             let attachingStoreToPaintedSession = previousStore == nil
@@ -445,6 +451,8 @@ struct BlockTranscriptView: NSViewRepresentable {
                 generation &+= 1
                 pageTasks.values.forEach { $0.cancel() }
                 pageTasks.removeAll(keepingCapacity: true)
+                pendingPageStarts.removeAll(keepingCapacity: true)
+                pageFlushScheduled = false
                 locateTask?.cancel()
                 locateTask = nil
                 loadingStarts.removeAll(keepingCapacity: true)
@@ -461,7 +469,8 @@ struct BlockTranscriptView: NSViewRepresentable {
                 viewportTarget = nil
                 expandedReasoning.removeAll(keepingCapacity: true)
                 expandedTools.removeAll(keepingCapacity: true)
-                table.noteNumberOfRowsChanged()
+                tableReloadPending = true
+                container.resetPaint()
             }
             routeKey = nextRouteKey
             revision = input.revision
@@ -482,11 +491,9 @@ struct BlockTranscriptView: NSViewRepresentable {
 
             if store == nil {
                 installPublishedTail(publishedTail)
+                tableReloadPending = false
             }
             let count = rowCount
-            if routeChanged {
-                table.noteNumberOfRowsChanged()
-            }
             if findChanged {
                 let visible = table.rows(in: table.visibleRect)
                 if visible.location != NSNotFound, visible.length > 0 {
@@ -502,12 +509,18 @@ struct BlockTranscriptView: NSViewRepresentable {
             prepareVisibleTurns()
             scheduleVisibleMeasurements(at: table.bounds.width)
             position(routeChanged: routeChanged)
+            if routeChanged, count > 0 {
+                container.emitPaintIfNeeded()
+            }
         }
 
         func dismantle(container: BlockTranscriptContainerView) {
             generation &+= 1
             pageTasks.values.forEach { $0.cancel() }
             pageTasks.removeAll()
+            pendingPageStarts.removeAll()
+            pageFlushScheduled = false
+            tableReloadPending = false
             locateTask?.cancel()
             locateTask = nil
             cacheWork.documentPreparationTask?.cancel()
@@ -671,6 +684,46 @@ struct BlockTranscriptView: NSViewRepresentable {
         }
 
         private func requestPage(start: Int) {
+            guard store != nil, start < rowCount else { return }
+            pendingPageStarts.insert(start)
+            schedulePageFlush()
+        }
+
+        private func schedulePageFlush() {
+            guard !pageFlushScheduled else { return }
+            pageFlushScheduled = true
+            let requestGeneration = generation
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.pageFlushScheduled = false
+                guard self.generation == requestGeneration else {
+                    self.pendingPageStarts.removeAll(keepingCapacity: true)
+                    self.tableReloadPending = false
+                    return
+                }
+                self.flushRequestedPages()
+            }
+        }
+
+        private func flushRequestedPages() {
+            let starts = pendingPageStarts.sorted()
+            pendingPageStarts.removeAll(keepingCapacity: true)
+            for start in starts {
+                startPageLoad(start: start)
+            }
+            if tableReloadPending {
+                tableReloadPending = false
+                table.reloadData()
+            }
+        }
+
+        /// Reads a page and installs it. Callers must be outside SwiftUI layout.
+        ///
+        /// `updateNSView` and `viewFor` run inside `NSHostingView.layout`. A
+        /// synchronous resident read plus `noteNumberOfRowsChanged` nested
+        /// there rebuilds the key-view loop and freezes input. Disk reads go
+        /// through `Task.detached` so the MainActor only applies the page.
+        private func startPageLoad(start: Int) {
             guard let store, let route,
                   start < rowCount,
                   loadingStarts.insert(start).inserted
@@ -683,12 +736,48 @@ struct BlockTranscriptView: NSViewRepresentable {
                 expectedGeneration: route.generation,
                 expectedEpoch: route.epoch
             )
-            if let paged = store as? PagedTranscriptStore,
-               let page = paged.residentTurnPage(request) {
-                loadingStarts.remove(start)
-                accept(page)
+            if store is PagedTranscriptStore {
+                let task = Task.detached { [weak self, store] in
+                    let page = (store as? PagedTranscriptStore)?.residentTurnPage(request)
+                    await MainActor.run {
+                        guard let self else { return }
+                        self.pageTasks.removeValue(forKey: start)
+                        guard self.generation == requestGeneration else {
+                            self.loadingStarts.remove(start)
+                            return
+                        }
+                        if let page {
+                            self.loadingStarts.remove(start)
+                            self.accept(page)
+                        } else {
+                            self.loadingStarts.remove(start)
+                            self.startAsyncPageLoad(
+                                start: start,
+                                store: store,
+                                request: request,
+                                requestGeneration: requestGeneration
+                            )
+                        }
+                    }
+                }
+                pageTasks[start] = task
                 return
             }
+            startAsyncPageLoad(
+                start: start,
+                store: store,
+                request: request,
+                requestGeneration: requestGeneration
+            )
+        }
+
+        private func startAsyncPageLoad(
+            start: Int,
+            store: any TranscriptTurnPageLocating,
+            request: TranscriptTurnPageRequest,
+            requestGeneration: Int
+        ) {
+            loadingStarts.insert(start)
             let task = Task { [weak self, store] in
                 do {
                     let page = try await store.turnPage(request)
@@ -709,6 +798,7 @@ struct BlockTranscriptView: NSViewRepresentable {
         }
 
         private func accept(_ page: TranscriptTurnPage) {
+            let acceptStart = DispatchTime.now().uptimeNanoseconds
             let previousCount = rowCount
             totalTurnCount = page.totalTurnCount
             for (offset, turn) in page.turns.enumerated() {
@@ -727,21 +817,36 @@ struct BlockTranscriptView: NSViewRepresentable {
                 }
             }
             if rowCount != previousCount {
-                table.noteNumberOfRowsChanged()
-            }
-            if page.hasMore, page.nextOrdinal > page.startOrdinal {
-                requestPage(start: page.nextOrdinal)
-            }
-            let indexes = IndexSet(page.turns.indices.map { index in page.startOrdinal + index })
-                .intersection(IndexSet(integersIn: 0..<rowCount))
-            guard !indexes.isEmpty else { return }
-            correctingHeights {
-                table.reloadData(forRowIndexes: indexes, columnIndexes: IndexSet(integer: 0))
-                table.noteHeightOfRows(withIndexesChanged: indexes)
-                container?.layoutTableDocument()
+                // A count jump from the painted tail to the full store must
+                // not insert every new row. `reloadData` asks only for the
+                // visible rows. `noteNumberOfRowsChanged` rebuilds the
+                // key-view loop for each inserted row and freezes input.
+                table.reloadData()
+                tableReloadPending = false
+                if previousCount > 0 {
+                    Log.info(
+                        "PERF|transcript accept|rows=\(rowCount) previous=\(previousCount) turns=\(page.turns.count)"
+                    )
+                }
+            } else {
+                let indexes = IndexSet(page.turns.indices.map { index in page.startOrdinal + index })
+                    .intersection(IndexSet(integersIn: 0..<rowCount))
+                if !indexes.isEmpty {
+                    correctingHeights {
+                        table.reloadData(forRowIndexes: indexes, columnIndexes: IndexSet(integer: 0))
+                        table.noteHeightOfRows(withIndexesChanged: indexes)
+                        container?.layoutTableDocument()
+                    }
+                }
             }
             prepareVisibleTurns()
             position(routeChanged: false)
+            let acceptUs = (DispatchTime.now().uptimeNanoseconds &- acceptStart) / 1_000
+            if acceptUs >= 1_000 {
+                Log.info(
+                    "PERF|transcript accept|us=\(acceptUs) rows=\(rowCount) turns=\(page.turns.count)"
+                )
+            }
         }
 
 
@@ -1470,16 +1575,26 @@ final class BlockTranscriptContainerView: NSView {
         scrollView.suppressSystemScrollEdgeEffect()
     }
 
-    func resetPaint() { didPaint = false }
+    func resetPaint() {
+        didPaint = false
+        needsDisplay = true
+        tableView.needsDisplay = true
+    }
+
+    /// Records first on-screen rows for this paint identity. Called after
+    /// a route installs a tail, so a reused table still reports publish-to-draw.
+    func emitPaintIfNeeded() {
+        guard !didPaint, tableView.numberOfRows > 0 else { return }
+        didPaint = true
+        let timestamp = DispatchTime.now().uptimeNanoseconds
+        DispatchQueue.main.async { [weak self] in self?.onPaint?(timestamp) }
+    }
 
     var scrollViewForTesting: NSScrollView { scrollView }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        guard !didPaint, tableView.numberOfRows > 0 else { return }
-        didPaint = true
-        let timestamp = DispatchTime.now().uptimeNanoseconds
-        DispatchQueue.main.async { [weak self] in self?.onPaint?(timestamp) }
+        emitPaintIfNeeded()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }

@@ -513,6 +513,17 @@ public actor HistoryCache: TranscriptPersisting {
         visibleTailAccess.tail(for: id, count: count)
     }
 
+    /// Fills the sidecar memory cache off the caller's actor. Keypress reads
+    /// then hit memory and do not decode JSON on the MainActor.
+    public nonisolated func prefetchResidentVisibleTails(_ ids: [String]) {
+        for id in ids {
+            _ = visibleTailAccess.tail(
+                for: id,
+                count: TranscriptPublicationPolicy.initialMessageCount
+            )
+        }
+    }
+
     /// Returns the disk-backed store for a session. A v3 flat cache entry is
     /// migrated one record at a time on first access, then the old file is
     /// removed only after the paged manifest and records are durable.

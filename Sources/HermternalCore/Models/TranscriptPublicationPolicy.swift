@@ -9,4 +9,8 @@ public enum TranscriptPublicationPolicy {
     public static let firstPaintBudgetMilliseconds = 100
     /// Wall-clock budget for publishing a warm or sidecar tail on the selection turn.
     public static let keypressPaintBudgetMilliseconds = 16
+    /// Delay before installing the paged store after a selection. Held-arrow
+    /// traversal cancels the previous opener, so only the settled chat pays
+    /// for page install.
+    public static let storeAttachSettleNanoseconds: UInt64 = 50_000_000
 }

@@ -17,6 +17,9 @@ struct TranscriptRendererInput {
     let findMessageID: String?
     let showsMetadata: Bool
     let publishedTail: [ChatMessage]
+    /// Stable chat identity for the painted surface. The paged route is nil
+    /// on the selection turn, so this is what distinguishes two tails.
+    let paintIdentity: String
     let onCopyCode: (String) -> Void
     let onPaint: (UInt64) -> Void
 
@@ -32,6 +35,7 @@ struct TranscriptRendererInput {
         findMessageID: String?,
         showsMetadata: Bool,
         publishedTail: [ChatMessage] = [],
+        paintIdentity: String = "",
         onCopyCode: @escaping (String) -> Void,
         onPaint: @escaping (UInt64) -> Void
     ) {
@@ -46,6 +50,7 @@ struct TranscriptRendererInput {
         self.findMessageID = findMessageID
         self.showsMetadata = showsMetadata
         self.publishedTail = publishedTail
+        self.paintIdentity = paintIdentity
         self.onCopyCode = onCopyCode
         self.onPaint = onPaint
     }

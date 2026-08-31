@@ -467,6 +467,85 @@ func concurrentPagedStoreCallersShareOneMigration() async throws {
     #expect(await cache.existingPagedStore(for: "session") === left)
 }
 
+@Test("prefetch fills sidecar memory so a later tail read hits no disk")
+func prefetchResidentVisibleTailsAvoidsSidecarDiskOnLaterRead() async throws {
+    let directory = try historyCacheTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let writer = HistoryCache(directory: directory)
+    let ids = (0..<8).map { index in "session-\(index)" }
+    for id in ids {
+        _ = await writer.store(
+            [ChatMessage(role: .assistant, text: "sidecar \(id)")],
+            for: id
+        )
+    }
+    let fileSystem = CountingCacheFileSystem()
+    let reader = HistoryCache(directory: directory, fileSystem: fileSystem)
+    reader.prefetchResidentVisibleTails(ids)
+    let readsAfterPrefetch = fileSystem.dataReadCount
+    #expect(readsAfterPrefetch > 0)
+    for id in ids {
+        #expect(reader.residentVisibleTail(for: id).map(\.text) == ["sidecar \(id)"])
+    }
+    #expect(fileSystem.dataReadCount == readsAfterPrefetch)
+}
+
+@Test("reconcile does not perform disk I/O on the MainActor")
+@MainActor
+func reconcileDoesNotPerformDiskIOOnTheMainActor() async throws {
+    let directory = try historyCacheTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let fileSystem = ThreadRecordingCacheFileSystem()
+    let cache = HistoryCache(directory: directory, fileSystem: fileSystem)
+    _ = await cache.store(
+        [ChatMessage(role: .assistant, text: "reconcile")],
+        for: "session"
+    )
+    fileSystem.resetMainThreadHits()
+    _ = await cache.reconcile(validIDs: ["session"])
+    #expect(fileSystem.mainThreadHits == 0)
+}
+
+@Test("resident visible tail stays inside the keypress budget during reconcile")
+func residentVisibleTailStaysBoundedDuringReconcile() async throws {
+    let directory = try historyCacheTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let writer = HistoryCache(directory: directory)
+    let ids = (0..<24).map { index in "session-\(index)" }
+    let messages = (0..<12).map { index in
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: Int64(index))),
+            role: index.isMultiple(of: 2) ? .user : .assistant,
+            text: "sidecar row \(index)"
+        )
+    }
+    for id in ids {
+        _ = await writer.store(messages, for: id)
+    }
+    let reader = HistoryCache(directory: directory)
+    let reconcile = Task { await reader.reconcile(validIDs: ids) }
+    var samples: [Double] = []
+    samples.reserveCapacity(ids.count)
+    for id in ids {
+        let start = ContinuousClock.now
+        let tail = reader.residentVisibleTail(for: id)
+        let elapsed = start.duration(to: .now)
+        #expect(tail.count == 12)
+        samples.append(
+            Double(elapsed.components.seconds) * 1_000
+                + Double(elapsed.components.attoseconds) / 1_000_000_000_000_000
+        )
+    }
+    _ = await reconcile.value
+    let sorted = samples.sorted()
+    let rank = Int((95.0 / 100.0 * Double(sorted.count)).rounded(.up))
+    let p95 = sorted[min(sorted.count, max(1, rank)) - 1]
+    #expect(p95 <= Double(TranscriptPublicationPolicy.keypressPaintBudgetMilliseconds))
+    print(
+        "PERF|sidecar during reconcile|p95Ms=\(String(format: "%.3f", p95)) samples=\(samples.count)"
+    )
+}
+
 private actor PrefetchGate {
     private var started = false
     private var released = false
@@ -609,6 +688,66 @@ private final class DecodeCountingCacheCodec: CacheCodec, @unchecked Sendable {
 
     func validate(_ data: Data) throws -> Bool {
         try base.validate(data)
+    }
+}
+
+private final class ThreadRecordingCacheFileSystem: CacheFileSystem, @unchecked Sendable {
+    private let base = LocalCacheFileSystem()
+    private let lock = NSLock()
+    private var hits = 0
+
+    var mainThreadHits: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return hits
+    }
+
+    func resetMainThreadHits() {
+        lock.lock()
+        hits = 0
+        lock.unlock()
+    }
+
+    private func recordIfMain() {
+        guard Thread.isMainThread else { return }
+        lock.lock()
+        hits += 1
+        lock.unlock()
+    }
+
+    func createDirectory(at url: URL) throws {
+        recordIfMain()
+        try base.createDirectory(at: url)
+    }
+
+    func data(at url: URL) throws -> Data {
+        recordIfMain()
+        return try base.data(at: url)
+    }
+
+    func write(_ data: Data, to url: URL) throws {
+        recordIfMain()
+        try base.write(data, to: url)
+    }
+
+    func removeItem(at url: URL) throws {
+        recordIfMain()
+        try base.removeItem(at: url)
+    }
+
+    func fileExists(at url: URL) -> Bool {
+        recordIfMain()
+        return base.fileExists(at: url)
+    }
+
+    func contentsOfDirectory(at url: URL) throws -> [URL] {
+        recordIfMain()
+        return try base.contentsOfDirectory(at: url)
+    }
+
+    func fileSize(at url: URL) -> Int64? {
+        recordIfMain()
+        return base.fileSize(at: url)
     }
 }
 

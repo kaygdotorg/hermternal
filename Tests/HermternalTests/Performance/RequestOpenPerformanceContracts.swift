@@ -148,6 +148,7 @@ func performanceWarmKeypressRequestOpenPublishesOnTheSameTurn() async throws {
         #expect(model.transcriptRouteIdentity == "live:\(fixture.session.id)")
         #expect(model.messages.count == TranscriptPublicationPolicy.initialMessageCount)
         #expect(model.messages.map(\.text) == Array(fixture.messages.suffix(12).map(\.text)))
+        #expect(model.activeTranscriptStore == nil)
         model.cancelOpenPreparation()
         _ = task
         walls.append(durationMilliseconds(elapsed))

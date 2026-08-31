@@ -225,11 +225,19 @@ struct ChatView: View {
                 : nil,
             showsMetadata: alwaysShowsChatMetadata,
             publishedTail: model.messages,
+            paintIdentity: transcriptIdentity,
             onCopyCode: { code in
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(code, forType: .string)
             },
             onPaint: { visibleAtNanoseconds in
+                let published = model.transcriptPublishUptimeNanoseconds
+                if published > 0 {
+                    let deltaMs = Double(visibleAtNanoseconds &- published) / 1_000_000
+                    Log.info(
+                        "PERF|transcript publishToDraw|ms=\(String(format: "%.3f", deltaMs)) session=\(model.selectedSessionID ?? "") rows=\(model.messages.count)"
+                    )
+                }
                 guard HermternalSwitchTrace.isEnabled else { return }
                 let generation = Int(route?.generation ?? 0)
                 Task { @MainActor in
@@ -246,7 +254,9 @@ struct ChatView: View {
         )
 
         BlockTranscriptView(input: rendererInput)
-            .id(transcriptIdentity)
+            // The representable is reused across chats. `paintIdentity`
+            // tells the coordinator the selection changed. Recreating the
+            // table on `.id(session)` was measured at 77-97 ms publish-to-draw.
             // Rows travel to the window's own top edge, so the CONTENT
             // dissolves before it reaches it. A `Material` behind the toolbar
             // controls could not do this: it is behind-window vibrancy and

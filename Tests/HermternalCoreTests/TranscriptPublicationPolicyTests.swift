@@ -21,3 +21,9 @@ func firstPaintBudgetMatchesSwitchContract() {
     #expect(TranscriptPublicationPolicy.firstPaintBudgetMilliseconds == 100)
     #expect(TranscriptPublicationPolicy.initialMessageCount == 12)
 }
+
+@Test("store attach settle is shorter than a held-arrow burst")
+func storeAttachSettleIsShorterThanAHeldArrowBurst() {
+    #expect(TranscriptPublicationPolicy.storeAttachSettleNanoseconds == 50_000_000)
+    #expect(TranscriptPublicationPolicy.keypressPaintBudgetMilliseconds == 16)
+}
