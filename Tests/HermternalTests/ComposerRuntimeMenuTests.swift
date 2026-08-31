@@ -482,6 +482,117 @@ func acceptedAttachmentSubmitDoesNotRestoreDraftAfterReadOnlyTransition() async 
     #expect(turn.submissionSessionIDs == ["live", "live"])
 }
 
+@Test("An unknown gateway submit outcome restores the draft without retrying")
+@MainActor
+func unknownGatewaySubmitOutcomeRestoresDraftWithoutRetrying() async {
+    let route = ComposerRoute(identity: "gateway-outcome-unknown", generation: 25)
+    let turn = RuntimeMenuTurnSpy(
+        sessionID: "live",
+        submitFailure: .outcomeUnknownAfterSend
+    )
+    let completion = RuntimeMenuOperationCompletion(expectedCount: 1)
+    let model = makeRuntimeMenuModel(
+        route: route,
+        runtime: RuntimeMenuSpy(),
+        turn: turn,
+        operationCompletion: completion
+    )
+
+    model.text = "May have been delivered"
+    model.submit()
+    await turn.waitForSubmission()
+    await completion.wait()
+
+    #expect(turn.submissionSessionIDs == ["live"])
+    #expect(model.text == "May have been delivered")
+    #expect(model.notice?.message == "The message may have been sent and was not retried.")
+}
+
+@Test("A pre-send route change restores the draft with no-send notice")
+@MainActor
+func preSendRouteChangeRestoresDraftWithNoSendNotice() async {
+    let route = ComposerRoute(identity: "gateway-route-changed", generation: 26)
+    let turn = RuntimeMenuTurnSpy(
+        sessionID: "live",
+        submitFailure: .unroutableFrame("route changed")
+    )
+    let completion = RuntimeMenuOperationCompletion(expectedCount: 1)
+    let model = makeRuntimeMenuModel(
+        route: route,
+        runtime: RuntimeMenuSpy(),
+        turn: turn,
+        operationCompletion: completion
+    )
+
+    model.text = "Not sent"
+    model.submit()
+    await turn.waitForSubmission()
+    await completion.wait()
+
+    #expect(turn.submissionSessionIDs == ["live"])
+    #expect(model.text == "Not sent")
+    #expect(model.notice?.message == "The chat changed before the message was sent.")
+}
+
+@Test("An uncertain preparation restores the draft without submitting the prompt")
+@MainActor
+func uncertainPreparationRestoresDraftWithoutSubmittingPrompt() async {
+    let route = ComposerRoute(identity: "gateway-preparation-unknown", generation: 27)
+    let turn = RuntimeMenuTurnSpy(
+        sessionID: "live",
+        prepareFailure: .outcomeUnknownAfterSend
+    )
+    let completion = RuntimeMenuOperationCompletion(expectedCount: 1)
+    let model = makeRuntimeMenuModel(
+        route: route,
+        runtime: RuntimeMenuSpy(),
+        turn: turn,
+        operationCompletion: completion
+    )
+
+    model.text = "Not submitted"
+    model.submit()
+    await turn.waitForPreparation()
+    await completion.wait()
+
+    #expect(turn.submissionSessionIDs.isEmpty)
+    #expect(model.text == "Not submitted")
+    #expect(model.notice?.message == "The chat setup could not be confirmed; the message was not sent.")
+}
+
+@Test("An inactive route restores its send notice when remounted")
+@MainActor
+func inactiveRouteRestoresSendNoticeWhenRemounted() async {
+    let routeA = ComposerRoute(identity: "gateway-notice-source", generation: 28)
+    let routeB = ComposerRoute(identity: "gateway-notice-destination", generation: 29)
+    let remountedRouteA = ComposerRoute(identity: routeA.identity, generation: 30)
+    let turn = RuntimeMenuTurnSpy(
+        sessionID: "live",
+        blocksPreparation: true,
+        prepareFailure: .outcomeUnknownAfterSend
+    )
+    let completion = RuntimeMenuOperationCompletion(expectedCount: 1)
+    let model = makeRuntimeMenuModel(
+        route: routeA,
+        runtime: RuntimeMenuSpy(),
+        turn: turn,
+        operationCompletion: completion
+    )
+
+    model.text = "Restore with notice"
+    model.submit()
+    await turn.waitForPreparation()
+    model.update(route: routeB)
+    turn.finishPreparation()
+    await completion.wait()
+
+    #expect(turn.submissionSessionIDs.isEmpty)
+    #expect(model.notice == nil)
+    model.update(route: remountedRouteA)
+    #expect(model.text == "Restore with notice")
+    #expect(model.notice?.message == "The chat setup could not be confirmed; the message was not sent.")
+}
+
 @Test("Accepted attachment failures discard staged drafts")
 @MainActor
 func acceptedAttachmentFailuresDiscardStagedDrafts() async throws {
@@ -1413,6 +1524,8 @@ private actor RuntimeMenuSpy: SessionRuntimeControlling {
 private final class RuntimeMenuTurnSpy: ComposerTurnRouting {
     let sessionID: String
     let blocksPreparation: Bool
+    let prepareFailure: GatewayError?
+    let submitFailure: GatewayError?
     private(set) var prepareRequests: [ComposerRouteToken] = []
     private(set) var submissionSessionIDs: [String] = []
     private var preparationWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
@@ -1420,23 +1533,32 @@ private final class RuntimeMenuTurnSpy: ComposerTurnRouting {
     private var pendingPreparationReleases = 0
     private var submissionWaiters: [CheckedContinuation<Void, Never>] = []
 
-    init(sessionID: String, blocksPreparation: Bool = false) {
+    init(
+        sessionID: String,
+        blocksPreparation: Bool = false,
+        prepareFailure: GatewayError? = nil,
+        submitFailure: GatewayError? = nil
+    ) {
         self.sessionID = sessionID
         self.blocksPreparation = blocksPreparation
+        self.prepareFailure = prepareFailure
+        self.submitFailure = submitFailure
     }
 
     func prepareSession(expectedRoute: ComposerRouteToken) async throws -> String {
         prepareRequests.append(expectedRoute)
         resumePreparationWaiters()
-        guard blocksPreparation else { return sessionID }
-        await withCheckedContinuation { continuation in
-            if pendingPreparationReleases > 0 {
-                pendingPreparationReleases -= 1
-                continuation.resume()
-            } else {
-                preparationReleaseWaiters.append(continuation)
+        if blocksPreparation {
+            await withCheckedContinuation { continuation in
+                if pendingPreparationReleases > 0 {
+                    pendingPreparationReleases -= 1
+                    continuation.resume()
+                } else {
+                    preparationReleaseWaiters.append(continuation)
+                }
             }
         }
+        if let prepareFailure { throw prepareFailure }
         return sessionID
     }
 
@@ -1447,6 +1569,7 @@ private final class RuntimeMenuTurnSpy: ComposerTurnRouting {
         for waiter in waiters {
             waiter.resume()
         }
+        if let submitFailure { throw submitFailure }
     }
 
     func stop() async {}

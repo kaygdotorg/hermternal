@@ -2672,14 +2672,17 @@ final class AppModel: ComposerTurnRouting {
         else { throw GatewayError.unroutableFrame("Composer session is no longer active.") }
         let expectedRoute = composerRoute.token
         let generation = openGenerations.current()
-        try await gateway.call(
+        _ = try await gateway.call(
             "prompt.submit",
             params: ["session_id": sessionID, "text": text]
         )
         guard openGenerations.isCurrent(generation),
               composerRoute.token == expectedRoute,
               !Task.isCancelled
-        else { throw GatewayError.unroutableFrame("Composer route changed.") }
+        else {
+            Log.error("composer.send code=confirmed_stale")
+            return
+        }
         composerText = ""
         streamingReducer.appendUser(text)
         let reduction = StreamingReduction(

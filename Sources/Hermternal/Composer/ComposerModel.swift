@@ -265,6 +265,7 @@ final class ComposerModel {
     @ObservationIgnored private var outgoingByRoute: [ComposerRouteToken: [ComposerAttachment]] = [:]
     @ObservationIgnored private var progressByRoute: [ComposerRouteToken: ComposerStagingProgress] = [:]
     @ObservationIgnored private var submittingRoutes: Set<ComposerRouteToken> = []
+    @ObservationIgnored private var sendNoticesByIdentity: [String: ComposerNotice] = [:]
     private(set) var route: ComposerRoute
     private var draft = ComposerDraft()
     private(set) var editorMode: ComposerEditorMode = .wysiwyg
@@ -384,7 +385,8 @@ final class ComposerModel {
 
     /// Applies the current chat. A new chat identity swaps the draft, so text
     func update(route newRoute: ComposerRoute) {
-        if newRoute.token != route.token {
+        let routeChanged = newRoute.token != route.token
+        if routeChanged {
             cancelRouteRuntimeTasks()
             cancelPreparationTasks()
             cancelDictation()
@@ -423,6 +425,9 @@ final class ComposerModel {
         if routeProgress != stagingProgress { stagingProgress = routeProgress }
         let routeIsSubmitting = submittingRoutes.contains(newRoute.token)
         if routeIsSubmitting != isSubmitting { isSubmitting = routeIsSubmitting }
+        if routeChanged {
+            notice = sendNoticesByIdentity[newRoute.identity]
+        }
         // The gateway is the authority. A reported value retires the request
         // only when the provider+model pair is the same identity.
         if let pendingModel,
@@ -461,6 +466,7 @@ final class ComposerModel {
     }
 
     func dismissNotice() {
+        clearSendNotice(for: route.token)
         notice = nil
     }
 
@@ -576,7 +582,7 @@ final class ComposerModel {
         draft = ComposerDraft()
         outgoingByRoute[target] = submitted.attachments
         outgoing = submitted.attachments
-        notice = nil
+        clearSendNotice(for: target)
         submittingRoutes.insert(target)
         isSubmitting = true
         let operationID = UUID()
@@ -617,6 +623,7 @@ final class ComposerModel {
         operationID: UUID
     ) async {
         var transaction: (any AttachmentStagingTransaction)?
+        var promptSubmissionBegan = false
         var submissionWasAccepted = false
         defer {
             if sendReceiptIDs[target] == operationID {
@@ -656,8 +663,10 @@ final class ComposerModel {
                     trimmed: submission.text,
                     fileReferences: []
                 )
+                promptSubmissionBegan = true
                 try await turn.submit(text: text, sessionID: sessionID)
                 submissionWasAccepted = true
+                clearSendNotice(for: target)
                 await files.discardAndWait(submitted.attachments)
                 guard !isUnmounted, route.token == target, !Task.isCancelled else {
                     return
@@ -729,8 +738,10 @@ final class ComposerModel {
                 target,
                 preparationEpoch: preparedSession.epoch
             ) else { throw ComposerOperationError.staleRoute }
+            promptSubmissionBegan = true
             try await turn.submit(text: text, sessionID: sessionID)
             submissionWasAccepted = true
+            clearSendNotice(for: target)
             let routeRemainsCurrent = !isUnmounted && route.token == target && !Task.isCancelled
             transaction = nil
             let committed = try await stagedTransaction.commit()
@@ -765,7 +776,36 @@ final class ComposerModel {
                 restore(
                     submitted,
                     routeIdentity: target.identity,
-                    notice: ComposerNotice("The message outcome could not be confirmed; it was not retried.")
+                    notice: ComposerNotice("The message outcome could not be confirmed; it was not retried."),
+                    noticeRoute: target
+                )
+            case GatewayError.outcomeUnknownAfterSend:
+                await compensate(transaction)
+                if promptSubmissionBegan {
+                    Log.error("composer.send code=delivery_unknown")
+                    restore(
+                        submitted,
+                        routeIdentity: target.identity,
+                        notice: ComposerNotice("The message may have been sent and was not retried."),
+                        noticeRoute: target
+                    )
+                } else {
+                    Log.error("composer.send code=preparation_unknown")
+                    restore(
+                        submitted,
+                        routeIdentity: target.identity,
+                        notice: ComposerNotice("The chat setup could not be confirmed; the message was not sent."),
+                        noticeRoute: target
+                    )
+                }
+            case GatewayError.unroutableFrame:
+                await compensate(transaction)
+                Log.error("composer.send code=route_changed")
+                restore(
+                    submitted,
+                    routeIdentity: target.identity,
+                    notice: ComposerNotice("The chat changed before the message was sent."),
+                    noticeRoute: target
                 )
             case ComposerOperationError.invalidReference:
                 await compensate(transaction)
@@ -773,7 +813,8 @@ final class ComposerModel {
                 restore(
                     submitted,
                     routeIdentity: target.identity,
-                    notice: ComposerNotice("The message could not be sent because an attachment reference was invalid.")
+                    notice: ComposerNotice("The message could not be sent because an attachment reference was invalid."),
+                    noticeRoute: target
                 )
             case let failure as AttachmentStagingBatchFailure:
                 switch failure.reason {
@@ -782,14 +823,16 @@ final class ComposerModel {
                     restore(
                         submitted,
                         routeIdentity: target.identity,
-                        notice: ComposerNotice("The message outcome could not be confirmed; it was not retried.")
+                        notice: ComposerNotice("The message outcome could not be confirmed; it was not retried."),
+                        noticeRoute: target
                     )
                 case .rejected:
                     Log.error("composer.send code=staging_rejected")
                     restore(
                         submitted,
                         routeIdentity: target.identity,
-                        notice: ComposerNotice("The attachment could not be sent.")
+                        notice: ComposerNotice("The attachment could not be sent."),
+                        noticeRoute: target
                     )
                 }
             default:
@@ -798,7 +841,8 @@ final class ComposerModel {
                 restore(
                     submitted,
                     routeIdentity: target.identity,
-                    notice: ComposerNotice("The message could not be sent.")
+                    notice: ComposerNotice("The message could not be sent."),
+                    noticeRoute: target
                 )
             }
         }
@@ -852,12 +896,32 @@ final class ComposerModel {
     private func restore(
         _ submitted: ComposerDraft,
         routeIdentity: String,
-        notice failure: ComposerNotice?
+        notice failure: ComposerNotice?,
+        noticeRoute: ComposerRouteToken? = nil
     ) {
         mutateDraft(for: routeIdentity) { current in
             current = ComposerSendPolicy.restore(submitted, into: current)
         }
-        if routeIdentity == route.identity, let failure { notice = failure }
+        if let failure, let noticeRoute {
+            setSendNotice(failure, for: noticeRoute.identity)
+        } else if routeIdentity == route.identity, let failure {
+            notice = failure
+        }
+    }
+
+    private func clearSendNotice(for target: ComposerRouteToken) {
+        setSendNotice(nil, for: target.identity)
+    }
+
+    private func setSendNotice(_ notice: ComposerNotice?, for routeIdentity: String) {
+        if let notice {
+            sendNoticesByIdentity[routeIdentity] = notice
+        } else {
+            sendNoticesByIdentity.removeValue(forKey: routeIdentity)
+        }
+        if route.identity == routeIdentity, self.notice != notice {
+            self.notice = notice
+        }
     }
 
     private func restoreSuperseded(_ submitted: ComposerDraft, routeIdentity: String) {
