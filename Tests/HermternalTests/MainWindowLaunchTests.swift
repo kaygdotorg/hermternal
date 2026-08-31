@@ -103,6 +103,190 @@ func explicitAppearanceInitializationAppliesAppKitOverride() throws {
     #expect(app.appearance?.name == expectedAppearance.name)
 }
 
+/// The window has to keep the size it opened at, and stay resizable, once its
+/// content host attaches.
+///
+/// `NSWindow` reads the content view controller's `preferredContentSize` as a
+/// size the window must hold, not as a size to open at. Measured on macOS
+/// 26.6.2: a window sized 1360x720, whose content controller preferred
+/// 1040x720, was pulled to 1040x720 by the attachment and then refused every
+/// wider frame; the same window with no preferred size kept 1360x720 and took
+/// the wider frame. That is the whole regression. The app restores its frame
+/// before attaching content, so a preferred size discards whatever size the
+/// user left the window at and then holds the window there. A tiling window
+/// manager resizes through the accessibility API, which lands in the same
+/// code path, so the window becomes unmanageable rather than merely stubborn.
+@Test("launch contract: attaching the content host leaves the window resizable")
+@MainActor
+func mainWindowStaysResizableAfterContentAttachment() throws {
+    _ = NSApplication.shared
+    let directory = FileManager.default.temporaryDirectory
+        .appending(path: "HermternalTests.MainWindow.\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let suiteName = "HermternalTests.AppearanceSettings.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let model = AppModel(cache: HistoryCache(directory: directory))
+    let shell = MainShellViewController(
+        appearance: AppearanceSettings(defaults: defaults),
+        model: model,
+        onModelStateChanged: {}
+    )
+    let window = NSWindow(
+        contentRect: NSRect(
+            origin: .zero,
+            size: MainWindowStartupConfiguration.defaultContentSize
+        ),
+        styleMask: [
+            .titled,
+            .closable,
+            .miniaturizable,
+            .resizable,
+            .fullSizeContentView
+        ],
+        backing: .buffered,
+        defer: false
+    )
+    MainWindowStartupConfiguration.prepare(window, restoringFrameNamed: nil)
+    // Stands in for a restored frame: the size the user left the window at,
+    // which is what every launch after the first opens with. It differs from
+    // the default on purpose — a preferred content size is only observable
+    // when the two disagree.
+    let restored = MainWindowStartupConfiguration.defaultContentSize.width + 320
+    window.setContentSize(
+        NSSize(
+            width: restored,
+            height: MainWindowStartupConfiguration.defaultContentSize.height
+        )
+    )
+    MainWindowStartupConfiguration.attach(shell, to: window)
+    defer { window.close() }
+
+    // Attachment kept the restored width. Asserted before the window is
+    // ordered on screen, because AppKit constrains a window it orders to the
+    // display's visible frame and a test must not depend on the display it
+    // runs on.
+    #expect(window.contentRect(forFrameRect: window.frame).width == restored)
+
+    // A preferred content size reaches the window through its layout rather
+    // than through the assignment, so the window is ordered front and laid out
+    // before the resize below is asked for.
+    window.makeKeyAndOrderFront(nil)
+    shell.view.layoutSubtreeIfNeeded()
+
+    // The rule, stated where a reintroduced assignment would break it.
+    #expect(shell.preferredContentSize == .zero)
+
+    // The window still takes a wider frame. Only the width is asserted:
+    // `setFrame` clamps a height taller than the visible area and leaves the
+    // width alone, which is what keeps this assertion portable.
+    let wider = restored + 200
+    window.setFrame(
+        NSRect(x: 0, y: 0, width: wider, height: window.frame.height),
+        display: false
+    )
+    #expect(window.frame.width == wider)
+
+    // And the floor is still declared. `contentMinSize` is the lever the user
+    // and a window manager resize against; a programmatic `setFrame` is not
+    // clamped by it, so the floor is asserted where it lives rather than
+    // through a frame that AppKit never bounds.
+    #expect(window.contentMinSize == MainWindowStartupConfiguration.minimumContentSize)
+}
+
+/// The window's translucency has to follow the Appearance pane.
+///
+/// `AppearanceSettings` is `@Observable`, and the backdrop reaches the window
+/// through a hosted SwiftUI root that reads it. The shell used to hold private
+/// copies of the opacity and the glass flag and push them into the backdrop by
+/// hand, so moving the slider changed the pane's own readout and nothing else;
+/// it also forced `isOpaque` to false on every attach and every update, which
+/// denied the fully solid end of the dial outright. Both halves are asserted
+/// here, because either one alone brings the regression back.
+@Test("appearance contract: the window backdrop follows the opacity dial")
+@MainActor
+func windowBackdropFollowsTheOpacityDial() async throws {
+    _ = NSApplication.shared
+    // Reduce Transparency resolves every treatment to opaque by design, so a
+    // machine with it enabled has nothing here to observe.
+    guard !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency else {
+        return
+    }
+    let directory = FileManager.default.temporaryDirectory
+        .appending(path: "HermternalTests.Backdrop.\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let suiteName = "HermternalTests.AppearanceSettings.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let appearance = AppearanceSettings(defaults: defaults)
+    appearance.previewBackgroundOpacity(0.6)
+
+    let model = AppModel(cache: HistoryCache(directory: directory))
+    let shell = MainShellViewController(
+        appearance: appearance,
+        model: model,
+        onModelStateChanged: {}
+    )
+    let window = NSWindow(
+        contentRect: NSRect(
+            origin: .zero,
+            size: MainWindowStartupConfiguration.defaultContentSize
+        ),
+        styleMask: [
+            .titled,
+            .closable,
+            .miniaturizable,
+            .resizable,
+            .fullSizeContentView
+        ],
+        backing: .buffered,
+        defer: false
+    )
+    MainWindowStartupConfiguration.prepare(window, restoringFrameNamed: nil)
+    MainWindowStartupConfiguration.attach(shell, to: window)
+    defer { window.close() }
+    window.makeKeyAndOrderFront(nil)
+
+    // A translucent dial reached the window at all. An `NSWindow` is opaque
+    // until something says otherwise, so this is the backdrop's own work.
+    #expect(await settles(shell) { !window.isOpaque })
+
+    // And the solid end of the dial is honoured rather than overwritten.
+    appearance.previewBackgroundOpacity(1)
+    #expect(await settles(shell) { window.isOpaque })
+
+    // A later shell update leaves it alone. `MainWindowController.show` runs
+    // this path every time something reopens the window — New Chat, a deep
+    // link, a reactivation — and it used to reset the window's translucency
+    // there, which threw away whatever the user had just chosen.
+    shell.update(appearance: appearance, model: model)
+    #expect(await settles(shell) { window.isOpaque })
+}
+
+/// Runs layout passes until `condition` holds, or gives up.
+///
+/// SwiftUI's observation delivers on a later main-actor turn, so a single
+/// layout pass is not enough to see a change land. The bound is small because
+/// a change that needs more turns than this is a defect either way.
+@MainActor
+private func settles(
+    _ controller: NSViewController,
+    until condition: () -> Bool
+) async -> Bool {
+    for _ in 0..<16 {
+        controller.view.needsLayout = true
+        controller.view.layoutSubtreeIfNeeded()
+        controller.view.displayIfNeeded()
+        if condition() { return true }
+        await Task.yield()
+    }
+    return condition()
+}
+
 @Test("launch contract: the app opens only the main window")
 func applicationLaunchOpensOnlyTheMainWindow() async throws {
     let fileManager = FileManager.default

@@ -45,6 +45,26 @@ private struct MainOverlayRoot: View {
     }
 }
 
+/// The window backdrop's own root.
+///
+/// It reads `AppearanceSettings` inside `body`, which is the whole point: the
+/// class is `@Observable`, so a read here subscribes this hosted view to the
+/// opacity slider and the Liquid Glass box. The shell used to hold two plain
+/// `Double` and `Bool` copies and push them into `WindowBackdrop` by hand,
+/// and an appearance change reached no code that pushed them again — the
+/// Appearance pane moved its own readout and the window kept its launch
+/// values. Nothing observes for us here; the read is the subscription.
+private struct WindowBackdropRoot: View {
+    let appearance: AppearanceSettings
+
+    var body: some View {
+        WindowBackdrop(
+            opacity: appearance.backgroundOpacity,
+            usesLiquidGlass: appearance.usesLiquidGlass
+        )
+    }
+}
+
 @MainActor
 private final class MainOverlayHostingView: NSHostingView<MainOverlayRoot> {
     let model: AppModel
@@ -68,12 +88,19 @@ private final class MainOverlayHostingView: NSHostingView<MainOverlayRoot> {
             }
         )
         safeAreaRegions = []
+        // This layer is pinned to all four edges of the shell. It must report
+        // no size of its own: `sizingOptions` defaults to `.standardBounds`,
+        // which makes a hosting view publish minimum, intrinsic, and maximum
+        // size constraints, and pay for a zero, an infinite, and an ideal
+        // measurement pass on every root assignment.
+        sizingOptions = []
     }
 
     required init(rootView: MainOverlayRoot) {
         self.model = rootView.model
         super.init(rootView: rootView)
         safeAreaRegions = []
+        sizingOptions = []
     }
     func update(appearance: AppearanceSettings) {
         rootView = MainOverlayRoot(
@@ -165,10 +192,8 @@ final class MainShellViewController: NSViewController {
     private let onModelStateChanged: @MainActor () -> Void
     private let contentHosting: NSHostingController<MainSplitRoot>
     private var overlayHosting: MainOverlayHostingView?
-    private var backgroundHosting: NSHostingView<WindowBackdrop>?
+    private var backgroundHosting: NSHostingView<WindowBackdropRoot>?
     private var hostedRootIsActive = true
-    private var backdropOpacity = 1.0
-    private var backdropUsesLiquidGlass = false
 
     init(
         appearance: AppearanceSettings,
@@ -186,8 +211,15 @@ final class MainShellViewController: NSViewController {
             )
         )
         super.init(nibName: nil, bundle: nil)
-        backdropOpacity = appearance.backgroundOpacity
-        backdropUsesLiquidGlass = appearance.usesLiquidGlass
+        // The content host fills the shell, and the shell fills the window,
+        // so it has no size of its own to publish. `sizingOptions` defaults to
+        // `.standardBounds`, which had it carry a minimum-size and a
+        // content-size constraint for content that wants neither, and answer a
+        // zero, an infinite and an ideal proposal on either side of every real
+        // layout pass — measured as eight proposals where two are the window's
+        // actual size. None of that reaches the picture, and the composer is
+        // measured once per extra proposal.
+        contentHosting.sizingOptions = []
     }
 
     override func loadView() {
@@ -225,23 +257,19 @@ final class MainShellViewController: NSViewController {
             isActive: hostedRootIsActive
         )
         overlayHosting?.update(appearance: appearance)
-
-        backdropOpacity = appearance.backgroundOpacity
-        backdropUsesLiquidGlass = appearance.usesLiquidGlass
-        backgroundHosting?.rootView = WindowBackdrop(
-            opacity: backdropOpacity,
-            usesLiquidGlass: backdropUsesLiquidGlass
-        )
+        updateBackdrop(appearance)
         configureWindowIfAttached()
     }
 
+    /// Installs the backdrop for one appearance object.
+    ///
+    /// Only the object is handed over. Its values are read inside
+    /// `WindowBackdropRoot.body`, so the slider and the glass box reach the
+    /// window through SwiftUI's own observation and not through a call that
+    /// something has to remember to make.
     func updateBackdrop(_ appearance: AppearanceSettings) {
-        backdropOpacity = appearance.backgroundOpacity
-        backdropUsesLiquidGlass = appearance.usesLiquidGlass
-        backgroundHosting?.rootView = WindowBackdrop(
-            opacity: backdropOpacity,
-            usesLiquidGlass: backdropUsesLiquidGlass
-        )
+        self.appearance = appearance
+        backgroundHosting?.rootView = WindowBackdropRoot(appearance: appearance)
     }
 
     var visibilityBridgeView: MainSplitVisibilityBridgeView? {
@@ -278,20 +306,26 @@ final class MainShellViewController: NSViewController {
     }
 
     private func configureWindowIfAttached() {
-        guard let window = view.window else { return }
-        window.isOpaque = false
-        window.backgroundColor = .clear
+        guard view.window != nil else { return }
+        // `isOpaque` and `backgroundColor` belong to `WindowBackdropView`,
+        // which resolves both from the user's opacity and treatment and puts
+        // them back when it leaves. The shell used to force them to `false`
+        // and `.clear` here, on every attach and on every `update`, which
+        // overwrote the backdrop's answer: an opacity of 100% asks for an
+        // opaque window, and the hairline-alpha fill the backdrop chooses for
+        // the translucent case is deliberately not `.clear`.
+        //
         // Initial chrome is settled before the content host attaches.
         // Re-applying it here makes AppKit lay out the titlebar and toolbar
         // again during the launch turn.
         if backgroundHosting == nil {
             let hosting = NSHostingView(
-                rootView: WindowBackdrop(
-                    opacity: backdropOpacity,
-                    usesLiquidGlass: backdropUsesLiquidGlass
-                )
+                rootView: WindowBackdropRoot(appearance: appearance)
             )
             hosting.safeAreaRegions = []
+            // Pinned to all four edges, exactly like the overlay: it reports
+            // no size of its own.
+            hosting.sizingOptions = []
             hosting.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(hosting, positioned: .below, relativeTo: nil)
             NSLayoutConstraint.activate([
@@ -723,6 +757,27 @@ enum MainWindowStartupConfiguration {
         }
     }
 
+    /// Attaches the content host and keeps the frame `prepare` chose.
+    ///
+    /// Assigning `contentViewController` makes AppKit size the window to the
+    /// content view's Auto Layout fitting size, and a hosted SwiftUI root that
+    /// fills whatever it is given has no fitting size of its own. Measured on
+    /// macOS 26.6.2: a window at 1360x720 dropped to 760x480 — the content
+    /// minimum — the moment the host was assigned. So the frame is captured
+    /// and put back.
+    ///
+    /// The alternative was answering with the shell's `preferredContentSize`,
+    /// which is what this window used to do. `NSWindow` reads that as a size
+    /// the window must hold rather than one to open at: it discarded the
+    /// restored frame every launch and then refused every wider frame,
+    /// including the accessibility resizes a tiling window manager makes.
+    static func attach(_ contentHost: NSViewController, to window: NSWindow) {
+        let preparedFrame = window.frame
+        window.contentViewController = contentHost
+        guard window.frame != preparedFrame else { return }
+        window.setFrame(preparedFrame, display: false)
+    }
+
     fileprivate static func setDefaultFrame(on window: NSWindow) {
         window.setContentSize(defaultContentSize)
         window.center()
@@ -803,7 +858,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 }
             )
             self.shellController = shellController
-            shellController.preferredContentSize = MainWindowStartupConfiguration.defaultContentSize
+            // The shell carries no `preferredContentSize`; see
+            // `MainWindowStartupConfiguration.attach` for what that cost.
             let window = NSWindow(
                 contentRect: NSRect(
                     origin: .zero,
@@ -824,7 +880,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             // those mutations otherwise triggering titlebar layout separately.
             MainWindowStartupConfiguration.prepare(window)
             window.delegate = self
-            window.contentViewController = shellController
+            MainWindowStartupConfiguration.attach(shellController, to: window)
             let toolbarController = MainToolbarController(
                 model: model,
                 visibilityBridge: shellController.visibilityBridgeView
