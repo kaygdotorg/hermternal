@@ -18,6 +18,12 @@ enum AppShapeScale {
     /// Compact app-owned rows and nested selections.
     static let row: CGFloat = 12
 
+    /// The outgoing bubble's bottom-trailing corner, which the tail consumes.
+    ///
+    /// The tail's hook lands tangent to the bubble's bottom edge here. 4pt is
+    /// the smallest radius that still antialiases cleanly at 1x.
+    static let outgoingBubbleTailCorner: CGFloat = compact / 2
+
     /// Dense content blocks, such as a code block inside a transcript.
     static let compact: CGFloat = 8
 }

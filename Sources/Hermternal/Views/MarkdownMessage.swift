@@ -26,6 +26,41 @@ enum MessageTypography {
     static let minimumTurnHeight: CGFloat = 92
     static let codePadding: CGFloat = 14
 
+    /// The outgoing bubble's text measure: half the document measure.
+    ///
+    /// The step down is unmistakable at any window width. 340pt still holds
+    /// about 52 characters of 13pt body text, which is the right measure for a
+    /// prompt rather than for a document.
+    static let outgoingTextMeasure: CGFloat = readingMeasure / 2
+
+    /// The space between the bubble's side and its text.
+    ///
+    /// The code block is the other app-owned filled block in this transcript,
+    /// and two filled blocks in one transcript pad alike. The value also equals
+    /// the body radius, so no glyph enters the corner curve.
+    static let outgoingBubblePaddingH: CGFloat = codePadding
+
+    /// The space between the bubble's top or bottom and its text.
+    ///
+    /// The space above the first line equals the space the renderer puts
+    /// between paragraphs, so the rhythm inside the bubble matches the rhythm
+    /// outside it.
+    static let outgoingBubblePaddingV: CGFloat = paragraphGap
+
+    /// The smallest honest outgoing row: one line of body text in its padding,
+    /// inside the turn rhythm.
+    ///
+    /// `minimumTurnHeight` cannot serve here. It reserves a role band, a
+    /// disclosure band, and a metadata band that an outgoing turn never shows.
+    static let outgoingMinimumTurnHeight: CGFloat =
+        2 * outgoingBubblePaddingV + bodyLineHeight + turnGap
+
+    /// Tolerance between the CoreText measurement and the text view's layout.
+    ///
+    /// The two round a final line's ascent differently by less than a point.
+    /// One point cannot clip a descender and is invisible in the bubble.
+    static let outgoingMeasurementSlack: CGFloat = 1
+
     static func headingTracking(_ level: Int) -> CGFloat {
         switch level {
         case 1: -0.2

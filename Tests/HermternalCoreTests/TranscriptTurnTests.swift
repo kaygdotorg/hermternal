@@ -24,6 +24,20 @@ private func turnRecord(
     )
 }
 
+private func projectionFixture() -> [WireMessageRecord] {
+    [
+        turnRecord("user", role: "user", text: "Question"),
+        turnRecord("assistant", text: "Working"),
+        turnRecord("empty-1"),
+        turnRecord("tool-start", displayKind: "tool_event", toolCallID: "call-1", toolName: "shell", toolStatus: "running"),
+        turnRecord("empty-2"),
+        turnRecord("tool-complete", displayKind: "tool_event", toolCallID: "call-1", toolName: "shell", toolStatus: "completed"),
+        turnRecord("hidden", displayKind: "hidden"),
+        turnRecord("session", role: "system", displayKind: "system_metadata"),
+        turnRecord("final", text: "Done")
+    ]
+}
+
 @Test("zero model markers use the session model")
 func zeroModelMarkersUseFallback() {
     let turns = TranscriptTurnProjector.project(
@@ -96,6 +110,61 @@ func toolErrorProjectsErrorState() {
     ]).first?.tools.first
     #expect(tool?.state == .error)
     #expect(tool?.name == "shell")
+}
+
+@Test("non-renderable placeholders keep tool attachment and turn targets stable")
+func placeholdersDoNotCreateSparseTurns() async throws {
+    let records = projectionFixture()
+    let projected = TranscriptTurnProjector.project(records: records)
+    #expect(projected.map(\.id) == ["user", "assistant", "final"])
+    #expect(projected.map(\.answer) == ["Question", "Working", "Done"])
+    #expect(projected[1].tools.map(\.id) == ["assistant:tool:call-1"])
+    #expect(projected[1].tools.first?.state == .completed)
+
+    let store = PagedTranscriptStore(
+        sessionID: "placeholder-turns",
+        directory: URL(fileURLWithPath: "/placeholder-turns"),
+        fileSystem: InMemoryTranscriptFileSystem()
+    )
+    for record in records { try await store.append(record) }
+    let page = try await store.turnPage(TranscriptTurnPageRequest())
+    #expect(page.turns.map(\.id) == ["user", "assistant", "final"])
+    #expect((try await store.locateTurn(messageID: "assistant"))?.ordinal == 1)
+    #expect((try await store.locateTurn(messageID: "empty-1"))?.ordinal == 1)
+    #expect((try await store.locateTurn(messageID: "tool-complete"))?.ordinal == 1)
+    #expect((try await store.locateTurn(messageID: "hidden"))?.ordinal == 1)
+    #expect((try await store.locateTurn(messageID: "session"))?.ordinal == 1)
+    #expect((try await store.locateTurn(messageID: "final"))?.ordinal == 2)
+}
+
+@Test("large placeholder counts do not create sparse turns")
+func largePlaceholderShapeStaysCompact() {
+    var records: [WireMessageRecord] = []
+    records.reserveCapacity(1_241)
+    for index in 0..<228 {
+        records.append(turnRecord("answer-\(index)", text: "answer"))
+    }
+    for index in 0..<424 {
+        records.append(turnRecord("empty-\(index)"))
+    }
+    for index in 0..<7 {
+        records.append(turnRecord("hidden-\(index)", displayKind: "hidden"))
+    }
+    for index in 0..<582 {
+        records.append(turnRecord(
+            "tool-\(index)",
+            displayKind: "tool_event",
+            toolCallID: "call-\(index)",
+            toolName: "shell",
+            toolStatus: "completed"
+        ))
+    }
+
+    #expect(records.count == 1_241)
+    let turns = TranscriptTurnProjector.project(records: records)
+    #expect(turns.count == 228)
+    #expect(turns.count < 654)
+    #expect(turns.last?.tools.count == 582)
 }
 
 @Test("paged store excludes model markers from rendered rows")
@@ -183,6 +252,32 @@ func legacyRowsProduceTurns() async throws {
     let store = PagedTranscriptStore(sessionID: "legacy", directory: directory, fileSystem: fs)
     let page = try await store.turnPage(TranscriptTurnPageRequest())
     #expect(page.turns.first?.answer == "cached answer")
+}
+
+@Test("version-one store rebuilds its turn index once")
+func versionOneStoreMigratesTurnIndexOnce() async throws {
+    let fs = InMemoryTranscriptFileSystem()
+    let directory = URL(fileURLWithPath: "/version-one-turns")
+    let seed = PagedTranscriptStore(sessionID: "version-one", directory: directory, fileSystem: fs)
+    for record in projectionFixture() { try await seed.append(record) }
+    try fs.write(
+        JSONEncoder().encode(TranscriptManifest(version: 1)),
+        to: directory.appendingPathComponent("manifest.json")
+    )
+
+    let migrated = PagedTranscriptStore(sessionID: "version-one", directory: directory, fileSystem: fs)
+    let migratedTurns = try await migrated.turnPage(TranscriptTurnPageRequest())
+    #expect(migratedTurns.turns.map(\.id) == ["user", "assistant", "final"])
+    #expect(migratedTurns.turns.map(\.answer) == ["Question", "Working", "Done"])
+    #expect(migratedTurns.turns[1].tools.map(\.id) == ["assistant:tool:call-1"])
+    let manifestData = try fs.data(at: directory.appendingPathComponent("manifest.json"))
+    #expect(try JSONDecoder().decode(TranscriptManifest.self, from: manifestData).version == 2)
+    #expect((await migrated.metrics()).diskWrites == 2)
+
+    let warm = PagedTranscriptStore(sessionID: "version-one", directory: directory, fileSystem: fs)
+    let warmTurns = try await warm.turnPage(TranscriptTurnPageRequest())
+    #expect(warmTurns.turns.map(\.id) == ["user", "assistant", "final"])
+    #expect((await warm.metrics()).diskWrites == 0)
 }
 
 @Test("turn pages use contiguous turn ordinals across wire metadata")

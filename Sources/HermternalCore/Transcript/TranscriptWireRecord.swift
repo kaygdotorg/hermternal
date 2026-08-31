@@ -169,6 +169,89 @@ public struct WireMessageRecord: Codable, Hashable, Sendable, Identifiable {
     }
 }
 
+/// Orders authoritative wire records by their durable numeric event ID.
+///
+/// A nonnumeric ID has no comparable durable position. Its source order stays
+/// unchanged so provisional and third-party records retain their exact wire
+/// semantics. Equal numeric IDs also remain stable.
+internal enum TranscriptWireOrder {
+    /// Returns `nil` unless every ID has a durable numeric event position.
+    static func normalized(_ messageIDs: [String]) -> [String]? {
+        guard !messageIDs.isEmpty else { return messageIDs }
+
+        var runStarts = [messageIDs.startIndex]
+        guard let first = Int64(messageIDs[0]) else { return nil }
+        var previous = first
+
+        for index in messageIDs.indices.dropFirst() {
+            guard let current = Int64(messageIDs[index]) else { return nil }
+            if current < previous { runStarts.append(index) }
+            previous = current
+        }
+        guard runStarts.count > 1 else { return messageIDs }
+        if runStarts.count == 2 {
+            return stableMerge(
+                messageIDs[..<runStarts[1]],
+                messageIDs[runStarts[1]...]
+            )
+        }
+
+        runStarts.append(messageIDs.endIndex)
+        var runs: [[String]] = []
+        runs.reserveCapacity(runStarts.count - 1)
+        for index in 0..<(runStarts.count - 1) {
+            runs.append(Array(messageIDs[runStarts[index]..<runStarts[index + 1]]))
+        }
+        while runs.count > 1 {
+            var merged: [[String]] = []
+            merged.reserveCapacity((runs.count + 1) / 2)
+            var index = 0
+            while index + 1 < runs.count {
+                merged.append(stableMerge(runs[index], runs[index + 1]))
+                index += 2
+            }
+            if index < runs.count { merged.append(runs[index]) }
+            runs = merged
+        }
+        return runs[0]
+    }
+
+    /// Returns `nil` unless both independently ordered sources have numeric
+    /// durable positions. Equal positions prefer `existing`.
+    static func merged(existing: [String], incoming: [String]) -> [String]? {
+        guard let existing = normalized(existing),
+              let incoming = normalized(incoming)
+        else { return nil }
+        return stableMerge(existing, incoming)
+    }
+
+    private static func stableMerge(_ left: [String], _ right: [String]) -> [String] {
+        stableMerge(left[...], right[...])
+    }
+
+    private static func stableMerge(
+        _ left: ArraySlice<String>,
+        _ right: ArraySlice<String>
+    ) -> [String] {
+        var merged: [String] = []
+        merged.reserveCapacity(left.count + right.count)
+        var leftIndex = left.startIndex
+        var rightIndex = right.startIndex
+        while leftIndex < left.endIndex && rightIndex < right.endIndex {
+            if Int64(left[leftIndex])! <= Int64(right[rightIndex])! {
+                merged.append(left[leftIndex])
+                left.formIndex(after: &leftIndex)
+            } else {
+                merged.append(right[rightIndex])
+                right.formIndex(after: &rightIndex)
+            }
+        }
+        merged.append(contentsOf: left[leftIndex...])
+        merged.append(contentsOf: right[rightIndex...])
+        return merged
+    }
+}
+
 /// The byte range in a message that a row descriptor exposes.
 public struct StringSlice: Codable, Hashable, Sendable {
     public let offset: Int

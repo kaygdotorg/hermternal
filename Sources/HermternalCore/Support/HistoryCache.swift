@@ -20,6 +20,16 @@ public struct CacheStoreResult: Sendable {
     }
 }
 
+public struct TranscriptPageAppendResult: Sendable {
+    public let summary: TranscriptSummary
+    public let appliedRecords: [WireMessageRecord]
+
+    public init(summary: TranscriptSummary, appliedRecords: [WireMessageRecord]) {
+        self.summary = summary
+        self.appliedRecords = appliedRecords
+    }
+}
+
 public enum HistoryCacheFileKind: Equatable, Sendable {
     case current(String)
     case legacy(String)
@@ -455,6 +465,10 @@ public actor HistoryCache: TranscriptPersisting {
         guard let directory else { return nil }
         return directory.appendingPathComponent("paged-\(Self.encodedFilename(for: id))", isDirectory: true)
     }
+    func existingPagedStore(for id: String) -> PagedTranscriptStore? {
+        pagedStores[id]
+    }
+
 
     /// Returns the disk-backed store for a session. A v3 flat cache entry is
     /// migrated one record at a time on first access, then the old file is
@@ -495,18 +509,18 @@ public actor HistoryCache: TranscriptPersisting {
         _ page: TranscriptMessagePage,
         for id: String,
         expectedEpoch: UInt64? = nil
-    ) async throws -> TranscriptSummary {
+    ) async throws -> TranscriptPageAppendResult {
         let authorized = expectedEpoch ?? epoch
         guard authorized == epoch, !Task.isCancelled else {
             throw TranscriptStoreError.staleEpoch(expected: authorized, actual: epoch)
         }
         let store = try await pagedStore(for: id)
         let records = page.messages.compactMap(WireMessageRecord.init(row:))
-        for record in records {
-            try Task.checkCancellation()
-            _ = try await store.append(record)
-        }
-        return try await store.summary()
+        let result = try await store.append(records)
+        return TranscriptPageAppendResult(
+            summary: result.summary,
+            appliedRecords: result.appliedRecords
+        )
     }
 
     public func transcriptPage(

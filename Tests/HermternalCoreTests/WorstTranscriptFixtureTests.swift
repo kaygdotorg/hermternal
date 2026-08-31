@@ -27,7 +27,10 @@ final class WorstTranscriptFixtureTests: XCTestCase {
         XCTAssertNotNil(admitted)
         XCTAssertNil(registry.admit(category: .sidebar, bytes: 1))
         XCTAssertNil(registry.admit(category: .search, bytes: 5))
-
+        let admittedMetrics = registry.metrics()
+        XCTAssertEqual(admittedMetrics.residentBytes, 6)
+        XCTAssertEqual(admittedMetrics.categories[.sidebar]?.residentBytes, 6)
+        XCTAssertEqual(admittedMetrics.categories[.sidebar]?.rejectionCount, 1)
         if let admitted {
             registry.evict(admitted)
         }

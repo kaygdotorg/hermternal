@@ -71,7 +71,7 @@ public final class InMemoryTranscriptFileSystem: TranscriptFileSystem, @unchecke
 }
 
 public struct TranscriptManifest: Codable, Hashable, Sendable {
-    public static let currentVersion = 1
+    public static let currentVersion = 2
     public let version: Int
     public let generation: UInt64
     public let epoch: UInt64

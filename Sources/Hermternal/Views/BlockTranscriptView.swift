@@ -36,6 +36,309 @@ struct BlockTranscriptView: NSViewRepresentable {
             let turn: TranscriptTurn
         }
 
+        struct MeasuredDocumentCache {
+            struct DisclosureState: Hashable, Sendable {
+                let reasoningExpanded: Bool
+                let toolsExpanded: Bool
+
+                init(reasoningExpanded: Bool = false, toolsExpanded: Bool = false) {
+                    self.reasoningExpanded = reasoningExpanded
+                    self.toolsExpanded = toolsExpanded
+                }
+            }
+
+            private struct Document {
+                let turn: TranscriptTurn
+                let document: MarkdownDocument
+            }
+
+            private struct Measurement {
+                let turn: TranscriptTurn
+                let effectiveWidth: CGFloat
+                let disclosure: DisclosureState
+                let layout: TranscriptTurnLayout
+            }
+
+            static let widthTolerance: CGFloat = 0.5
+
+            private var documents: [String: Document] = [:]
+            private var measurements: [Int: Measurement] = [:]
+
+            var documentCount: Int { documents.count }
+            var measurementCount: Int { measurements.count }
+
+            static func matchesWidth(_ lhs: CGFloat, _ rhs: CGFloat) -> Bool {
+                abs(lhs - rhs) <= widthTolerance
+            }
+
+            func document(for turn: TranscriptTurn) -> MarkdownDocument? {
+                guard let cached = documents[turn.id], cached.turn == turn else { return nil }
+                return cached.document
+            }
+
+            func document(for turnID: String) -> MarkdownDocument? {
+                documents[turnID]?.document
+            }
+
+            /// The measured width and height for one row.
+            ///
+            /// Both come from a single measurement at a single effective width,
+            /// so the width the view lays out at is the width the height was
+            /// computed at.
+            func layout(
+                for ordinal: Int,
+                turn: TranscriptTurn,
+                effectiveWidth: CGFloat,
+                disclosure: DisclosureState
+            ) -> TranscriptTurnLayout? {
+                guard let measurement = measurements[ordinal],
+                      measurement.turn == turn,
+                      measurement.disclosure == disclosure,
+                      Self.matchesWidth(measurement.effectiveWidth, effectiveWidth)
+                else { return nil }
+                return measurement.layout
+            }
+
+            func height(
+                for ordinal: Int,
+                turn: TranscriptTurn,
+                effectiveWidth: CGFloat,
+                disclosure: DisclosureState
+            ) -> CGFloat? {
+                layout(
+                    for: ordinal,
+                    turn: turn,
+                    effectiveWidth: effectiveWidth,
+                    disclosure: disclosure
+                )?.height
+            }
+
+            func height(for ordinal: Int, turnID: String, width: CGFloat) -> CGFloat? {
+                guard let measurement = measurements[ordinal],
+                      measurement.turn.id == turnID,
+                      Self.matchesWidth(measurement.effectiveWidth, width)
+                else { return nil }
+                return measurement.layout.height
+            }
+
+            @discardableResult
+            mutating func accept(
+                document: MarkdownDocument,
+                for turn: TranscriptTurn,
+                ordinal: Int,
+                width: CGFloat,
+                disclosure: DisclosureState = .init(),
+                measure: (TranscriptTurn, MarkdownDocument, CGFloat) -> CGFloat
+            ) -> Bool {
+                if self.document(for: turn) != nil,
+                   height(
+                        for: ordinal,
+                        turn: turn,
+                        effectiveWidth: width,
+                        disclosure: disclosure
+                   ) != nil {
+                    return false
+                }
+                if let previous = measurements[ordinal], previous.turn != turn,
+                   documents[previous.turn.id]?.turn == previous.turn {
+                    documents.removeValue(forKey: previous.turn.id)
+                }
+                store(document: document, for: turn)
+                store(
+                    height: measure(turn, document, width),
+                    for: turn,
+                    ordinal: ordinal,
+                    effectiveWidth: width,
+                    disclosure: disclosure
+                )
+                return true
+            }
+
+            @discardableResult
+            mutating func store(document: MarkdownDocument, for turn: TranscriptTurn) -> Bool {
+                guard documents[turn.id]?.turn != turn else { return false }
+                documents[turn.id] = Document(turn: turn, document: document)
+                return true
+            }
+
+            mutating func store(
+                layout: TranscriptTurnLayout,
+                for turn: TranscriptTurn,
+                ordinal: Int,
+                effectiveWidth: CGFloat,
+                disclosure: DisclosureState
+            ) {
+                measurements[ordinal] = Measurement(
+                    turn: turn,
+                    effectiveWidth: effectiveWidth,
+                    disclosure: disclosure,
+                    layout: layout
+                )
+            }
+
+            /// Stores a height alone, for a caller that has no width to record.
+            /// The effective width stands in, which is the widest the text can
+            /// be at this key.
+            mutating func store(
+                height: CGFloat,
+                for turn: TranscriptTurn,
+                ordinal: Int,
+                effectiveWidth: CGFloat,
+                disclosure: DisclosureState
+            ) {
+                store(
+                    layout: TranscriptTurnLayout(
+                        textWidth: effectiveWidth,
+                        height: height
+                    ),
+                    for: turn,
+                    ordinal: ordinal,
+                    effectiveWidth: effectiveWidth,
+                    disclosure: disclosure
+                )
+            }
+
+            @discardableResult
+            mutating func remeasureIfNeeded(
+                turn: TranscriptTurn,
+                ordinal: Int,
+                width: CGFloat,
+                disclosure: DisclosureState = .init(),
+                measure: (TranscriptTurn, MarkdownDocument, CGFloat) -> CGFloat
+            ) -> Bool {
+                guard let document = document(for: turn),
+                      height(
+                        for: ordinal,
+                        turn: turn,
+                        effectiveWidth: width,
+                        disclosure: disclosure
+                      ) == nil
+                else { return false }
+                store(
+                    height: measure(turn, document, width),
+                    for: turn,
+                    ordinal: ordinal,
+                    effectiveWidth: width,
+                    disclosure: disclosure
+                )
+                return true
+            }
+
+            @discardableResult
+            mutating func remeasure(
+                turn: TranscriptTurn,
+                ordinal: Int,
+                width: CGFloat,
+                disclosure: DisclosureState = .init(),
+                measure: (TranscriptTurn, MarkdownDocument, CGFloat) -> CGFloat
+            ) -> Bool {
+                guard let document = document(for: turn) else { return false }
+                store(
+                    height: measure(turn, document, width),
+                    for: turn,
+                    ordinal: ordinal,
+                    effectiveWidth: width,
+                    disclosure: disclosure
+                )
+                return true
+            }
+
+            mutating func remove(turn: TranscriptTurn, ordinal: Int) {
+                if documents[turn.id]?.turn == turn {
+                    documents.removeValue(forKey: turn.id)
+                }
+                if measurements[ordinal]?.turn == turn {
+                    measurements.removeValue(forKey: ordinal)
+                }
+            }
+
+            mutating func remove(turnID: String, ordinal: Int) {
+                documents.removeValue(forKey: turnID)
+                measurements.removeValue(forKey: ordinal)
+            }
+
+            mutating func removeAll(keepingCapacity: Bool = false) {
+                documents.removeAll(keepingCapacity: keepingCapacity)
+                measurements.removeAll(keepingCapacity: keepingCapacity)
+            }
+        }
+
+
+        private struct ParseRequest: Hashable, Sendable {
+            let ordinal: Int
+            let turn: TranscriptTurn
+        }
+
+        private struct ParseBatch: Sendable {
+            let id: UUID
+            let generation: Int
+            let revision: UInt64
+            let requests: [ParseRequest]
+        }
+
+        private struct MeasurementRequest: Hashable, Sendable {
+            let ordinal: Int
+            let turn: TranscriptTurn
+            let effectiveWidth: CGFloat
+            let disclosure: MeasuredDocumentCache.DisclosureState
+        }
+
+        private struct MeasurementWorkItem: Sendable {
+            let request: MeasurementRequest
+            let document: MarkdownDocument
+        }
+
+        private struct MeasurementBatch: Sendable {
+            let id: UUID
+            let generation: Int
+            let revision: UInt64
+            let workItems: [MeasurementWorkItem]
+        }
+
+        private struct CacheWork {
+            var documentPreparationTask: Task<Void, Never>?
+            var documentPreparationBatch: ParseBatch?
+            var measurementTask: Task<Void, Never>?
+            var measurementBatch: MeasurementBatch?
+            var measurementBatchState = MeasurementBatchState()
+
+        }
+
+        struct MeasurementBatchState {
+            private(set) var activeID: UUID?
+            private(set) var reschedulePending = false
+
+            mutating func begin() -> (id: UUID, replaced: UUID?) {
+                let id = UUID()
+                let replaced = activeID
+                activeID = id
+                return (id, replaced)
+            }
+
+            func accepts(_ id: UUID) -> Bool { activeID == id }
+
+            mutating func queueReschedule() { reschedulePending = true }
+
+            mutating func takeReschedule() -> Bool {
+                let pending = reschedulePending
+                reschedulePending = false
+                return pending
+            }
+
+            @discardableResult
+            mutating func finish(_ id: UUID) -> Bool {
+                guard activeID == id else { return false }
+                activeID = nil
+                return true
+            }
+
+            mutating func reset() {
+                activeID = nil
+                reschedulePending = false
+            }
+        }
+
+
         private let table = BlockTranscriptTableView()
         private weak var container: BlockTranscriptContainerView?
         private var store: (any TranscriptTurnPageLocating)?
@@ -43,8 +346,10 @@ struct BlockTranscriptView: NSViewRepresentable {
         private var summary: TranscriptSummary?
         private var loadedTurns: [Int: LoadedTurn] = [:]
         private var loadedOrder: [Int] = []
-        private var parsedDocuments: [String: MarkdownDocument] = [:]
-        private var heightByOrdinal: [Int: CGFloat] = [:]
+        private var measuredDocuments = MeasuredDocumentCache()
+
+        private var cacheWork = CacheWork()
+
         private var totalTurnCount: Int?
         private var loadingStarts = Set<Int>()
         private var pageTasks: [Int: Task<Void, Never>] = [:]
@@ -80,7 +385,9 @@ struct BlockTranscriptView: NSViewRepresentable {
             table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
             table.backgroundColor = .clear
             table.setAccessibilityElement(false)
-            table.addTableColumn(NSTableColumn(identifier: .init("transcript")))
+            let transcriptColumn = NSTableColumn(identifier: .init("transcript"))
+            transcriptColumn.resizingMask = .autoresizingMask
+            table.addTableColumn(transcriptColumn)
 
             let result = BlockTranscriptContainerView(tableView: table)
             result.onWidthChange = { [weak self] in self?.invalidateHeights() }
@@ -94,6 +401,7 @@ struct BlockTranscriptView: NSViewRepresentable {
                     guard let self else { return }
                     self.followsStreaming = self.isStreaming && self.isNearBottom()
                     self.requestVisiblePages()
+                    self.scheduleVisibleMeasurements(at: self.table.bounds.width)
                     self.prepareVisibleTurns()
                 }
             }
@@ -132,9 +440,12 @@ struct BlockTranscriptView: NSViewRepresentable {
                 loadingStarts.removeAll(keepingCapacity: true)
                 loadedTurns.removeAll(keepingCapacity: true)
                 loadedOrder.removeAll(keepingCapacity: true)
-                parsedDocuments.removeAll(keepingCapacity: true)
+                measuredDocuments.removeAll(keepingCapacity: true)
+                cacheWork.documentPreparationTask?.cancel()
+                cacheWork.measurementTask?.cancel()
+                cacheWork.measurementBatchState.reset()
                 totalTurnCount = nil
-                heightByOrdinal.removeAll(keepingCapacity: true)
+
                 targetOrdinal = nil
                 consumedPendingMessageID = nil
                 viewportTarget = nil
@@ -152,8 +463,10 @@ struct BlockTranscriptView: NSViewRepresentable {
             }
             pendingMessageID = input.pendingMessageID
             if revisionChanged, !routeChanged {
-                parsedDocuments.removeAll(keepingCapacity: true)
-                heightByOrdinal.removeAll(keepingCapacity: true)
+                cacheWork.documentPreparationTask?.cancel()
+                cacheWork.measurementTask?.cancel()
+                cacheWork.measurementBatchState.reset()
+
                 loadingStarts.removeAll(keepingCapacity: true)
             }
 
@@ -174,6 +487,7 @@ struct BlockTranscriptView: NSViewRepresentable {
             }
             requestVisiblePages()
             prepareVisibleTurns()
+            scheduleVisibleMeasurements(at: table.bounds.width)
             position(routeChanged: routeChanged)
         }
 
@@ -183,8 +497,12 @@ struct BlockTranscriptView: NSViewRepresentable {
             pageTasks.removeAll()
             locateTask?.cancel()
             locateTask = nil
+            cacheWork.documentPreparationTask?.cancel()
+            cacheWork.measurementTask?.cancel()
+            cacheWork.measurementBatchState.reset()
             for observer in observers { NotificationCenter.default.removeObserver(observer) }
             observers.removeAll()
+            container.stopObservingSystemPalette()
             container.onPaint = nil
             table.delegate = nil
             table.dataSource = nil
@@ -213,14 +531,31 @@ struct BlockTranscriptView: NSViewRepresentable {
                 requestPage(containing: row)
                 return view
             }
-            let document = parsedDocuments[loaded.turn.id]
+            let document = measuredDocuments.document(for: loaded.turn)
+            let disclosure = MeasuredDocumentCache.DisclosureState(
+                reasoningExpanded: expandedReasoning.contains(loaded.turn.id),
+                toolsExpanded: expandedTools.contains(loaded.turn.id)
+            )
+            // The measured fitting width, so a short outgoing bubble hugs its
+            // text. It is `nil` until the measurement lands, and the bubble
+            // then renders at its cap.
+            let outgoingTextWidth = measuredDocuments.layout(
+                for: row,
+                turn: loaded.turn,
+                effectiveWidth: TranscriptTurnTextRenderer.effectiveWidth(
+                    for: loaded.turn,
+                    availableWidth: tableView.bounds.width
+                ),
+                disclosure: disclosure
+            )?.textWidth
             view.configure(
                 turn: loaded.turn,
                 document: document,
-                reasoningExpanded: expandedReasoning.contains(loaded.turn.id),
-                toolsExpanded: expandedTools.contains(loaded.turn.id),
+                reasoningExpanded: disclosure.reasoningExpanded,
+                toolsExpanded: disclosure.toolsExpanded,
                 showsMetadata: showsMetadata,
                 findQuery: findQuery,
+                outgoingTextWidth: outgoingTextWidth,
                 onReasoning: { [weak self] id in self?.toggleReasoning(id) },
                 onTools: { [weak self] id in self?.toggleTools(id) },
                 onCopyCode: onCopyCode
@@ -230,23 +565,39 @@ struct BlockTranscriptView: NSViewRepresentable {
 
         /// Height is a pure cache lookup. It never asks AppKit to create a row.
         func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-            heightByOrdinal[row] ?? estimatedHeight(for: loadedTurns[row]?.turn, width: tableView.bounds.width)
+            guard let loaded = loadedTurns[row] else {
+                return estimatedHeight(for: nil, width: tableView.bounds.width)
+            }
+            let turn = loaded.turn
+            let effectiveWidth = TranscriptTurnTextRenderer.effectiveWidth(
+                for: turn,
+                availableWidth: tableView.bounds.width
+            )
+            let disclosure = MeasuredDocumentCache.DisclosureState(
+                reasoningExpanded: expandedReasoning.contains(turn.id),
+                toolsExpanded: expandedTools.contains(turn.id)
+            )
+            return measuredDocuments.height(
+                for: row,
+                turn: turn,
+                effectiveWidth: effectiveWidth,
+                disclosure: disclosure
+            ) ?? estimatedHeight(for: turn, width: tableView.bounds.width)
         }
+
 
         func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { false }
 
         private func estimatedHeight(for turn: TranscriptTurn?, width: CGFloat) -> CGFloat {
             guard let turn else { return MessageTypography.loadingRowHeight }
-            let measure = max(1, min(MessageTypography.readingMeasure, width - 40))
-            let answerLines = max(1, Int(ceil(CGFloat(turn.answer.utf16.count) / max(32, measure / 7))))
-            let reasoning = turn.reasoning == nil ? 0 : MessageTypography.disclosureHeight
-            let tools = turn.tools.isEmpty ? 0 : MessageTypography.disclosureHeight
-            return MessageTypography.roleLabelHeight
-                + CGFloat(answerLines) * MessageTypography.bodyLineHeight
-                + reasoning + tools
-                + MessageTypography.turnGap
-                + MessageTypography.metadataFooterHeight
+            return TranscriptTurnTextRenderer.provisionalHeight(
+                turn: turn,
+                availableWidth: width,
+                reasoningExpanded: expandedReasoning.contains(turn.id),
+                toolsExpanded: expandedTools.contains(turn.id)
+            )
         }
+
 
         private func requestVisiblePages() {
             let visible = table.rows(in: table.visibleRect)
@@ -310,15 +661,18 @@ struct BlockTranscriptView: NSViewRepresentable {
             totalTurnCount = page.totalTurnCount
             for (offset, turn) in page.turns.enumerated() {
                 let ordinal = page.startOrdinal + offset
+                if let previous = loadedTurns[ordinal], previous.turn != turn {
+                    measuredDocuments.remove(turn: previous.turn, ordinal: ordinal)
+                }
                 loadedTurns[ordinal] = LoadedTurn(ordinal: ordinal, turn: turn)
-                loadedOrder.removeAll { $0 == ordinal }
+                loadedOrder.removeAll { value in value == ordinal }
                 loadedOrder.append(ordinal)
-                heightByOrdinal[ordinal] = estimatedHeight(for: turn, width: table.bounds.width)
             }
             while loadedOrder.count > 256 {
                 let old = loadedOrder.removeFirst()
-                loadedTurns.removeValue(forKey: old)
-                heightByOrdinal.removeValue(forKey: old)
+                if let evicted = loadedTurns.removeValue(forKey: old) {
+                    measuredDocuments.remove(turn: evicted.turn, ordinal: old)
+                }
             }
             if rowCount != previousCount {
                 table.noteNumberOfRowsChanged()
@@ -326,66 +680,265 @@ struct BlockTranscriptView: NSViewRepresentable {
             if page.hasMore, page.nextOrdinal > page.startOrdinal {
                 requestPage(start: page.nextOrdinal)
             }
-            let indexes = IndexSet(page.turns.indices.map { page.startOrdinal + $0 })
+            let indexes = IndexSet(page.turns.indices.map { index in page.startOrdinal + index })
                 .intersection(IndexSet(integersIn: 0..<rowCount))
             guard !indexes.isEmpty else { return }
-            table.reloadData(forRowIndexes: indexes, columnIndexes: IndexSet(integer: 0))
-            table.noteHeightOfRows(withIndexesChanged: indexes)
-            container?.layoutTableDocument()
+            correctingHeights {
+                table.reloadData(forRowIndexes: indexes, columnIndexes: IndexSet(integer: 0))
+                table.noteHeightOfRows(withIndexesChanged: indexes)
+                container?.layoutTableDocument()
+            }
             prepareVisibleTurns()
             position(routeChanged: false)
         }
 
-        private func prepareVisibleTurns() {
+
+        private func visibleRange() -> Range<Int> {
             let visible = table.rows(in: table.visibleRect)
-            let range: Range<Int>
             if visible.location == NSNotFound || visible.length == 0 {
-                range = 0..<min(rowCount, TranscriptPageRequestPlanner.pageSize)
-            } else {
-                range = max(0, visible.location - overdrawRows)..<min(
-                    rowCount,
-                    visible.location + visible.length + overdrawRows
+                return 0..<min(rowCount, TranscriptPageRequestPlanner.pageSize)
+            }
+            return max(0, visible.location - overdrawRows)..<min(
+                rowCount,
+                visible.location + visible.length + overdrawRows
+            )
+        }
+
+        private func visibleMeasuredTurns() -> [(Int, TranscriptTurn, MarkdownDocument)] {
+            visibleRange().compactMap { ordinal in
+                guard let turn = loadedTurns[ordinal]?.turn,
+                      let document = measuredDocuments.document(for: turn)
+                else { return nil }
+                return (ordinal, turn, document)
+            }
+        }
+
+
+        private func prepareVisibleTurns() {
+            let requests = visibleRange().compactMap { ordinal -> ParseRequest? in
+                guard let turn = loadedTurns[ordinal]?.turn,
+                      measuredDocuments.document(for: turn) == nil
+                else { return nil }
+                return ParseRequest(ordinal: ordinal, turn: turn)
+            }
+            guard !requests.isEmpty else {
+                cacheWork.documentPreparationTask?.cancel()
+                return
+            }
+            let current = generation
+            let currentRevision = revision
+            let desired = ParseBatch(
+                id: UUID(),
+                generation: current,
+                revision: currentRevision,
+                requests: requests
+            )
+            guard let active = cacheWork.documentPreparationBatch else {
+                startDocumentPreparation(desired)
+                return
+            }
+            if active.generation == current,
+               active.revision == currentRevision,
+               Set(requests).isSubset(of: Set(active.requests)),
+               cacheWork.documentPreparationTask?.isCancelled != true {
+                return
+            }
+            cacheWork.documentPreparationTask?.cancel()
+        }
+
+        private func startDocumentPreparation(_ batch: ParseBatch) {
+            cacheWork.documentPreparationBatch = batch
+            cacheWork.documentPreparationTask = Task { [weak self] in
+                let parser = Task.detached(priority: .userInitiated) { () -> [(ParseRequest, MarkdownDocument)] in
+                    var prepared: [(ParseRequest, MarkdownDocument)] = []
+                    for request in batch.requests {
+                        guard !Task.isCancelled else { return [] }
+                        prepared.append((request, MarkdownDocument.parse(request.turn.answer).document))
+                        guard !Task.isCancelled else { return [] }
+                    }
+                    return prepared
+                }
+                let prepared: [(ParseRequest, MarkdownDocument)] = await withTaskCancellationHandler(
+                    operation: { await parser.value },
+                    onCancel: { parser.cancel() }
+                )
+                guard let self,
+                      self.cacheWork.documentPreparationBatch?.id == batch.id
+                else { return }
+                self.cacheWork.documentPreparationTask = nil
+                self.cacheWork.documentPreparationBatch = nil
+                if !Task.isCancelled,
+                   self.generation == batch.generation,
+                   self.revision == batch.revision {
+                    let indexes = IndexSet(prepared.compactMap { item in
+                        let (request, document) = item
+                        guard let loaded = self.loadedTurns[request.ordinal],
+                              loaded.turn == request.turn
+                        else { return nil }
+                        self.measuredDocuments.store(document: document, for: request.turn)
+                        return request.ordinal
+                    })
+                    if !indexes.isEmpty {
+                        self.correctingHeights {
+                            self.table.reloadData(
+                                forRowIndexes: indexes,
+                                columnIndexes: IndexSet(integer: 0)
+                            )
+                            self.table.noteHeightOfRows(withIndexesChanged: indexes)
+                            self.container?.layoutTableDocument()
+                        }
+                    }
+                }
+                self.scheduleVisibleMeasurements(at: self.table.bounds.width)
+                self.prepareVisibleTurns()
+            }
+        }
+
+
+        private func scheduleVisibleMeasurements(at width: CGFloat) {
+            let current = generation
+            let currentRevision = revision
+            let workItems = visibleMeasuredTurns().compactMap { ordinal, turn, document -> MeasurementWorkItem? in
+                let effectiveWidth = TranscriptTurnTextRenderer.effectiveWidth(
+                    for: turn,
+                    availableWidth: width
+                )
+                let disclosure = MeasuredDocumentCache.DisclosureState(
+                    reasoningExpanded: expandedReasoning.contains(turn.id),
+                    toolsExpanded: expandedTools.contains(turn.id)
+                )
+                guard measuredDocuments.height(
+                    for: ordinal,
+                    turn: turn,
+                    effectiveWidth: effectiveWidth,
+                    disclosure: disclosure
+                ) == nil else { return nil }
+                return MeasurementWorkItem(
+                    request: MeasurementRequest(
+                        ordinal: ordinal,
+                        turn: turn,
+                        effectiveWidth: effectiveWidth,
+                        disclosure: disclosure
+                    ),
+                    document: document
                 )
             }
-            let candidates = range.compactMap { loadedTurns[$0]?.turn }
-                .filter { parsedDocuments[$0.id] == nil }
-            guard !candidates.isEmpty else { return }
-            let current = generation
-            let width = table.bounds.width
-            let expandedReasoning = self.expandedReasoning
-            let expandedTools = self.expandedTools
-            Task { [weak self] in
-                let prepared = await Task.detached(priority: .userInitiated) {
-                    candidates.map { turn in
-                        let document = MarkdownDocument.parse(turn.answer).document
-                        let height = TranscriptTurnTextRenderer.measuredHeight(
-                            turn: turn,
-                            document: document,
-                            width: width,
-                            reasoningExpanded: expandedReasoning.contains(turn.id),
-                            toolsExpanded: expandedTools.contains(turn.id)
-                        )
-                        return (turn.id, document, height)
-                    }
-                }.value
-                guard let self, self.generation == current else { return }
-                for (id, document, height) in prepared {
-                    self.parsedDocuments[id] = document
-                    if let ordinal = self.loadedTurns.first(where: { $0.value.turn.id == id })?.key {
-                        self.heightByOrdinal[ordinal] = height
-                    }
-                }
-                let indexes = IndexSet(prepared.compactMap { item in
-                    self.loadedTurns.first(where: { $0.value.turn.id == item.0 })?.key
-                })
-                if !indexes.isEmpty {
-                    self.table.reloadData(forRowIndexes: indexes, columnIndexes: IndexSet(integer: 0))
-                    self.table.noteHeightOfRows(withIndexesChanged: indexes)
-                    self.container?.layoutTableDocument()
-                }
+            guard !workItems.isEmpty else {
+                cacheWork.measurementTask?.cancel()
+                cacheWork.measurementBatchState.reset()
+                return
             }
-
+            guard let active = cacheWork.measurementBatch else {
+                startMeasurement(
+                    workItems,
+                    generation: current,
+                    revision: currentRevision
+                )
+                return
+            }
+            if active.generation == current,
+               active.revision == currentRevision,
+               Set(workItems.map(\.request)).isSubset(of: Set(active.workItems.map(\.request))),
+               cacheWork.measurementTask?.isCancelled != true {
+                return
+            }
+            cacheWork.measurementBatchState.queueReschedule()
+            cacheWork.measurementTask?.cancel()
         }
+
+        private func startMeasurement(
+            _ workItems: [MeasurementWorkItem],
+            generation: Int,
+            revision: UInt64
+        ) {
+            let transition = cacheWork.measurementBatchState.begin()
+            let batch = MeasurementBatch(
+                id: transition.id,
+                generation: generation,
+                revision: revision,
+                workItems: workItems
+            )
+            cacheWork.measurementBatch = batch
+            cacheWork.measurementTask = Task { [weak self] in
+                let measurer = Task.detached(priority: .userInitiated) { () -> [(MeasurementRequest, TranscriptTurnLayout)] in
+                    var measured: [(MeasurementRequest, TranscriptTurnLayout)] = []
+                    for workItem in batch.workItems {
+                        guard !Task.isCancelled else { return [] }
+                        let request = workItem.request
+                        measured.append((
+                            request,
+                            TranscriptTurnTextRenderer.measuredLayout(
+                                turn: request.turn,
+                                document: workItem.document,
+                                width: request.effectiveWidth,
+                                reasoningExpanded: request.disclosure.reasoningExpanded,
+                                toolsExpanded: request.disclosure.toolsExpanded
+                            )
+                        ))
+                        guard !Task.isCancelled else { return [] }
+                    }
+                    return measured
+                }
+                let measured: [(MeasurementRequest, TranscriptTurnLayout)] = await withTaskCancellationHandler(
+                    operation: { await measurer.value },
+                    onCancel: { measurer.cancel() }
+                )
+                guard let self,
+                      self.cacheWork.measurementBatch?.id == batch.id
+                else { return }
+                self.cacheWork.measurementTask = nil
+                self.cacheWork.measurementBatch = nil
+                let accepted = self.cacheWork.measurementBatchState.finish(batch.id)
+                let reschedule = self.cacheWork.measurementBatchState.takeReschedule()
+                if !Task.isCancelled,
+                   accepted,
+                   self.generation == batch.generation,
+                   self.revision == batch.revision {
+                    let currentWidth = self.table.bounds.width
+                    var indexes = IndexSet()
+                    for item in measured {
+                        let (request, layout) = item
+                        guard let loaded = self.loadedTurns[request.ordinal],
+                              loaded.turn == request.turn
+                        else { continue }
+                        let disclosure = MeasuredDocumentCache.DisclosureState(
+                            reasoningExpanded: self.expandedReasoning.contains(request.turn.id),
+                            toolsExpanded: self.expandedTools.contains(request.turn.id)
+                        )
+                        let effectiveWidth = TranscriptTurnTextRenderer.effectiveWidth(
+                            for: request.turn,
+                            availableWidth: currentWidth
+                        )
+                        guard disclosure == request.disclosure,
+                              MeasuredDocumentCache.matchesWidth(effectiveWidth, request.effectiveWidth)
+                        else { continue }
+                        self.measuredDocuments.store(
+                            layout: layout,
+                            for: request.turn,
+                            ordinal: request.ordinal,
+                            effectiveWidth: request.effectiveWidth,
+                            disclosure: request.disclosure
+                        )
+                        indexes.insert(request.ordinal)
+                    }
+                    if !indexes.isEmpty {
+                        self.correctingHeights {
+                            self.table.reloadData(
+                                forRowIndexes: indexes,
+                                columnIndexes: IndexSet(integer: 0)
+                            )
+                            self.table.noteHeightOfRows(withIndexesChanged: indexes)
+                            self.container?.layoutTableDocument()
+                        }
+                    }
+                }
+                if reschedule || !Task.isCancelled {
+                    self.scheduleVisibleMeasurements(at: self.table.bounds.width)
+                }
+                self.prepareVisibleTurns()
+            }
+        }
+
 
         private func toggleReasoning(_ id: String) {
             if expandedReasoning.contains(id) { expandedReasoning.remove(id) }
@@ -400,16 +953,14 @@ struct BlockTranscriptView: NSViewRepresentable {
         }
 
         private func reloadTurn(_ id: String) {
-            guard let ordinal = loadedTurns.first(where: { $0.value.turn.id == id })?.key else { return }
-            heightByOrdinal[ordinal] = estimatedHeight(
-                for: loadedTurns[ordinal]!.turn,
-                width: table.bounds.width
-            )
+            guard let ordinal = loadedTurns.first(where: { entry in entry.value.turn.id == id })?.key else { return }
             let indexes = IndexSet(integer: ordinal)
             table.reloadData(forRowIndexes: indexes, columnIndexes: IndexSet(integer: 0))
             table.noteHeightOfRows(withIndexesChanged: indexes)
             container?.layoutTableDocument()
+            scheduleVisibleMeasurements(at: table.bounds.width)
         }
+
 
         private func position(routeChanged: Bool) {
             let current = generation
@@ -471,25 +1022,61 @@ struct BlockTranscriptView: NSViewRepresentable {
         }
 
         private func isNearBottom() -> Bool {
-            guard let clip = table.enclosingScrollView?.contentView else { return true }
-            let distance = max(0, table.bounds.height - clip.bounds.maxY)
-            return distance <= max(48, clip.bounds.height * 0.15)
+            TranscriptViewportAnchoring.isNearBottom(table)
         }
 
         private func scrollToBottom() {
-            guard let clip = table.enclosingScrollView?.contentView else { return }
-            clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: max(0, table.bounds.height - clip.bounds.height)))
-            table.enclosingScrollView?.reflectScrolledClipView(clip)
+            TranscriptViewportAnchoring.pinToBottom(table)
         }
-        private func invalidateHeights() {
-            heightByOrdinal.removeAll(keepingCapacity: true)
-            for (ordinal, loaded) in loadedTurns {
-                heightByOrdinal[ordinal] = estimatedHeight(
-                    for: loaded.turn,
-                    width: table.bounds.width
-                )
+
+        /// True when the viewport follows the streaming end of the transcript.
+        ///
+        /// The property uses the same policy as `position(routeChanged:)`. A
+        /// deep-link target and a Find target keep precedence over the stream.
+        /// The property does not change `viewportTarget`.
+        private var followsStreamingBottom: Bool {
+            guard !isReadOnly, isStreaming, followsStreaming else { return false }
+            return TranscriptRendererTestSeam.viewportTarget(
+                pendingMessageID: TranscriptRendererTestSeam.activePendingMessageID(
+                    pendingMessageID: pendingMessageID,
+                    consumedPendingMessageID: consumedPendingMessageID
+                ),
+                findMessageID: findMessageID,
+                isStreaming: isStreaming,
+                isNearBottom: followsStreaming,
+                routeChanged: false,
+                currentTarget: viewportTarget
+            ) == .bottom
+        }
+
+        /// Applies one row-height correction and holds the reader in place.
+        ///
+        /// A corrected row above the viewport moves each later row origin. The
+        /// anchor holds the first visible row and its intra-row offset, so the
+        /// same text stays in front of the reader. When the viewport follows the
+        /// streaming end, the renderer pins the end again, because a taller tail
+        /// moves the end down. The renderer never scrolls a reader who moved
+        /// away from the end.
+        ///
+        /// The three callers are asynchronous completions. Each one already
+        /// tested its generation and its revision, so a superseded completion
+        /// does not get here.
+        private func correctingHeights(_ correct: () -> Void) {
+            let followsBottom = followsStreamingBottom
+            let anchor = followsBottom
+                ? nil
+                : TranscriptViewportAnchoring.anchor(in: table)
+            correct()
+            if followsBottom {
+                TranscriptViewportAnchoring.pinToBottom(table)
+            } else if let anchor {
+                TranscriptViewportAnchoring.restore(anchor, in: table)
             }
         }
+        private func invalidateHeights() {
+            scheduleVisibleMeasurements(at: table.bounds.width)
+        }
+
 
     }
 }
@@ -527,6 +1114,134 @@ enum TranscriptRendererTestSeam {
     }
 
     static func attributedAnswer(_ document: MarkdownDocument) -> NSAttributedString { TranscriptTurnTextRenderer.attributedAnswer(document) }
+
+    static func effectiveWidth(for turn: TranscriptTurn, availableWidth: CGFloat) -> CGFloat {
+        TranscriptTurnTextRenderer.effectiveWidth(for: turn, availableWidth: availableWidth)
+    }
+
+    static func provisionalHeight(
+        for turn: TranscriptTurn,
+        availableWidth: CGFloat,
+        reasoningExpanded: Bool,
+        toolsExpanded: Bool
+    ) -> CGFloat {
+        TranscriptTurnTextRenderer.provisionalHeight(
+            turn: turn,
+            availableWidth: availableWidth,
+            reasoningExpanded: reasoningExpanded,
+            toolsExpanded: toolsExpanded
+        )
+    }
+
+    static func measuredLayout(
+        for turn: TranscriptTurn,
+        document: MarkdownDocument,
+        width: CGFloat,
+        reasoningExpanded: Bool = false,
+        toolsExpanded: Bool = false
+    ) -> TranscriptTurnLayout {
+        TranscriptTurnTextRenderer.measuredLayout(
+            turn: turn,
+            document: document,
+            width: width,
+            reasoningExpanded: reasoningExpanded,
+            toolsExpanded: toolsExpanded
+        )
+    }
+
+    static func outgoingRowHeight(textHeight: CGFloat) -> CGFloat {
+        TranscriptTurnTextRenderer.outgoingRowHeight(textHeight: textHeight)
+    }
+}
+
+/// The scroll arithmetic for the transcript viewport.
+///
+/// One type owns the clip-view mathematics for the transcript. The renderer
+/// takes an anchor before a row-height correction. The renderer restores the
+/// anchor after the correction. The correction rule is in
+/// `TranscriptViewportPolicy`, so Core keeps the rule and this adapter keeps
+/// only the AppKit access.
+@MainActor
+enum TranscriptViewportAnchoring {
+    /// The place that a reader holds in the document.
+    ///
+    /// `ordinal` is the first row in the viewport. `rowOrigin` is the top edge
+    /// of that row. `documentOrigin` is the top edge of the viewport. The
+    /// difference of the last two values is the intra-row offset.
+    struct Anchor {
+        let ordinal: Int
+        let rowOrigin: CGFloat
+        let documentOrigin: CGFloat
+    }
+
+    /// True when the viewport is at the end of the document.
+    ///
+    /// The band is 48 points, or 15 percent of a tall viewport.
+    static func isNearBottom(_ table: NSTableView) -> Bool {
+        guard let clip = table.enclosingScrollView?.contentView else { return true }
+        let distance = max(0, table.bounds.height - clip.bounds.maxY)
+        return distance <= max(48, clip.bounds.height * 0.15)
+    }
+
+    /// The place that the reader holds now.
+    ///
+    /// The result is `nil` when the table has no scroll view, or when no row is
+    /// in the viewport. A correction then moves nothing.
+    ///
+    /// `documentOrigin` comes from the clip view, because `restore` writes a
+    /// clip origin. The row lookup uses the table's own visible rectangle. A
+    /// table style can add a vertical inset to the row rectangles, and the two
+    /// coordinate spaces must not be mixed in the value that gets written back.
+    static func anchor(in table: NSTableView) -> Anchor? {
+        guard let clip = table.enclosingScrollView?.contentView else { return nil }
+        let viewport = table.visibleRect
+        guard viewport.height > 0 else { return nil }
+        let rows = table.rows(in: viewport)
+        guard rows.location != NSNotFound,
+              rows.length > 0,
+              rows.location < table.numberOfRows
+        else { return nil }
+        return Anchor(
+            ordinal: rows.location,
+            rowOrigin: table.rect(ofRow: rows.location).minY,
+            documentOrigin: clip.bounds.origin.y
+        )
+    }
+
+    /// Moves the viewport, so the anchor row keeps its intra-row offset.
+    ///
+    /// A corrected row above the anchor row moves the anchor row down. The Core
+    /// policy changes that movement into the new viewport origin. A row count
+    /// that no longer holds the anchor row moves nothing.
+    static func restore(_ anchor: Anchor, in table: NSTableView) {
+        guard anchor.ordinal >= 0, anchor.ordinal < table.numberOfRows else { return }
+        let origin = TranscriptViewportPolicy.preservedScrollOrigin(
+            currentOrigin: Double(anchor.documentOrigin),
+            oldAnchorOrigin: Double(anchor.rowOrigin),
+            newAnchorOrigin: Double(table.rect(ofRow: anchor.ordinal).minY)
+        )
+        scroll(table, to: CGFloat(origin))
+    }
+
+    /// Moves the viewport to the end of the document.
+    static func pinToBottom(_ table: NSTableView) {
+        guard let clip = table.enclosingScrollView?.contentView else { return }
+        scroll(table, to: table.bounds.height - clip.bounds.height)
+    }
+
+    /// Writes one viewport origin, and only when the origin changes.
+    ///
+    /// The method holds the target inside the scrollable range. A repeated write
+    /// of the same origin makes the scroll view redraw for no reason.
+    private static func scroll(_ table: NSTableView, to origin: CGFloat) {
+        guard let scrollView = table.enclosingScrollView else { return }
+        let clip = scrollView.contentView
+        let limit = max(0, table.bounds.height - clip.bounds.height)
+        let target = min(max(0, origin), limit)
+        guard abs(target - clip.bounds.origin.y) > 0.5 else { return }
+        clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: target))
+        scrollView.reflectScrolledClipView(clip)
+    }
 }
 
 @MainActor
@@ -536,6 +1251,14 @@ final class BlockTranscriptContainerView: NSView {
     private var lastWidth: CGFloat = 0
     var onWidthChange: (() -> Void)?
     var onPaint: ((UInt64) -> Void)?
+
+    /// Observers for the outgoing bubble's colour inputs.
+    ///
+    /// They are registered once here, never per row: rows are recycled and
+    /// dozens are live, so a per-row observer is exactly the allocation to
+    /// avoid.
+    private var colorObservers: [NSObjectProtocol] = []
+    private var accessibilityObservers: [NSObjectProtocol] = []
     private var didPaint = false
 
     init(tableView: NSTableView) {
@@ -557,6 +1280,7 @@ final class BlockTranscriptContainerView: NSView {
             scrollView.topAnchor.constraint(equalTo: topAnchor),
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
+        observeSystemPalette()
     }
     func resetPaint() { didPaint = false }
 
@@ -575,11 +1299,66 @@ final class BlockTranscriptContainerView: NSView {
         layoutTableDocument()
     }
 
+    /// A system accent, appearance, or contrast change alters the bubble's fill
+    /// and its text colour. `viewDidChangeEffectiveAppearance` covers the
+    /// appearance, and the two notifications cover the other two inputs.
+    private func observeSystemPalette() {
+        colorObservers.append(NotificationCenter.default.addObserver(
+            forName: NSColor.systemColorsDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.reloadOutgoingPalette() }
+        })
+        accessibilityObservers.append(
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.reloadOutgoingPalette() }
+            }
+        )
+    }
+
+    /// Removes the palette observers. The renderer calls this when it takes the
+    /// container down.
+    func stopObservingSystemPalette() {
+        for observer in colorObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        for observer in accessibilityObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        colorObservers.removeAll()
+        accessibilityObservers.removeAll()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        reloadOutgoingPalette()
+    }
+
+    /// Invalidates only the rows the table has materialised, so the cost is
+    /// bounded by the viewport. A row scrolled in afterwards is configured
+    /// fresh and resolves its colours then.
+    func reloadOutgoingPalette() {
+        tableView.enumerateAvailableRowViews { rowView, _ in
+            for case let cell as TranscriptTurnRowView in rowView.subviews {
+                cell.reloadOutgoingPalette()
+            }
+        }
+    }
+
     func layoutTableDocument() {
         let width = max(1, scrollView.contentView.bounds.width)
-        let changed = abs(width - lastWidth) > 0.5
+        let changed = abs(width - lastWidth) > BlockTranscriptView.Coordinator.MeasuredDocumentCache.widthTolerance
         lastWidth = width
         tableView.frame.size.width = width
+        if let column = tableView.tableColumns.first,
+           abs(column.width - width) > BlockTranscriptView.Coordinator.MeasuredDocumentCache.widthTolerance {
+            column.width = width
+        }
         if changed {
             onWidthChange?()
         }
@@ -593,7 +1372,7 @@ final class BlockTranscriptContainerView: NSView {
 }
 
 @MainActor
-private final class BlockTranscriptTableView: NSTableView {
+final class BlockTranscriptTableView: NSTableView {
     override func makeView(withIdentifier identifier: NSUserInterfaceItemIdentifier, owner: Any?) -> NSView? {
         if let view = super.makeView(withIdentifier: identifier, owner: owner) { return view }
         guard identifier == TranscriptTurnRowView.identifier else { return nil }
@@ -611,6 +1390,7 @@ final class TranscriptTurnRowView: NSTableCellView {
     private let roleLabel = NSTextField(labelWithString: "")
     private let answerView = NSTextView()
     private let reasoningButton = NSButton()
+    var answerViewForTesting: NSTextView { answerView }
     var reasoningButtonForTesting: NSButton { reasoningButton }
     private let reasoningView = NSTextView()
     private let toolsButton = NSButton()
@@ -628,43 +1408,114 @@ final class TranscriptTurnRowView: NSTableCellView {
     private var bodyLeadingConstraints: [NSLayoutConstraint] = []
     private var bodyTrailingConstraints: [NSLayoutConstraint] = []
     private var centeredConstraint: NSLayoutConstraint!
+    private var measureWidthConstraint: NSLayoutConstraint!
+    private var stackTopConstraint: NSLayoutConstraint!
+    private var stackBottomConstraint: NSLayoutConstraint!
     private var userTrailingConstraint: NSLayoutConstraint!
     private var userMaxWidthConstraint: NSLayoutConstraint!
+    private var userTextWidthConstraint: NSLayoutConstraint!
     private var tracking: NSTrackingArea?
     private var metadataAlwaysVisible = false
+
+    /// The outgoing bubble's fill, behind the answer text.
+    private let bubble = OutgoingBubbleView(frame: .zero)
+
+    /// Whether the configured turn is the user's own.
+    private var isOutgoing = false
+
+    /// The active Find query, so a palette change can re-mark the matches
+    /// without parsing the answer again.
+    private var outgoingFindQuery = ""
+
+    var bubbleForTesting: NSView { bubble }
+    var isOutgoingForTesting: Bool { isOutgoing }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         identifier = Self.identifier
-        translatesAutoresizingMaskIntoConstraints = false
+        translatesAutoresizingMaskIntoConstraints = true
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
-        let measureWidth = stack.widthAnchor.constraint(
+        measureWidthConstraint = stack.widthAnchor.constraint(
             equalTo: widthAnchor,
             constant: -2 * MessageTypography.transcriptInset
         )
-        measureWidth.priority = .defaultHigh
+        measureWidthConstraint.priority = NSLayoutConstraint.Priority(999)
         centeredConstraint = stack.centerXAnchor.constraint(equalTo: centerXAnchor)
+        // The tail tip, not the text, lands on the transcript gutter. The
+        // gutter, the tail, and the bubble's padding all sit outside the stack.
         userTrailingConstraint = stack.trailingAnchor.constraint(
             equalTo: trailingAnchor,
-            constant: -MessageTypography.transcriptInset
+            constant: -(MessageTypography.transcriptInset
+                + OutgoingBubbleGeometry.tailWidth
+                + MessageTypography.outgoingBubblePaddingH)
         )
         userTrailingConstraint.isActive = false
         userMaxWidthConstraint = stack.widthAnchor.constraint(
-            lessThanOrEqualToConstant: MessageTypography.readingMeasure * 0.72
+            lessThanOrEqualToConstant: MessageTypography.outgoingTextMeasure
         )
         userMaxWidthConstraint.isActive = false
+        // The measured fitting width, so a short bubble hugs its text.
+        //
+        // 999, not `defaultHigh`. The answer view is an `NSTextView` whose
+        // horizontal compression resistance is `defaultHigh`, so at 750 this
+        // equality only tied with the text view's own intrinsic width and the
+        // engine was free to satisfy either one. The stack then kept a width
+        // the measurement never asked for. 999 beats every optional constraint
+        // the text view raises and still loses to the required leading inset,
+        // so a window too narrow for the measured width shrinks the stack
+        // instead of breaking the layout.
+        userTextWidthConstraint = stack.widthAnchor.constraint(
+            equalToConstant: MessageTypography.outgoingTextMeasure
+        )
+        userTextWidthConstraint.priority = NSLayoutConstraint.Priority(999)
+        userTextWidthConstraint.isActive = false
+        stackTopConstraint = stack.topAnchor.constraint(
+            equalTo: topAnchor,
+            constant: MessageTypography.turnGap / 2
+        )
+        stackBottomConstraint = stack.bottomAnchor.constraint(
+            equalTo: bottomAnchor,
+            constant: -MessageTypography.turnGap / 2
+        )
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: MessageTypography.transcriptInset),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -MessageTypography.transcriptInset),
             centeredConstraint,
             stack.widthAnchor.constraint(lessThanOrEqualToConstant: MessageTypography.readingMeasure),
-            stack.topAnchor.constraint(equalTo: topAnchor, constant: MessageTypography.turnGap / 2),
-            measureWidth,
+            stackTopConstraint,
+            measureWidthConstraint,
             stack.widthAnchor.constraint(greaterThanOrEqualToConstant: 1),
-            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -MessageTypography.turnGap / 2)
+            stackBottomConstraint
+        ])
+        // The bubble is a sibling below the text, never its superview, so it
+        // cannot clip a glyph. These four constraints stay active for every
+        // speaker and `configure` only hides the view: a hidden view with
+        // constant constraints costs no drawing, while activating and
+        // deactivating them on every row reuse dirties the layout engine on
+        // every scroll step.
+        bubble.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(bubble, positioned: .below, relativeTo: stack)
+        NSLayoutConstraint.activate([
+            bubble.leadingAnchor.constraint(
+                equalTo: stack.leadingAnchor,
+                constant: -MessageTypography.outgoingBubblePaddingH
+            ),
+            bubble.trailingAnchor.constraint(
+                equalTo: stack.trailingAnchor,
+                constant: MessageTypography.outgoingBubblePaddingH
+                    + OutgoingBubbleGeometry.tailWidth
+            ),
+            bubble.topAnchor.constraint(
+                equalTo: stack.topAnchor,
+                constant: -MessageTypography.outgoingBubblePaddingV
+            ),
+            bubble.bottomAnchor.constraint(
+                equalTo: stack.bottomAnchor,
+                constant: MessageTypography.outgoingBubblePaddingV
+            )
         ])
         roleHeader.orientation = .horizontal
         roleHeader.alignment = .top
@@ -693,8 +1544,8 @@ final class TranscriptTurnRowView: NSTableCellView {
         stack.addArrangedSubview(copyButton)
         configureTextView(answerView)
         stack.addArrangedSubview(answerView)
-        configureDisclosure(reasoningButton, title: "Reasoning")
-        configureDisclosure(toolsButton, title: "Tools")
+        configureDisclosure(reasoningButton, title: DisclosureBand.reasoning)
+        configureDisclosure(toolsButton, title: DisclosureBand.tools)
         stack.insertArrangedSubview(reasoningButton, at: 1)
         stack.insertArrangedSubview(reasoningView, at: 2)
         stack.insertArrangedSubview(toolsButton, at: 3)
@@ -776,7 +1627,36 @@ final class TranscriptTurnRowView: NSTableCellView {
         reasoningLabel.isHidden = true
         metadataStack.isHidden = true
         metadataStack.alphaValue = 0
+        resetOutgoing()
         setAccessibilityLabel("Loading transcript row")
+    }
+
+    /// Returns every outgoing-only property to its agent-row value.
+    ///
+    /// A recycled row must carry nothing from the turn before it: not the
+    /// bubble, not the trailing alignment, not the measured width, and not the
+    /// selection and link colours that only an accent fill needs.
+    private func resetOutgoing() {
+        isOutgoing = false
+        outgoingFindQuery = ""
+        bubble.isHidden = true
+        centeredConstraint.isActive = true
+        userTrailingConstraint.isActive = false
+        userMaxWidthConstraint.isActive = false
+        userTextWidthConstraint.isActive = false
+        measureWidthConstraint.isActive = true
+        stackTopConstraint.constant = MessageTypography.turnGap / 2
+        stackBottomConstraint.constant = -MessageTypography.turnGap / 2
+        roleHeader.isHidden = false
+        answerView.selectedTextAttributes = [
+            .backgroundColor: NSColor.selectedTextBackgroundColor,
+            .foregroundColor: NSColor.selectedTextColor
+        ]
+        answerView.linkTextAttributes = [
+            .foregroundColor: NSColor.linkColor,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .cursor: NSCursor.pointingHand
+        ]
     }
 
     func configure(
@@ -786,6 +1666,7 @@ final class TranscriptTurnRowView: NSTableCellView {
         toolsExpanded: Bool,
         showsMetadata: Bool,
         findQuery: String,
+        outgoingTextWidth: CGFloat? = nil,
         onReasoning: @escaping (String) -> Void,
         onTools: @escaping (String) -> Void,
         onCopyCode: @escaping (String) -> Void
@@ -795,6 +1676,8 @@ final class TranscriptTurnRowView: NSTableCellView {
         self.onTools = onTools
         self.onCopyCode = onCopyCode
         let isHermes = turn.speaker == .hermes
+        let isUser = turn.speaker == .me
+        if !isUser { resetOutgoing() }
         markView.isHidden = !isHermes
         if isHermes {
             let isDark = NSApp.effectiveAppearance.bestMatch(
@@ -805,47 +1688,166 @@ final class TranscriptTurnRowView: NSTableCellView {
             markView.image = nil
         }
         roleLabel.isHidden = turn.speaker != .system
-        let isUser = turn.speaker == .me
+        isOutgoing = isUser
+        outgoingFindQuery = isUser ? findQuery : ""
         centeredConstraint.isActive = !isUser
         userTrailingConstraint.isActive = isUser
         userMaxWidthConstraint.isActive = isUser
+        // A full-row width equality at priority 999 holds an outgoing stack at
+        // its cap on any wide window, so a one-word bubble could never shrink.
+        measureWidthConstraint.isActive = !isUser
+        userTextWidthConstraint.isActive = isUser
+        userTextWidthConstraint.constant = outgoingTextWidth
+            ?? MessageTypography.outgoingTextMeasure
+        // The bubble's padding sits inside the same row band an agent row uses,
+        // so both speakers keep one turn rhythm and consecutive bubbles stay
+        // exactly `turnGap` apart.
+        let band = MessageTypography.turnGap / 2
+            + (isUser ? MessageTypography.outgoingBubblePaddingV : 0)
+        stackTopConstraint.constant = band
+        stackBottomConstraint.constant = -band
+        // An `NSStackView` with no visible arranged subview still contributes
+        // one spacing gap to its parent. Against two required equalities that
+        // gap compresses the answer view and clips its last line.
+        roleHeader.isHidden = isUser
         let indent = isHermes ? MessageTypography.hermesIndent : 0
         for constraint in bodyLeadingConstraints {
             constraint.constant = indent
         }
+        // One resolution for the whole row. The bubble's fill and the text's
+        // colour come out of the same value, so they cannot state two accents.
+        let outgoing: OutgoingBubbleColors? = isUser ? outgoingColors() : nil
+        let policy: TranscriptTurnTextRenderer.ForegroundPolicy
+        if let outgoing { policy = .uniform(outgoing.foreground) } else { policy = .semantic }
         if let renderedDocument = document {
             answerView.textStorage?.setAttributedString(
                 TranscriptTurnTextRenderer.attributedAnswer(
                     renderedDocument,
-                    findQuery: findQuery
+                    findQuery: findQuery,
+                    foreground: policy
                 )
             )
-            codeToCopy = TranscriptTurnTextRenderer.codeText(renderedDocument)
+            // An outgoing row shows no copy button, so it must not walk the
+            // document's blocks and join their code only to discard the result.
+            codeToCopy = isUser
+                ? ""
+                : TranscriptTurnTextRenderer.codeText(renderedDocument)
         } else {
             answerView.textStorage?.setAttributedString(
-                TranscriptTurnTextRenderer.plainAnswer(turn.answer)
+                TranscriptTurnTextRenderer.plainAnswer(
+                    turn.answer,
+                    foreground: policy
+                )
             )
             codeToCopy = ""
         }
-        copyButton.isHidden = codeToCopy.isEmpty
-        copyButton.toolTip = codeToCopy.isEmpty ? nil : "Copy code"
         answerView.isHidden = turn.answer.isEmpty
-        reasoningButton.isHidden = turn.reasoning == nil
-        reasoningView.isHidden = turn.reasoning == nil || !reasoningExpanded
-        reasoningView.string = turn.reasoning?.text ?? ""
-        reasoningButton.title = reasoningExpanded ? "Hide reasoning" : "Reasoning"
-        toolsButton.isHidden = turn.tools.isEmpty
-        toolsView.isHidden = turn.tools.isEmpty || !toolsExpanded
-        toolsView.string = TranscriptTurnTextRenderer.toolText(turn.tools)
-        toolsButton.title = toolsExpanded ? "Hide tools" : "Tools"
-        modelLabel.stringValue = turn.model ?? ""
-        modelLabel.isHidden = turn.model == nil || turn.model?.isEmpty == true
-        reasoningLabel.stringValue = turn.reasoning?.label ?? ""
-        reasoningLabel.isHidden = turn.reasoning == nil
-        metadataAlwaysVisible = showsMetadata
-        metadataStack.isHidden = modelLabel.isHidden && reasoningLabel.isHidden
-        metadataStack.alphaValue = metadataAlwaysVisible ? 1 : 0
+        // `outgoing` is non-nil for exactly the turns `isUser` is true for.
+        if let outgoing {
+            applyOutgoingTextAttributes()
+            // The user's own text needs no copy button, no disclosures, and no
+            // metadata. Every one of those bands is dropped from the outgoing
+            // measurement, so none of them may appear in the view.
+            copyButton.isHidden = true
+            copyButton.toolTip = nil
+            reasoningButton.isHidden = true
+            reasoningView.isHidden = true
+            reasoningView.string = ""
+            toolsButton.isHidden = true
+            toolsView.isHidden = true
+            toolsView.string = ""
+            modelLabel.stringValue = ""
+            modelLabel.isHidden = true
+            reasoningLabel.stringValue = ""
+            reasoningLabel.isHidden = true
+            metadataAlwaysVisible = false
+            metadataStack.isHidden = true
+            metadataStack.alphaValue = 0
+            bubble.isHidden = turn.answer.isEmpty
+            bubble.apply(outgoing)
+        } else {
+            copyButton.isHidden = codeToCopy.isEmpty
+            copyButton.toolTip = codeToCopy.isEmpty ? nil : "Copy code"
+            reasoningButton.isHidden = turn.reasoning == nil
+            reasoningView.isHidden = turn.reasoning == nil || !reasoningExpanded
+            reasoningView.string = turn.reasoning?.text ?? ""
+            applyDisclosure(
+                title: reasoningExpanded
+                    ? DisclosureBand.hideReasoning
+                    : DisclosureBand.reasoning,
+                to: reasoningButton,
+                expanded: reasoningExpanded
+            )
+            toolsButton.isHidden = turn.tools.isEmpty
+            toolsView.isHidden = turn.tools.isEmpty || !toolsExpanded
+            toolsView.string = TranscriptTurnTextRenderer.toolText(turn.tools)
+            applyDisclosure(
+                title: toolsExpanded
+                    ? DisclosureBand.hideTools
+                    : DisclosureBand.tools,
+                to: toolsButton,
+                expanded: toolsExpanded
+            )
+            modelLabel.stringValue = turn.model ?? ""
+            modelLabel.isHidden = turn.model == nil || turn.model?.isEmpty == true
+            reasoningLabel.stringValue = turn.reasoning?.label ?? ""
+            reasoningLabel.isHidden = turn.reasoning == nil
+            metadataAlwaysVisible = showsMetadata
+            metadataStack.isHidden = modelLabel.isHidden && reasoningLabel.isHidden
+            metadataStack.alphaValue = metadataAlwaysVisible ? 1 : 0
+        }
+        // A row recycled from `configureLoading` keeps announcing "Loading
+        // transcript row" until a configured row replaces the label.
+        setAccessibilityLabel(turn.speaker.label)
         needsLayout = true
+    }
+
+    /// Re-resolves the bubble's colours after a system colour, appearance, or
+    /// contrast change.
+    ///
+    /// The answer is not parsed again. One attribute run covers the whole text,
+    /// and the Find matches are re-marked from the stored query.
+    func reloadOutgoingPalette() {
+        guard isOutgoing else { return }
+        let colors = outgoingColors()
+        bubble.apply(colors)
+        guard let storage = answerView.textStorage, storage.length > 0 else { return }
+        let whole = NSRange(location: 0, length: storage.length)
+        storage.beginEditing()
+        storage.addAttribute(.foregroundColor, value: colors.foreground, range: whole)
+        TranscriptTurnTextRenderer.markOutgoingFindMatches(
+            in: storage,
+            query: outgoingFindQuery
+        )
+        storage.endEditing()
+    }
+
+    /// The bubble's colours in this row's appearance.
+    ///
+    /// This row's effective appearance is the one the bubble is seen in, and the
+    /// bubble reads the same appearance through its own superview chain, so both
+    /// callers of the palette land on one answer.
+    private func outgoingColors() -> OutgoingBubbleColors {
+        OutgoingBubblePalette.colors(for: effectiveAppearance)
+    }
+
+    /// Selection and link treatment for text on an accent fill.
+    private func applyOutgoingTextAttributes() {
+        // The default selection background is an accent tint, which is
+        // invisible on an accent fill. The text-surface pair is the standard
+        // one, follows appearance and contrast, and lifts the selection out of
+        // the bubble.
+        answerView.selectedTextAttributes = [
+            .backgroundColor: NSColor.textBackgroundColor,
+            .foregroundColor: NSColor.textColor
+        ]
+        // No foreground here. The attributed string already carries the row's
+        // uniform colour on every run, and a Find match carries black. A
+        // foreground in `linkTextAttributes` would override both.
+        answerView.linkTextAttributes = [
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .cursor: NSCursor.pointingHand
+        ]
     }
 
     private func configureTextView(_ view: NSTextView) {
@@ -861,14 +1863,81 @@ final class TranscriptTurnRowView: NSTableCellView {
         view.font = NSFont.preferredFont(forTextStyle: .body)
     }
 
-    private func configureDisclosure(_ button: NSButton, title: String) {
-        button.title = title
-        button.bezelStyle = .disclosure
+    /// The disclosure bands' fixed presentation, resolved once.
+    ///
+    /// A row is reconfigured on every reuse during a scroll, so neither an
+    /// attributed title nor a symbol image may be built per row. The titles
+    /// hold the dynamic `NSColor`, not a resolved one, so a band still follows
+    /// an appearance change with no rebuild.
+    @MainActor
+    private enum DisclosureBand {
+        static let font = NSFont.preferredFont(forTextStyle: .footnote)
+        static let reasoning = title("Reasoning")
+        static let hideReasoning = title("Hide reasoning")
+        static let tools = title("Tools")
+        static let hideTools = title("Hide tools")
+
+        /// `chevron.forward` mirrors itself in a right-to-left layout.
+        /// `chevron.right` does not.
+        static let collapsedChevron = chevron("chevron.forward")
+        static let expandedChevron = chevron("chevron.down")
+
+        private static func title(_ value: String) -> NSAttributedString {
+            NSAttributedString(
+                string: value,
+                attributes: [
+                    .font: font,
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ]
+            )
+        }
+
+        private static func chevron(_ name: String) -> NSImage? {
+            NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+                .withSymbolConfiguration(
+                    NSImage.SymbolConfiguration(textStyle: .footnote)
+                )
+        }
+    }
+
+    private func configureDisclosure(_ button: NSButton, title: NSAttributedString) {
+        // Not `.disclosure`. That bezel is the bare system triangle: it has a
+        // fixed 13x13pt intrinsic size, and its title rect is 13pt wide and
+        // centred on the frame whatever `alignment` names. A band pinned across
+        // the row therefore tightened "Reasoning" and clipped it to two
+        // overlapping glyphs in the middle of the row. A borderless button
+        // carries a title, and the system chevron states the disclosure.
+        button.bezelStyle = .push
+        button.isBordered = false
         button.alignment = .left
-        button.font = NSFont.preferredFont(forTextStyle: .footnote)
+        button.imagePosition = .imageLeading
+        button.imageHugsTitle = true
+        button.font = DisclosureBand.font
         button.contentTintColor = .secondaryLabelColor
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.setAccessibilityLabel("Show \(title.lowercased())")
+        applyDisclosure(title: title, to: button, expanded: false)
+    }
+
+    /// Sets one band's title, chevron, and announcement together.
+    ///
+    /// `contentTintColor` reaches the symbol but not the title, so the title
+    /// carries its own colour. One call site for all three values means an
+    /// expanded band cannot keep a collapsed chevron or announce "show".
+    private func applyDisclosure(
+        title: NSAttributedString,
+        to button: NSButton,
+        expanded: Bool
+    ) {
+        // Both writes below invalidate the button's layout, and a row is
+        // reconfigured on every reuse during a scroll. The title differs
+        // between the two states, so this one compare covers the chevron and
+        // the announcement as well.
+        guard button.attributedTitle.string != title.string else { return }
+        button.attributedTitle = title
+        button.image = expanded
+            ? DisclosureBand.expandedChevron
+            : DisclosureBand.collapsedChevron
+        button.setAccessibilityLabel(title.string)
     }
 
     @objc private func reasoningAction() { onReasoning(turnID) }
@@ -879,35 +1948,89 @@ final class TranscriptTurnRowView: NSTableCellView {
     }
 }
 
+/// A measured transcript row: the text's fitting width and the row height.
+///
+/// Width and height come from one measurement at one effective width, under one
+/// cache key, so the width the view lays out at is the width the height was
+/// computed at.
+struct TranscriptTurnLayout: Hashable, Sendable {
+    /// The tightest width the text fits in, never wider than the effective
+    /// width it was measured against.
+    let textWidth: CGFloat
+
+    /// The whole row height, bands included.
+    let height: CGFloat
+}
+
 private enum TranscriptTurnTextRenderer {
-    static func plainAnswer(_ text: String) -> NSAttributedString {
+    /// How an attributed answer carries colour.
+    enum ForegroundPolicy {
+        /// Semantic label colours, for a row on the window background.
+        case semantic
+
+        /// One colour for every run, for a row on a filled bubble.
+        case uniform(NSColor)
+
+        /// No colour attributes at all, for the off-main measurement pass.
+        ///
+        /// Text metrics depend on font, paragraph style, and tracking, never on
+        /// colour. Resolving a dynamic `NSColor` off the main thread is not
+        /// safe, so the measurement pass names no colour.
+        case unstyled
+
+        /// Whether the row sits on a filled bubble.
+        var isUniform: Bool {
+            if case .uniform = self { true } else { false }
+        }
+    }
+
+    static func plainAnswer(
+        _ text: String,
+        foreground: ForegroundPolicy = .semantic
+    ) -> NSAttributedString {
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = MessageTypography.bodyLineSpacing
-        return NSAttributedString(
-            string: text,
-            attributes: [
-                .font: NSFont.preferredFont(forTextStyle: .body),
-                .foregroundColor: NSColor.labelColor,
-                .paragraphStyle: paragraph
-            ]
-        )
+        var attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.preferredFont(forTextStyle: .body),
+            .paragraphStyle: paragraph
+        ]
+        switch foreground {
+        case .semantic: attributes[.foregroundColor] = NSColor.labelColor
+        case .uniform(let color): attributes[.foregroundColor] = color
+        case .unstyled: break
+        }
+        return NSAttributedString(string: text, attributes: attributes)
     }
+
     static func attributedAnswer(
         _ document: MarkdownDocument,
-        findQuery: String = ""
+        findQuery: String = "",
+        foreground: ForegroundPolicy = .semantic
     ) -> NSAttributedString {
         let output = NSMutableAttributedString()
         for (index, block) in document.blocks.enumerated() {
             if index > 0 { output.append(NSAttributedString(string: "\n\n")) }
-            append(block, source: document, to: output)
+            append(block, source: document, to: output, foreground: foreground)
         }
-        markFindMatches(in: output, query: findQuery)
+        markFindMatches(in: output, query: findQuery, onFill: foreground.isUniform)
         return output
+    }
+
+    /// Re-marks the Find matches on a filled row.
+    ///
+    /// A palette change must not parse the answer again, so the row re-marks
+    /// the text it already holds.
+    static func markOutgoingFindMatches(
+        in output: NSMutableAttributedString,
+        query: String
+    ) {
+        markFindMatches(in: output, query: query, onFill: true)
     }
 
     private static func markFindMatches(
         in output: NSMutableAttributedString,
-        query: String
+        query: String,
+        onFill: Bool
     ) {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !needle.isEmpty else { return }
@@ -920,11 +2043,29 @@ private enum TranscriptTurnTextRenderer {
                 range: search
             )
             guard found.location != NSNotFound else { break }
-            output.addAttribute(
-                .backgroundColor,
-                value: NSColor.controlAccentColor.withAlphaComponent(0.22),
-                range: found
-            )
+            if onFill {
+                // A 22% accent tint is invisible on an accent fill.
+                // `findHighlightColor` is the documented system find indicator
+                // and is a bright yellow in both appearances. Black is the only
+                // foreground that clears 4.5:1 on it. `textColor` would resolve
+                // to white in dark mode and fail.
+                output.addAttribute(
+                    .backgroundColor,
+                    value: NSColor.findHighlightColor,
+                    range: found
+                )
+                output.addAttribute(
+                    .foregroundColor,
+                    value: NSColor.black,
+                    range: found
+                )
+            } else {
+                output.addAttribute(
+                    .backgroundColor,
+                    value: NSColor.controlAccentColor.withAlphaComponent(0.22),
+                    range: found
+                )
+            }
             let next = found.location + max(1, found.length)
             search = NSRange(
                 location: next,
@@ -933,17 +2074,196 @@ private enum TranscriptTurnTextRenderer {
         }
     }
 
-    static func measuredHeight(
+    static func effectiveWidth(
+        for turn: TranscriptTurn,
+        availableWidth: CGFloat
+    ) -> CGFloat {
+        let outer = max(1, min(MessageTypography.readingMeasure, availableWidth - 40))
+        switch turn.speaker {
+        case .me:
+            // The tail and both bubble paddings come off the width before the
+            // text gets any. `outer` already removed both transcript insets, so
+            // the tail and the padding are all that remains to remove.
+            return max(1, min(
+                outer
+                    - 2 * MessageTypography.outgoingBubblePaddingH
+                    - OutgoingBubbleGeometry.tailWidth,
+                MessageTypography.outgoingTextMeasure
+            ))
+        case .hermes:
+            return max(1, outer - MessageTypography.hermesIndent)
+        case .system:
+            return outer
+        }
+    }
+
+    /// The outgoing row height for a measured or an estimated text height.
+    ///
+    /// This is the constraint chain exactly: a 12pt band, 10pt of padding, the
+    /// text, 10pt of padding, and a 12pt band. An outgoing row shows no role
+    /// band, no disclosure band, no metadata band, and no copy band, so none of
+    /// them is measured. The last point is the tolerance between the CoreText
+    /// measurement and the text view's own layout rounding.
+    static func outgoingRowHeight(textHeight: CGFloat) -> CGFloat {
+        max(
+            MessageTypography.outgoingMinimumTurnHeight,
+            ceil(textHeight)
+                + 2 * MessageTypography.outgoingBubblePaddingV
+                + MessageTypography.turnGap
+                + MessageTypography.outgoingMeasurementSlack
+        )
+    }
+
+    static func provisionalHeight(
+        turn: TranscriptTurn,
+        availableWidth: CGFloat,
+        reasoningExpanded: Bool,
+        toolsExpanded: Bool
+    ) -> CGFloat {
+        let textWidth = effectiveWidth(for: turn, availableWidth: availableWidth)
+        if turn.speaker == .me {
+            return outgoingProvisionalHeight(turn: turn, textWidth: textWidth)
+        }
+        let charactersPerLine = max(1, Int(textWidth / 24))
+        func hardLineCount(in value: String) -> Int {
+            1 + value.utf8.reduce(into: 0) { count, byte in
+                if byte == 10 { count += 1 }
+            }
+        }
+        func wrappedLineCount(characters: Int, hardLines: Int) -> Int {
+            max(hardLines, (max(1, characters) + charactersPerLine - 1) / charactersPerLine)
+        }
+
+        var lineCount = wrappedLineCount(
+            characters: turn.answer.utf16.count,
+            hardLines: hardLineCount(in: turn.answer)
+        )
+        if reasoningExpanded, let reasoning = turn.reasoning?.text {
+            lineCount += wrappedLineCount(
+                characters: reasoning.utf16.count,
+                hardLines: hardLineCount(in: reasoning)
+            )
+        }
+        if toolsExpanded {
+            for (index, tool) in turn.tools.enumerated() {
+                if index > 0 { lineCount += 1 }
+                var characters = tool.name.utf16.count + tool.state.rawValue.utf16.count + 3
+                var hardLines = hardLineCount(in: tool.name)
+                    + hardLineCount(in: tool.state.rawValue)
+                if let input = tool.input, !input.isEmpty {
+                    characters += input.utf16.count + 8
+                    hardLines += hardLineCount(in: input)
+                }
+                if let output = tool.output, !output.isEmpty {
+                    characters += output.utf16.count + 9
+                    hardLines += hardLineCount(in: output)
+                }
+                lineCount += wrappedLineCount(
+                    characters: characters,
+                    hardLines: hardLines
+                )
+            }
+        }
+        let channels = (turn.reasoning == nil ? 0 : 1) + (turn.tools.isEmpty ? 0 : 1)
+        let fixedHeight = MessageTypography.roleLabelHeight
+            + CGFloat(channels) * MessageTypography.disclosureHeight
+            + MessageTypography.metadataFooterHeight
+            + CGFloat(channels + 1) * MessageTypography.internalBlockGap
+            + MessageTypography.turnGap
+        return max(
+            MessageTypography.minimumTurnHeight,
+            fixedHeight + CGFloat(lineCount) * max(MessageTypography.bodyLineHeight, 24)
+        )
+    }
+
+    /// The outgoing height before the real measurement lands.
+    ///
+    /// The per-character advance is half the body point size, the standard
+    /// approximation of a mean Latin lowercase advance. The agent branch's 24pt
+    /// figure is about 3.7 times the real value, which would collapse the
+    /// bubble visibly the moment the real measurement arrives.
+    private static func outgoingProvisionalHeight(
+        turn: TranscriptTurn,
+        textWidth: CGFloat
+    ) -> CGFloat {
+        let advance = max(1, NSFont.preferredFont(forTextStyle: .body).pointSize / 2)
+        let charactersPerLine = max(1, Int(textWidth / advance))
+        // One pass gives both counts. A line feed is unit 10 in UTF-16 exactly
+        // as it is byte 10 in UTF-8, so the hard-line count is unchanged.
+        var characters = 0
+        var lineFeeds = 0
+        for unit in turn.answer.utf16 {
+            characters += 1
+            if unit == 10 { lineFeeds += 1 }
+        }
+        let lineCount = max(
+            1 + lineFeeds,
+            (max(1, characters) + charactersPerLine - 1) / charactersPerLine
+        )
+        return outgoingRowHeight(
+            textHeight: CGFloat(lineCount)
+                * (MessageTypography.bodyLineHeight + MessageTypography.bodyLineSpacing)
+        )
+    }
+
+    /// Measures one row off the main thread.
+    ///
+    /// The outgoing branch keeps the framesetter's fitting width, which the
+    /// agent branch has no use for. That width is what lets a short bubble hug
+    /// its text with no main-thread text layout.
+    static func measuredLayout(
         turn: TranscriptTurn,
         document: MarkdownDocument,
         width: CGFloat,
         reasoningExpanded: Bool,
         toolsExpanded: Bool
-    ) -> CGFloat {
-        let outer = max(1, min(MessageTypography.readingMeasure, width - 40))
-        let contentWidth = turn.speaker == .me
-            ? min(outer, MessageTypography.readingMeasure * 0.72)
-            : max(1, outer - (turn.speaker == .hermes ? MessageTypography.hermesIndent : 0))
+    ) -> TranscriptTurnLayout {
+        let contentWidth = max(1, width)
+        switch turn.speaker {
+        case .me:
+            return outgoingLayout(document: document, width: contentWidth)
+        case .hermes, .system:
+            return agentLayout(
+                turn: turn,
+                document: document,
+                width: contentWidth,
+                reasoningExpanded: reasoningExpanded,
+                toolsExpanded: toolsExpanded
+            )
+        }
+    }
+
+    private static func outgoingLayout(
+        document: MarkdownDocument,
+        width: CGFloat
+    ) -> TranscriptTurnLayout {
+        // The display string, without its colours. The agent branch measures
+        // raw Markdown source in a substitute font, which a height with slack
+        // survives but a width does not: a wrong width wraps differently from
+        // the view, and the cached height is then wrong for the width the view
+        // lays out at, which is clipped text.
+        let value = attributedAnswer(document, foreground: .unstyled)
+        let framesetter = CTFramesetterCreateWithAttributedString(value)
+        let size = CTFramesetterSuggestFrameSizeWithConstraints(
+            framesetter,
+            CFRange(location: 0, length: value.length),
+            nil,
+            CGSize(width: width, height: .greatestFiniteMagnitude),
+            nil
+        )
+        return TranscriptTurnLayout(
+            textWidth: min(width, ceil(size.width)),
+            height: outgoingRowHeight(textHeight: size.height)
+        )
+    }
+
+    private static func agentLayout(
+        turn: TranscriptTurn,
+        document: MarkdownDocument,
+        width: CGFloat,
+        reasoningExpanded: Bool,
+        toolsExpanded: Bool
+    ) -> TranscriptTurnLayout {
         let body = document.source
             + (reasoningExpanded ? "\n" + (turn.reasoning?.text ?? "") : "")
             + (toolsExpanded ? "\n" + toolText(turn.tools) : "")
@@ -957,11 +2277,11 @@ private enum TranscriptTurnTextRenderer {
             framesetter,
             CFRange(location: 0, length: value.length),
             nil,
-            CGSize(width: contentWidth, height: .greatestFiniteMagnitude),
+            CGSize(width: width, height: .greatestFiniteMagnitude),
             nil
         )
         let channels = (turn.reasoning == nil ? 0 : 1) + (turn.tools.isEmpty ? 0 : 1)
-        return max(
+        let height = max(
             MessageTypography.minimumTurnHeight,
             ceil(size.height)
                 + MessageTypography.roleLabelHeight
@@ -970,6 +2290,7 @@ private enum TranscriptTurnTextRenderer {
                 + CGFloat(channels + 1) * MessageTypography.internalBlockGap
                 + MessageTypography.turnGap
         )
+        return TranscriptTurnLayout(textWidth: width, height: height)
     }
 
     static func copyText(for turns: [TranscriptTurn]) -> String {
@@ -993,12 +2314,25 @@ private enum TranscriptTurnTextRenderer {
         }.joined(separator: "\n\n")
     }
 
-    private static func append(_ block: MarkdownBlock, source: MarkdownDocument, to output: NSMutableAttributedString) {
+    private static func append(
+        _ block: MarkdownBlock,
+        source: MarkdownDocument,
+        to output: NSMutableAttributedString,
+        foreground policy: ForegroundPolicy
+    ) {
         let font = NSFont.preferredFont(forTextStyle: .body)
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = MessageTypography.bodyLineSpacing
         paragraph.paragraphSpacing = MessageTypography.paragraphGap
-        let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph]
+        var attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .paragraphStyle: paragraph
+        ]
+        switch policy {
+        case .semantic: attributes[.foregroundColor] = NSColor.labelColor
+        case .uniform(let color): attributes[.foregroundColor] = color
+        case .unstyled: break
+        }
         switch block {
         case .paragraph(_, _, let inlines): output.append(attributedInline(inlines, attributes: attributes))
         case .heading(_, _, let level, let inlines):
@@ -1006,7 +2340,11 @@ private enum TranscriptTurnTextRenderer {
             output.append(attributedInline(inlines, attributes: heading))
         case .quote(_, _, let inlines):
             var quoteAttributes = attributes
-            quoteAttributes[.foregroundColor] = NSColor.secondaryLabelColor
+            // A uniform foreground stays uniform. A secondary label colour on
+            // an accent fill is unreadable.
+            if case .semantic = policy {
+                quoteAttributes[.foregroundColor] = NSColor.secondaryLabelColor
+            }
             let quoteParagraph = (paragraph.mutableCopy() as? NSMutableParagraphStyle) ?? NSMutableParagraphStyle()
             quoteParagraph.headIndent = 10
             quoteParagraph.firstLineHeadIndent = 10
@@ -1029,7 +2367,13 @@ private enum TranscriptTurnTextRenderer {
             codeParagraph.firstLineHeadIndent = MessageTypography.codePadding
             codeParagraph.tailIndent = -MessageTypography.codePadding
             codeAttributes[.paragraphStyle] = codeParagraph
-            codeAttributes[.backgroundColor] = NSColor.controlBackgroundColor.withAlphaComponent(0.42)
+            // The 42% window-background tint reads as a code block only on the
+            // window background. On an accent fill it dims the fill under the
+            // text and eats the contrast the foreground was chosen for, so an
+            // outgoing row keeps the monospaced typography and drops the tint.
+            if case .semantic = policy {
+                codeAttributes[.backgroundColor] = NSColor.controlBackgroundColor.withAlphaComponent(0.42)
+            }
             output.append(NSAttributedString(string: (language.isEmpty ? "" : language + "\n") + code, attributes: codeAttributes))
         case .table(_, _, let headers, let rows):
             let tableRows = [headers] + rows.map(\.cells)
@@ -1063,6 +2407,9 @@ private enum TranscriptTurnTextRenderer {
                 var code = attributes; code[.font] = NSFont.monospacedSystemFont(ofSize: (attributes[.font] as? NSFont)?.pointSize ?? NSFont.systemFontSize, weight: .regular)
                 output.append(NSAttributedString(string: text, attributes: code))
             case .link(let destination, _, let children):
+                // The inherited attributes already carry the row's foreground,
+                // so a link on an accent fill stays legible. The text view's
+                // `linkTextAttributes` supplies the underline.
                 var link = attributes; link[.link] = URL(string: destination) ?? destination
                 output.append(attributedInline(children, attributes: link))
             }

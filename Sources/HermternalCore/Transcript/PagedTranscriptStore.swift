@@ -155,6 +155,25 @@ public struct TranscriptMutationResult: Sendable, Equatable {
     }
 }
 
+public struct TranscriptBatchMutationResult: Sendable {
+    public let appliedRecords: [WireMessageRecord]
+    public let generation: UInt64
+    public let epoch: UInt64
+    public let summary: TranscriptSummary
+
+    public init(
+        appliedRecords: [WireMessageRecord],
+        generation: UInt64,
+        epoch: UInt64,
+        summary: TranscriptSummary
+    ) {
+        self.appliedRecords = appliedRecords
+        self.generation = generation
+        self.epoch = epoch
+        self.summary = summary
+    }
+}
+
 public struct TranscriptStoreMetrics: Sendable, Equatable {
     public let pageReads: Int
     public let pageCacheHits: Int
@@ -163,10 +182,11 @@ public struct TranscriptStoreMetrics: Sendable, Equatable {
     public let cancelledReads: Int
     public let diskReads: Int
     public let diskWrites: Int
+    public let byteMaterializations: Int
     public let memory: TranscriptMemoryMetrics
 
-    public init(pageReads: Int = 0, pageCacheHits: Int = 0, pageCacheEvictions: Int = 0, staleWrites: Int = 0, cancelledReads: Int = 0, diskReads: Int = 0, diskWrites: Int = 0, memory: TranscriptMemoryMetrics) {
-        self.pageReads = pageReads; self.pageCacheHits = pageCacheHits; self.pageCacheEvictions = pageCacheEvictions; self.staleWrites = staleWrites; self.cancelledReads = cancelledReads; self.diskReads = diskReads; self.diskWrites = diskWrites; self.memory = memory
+    public init(pageReads: Int = 0, pageCacheHits: Int = 0, pageCacheEvictions: Int = 0, staleWrites: Int = 0, cancelledReads: Int = 0, diskReads: Int = 0, diskWrites: Int = 0, byteMaterializations: Int = 0, memory: TranscriptMemoryMetrics) {
+        self.pageReads = pageReads; self.pageCacheHits = pageCacheHits; self.pageCacheEvictions = pageCacheEvictions; self.staleWrites = staleWrites; self.cancelledReads = cancelledReads; self.diskReads = diskReads; self.diskWrites = diskWrites; self.byteMaterializations = byteMaterializations; self.memory = memory
     }
 }
 
@@ -213,6 +233,10 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
     private var cancelledReads = 0
     private var diskReads = 0
     private var diskWrites = 0
+    private var replayRecordID: String?
+    private var replayRecord: WireMessageRecord?
+    private var replayRecordBytes: [UInt8] = []
+    private var byteMaterializations = 0
 
     public init(
         route: TranscriptRoute,
@@ -242,9 +266,13 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
         try fileSystem.createDirectory(directory)
         let manifestURL = directory.appendingPathComponent("manifest.json")
         let indexURL = directory.appendingPathComponent("index.json")
+        var migratesVersion1 = false
         if fileSystem.exists(manifestURL) {
             let manifestData = try fileSystem.data(at: manifestURL)
-            guard let manifest = try? JSONDecoder().decode(TranscriptManifest.self, from: manifestData), manifest.version == TranscriptManifest.currentVersion else { throw TranscriptStoreError.corruptManifest }
+            guard let manifest = try? JSONDecoder().decode(TranscriptManifest.self, from: manifestData),
+                  manifest.version == 1 || manifest.version == TranscriptManifest.currentVersion
+            else { throw TranscriptStoreError.corruptManifest }
+            migratesVersion1 = manifest.version == 1
             generation = manifest.generation
             epoch = manifest.epoch
             summaryCountKind = manifest.exactCount ? .exact : .provisional
@@ -255,15 +283,35 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
             guard let index = try? JSONDecoder().decode(TranscriptDiskIndex.self, from: indexData) else { throw TranscriptStoreError.corruptIndex }
             entries = index.entries
             descriptors = index.descriptors
-            order = index.orderedMessageIDs ?? entries.values.sorted { $0.firstOrdinal < $1.firstOrdinal }.map(\.messageID)
+            let persistedOrder = index.orderedMessageIDs
+                ?? entries.values.sorted { $0.firstOrdinal < $1.firstOrdinal }.map(\.messageID)
+            order = TranscriptWireOrder.normalized(persistedOrder) ?? persistedOrder
+            let repairedWireOrder = order != persistedOrder
             modelSwitchIndex = index.modelSwitches ?? []
             turnIndex = index.turns ?? []
-            if index.modelSwitches == nil || index.turns == nil {
+            let requiresMetadataRebuild = index.modelSwitches == nil || index.turns == nil
+            var rebuiltDescriptors = false
+            if migratesVersion1 {
+                if repairedWireOrder || requiresMetadataRebuild {
+                    try rebuildDescriptors()
+                    rebuiltDescriptors = true
+                } else {
+                    try rebuildTurnIndex()
+                }
+            } else if requiresMetadataRebuild || repairedWireOrder {
                 try rebuildDescriptors()
+                rebuiltDescriptors = true
             } else {
                 buildTurnLookup()
             }
-            if let count = try? currentRowCount(), descriptors.count != count { throw TranscriptStoreError.corruptIndex }
+            if !rebuiltDescriptors,
+               let count = try? currentRowCount(),
+               descriptors.count != count {
+                throw TranscriptStoreError.corruptIndex
+            }
+            if migratesVersion1 || repairedWireOrder { try persistIndex() }
+        } else if migratesVersion1 {
+            try persistIndex()
         }
         loaded = true
     }
@@ -292,6 +340,9 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
         for admission in pageAdmissions.values { Task { await memoryBudget.release(admission) } }
         pageAdmissions.removeAll(keepingCapacity: true)
         pageCache.removeAll(keepingCapacity: true)
+        replayRecordID = nil
+        replayRecord = nil
+        replayRecordBytes.removeAll(keepingCapacity: true)
         pageOrder.removeAll(keepingCapacity: true)
         try persistIndex()
         return TranscriptRoute(sessionID: route.sessionID, generation: generation, epoch: epoch)
@@ -335,8 +386,17 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
         while ordinal < descriptors.count && rows.count < request.maximumRows {
             try Task.checkCancellation()
             let descriptor = descriptors[ordinal]
-            let message = try readRecord(messageID: descriptor.messageID)
-            let text = slice(descriptor.slice, from: message.text)
+            let message: WireMessageRecord
+            if replayRecordID == descriptor.messageID, let replayRecord {
+                message = replayRecord
+            } else {
+                message = try readRecord(messageID: descriptor.messageID)
+                replayRecordID = descriptor.messageID
+                replayRecord = message
+                replayRecordBytes = Array(message.text.utf8)
+                byteMaterializations += 1
+            }
+            let text = slice(descriptor.slice, from: replayRecordBytes)
             let cost = text.utf8.count + 64
             guard cost <= request.maximumBytes else {
                 if rows.isEmpty { ordinal += 1 }
@@ -413,6 +473,215 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
         try await apply(.append(record), expectedGeneration: expectedGeneration, expectedEpoch: expectedEpoch)
     }
 
+    /// Persists one independently ordered authoritative source as a batch.
+    ///
+    /// Numeric durable event IDs are stably merged with the persisted source
+    /// order. Records with nonnumeric IDs retain the exact source order.
+    public func append(
+        _ records: [WireMessageRecord],
+        expectedGeneration: UInt64? = nil,
+        expectedEpoch: UInt64? = nil
+    ) async throws -> TranscriptBatchMutationResult {
+        try ensureLoaded()
+        do { try checkRoute(generation: expectedGeneration, epoch: expectedEpoch) }
+        catch let error as TranscriptStoreError {
+            staleWrites += 1
+            throw error
+        }
+        guard !Task.isCancelled else { throw CancellationError() }
+        guard !records.isEmpty else {
+            return TranscriptBatchMutationResult(
+                appliedRecords: [],
+                generation: generation,
+                epoch: epoch,
+                summary: makeSummary()
+            )
+        }
+
+        var stagedEntries = entries
+        var appliedRecords: [WireMessageRecord] = []
+        appliedRecords.reserveCapacity(records.count)
+        var recordsForRebuild: [String: WireMessageRecord] = [:]
+        recordsForRebuild.reserveCapacity(records.count)
+        let existingOrderIDs = Set(order)
+        var sourceOrderIDs: [String] = []
+        sourceOrderIDs.reserveCapacity(records.count)
+        var sourceOrderIDSet = Set<String>()
+        sourceOrderIDSet.reserveCapacity(records.count)
+        var recordRollbacks: [String: FileRollback] = [:]
+        recordRollbacks.reserveCapacity(records.count)
+        var rollbackOrder: [String] = []
+        rollbackOrder.reserveCapacity(records.count)
+        var indexPersistenceRollbacks: [FileRollback] = []
+        var beganIndexPersistence = false
+
+        do {
+            for record in records {
+                try Task.checkCancellation()
+                if let old = stagedEntries[record.messageID] {
+                    guard record.revision >= old.revision else { continue }
+                    if record.revision == old.revision {
+                        let stored: WireMessageRecord
+                        if let knownRecord = recordsForRebuild[record.messageID] {
+                            stored = knownRecord
+                        } else {
+                            stored = try readRecord(messageID: record.messageID)
+                        }
+                        if record == stored {
+                            recordsForRebuild[record.messageID] = stored
+                            if !existingOrderIDs.contains(record.messageID),
+                               sourceOrderIDSet.insert(record.messageID).inserted {
+                                sourceOrderIDs.append(record.messageID)
+                            }
+                            continue
+                        }
+                    }
+                    try stageRecordRollback(
+                        messageID: record.messageID,
+                        rollbacks: &recordRollbacks,
+                        rollbackOrder: &rollbackOrder
+                    )
+                    try persistRecord(record)
+                    try Task.checkCancellation()
+                    stagedEntries[record.messageID] = TranscriptDiskIndex.Entry(
+                        messageID: record.messageID,
+                        recordOffset: old.recordOffset,
+                        recordLength: old.recordLength,
+                        firstOrdinal: old.firstOrdinal,
+                        rowCount: old.rowCount,
+                        revision: record.revision
+                    )
+                } else {
+                    try stageRecordRollback(
+                        messageID: record.messageID,
+                        rollbacks: &recordRollbacks,
+                        rollbackOrder: &rollbackOrder
+                    )
+                    try persistRecord(record)
+                    try Task.checkCancellation()
+                    stagedEntries[record.messageID] = TranscriptDiskIndex.Entry(
+                        messageID: record.messageID,
+                        recordOffset: 0,
+                        recordLength: 0,
+                        firstOrdinal: 0,
+                        rowCount: 0,
+                        revision: record.revision
+                    )
+                }
+                appliedRecords.append(record)
+                recordsForRebuild[record.messageID] = record
+                if !existingOrderIDs.contains(record.messageID),
+                   sourceOrderIDSet.insert(record.messageID).inserted {
+                    sourceOrderIDs.append(record.messageID)
+                }
+            }
+
+            let repairsIndex = requiresIndexRepair(
+                recordsByMessageID: recordsForRebuild,
+                orderIDs: existingOrderIDs
+            )
+            guard !appliedRecords.isEmpty || repairsIndex else {
+                return TranscriptBatchMutationResult(
+                    appliedRecords: [],
+                    generation: generation,
+                    epoch: epoch,
+                    summary: makeSummary()
+                )
+            }
+
+            var stagedBaseOrder: [String] = []
+            stagedBaseOrder.reserveCapacity(order.count)
+            var stagedOrderIDs = Set<String>()
+            stagedOrderIDs.reserveCapacity(stagedEntries.count)
+            for messageID in order {
+                guard stagedEntries[messageID] != nil,
+                      stagedOrderIDs.insert(messageID).inserted
+                else { continue }
+                stagedBaseOrder.append(messageID)
+            }
+
+            var pendingOrderIDs: [String] = []
+            pendingOrderIDs.reserveCapacity(max(0, stagedEntries.count - stagedBaseOrder.count))
+            for messageID in sourceOrderIDs {
+                guard stagedEntries[messageID] != nil,
+                      stagedOrderIDs.insert(messageID).inserted
+                else { continue }
+                pendingOrderIDs.append(messageID)
+            }
+            let remainingOrderIDs = stagedEntries.values
+                .filter { !stagedOrderIDs.contains($0.messageID) }
+                .sorted {
+                    $0.firstOrdinal == $1.firstOrdinal
+                        ? $0.messageID < $1.messageID
+                        : $0.firstOrdinal < $1.firstOrdinal
+                }
+                .map(\.messageID)
+            pendingOrderIDs.append(contentsOf: remainingOrderIDs)
+
+            let stagedOrder: [String]
+            if let merged = TranscriptWireOrder.merged(existing: stagedBaseOrder, incoming: pendingOrderIDs) {
+                stagedOrder = merged
+            } else {
+                stagedOrder = stagedBaseOrder + pendingOrderIDs
+            }
+            let rebuilt = try buildRebuiltIndex(
+                order: stagedOrder,
+                entries: stagedEntries,
+                recordsByMessageID: recordsForRebuild
+            )
+            try Task.checkCancellation()
+            let committedEpoch = epoch &+ 1
+            let indexRollback = try captureFileRollback(
+                at: directory.appendingPathComponent("index.json")
+            )
+            let manifestRollback = try captureFileRollback(
+                at: directory.appendingPathComponent("manifest.json")
+            )
+            indexPersistenceRollbacks = [indexRollback, manifestRollback]
+            beganIndexPersistence = true
+            try persistIndex(
+                entries: rebuilt.entries,
+                descriptors: rebuilt.descriptors,
+                modelSwitches: rebuilt.modelSwitches,
+                order: stagedOrder,
+                turns: rebuilt.turns,
+                generation: generation,
+                epoch: committedEpoch
+            )
+
+            entries = rebuilt.entries
+            order = stagedOrder
+            descriptors = rebuilt.descriptors
+            turnIndex = rebuilt.turns
+            turnOrdinalByMessageID = rebuilt.turnLookup
+            modelSwitchIndex = rebuilt.modelSwitches
+            epoch = committedEpoch
+            invalidatePageCache()
+            return TranscriptBatchMutationResult(
+                appliedRecords: appliedRecords,
+                generation: generation,
+                epoch: epoch,
+                summary: makeSummary()
+            )
+        } catch let batchError {
+            var cleanupError: Error?
+            do {
+                try rollbackRecords(rollbackOrder, rollbacks: recordRollbacks)
+            } catch {
+                cleanupError = error
+            }
+            if beganIndexPersistence {
+                do {
+                    try rollbackFiles(indexPersistenceRollbacks)
+                } catch {
+                    if cleanupError == nil { cleanupError = error }
+                }
+            }
+            if let cleanupError { throw cleanupError }
+            throw batchError
+        }
+    }
+
     public func replace(_ record: WireMessageRecord, expectedGeneration: UInt64? = nil, expectedEpoch: UInt64? = nil) async throws -> TranscriptMutationResult {
         try await apply(.replace(record), expectedGeneration: expectedGeneration, expectedEpoch: expectedEpoch)
     }
@@ -429,6 +698,12 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
         case .append(let record):
             if let old = entries[record.messageID] {
                 guard record.revision >= old.revision else { return result(applied: false) }
+                if record.revision == old.revision {
+                    let stored = try readRecord(messageID: record.messageID)
+                    if stored == record {
+                        return result(applied: false)
+                    }
+                }
                 try persistRecord(record)
                 entries[record.messageID] = try makeEntry(record: record, firstOrdinal: old.firstOrdinal)
                 try rebuildDescriptors()
@@ -492,12 +767,7 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
             turnOrdinalByMessageID.removeAll(keepingCapacity: true)
             modelSwitchIndex.removeAll(keepingCapacity: true)
         }
-        epoch &+= 1
-        pageCache.removeAll(keepingCapacity: true)
-        pageOrder.removeAll(keepingCapacity: true)
-        for admission in pageAdmissions.values { Task { await memoryBudget.release(admission) } }
-        pageAdmissions.removeAll(keepingCapacity: true)
-        try persistIndex()
+        try finishMutation()
         return result(applied: true)
     }
 
@@ -529,7 +799,7 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
     }
 
     public func metrics() async -> TranscriptStoreMetrics {
-        TranscriptStoreMetrics(pageReads: pageReads, pageCacheHits: pageCacheHits, pageCacheEvictions: pageCacheEvictions, staleWrites: staleWrites, cancelledReads: cancelledReads, diskReads: diskReads, diskWrites: diskWrites, memory: await memoryBudget.metrics())
+        TranscriptStoreMetrics(pageReads: pageReads, pageCacheHits: pageCacheHits, pageCacheEvictions: pageCacheEvictions, staleWrites: staleWrites, cancelledReads: cancelledReads, diskReads: diskReads, diskWrites: diskWrites, byteMaterializations: byteMaterializations, memory: await memoryBudget.metrics())
     }
 
     private func ensureLoaded() throws { if !loaded { try load() } }
@@ -537,6 +807,22 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
         TranscriptSummary(rowCount: reportedRowCount ?? descriptors.count, messageCount: order.count, countKind: summaryCountKind, generation: generation, epoch: epoch)
     }
     private func result(applied: Bool) -> TranscriptMutationResult { TranscriptMutationResult(applied: applied, generation: generation, epoch: epoch, summary: makeSummary()) }
+
+    private func finishMutation() throws {
+        epoch &+= 1
+        invalidatePageCache()
+        try persistIndex()
+    }
+
+    private func invalidatePageCache() {
+        pageCache.removeAll(keepingCapacity: true)
+        replayRecordID = nil
+        replayRecord = nil
+        replayRecordBytes.removeAll(keepingCapacity: true)
+        pageOrder.removeAll(keepingCapacity: true)
+        for admission in pageAdmissions.values { Task { await memoryBudget.release(admission) } }
+        pageAdmissions.removeAll(keepingCapacity: true)
+    }
 
     private func checkRoute(generation expectedGeneration: UInt64?, epoch expectedEpoch: UInt64?) throws {
         if let expectedGeneration, expectedGeneration != generation { throw TranscriptStoreError.staleGeneration(expected: expectedGeneration, actual: generation) }
@@ -546,6 +832,80 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
     private func recordURL(messageID: String) -> URL {
         let encoded = Data(messageID.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "+", with: "-")
         return directory.appendingPathComponent("record-\(encoded).json")
+    }
+
+    private struct FileRollback {
+        let url: URL
+        let originalBytes: Data?
+    }
+
+    private func captureFileRollback(at url: URL) throws -> FileRollback {
+        guard fileSystem.exists(url) else {
+            return FileRollback(url: url, originalBytes: nil)
+        }
+        let originalBytes = try fileSystem.data(at: url)
+        return FileRollback(url: url, originalBytes: originalBytes)
+    }
+
+    private func stageRecordRollback(
+        messageID: String,
+        rollbacks: inout [String: FileRollback],
+        rollbackOrder: inout [String]
+    ) throws {
+        guard rollbacks[messageID] == nil else { return }
+        let rollback: FileRollback
+        if entries[messageID] == nil {
+            rollback = FileRollback(
+                url: recordURL(messageID: messageID),
+                originalBytes: nil
+            )
+        } else {
+            rollback = try captureFileRollback(
+                at: recordURL(messageID: messageID)
+            )
+        }
+        rollbacks[messageID] = rollback
+        rollbackOrder.append(messageID)
+    }
+
+    private func rollbackRecords(
+        _ rollbackOrder: [String],
+        rollbacks: [String: FileRollback]
+    ) throws {
+        try rollbackFiles(rollbackOrder.compactMap { rollbacks[$0] })
+    }
+
+    private func rollbackFiles(_ rollbacks: [FileRollback]) throws {
+        var firstError: Error?
+        for rollback in rollbacks {
+            do {
+                try restoreFile(rollback)
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+        }
+        if let firstError { throw firstError }
+    }
+
+    private func restoreFile(_ rollback: FileRollback) throws {
+        let temp = rollback.url.appendingPathExtension("tmp")
+        if let originalBytes = rollback.originalBytes {
+            do {
+                try fileSystem.write(originalBytes, to: temp)
+                try fileSystem.move(temp, to: rollback.url)
+                diskWrites += 1
+            } catch {
+                try? fileSystem.remove(temp)
+                throw error
+            }
+        } else {
+            if fileSystem.exists(rollback.url) {
+                try fileSystem.remove(rollback.url)
+            }
+            if fileSystem.exists(temp) {
+                try fileSystem.remove(temp)
+            }
+        }
     }
 
     private func persistRecord(_ record: WireMessageRecord) throws {
@@ -579,16 +939,48 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
         return TranscriptDiskIndex.Entry(messageID: record.messageID, recordOffset: 0, recordLength: UInt64(record.text.utf8.count), firstOrdinal: firstOrdinal, rowCount: chunks.count, revision: record.revision)
     }
 
-    private func rebuildDescriptors() throws {
-        var rebuilt: [TranscriptRowDescriptor] = []
-        rebuilt.reserveCapacity(max(1, descriptors.count))
+    private struct RebuiltIndex {
+        let entries: [String: TranscriptDiskIndex.Entry]
+        let descriptors: [TranscriptRowDescriptor]
+        let modelSwitches: [TranscriptModelSwitchMarker]
+        let turns: [TranscriptTurnIndexEntry]
+        let turnLookup: [String: Int]
+    }
+
+    private func rebuildDescriptors(
+        recordsByMessageID: [String: WireMessageRecord] = [:]
+    ) throws {
+        let rebuilt = try buildRebuiltIndex(
+            order: order,
+            entries: entries,
+            recordsByMessageID: recordsByMessageID
+        )
+        entries = rebuilt.entries
+        descriptors = rebuilt.descriptors
+        modelSwitchIndex = rebuilt.modelSwitches
+        turnIndex = rebuilt.turns
+        turnOrdinalByMessageID = rebuilt.turnLookup
+    }
+
+    private func buildRebuiltIndex(
+        order: [String],
+        entries: [String: TranscriptDiskIndex.Entry],
+        recordsByMessageID: [String: WireMessageRecord]
+    ) throws -> RebuiltIndex {
+        var rebuiltEntries = entries
+        var rebuiltDescriptors: [TranscriptRowDescriptor] = []
+        rebuiltDescriptors.reserveCapacity(max(1, descriptors.count))
         var ordinal = 0
         var markers: [TranscriptModelSwitchMarker] = []
-        var turns: [TranscriptTurnIndexEntry] = []
-        var currentTurn = -1
+        var turnIndexBuilder = TranscriptTurnIndexBuilder()
         for (wireOrdinal, messageID) in order.enumerated() {
             try Task.checkCancellation()
-            let record = try readRecord(messageID: messageID)
+            let record: WireMessageRecord
+            if let supplied = recordsByMessageID[messageID] {
+                record = supplied
+            } else {
+                record = try readRecord(messageID: messageID)
+            }
             if record.isModelSwitch {
                 markers.append(TranscriptModelSwitchMarker(
                     id: record.messageID,
@@ -599,7 +991,7 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
             }
             let chunks = record.isRenderable ? chunkText(record.text) : []
             let first = ordinal
-            entries[messageID] = TranscriptDiskIndex.Entry(
+            rebuiltEntries[messageID] = TranscriptDiskIndex.Entry(
                 messageID: messageID,
                 recordOffset: 0,
                 recordLength: UInt64(record.text.utf8.count),
@@ -608,7 +1000,7 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
                 revision: record.revision
             )
             for (block, chunk) in chunks.enumerated() {
-                rebuilt.append(TranscriptRowDescriptor(
+                rebuiltDescriptors.append(TranscriptRowDescriptor(
                     messageID: messageID,
                     blockIndex: block,
                     ordinal: ordinal,
@@ -618,59 +1010,98 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
                 ))
                 ordinal += 1
             }
+            turnIndexBuilder.append(record, at: wireOrdinal)
+        }
+        let rebuiltTurns = turnIndexBuilder.turns
+        return RebuiltIndex(
+            entries: rebuiltEntries,
+            descriptors: rebuiltDescriptors,
+            modelSwitches: markers,
+            turns: rebuiltTurns,
+            turnLookup: turnLookup(for: rebuiltTurns, order: order)
+        )
+    }
 
-            guard !record.isModelSwitch else { continue }
-            let speaker: TranscriptSpeaker
-            switch record.role.lowercased() {
-            case "user", "me": speaker = .me
-            case "assistant", "hermes", "agent", "tool": speaker = .hermes
-            default: speaker = .system
+    private func requiresIndexRepair(
+        recordsByMessageID: [String: WireMessageRecord],
+        orderIDs: Set<String>
+    ) -> Bool {
+        guard entries.count == order.count,
+              orderIDs.count == order.count
+        else { return true }
+
+        for (messageID, record) in recordsByMessageID {
+            guard orderIDs.contains(messageID),
+                  let entry = entries[messageID],
+                  entry.firstOrdinal >= 0,
+                  entry.rowCount >= 0
+            else { return true }
+
+            let expectedChunks = record.isRenderable ? chunkText(record.text) : []
+            guard entry.revision == record.revision,
+                  entry.recordLength == UInt64(record.text.utf8.count),
+                  entry.rowCount == expectedChunks.count,
+                  entry.firstOrdinal + entry.rowCount <= descriptors.count
+            else { return true }
+
+            let marker = modelSwitchIndex.first { $0.id == messageID }
+            if record.isModelSwitch {
+                guard let wireOrdinal = order.firstIndex(of: messageID),
+                      marker == TranscriptModelSwitchMarker(
+                          id: messageID,
+                          model: record.modelSwitchName,
+                          ordinal: wireOrdinal,
+                          renderedOrdinal: entry.firstOrdinal
+                      )
+                else { return true }
+            } else if marker != nil {
+                return true
             }
-            if record.isToolEvent {
-                if currentTurn < 0 || turns[currentTurn].speaker != .hermes {
-                    turns.append(TranscriptTurnIndexEntry(
-                        id: record.turnID ?? record.messageID,
-                        firstWireOrdinal: wireOrdinal,
-                        lastWireOrdinal: wireOrdinal,
-                        speaker: .hermes
-                    ))
-                    currentTurn = turns.count - 1
-                } else {
-                    turns[currentTurn].lastWireOrdinal = wireOrdinal
-                }
-            } else {
-                let stableID = record.turnID ?? record.messageID
-                let startsNew = currentTurn < 0
-                    || turns[currentTurn].speaker != speaker
-                    || turns[currentTurn].id != stableID
-                    || record.turnID == nil
-                if startsNew {
-                    turns.append(TranscriptTurnIndexEntry(
-                        id: stableID,
-                        firstWireOrdinal: wireOrdinal,
-                        lastWireOrdinal: wireOrdinal,
-                        speaker: speaker
-                    ))
-                    currentTurn = turns.count - 1
-                } else {
-                    turns[currentTurn].lastWireOrdinal = wireOrdinal
-                }
+            if record.isRenderable, turnOrdinalByMessageID[messageID] == nil {
+                return true
+            }
+
+            for (block, expected) in expectedChunks.enumerated() {
+                let descriptor = descriptors[entry.firstOrdinal + block]
+                guard descriptor.messageID == messageID,
+                      descriptor.blockIndex == block,
+                      descriptor.ordinal == entry.firstOrdinal + block,
+                      descriptor.slice == expected.slice,
+                      descriptor.byteCount == expected.byteCount,
+                      descriptor.isContinuation == (block > 0)
+                else { return true }
             }
         }
-        modelSwitchIndex = markers
-        turnIndex = turns
-        descriptors = rebuilt
+        return false
+    }
+
+    private func rebuildTurnIndex() throws {
+        var builder = TranscriptTurnIndexBuilder()
+        for (wireOrdinal, messageID) in order.enumerated() {
+            try Task.checkCancellation()
+            builder.append(try readRecord(messageID: messageID), at: wireOrdinal)
+        }
+        turnIndex = builder.turns
         buildTurnLookup()
     }
+
     private func buildTurnLookup() {
-        turnOrdinalByMessageID.removeAll(keepingCapacity: true)
-        for (turnOrdinal, span) in turnIndex.enumerated() {
+        turnOrdinalByMessageID = turnLookup(for: turnIndex, order: order)
+    }
+
+    private func turnLookup(
+        for turns: [TranscriptTurnIndexEntry],
+        order: [String]
+    ) -> [String: Int] {
+        var lookup: [String: Int] = [:]
+        for (turnOrdinal, span) in turns.enumerated() {
             guard span.firstWireOrdinal <= span.lastWireOrdinal else { continue }
             for wireOrdinal in span.firstWireOrdinal...span.lastWireOrdinal {
                 guard wireOrdinal < order.count else { continue }
-                turnOrdinalByMessageID[order[wireOrdinal]] = turnOrdinal
+                lookup[order[wireOrdinal]] = turnOrdinal
             }
         }
+        return lookup
     }
 
 
@@ -688,15 +1119,38 @@ public actor PagedTranscriptStore: TranscriptTurnPageLocating {
         return result
     }
 
-    private func slice(_ slice: StringSlice, from text: String) -> String {
-        let bytes = Array(text.utf8)
+    private func slice(_ slice: StringSlice, from bytes: [UInt8]) -> String {
         guard slice.offset < bytes.count || slice.length == 0 else { return "" }
         let end = min(bytes.count, slice.end)
         return String(decoding: bytes[slice.offset..<end], as: UTF8.self)
     }
 
+    private func slice(_ range: StringSlice, from text: String) -> String {
+        slice(range, from: Array(text.utf8))
+    }
+
     private func persistIndex() throws {
-        let index = TranscriptDiskIndex(entries: entries, descriptors: descriptors, modelSwitches: modelSwitchIndex, orderedMessageIDs: order, turns: turnIndex)
+        try persistIndex(
+            entries: entries,
+            descriptors: descriptors,
+            modelSwitches: modelSwitchIndex,
+            order: order,
+            turns: turnIndex,
+            generation: generation,
+            epoch: epoch
+        )
+    }
+
+    private func persistIndex(
+        entries: [String: TranscriptDiskIndex.Entry],
+        descriptors: [TranscriptRowDescriptor],
+        modelSwitches: [TranscriptModelSwitchMarker],
+        order: [String],
+        turns: [TranscriptTurnIndexEntry],
+        generation: UInt64,
+        epoch: UInt64
+    ) throws {
+        let index = TranscriptDiskIndex(entries: entries, descriptors: descriptors, modelSwitches: modelSwitches, orderedMessageIDs: order, turns: turns)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let indexData = try encoder.encode(index)

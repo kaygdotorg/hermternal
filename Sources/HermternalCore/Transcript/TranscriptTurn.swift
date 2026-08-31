@@ -240,46 +240,29 @@ public enum TranscriptTurnProjector {
         let hasMarkers = hasModelMarkers ?? !markers.isEmpty
         var markerCursor = 0
         var activeModel = initialModel
+        var indexBuilder = TranscriptTurnIndexBuilder()
         var turns: [MutableTurn] = []
-        var currentTurn = -1
 
         for (ordinal, record) in records.enumerated() {
             while markerCursor < markers.count && markers[markerCursor].ordinal < ordinal {
                 activeModel = markers[markerCursor].model
                 markerCursor += 1
             }
-            guard !record.isModelSwitch else { continue }
-
-            if record.isToolEvent {
-                if currentTurn < 0 || turns[currentTurn].speaker != .hermes {
-                    currentTurn = turns.count
-                    turns.append(MutableTurn(
-                        id: record.turnID ?? record.messageID,
-                        speaker: .hermes,
-                        model: hasMarkers ? activeModel : sessionModel,
-                        timestamp: record.timestamp
-                    ))
-                }
-                turns[currentTurn].addTool(record)
-                continue
-            }
-
-            let speaker = TranscriptSpeaker(role: record.role)
-            let stableID = record.turnID ?? record.messageID
-            let startsNewTurn = currentTurn < 0
-                || turns[currentTurn].speaker != speaker
-                || turns[currentTurn].id != stableID
-                || record.turnID == nil
-            if startsNewTurn {
-                currentTurn = turns.count
+            guard let currentTurn = indexBuilder.append(record, at: ordinal) else { continue }
+            if currentTurn == turns.count {
+                let span = indexBuilder.turns[currentTurn]
                 turns.append(MutableTurn(
-                    id: stableID,
-                    speaker: speaker,
+                    id: span.id,
+                    speaker: span.speaker,
                     model: hasMarkers ? activeModel : sessionModel,
                     timestamp: record.timestamp
                 ))
             }
-            turns[currentTurn].append(record)
+            if record.isToolEvent {
+                turns[currentTurn].addTool(record)
+            } else {
+                turns[currentTurn].append(record)
+            }
         }
         return turns.map(\.value)
     }
@@ -343,6 +326,54 @@ public enum TranscriptTurnProjector {
                 timestamp: timestamp
             )
         }
+    }
+}
+
+internal struct TranscriptTurnIndexBuilder {
+    private(set) var turns: [TranscriptTurnIndexEntry] = []
+    private var currentTurn = -1
+
+    @discardableResult
+    mutating func append(_ record: WireMessageRecord, at ordinal: Int) -> Int? {
+        guard !record.isModelSwitch else { return nil }
+        guard record.isToolEvent || record.isRenderable else {
+            if currentTurn >= 0 { turns[currentTurn].lastWireOrdinal = ordinal }
+            return nil
+        }
+
+        if record.isToolEvent {
+            if currentTurn < 0 || turns[currentTurn].speaker != .hermes {
+                turns.append(TranscriptTurnIndexEntry(
+                    id: record.turnID ?? record.messageID,
+                    firstWireOrdinal: ordinal,
+                    lastWireOrdinal: ordinal,
+                    speaker: .hermes
+                ))
+                currentTurn = turns.count - 1
+            } else {
+                turns[currentTurn].lastWireOrdinal = ordinal
+            }
+            return currentTurn
+        }
+
+        let speaker = TranscriptSpeaker(role: record.role)
+        let stableID = record.turnID ?? record.messageID
+        let startsNew = currentTurn < 0
+            || turns[currentTurn].speaker != speaker
+            || turns[currentTurn].id != stableID
+            || record.turnID == nil
+        if startsNew {
+            turns.append(TranscriptTurnIndexEntry(
+                id: stableID,
+                firstWireOrdinal: ordinal,
+                lastWireOrdinal: ordinal,
+                speaker: speaker
+            ))
+            currentTurn = turns.count - 1
+        } else {
+            turns[currentTurn].lastWireOrdinal = ordinal
+        }
+        return currentTurn
     }
 }
 

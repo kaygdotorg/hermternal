@@ -231,14 +231,16 @@ public final class AppMemoryRegistry: @unchecked Sendable {
             let remaining = resident >= profile.totalBytes
                 ? 0
                 : profile.totalBytes - resident
-            guard bytes <= profile.limit(for: category), bytes <= remaining
-            else {
-                var state = stateByCategory[category, default: State()]
-                state.rejected = saturatingAdd(state.rejected, bytes)
-                state.rejectionCount = saturatingAdd(state.rejectionCount, 1)
-                stateByCategory[category] = state
-                return nil
-            }
+            let categoryLimit = profile.limit(for: category)
+            let categoryResident = stateByCategory[category, default: State()].resident
+            guard categoryResident <= categoryLimit,
+                  bytes <= categoryLimit - categoryResident,
+                  bytes <= remaining else { var state = stateByCategory[category, default: State()]
+                  state.rejected = saturatingAdd(state.rejected, bytes)
+                  state.rejectionCount = saturatingAdd(state.rejectionCount, 1)
+                  stateByCategory[category] = state
+                  return nil
+               }
 
             var state = stateByCategory[category, default: State()]
             state.resident = saturatingAdd(state.resident, bytes)

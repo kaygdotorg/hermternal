@@ -213,6 +213,7 @@ public actor RestClient {
                 byteCount: bytes,
                 hasMore: hasMore
             ))
+            try Task.checkCancellation()
             messageCount += page.messages.count
             if !hasMore {
                 return TranscriptSummary(
@@ -234,6 +235,7 @@ public actor RestClient {
             try Task.checkCancellation()
             accumulator.append(page.messages)
         }
+        try Task.checkCancellation()
         return accumulator.value
     }
 

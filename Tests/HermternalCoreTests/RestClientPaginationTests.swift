@@ -92,7 +92,7 @@ func restPagingCancellationBetweenPages() async throws {
     let task = Task {
         try? await client.sessionMessages(durableID: fixture.id)
     }
-    while fixture.offsets != [0, 500] {
+    while !fixture.isBlockedPageWaiting {
         await Task.yield()
     }
     task.cancel()
@@ -159,6 +159,9 @@ private final class PagingFixture: @unchecked Sendable {
     private let releaseGate = DispatchSemaphore(value: 0)
     private var requests: [Int] = []
     private var nextPage = 0
+    private var blockedPageOffset: Int?
+    private var blockedPageIsWaiting = false
+    private var blockedPageWasReleased = false
 
     init(pages: [PagingPage], blockedPage: Int? = nil) {
         self.id = UUID().uuidString
@@ -171,6 +174,11 @@ private final class PagingFixture: @unchecked Sendable {
         return requests
     }
 
+    var isBlockedPageWaiting: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return blockedPageIsWaiting
+    }
+
     func response(for request: URLRequest) -> (Int, Data) {
         let offset = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
             .queryItems!.first { $0.name == "offset" }!.value!
@@ -180,8 +188,18 @@ private final class PagingFixture: @unchecked Sendable {
         let pageIndex = nextPage
         let page = pages[min(nextPage, pages.count - 1)]
         nextPage += 1
+        if pageIndex == blockedPage {
+            blockedPageOffset = parsedOffset
+            blockedPageIsWaiting = true
+            blockedPageWasReleased = false
+        }
         lock.unlock()
-        if pageIndex == blockedPage { releaseGate.wait() }
+        if pageIndex == blockedPage {
+            releaseGate.wait()
+            lock.lock()
+            blockedPageIsWaiting = false
+            lock.unlock()
+        }
 
         let payload: JSONValue = .object([
             "messages": .array(page.rows),
@@ -196,6 +214,32 @@ private final class PagingFixture: @unchecked Sendable {
     }
 
     func releaseBlockedPage() {
+        releaseBlockedPage(matching: nil)
+    }
+
+    func releaseBlockedPage(for request: URLRequest) {
+        guard let offsetValue = URLComponents(
+            url: request.url!,
+            resolvingAgainstBaseURL: false
+        )?.queryItems?.first(where: { $0.name == "offset" })?.value,
+        let offset = Int(offsetValue)
+        else {
+            return
+        }
+        releaseBlockedPage(matching: offset)
+    }
+
+    private func releaseBlockedPage(matching offset: Int?) {
+        lock.lock()
+        guard blockedPageIsWaiting,
+              !blockedPageWasReleased,
+              offset == nil || blockedPageOffset == offset
+        else {
+            lock.unlock()
+            return
+        }
+        blockedPageWasReleased = true
+        lock.unlock()
         releaseGate.signal()
     }
 }
@@ -247,7 +291,7 @@ private final class PagingURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     override func stopLoading() {
-        PagingRegistry.shared.fixture(for: request)?.releaseBlockedPage()
+        PagingRegistry.shared.fixture(for: request)?.releaseBlockedPage(for: request)
     }
 }
 
