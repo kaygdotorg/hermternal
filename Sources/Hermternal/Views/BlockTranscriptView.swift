@@ -1371,6 +1371,8 @@ final class BlockTranscriptContainerView: NSView {
             bottom: 0,
             right: 0
         )
+        // Same KVC guard as every other scroll surface. The setter lives on
+        // `NSScrollView.suppressSystemScrollEdgeEffect`.
         suppressSystemScrollEdgeEffect()
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
@@ -1404,26 +1406,14 @@ final class BlockTranscriptContainerView: NSView {
     /// built-in scroll edge effect along with the toolbar's backing. The scene
     /// went with the move and nothing replaced it.
     ///
-    /// `allowedPocketEdges` is the lever this build has. There is no public
-    /// one: `NSScrollEdgeEffectStyle` reaches the effect only through titlebar
-    /// and split-view accessory controllers, and picks a style rather than
-    /// turning the effect off, while SwiftUI's `scrollEdgeEffectHidden` does
-    /// not cross a representable boundary into an AppKit scroll view. Guarded
-    /// on the setter, so a build where the property has moved leaves the
-    /// system drawing its own top edge — a cosmetic regression rather than a
-    /// broken window.
-    ///
-    /// Re-asserted on every window change, because the pocket is created for
-    /// the titlebar the scroll view lands under, not once for the view.
+    /// The setter is `NSScrollView.suppressSystemScrollEdgeEffect`: the same
+    /// guarded `allowedPocketEdges=0` KVC as the sidebar list. Re-asserted on
+    /// every window change, because the pocket is created for the titlebar
+    /// the scroll view lands under, not once for the view.
     /// Defended by transcriptSurfaceSuppressesTheSystemScrollEdgeEffect.
     private func suppressSystemScrollEdgeEffect() {
-        guard scrollView.responds(to: Self.allowedPocketEdgesSetter) else { return }
-        scrollView.setValue(0, forKey: Self.allowedPocketEdgesKey)
+        scrollView.suppressSystemScrollEdgeEffect()
     }
-
-    private static let allowedPocketEdgesKey = "allowedPocketEdges"
-    private static let allowedPocketEdgesSetter =
-        NSSelectorFromString("setAllowedPocketEdges:")
 
     func resetPaint() { didPaint = false }
 

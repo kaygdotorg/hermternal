@@ -986,6 +986,68 @@ func transcriptSurfaceSuppressesTheSystemScrollEdgeEffect() throws {
     #expect(edges == 0)
 }
 
+@Test("the sidebar list leaves the system no scroll edge effect")
+@MainActor
+func sidebarSurfaceSuppressesTheSystemScrollEdgeEffect() async throws {
+    _ = NSApplication.shared
+    let hosting = NSHostingView(rootView: SidebarPocketContractHarness())
+    hosting.frame = NSRect(x: 0, y: 0, width: 250, height: 704)
+    let window = NSWindow(
+        contentRect: hosting.frame,
+        styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+        backing: .buffered,
+        defer: false
+    )
+    window.titlebarAppearsTransparent = true
+    window.toolbar = NSToolbar()
+    window.contentView = hosting
+    window.makeKeyAndOrderFront(nil)
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+    let suppressor = try #require(firstScrollEdgeEffectSuppressor(in: hosting))
+    suppressor.suppressAttachedScrollViews()
+    let attached = suppressor.attachedListScrollViews()
+    #expect(!attached.isEmpty)
+    let scrollView = try #require(attached.first)
+
+    // macOS 26 gives a sidebar `ListCoreScrollView` the same titlebar pocket
+    // the transcript already turns off. On a build with no such property
+    // there is no pocket to turn off.
+    guard scrollView.responds(to: NSSelectorFromString("setAllowedPocketEdges:"))
+    else { return }
+    let edges = try #require(scrollView.value(forKey: "allowedPocketEdges") as? Int)
+    #expect(edges == 0)
+    #expect(scrollView.systemScrollPocketViews.isEmpty)
+}
+
+/// A `.sidebar` `List` with the same AppKit host the column installs.
+private struct SidebarPocketContractHarness: View {
+    var body: some View {
+        List(0..<20, id: \.self) { index in
+            Text("session \(index)")
+        }
+        .listStyle(.sidebar)
+        .background {
+            ScrollEdgeEffectSuppressor()
+                .allowsHitTesting(false)
+        }
+    }
+}
+
+@MainActor
+private func firstScrollEdgeEffectSuppressor(
+    in view: NSView
+) -> ScrollEdgeEffectSuppressingView? {
+    if let match = view as? ScrollEdgeEffectSuppressingView { return match }
+    for subview in view.subviews {
+        if let found = firstScrollEdgeEffectSuppressor(in: subview) { return found }
+    }
+    return nil
+}
+
+
 @Test("insetted transcript content rests below the chrome and keeps its anchor and its end")
 @MainActor
 func transcriptContentInsetKeepsRestingRowsOutOfTheChrome() throws {

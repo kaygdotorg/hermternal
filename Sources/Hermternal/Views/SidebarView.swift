@@ -648,6 +648,7 @@ struct SidebarView: View {
             }
             .listStyle(.sidebar)
             .scrollContentBackground(.hidden)
+            .modifier(SidebarScrollEdgeEffectSuppression())
             // No `.focusable()`, for the reason recorded on `chatList`.
             .focused($focusedList, equals: .archived)
             // List remains the owner of selection. This observes the
@@ -682,6 +683,7 @@ struct SidebarView: View {
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
+        .modifier(SidebarScrollEdgeEffectSuppression())
         // The list keeps its full height, so rows travel all the way to
         // the floating layer and dissolve on the way. Its SCROLL CONTENT
         // stops short of it, so the last row cannot come to rest inside
@@ -2202,6 +2204,24 @@ private struct SidebarDissolveMask<Ramp: View>: ViewModifier {
             content.mask { ramp }
         } else {
             content
+        }
+    }
+}
+
+/// Turns the system scroll pocket off on the sidebar `List`.
+///
+/// The list is SwiftUI's `ListCoreScrollView`. The transcript already
+/// calls `NSScrollView.suppressSystemScrollEdgeEffect` on the scroll view
+/// it owns. This modifier installs the shared AppKit host that finds that
+/// list scroll view and applies the same guarded `allowedPocketEdges=0`
+/// setter, in init and again when the host moves to a window, because the
+/// pocket is created for the titlebar the scroll view lands under.
+/// Defended by sidebarSurfaceSuppressesTheSystemScrollEdgeEffect.
+private struct SidebarScrollEdgeEffectSuppression: ViewModifier {
+    func body(content: Content) -> some View {
+        content.background {
+            ScrollEdgeEffectSuppressor()
+                .allowsHitTesting(false)
         }
     }
 }
