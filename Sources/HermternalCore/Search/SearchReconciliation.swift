@@ -113,52 +113,22 @@ public actor SearchIndexReconciliation: PagedTranscriptPersisting {
         }
 
         do {
-            // HistoryCache exposes a disk-backed paged store. Prefer it after
-            // persistence so indexing never retains the full transcript.
-            if let paged = try? await cache.pagedStore(for: sessionID),
+            // Use a paged store only after the append flow created it.
+            // Indexing must not migrate the authoritative raw cache payload.
+            if let paged = await cache.existingPagedStore(for: sessionID),
                let pagedSummary = try? await paged.summary(),
                (pagedSummary.messageCount > 0 || messages.isEmpty) {
-                let stream = AsyncThrowingStream<SearchDocumentPage, Error> { continuation in
-                    let producer = Task {
-                        do {
-                            var ordinal = 0
-                            while !Task.isCancelled {
-                                let page = try await paged.page(TranscriptPageRequest(
-                                    startOrdinal: ordinal,
-                                    maximumBytes: TranscriptPageRequest.hardMaximumBytes,
-                                    maximumRows: TranscriptPageRequest.hardMaximumRows,
-                                    expectedEpoch: expectedEpoch
-                                ))
-                                let documents = page.rows.compactMap { row -> SearchDocument? in
-                                    guard row.message.isSearchable,
-                                          let messageID = Int64(row.message.messageID),
-                                          let role = Role(rawValue: row.message.role)
-                                    else { return nil }
-                                    return SearchDocument(
-                                        messageID: ServerMessageID(rawValue: messageID),
-                                        body: row.text,
-                                        role: role,
-                                        timestamp: row.message.timestamp,
-                                        displayKind: row.message.displayKind,
-                                        isTool: row.message.isToolEvent
-                                    )
-                                }
-                                continuation.yield(SearchDocumentPage(documents: documents))
-                                if !page.hasMore { break }
-                                ordinal = page.nextOrdinal
-                            }
-                            continuation.finish()
-                        } catch {
-                            continuation.finish(throwing: error)
-                        }
+                let pages: @Sendable () -> AsyncThrowingStream<SearchDocumentPage, Error> = {
+                    let cursor = PagedSearchReplayCursor(store: paged, summary: pagedSummary)
+                    return SearchReplayStream.demandDriven {
+                        try await cursor.next()
                     }
-                    continuation.onTermination = { _ in producer.cancel() }
                 }
                 try await index.replacePaged(
                     sessionID: sessionID,
                     title: title,
                     truncated: snapshot.truncated,
-                    pages: stream
+                    pages: pages
                 )
             } else {
                 let documents = messages.compactMap { message -> SearchDocument? in
@@ -187,10 +157,9 @@ public actor SearchIndexReconciliation: PagedTranscriptPersisting {
         for sessionID: String,
         expectedEpoch: UInt64? = nil
     ) async throws -> TranscriptSummary {
-        let summary = try await cache.appendTranscriptPage(page, for: sessionID, expectedEpoch: expectedEpoch)
-        let documents = page.messages.compactMap { value -> SearchDocument? in
-            guard let record = WireMessageRecord(row: value),
-                  record.isSearchable,
+        let appendResult = try await cache.appendTranscriptPage(page, for: sessionID, expectedEpoch: expectedEpoch)
+        let documents = appendResult.appliedRecords.compactMap { record -> SearchDocument? in
+            guard record.isSearchable,
                   let messageID = Int64(record.messageID),
                   let role = Role(rawValue: record.role)
             else { return nil }
@@ -212,7 +181,7 @@ public actor SearchIndexReconciliation: PagedTranscriptPersisting {
         } catch {
             recordIndexFailure(error, operation: "append")
         }
-        return summary
+        return appendResult.summary
     }
 
     public func pagedSummary(for sessionID: String) async throws -> TranscriptSummary {
@@ -283,5 +252,61 @@ public actor SearchIndexReconciliation: PagedTranscriptPersisting {
             recordIndexFailure(error, operation: "reconcile")
         }
         return statistics
+    }
+}
+
+internal enum SearchReplayStream {
+    static func demandDriven(
+        _ next: @escaping @Sendable () async throws -> SearchDocumentPage?
+    ) -> AsyncThrowingStream<SearchDocumentPage, Error> {
+        AsyncThrowingStream(unfolding: next)
+    }
+}
+
+private actor PagedSearchReplayCursor {
+    private let store: PagedTranscriptStore
+    private let summary: TranscriptSummary
+    private var ordinal = 0
+    private var previousMessageID: String?
+    private var finished = false
+
+    init(store: PagedTranscriptStore, summary: TranscriptSummary) {
+        self.store = store
+        self.summary = summary
+    }
+
+    func next() async throws -> SearchDocumentPage? {
+        guard !finished else { return nil }
+        try Task.checkCancellation()
+        let page = try await store.page(TranscriptPageRequest(
+            startOrdinal: ordinal,
+            maximumBytes: TranscriptPageRequest.hardMaximumBytes,
+            maximumRows: TranscriptPageRequest.hardMaximumRows,
+            expectedGeneration: summary.generation,
+            expectedEpoch: summary.epoch
+        ))
+        ordinal = page.nextOrdinal
+        finished = !page.hasMore
+
+        var documents: [SearchDocument] = []
+        documents.reserveCapacity(page.rows.count)
+        for row in page.rows {
+            let record = row.message
+            guard record.messageID != previousMessageID else { continue }
+            previousMessageID = record.messageID
+            guard record.isSearchable,
+                  let messageID = Int64(record.messageID),
+                  let role = Role(rawValue: record.role)
+            else { continue }
+            documents.append(SearchDocument(
+                messageID: ServerMessageID(rawValue: messageID),
+                body: record.text,
+                role: role,
+                timestamp: record.timestamp,
+                displayKind: record.displayKind,
+                isTool: record.isToolEvent
+            ))
+        }
+        return SearchDocumentPage(documents: documents)
     }
 }

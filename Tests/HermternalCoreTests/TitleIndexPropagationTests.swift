@@ -69,6 +69,7 @@ func retitlingSessionRewritesFTSRows() async throws {
     ))
 
     #expect(try await index.storedDigest(for: "session") != firstDigest)
+    #expect(try await index.indexedMessageCount(sessionID: "session") == 1)
     #expect(try await index.search("annual", limit: 10).hits.first?.sessionTitle == "Annual plan")
     #expect(try await index.search("quarterly", limit: 10).hits.isEmpty)
     try await index.disable()

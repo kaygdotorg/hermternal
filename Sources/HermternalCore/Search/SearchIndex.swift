@@ -120,6 +120,7 @@ public enum SearchIndexError: Error, LocalizedError, Sendable {
     case sqlite(code: Int32, message: String)
     case invalidDatabaseURL
     case unavailableSQLite
+    case replayChanged
 
     public var errorDescription: String? {
         switch self {
@@ -127,12 +128,13 @@ public enum SearchIndexError: Error, LocalizedError, Sendable {
         case .sqlite(let code, let message): "SQLite error \(code): \(message)"
         case .invalidDatabaseURL: "The search index URL is not a file URL."
         case .unavailableSQLite: "The system SQLite library is unavailable."
+        case .replayChanged: "The transcript changed while it was being indexed."
         }
     }
 }
 
 public actor SearchIndex: SearchQuerying {
-    public static let schemaVersion = 2
+    public static let schemaVersion = 4
     public static let defaultLimit = 100
     /// A chat contributes at most three rows per query. Round-robin diversity
     /// makes a large transcript useful without letting it exhaust the panel.
@@ -146,6 +148,8 @@ public actor SearchIndex: SearchQuerying {
     private var disabled = false
     private var generation: UInt64 = 0
     private var runningQuery: RunningQuery?
+    private var queryGateReleaseHook: (@Sendable () async -> Void)?
+    private let mutationGate = SearchIndexMutationGate()
 
 
 
@@ -162,202 +166,332 @@ public actor SearchIndex: SearchQuerying {
         database?.close()
     }
 
-    // Actor methods may re-enter while search awaits its detached task. Every
-    // mutating path therefore bumps generation and synchronously joins the
-    // exact query lease before taking the connection's exclusive lifecycle lock.
+    // Actor methods can re-enter while a replacement awaits a page. The
+    // mutation gate keeps a replacement and an accepted append in one order.
     public func replace(_ snapshot: SearchSessionSnapshot) async throws {
-        let pages = AsyncThrowingStream<SearchDocumentPage, Error> { continuation in
-            continuation.yield(SearchDocumentPage(documents: snapshot.documents))
-            continuation.finish()
-        }
         try await replacePaged(
             sessionID: snapshot.sessionID,
             title: snapshot.title,
             truncated: snapshot.truncated,
-            pages: pages
+            pages: {
+                AsyncThrowingStream { continuation in
+                    continuation.yield(SearchDocumentPage(documents: snapshot.documents))
+                    continuation.finish()
+                }
+            }
         )
     }
 
-    /// Replaces one session from bounded pages.
+    /// Replaces one session from replayable bounded pages.
     ///
-    /// Each page is committed independently. A digest is updated as pages
-    /// arrive, so the index never builds a corpus-sized document array.
+    /// The first pass calculates the digest without SQLite writes. A changed
+    /// digest gets a second pass in one exclusive database transaction.
     public func replacePaged(
         sessionID: String,
         title: String,
         truncated: Bool,
-        pages: AsyncThrowingStream<SearchDocumentPage, Error>
+        pages: @escaping @Sendable () -> AsyncThrowingStream<SearchDocumentPage, Error>
     ) async throws {
-        generation &+= 1
-        stopRunningQuery()
-        guard !disabled, let database else { throw SearchIndexError.disabled }
-        let requestGeneration = generation
-        var digest = SearchDigest.Incremental(sessionID: sessionID, title: title, truncated: truncated)
+        try await mutationGate.acquire()
+        do {
+            try Task.checkCancellation()
+            generation &+= 1
+            stopRunningQuery()
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            let requestGeneration = generation
+            let value = try await digest(
+                sessionID: sessionID,
+                title: title,
+                truncated: truncated,
+                pages: pages,
+                generation: requestGeneration
+            )
+            let unchanged = try database.withExclusive {
+                try database.sessionMatches(
+                    sessionID: sessionID,
+                    digest: value,
+                    title: title,
+                    incomplete: truncated
+                )
+            }
+            guard !unchanged else {
+                await mutationGate.release()
+                return
+            }
 
-        try database.withExclusive {
-            try database.begin()
+            let transaction = try database.beginExclusiveTransaction()
             do {
                 try database.deleteSession(sessionID)
                 try database.deleteSessionMetadata(sessionID)
-                try database.commit()
-            } catch {
-                database.rollback()
-                throw error
-            }
-        }
-
-        do {
-            for try await page in pages {
+                var replay = SearchDigest.Multiset(
+                    sessionID: sessionID,
+                    title: title,
+                    truncated: truncated
+                )
+                for try await page in pages() {
+                    guard requestGeneration == generation, !Task.isCancelled else {
+                        throw CancellationError()
+                    }
+                    for document in page.documents where document.isSearchable {
+                        replay.append(document)
+                        try database.insertIndexed(
+                            title: title,
+                            document: document,
+                            sessionID: sessionID
+                        )
+                    }
+                }
                 guard requestGeneration == generation, !Task.isCancelled else {
                     throw CancellationError()
                 }
-                let documents = page.documents.filter(\.isSearchable).sorted(by: Self.canonicalOrder)
-                guard !documents.isEmpty else { continue }
-                try database.withExclusive {
-                    try database.begin()
-                    do {
-                        for document in documents {
-                            try database.insert(
-                                title: title,
-                                body: document.body,
-                                sessionID: sessionID,
-                                messageID: document.messageID.rawValue,
-                                role: document.role.rawValue,
-                                timestamp: document.timestamp
-                            )
-                        }
-                        try database.commit()
-                    } catch {
-                        database.rollback()
-                        throw error
-                    }
+                guard replay.finalize() == value else {
+                    throw SearchIndexError.replayChanged
                 }
+                try database.upsertSessionMetadata(
+                    sessionID: sessionID,
+                    digest: value,
+                    title: title,
+                    incomplete: truncated
+                )
+                try transaction.commit()
+            } catch {
+                transaction.rollback()
+                throw error
             }
-            guard requestGeneration == generation, !Task.isCancelled else {
-                throw CancellationError()
-            }
-            let value = digest.finalize()
-            try database.withExclusive {
-                try database.begin()
-                do {
-                    try database.upsertSessionMetadata(sessionID: sessionID, digest: value, incomplete: truncated)
-                    try database.commit()
-                } catch {
-                    database.rollback()
-                    throw error
-                }
-            }
+            await mutationGate.release()
         } catch {
-            if requestGeneration == generation {
-                try? database.withExclusive {
-                    try database.begin()
-                    do {
-                        try database.deleteSession(sessionID)
-                        try database.deleteSessionMetadata(sessionID)
-                        try database.commit()
-                    } catch { database.rollback() }
-                }
-            }
+            await mutationGate.release()
             throw error
         }
     }
 
     /// Appends one bounded page to an existing indexed session.
+    ///
+    /// Replayed documents and matching status leave persistent storage alone.
+    /// A changed document invalidates the completed digest; a title change
+    /// updates session rows through their keyed FTS row identities.
     public func append(
         _ page: SearchDocumentPage,
         sessionID: String,
         title: String,
         truncated: Bool = false
     ) async throws {
-        guard !disabled, let database else { throw SearchIndexError.disabled }
-        let documents = page.documents.filter(\.isSearchable).sorted(by: Self.canonicalOrder)
-        try database.withExclusive {
-            try database.begin()
-            do {
+        try await mutationGate.acquire()
+        do {
+            try Task.checkCancellation()
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            let documents = Self.lastDocuments(in: page.documents)
+            try database.withExclusive {
+                let metadata = try database.sessionMetadata(sessionID)
+                var changed: [(SearchDocument, SearchIdentity?)] = []
+                changed.reserveCapacity(documents.count)
                 for document in documents {
-                    try database.insert(
-                        title: title,
-                        body: document.body,
+                    let identity = try database.identity(
                         sessionID: sessionID,
-                        messageID: document.messageID.rawValue,
-                        role: document.role.rawValue,
-                        timestamp: document.timestamp
+                        messageID: document.messageID.rawValue
                     )
+                    guard let identity else {
+                        changed.append((document, nil))
+                        continue
+                    }
+                    guard !identity.matches(document) else { continue }
+                    guard identity.isLowerRank(than: document) else { continue }
+                    changed.append((document, identity))
                 }
-                try database.upsertSessionMetadata(sessionID: sessionID, digest: "", incomplete: truncated)
-                try database.commit()
-            } catch {
-                database.rollback()
-                throw error
+                let titleChanged = metadata.map { $0.title != title } ?? false
+                let statusChanged = metadata?.incomplete != truncated || metadata?.warmed != true
+                guard !changed.isEmpty || titleChanged || statusChanged else { return }
+
+                try database.begin()
+                do {
+                    for (document, identity) in changed {
+                        if let identity {
+                            try database.deleteIndexedRow(rowID: identity.ftsRowID)
+                        }
+                        let rowID = try database.insert(
+                            title: title,
+                            body: document.body,
+                            sessionID: sessionID,
+                            messageID: document.messageID.rawValue,
+                            role: document.role.rawValue,
+                            timestamp: document.timestamp
+                        )
+                        try database.upsertIdentity(
+                            document,
+                            sessionID: sessionID,
+                            ftsRowID: rowID
+                        )
+                    }
+                    if titleChanged {
+                        try database.updateSessionTitle(sessionID: sessionID, title: title)
+                    }
+                    if !changed.isEmpty {
+                        try database.upsertSessionMetadata(
+                            sessionID: sessionID,
+                            digest: try database.digest(
+                                for: sessionID,
+                                title: title,
+                                truncated: truncated
+                            ),
+                            title: title,
+                            incomplete: truncated
+                        )
+                    } else {
+                        try database.upsertSessionMetadata(
+                            sessionID: sessionID,
+                            digest: metadata.map {
+                                SearchDigest.Multiset.replacingHeader(
+                                    in: $0.digest,
+                                    sessionID: sessionID,
+                                    title: title,
+                                    truncated: truncated
+                                )
+                            } ?? SearchDigest.Multiset(
+                                sessionID: sessionID,
+                                title: title,
+                                truncated: truncated
+                            ).finalize(),
+                            title: title,
+                            incomplete: truncated
+                        )
+                    }
+                    try database.commit()
+                } catch {
+                    database.rollback()
+                    throw error
+                }
             }
+            await mutationGate.release()
+        } catch {
+            await mutationGate.release()
+            throw error
         }
     }
 
 
     public func remove(sessionID: String) async throws {
-        generation &+= 1
-        stopRunningQuery()
-        guard !disabled, let database else { throw SearchIndexError.disabled }
-        try database.withExclusive {
-            try database.begin()
-            do {
-                try database.deleteSession(sessionID)
-                try database.deleteSessionMetadata(sessionID)
-                try database.commit()
-            } catch { database.rollback(); throw error }
+        try await mutationGate.acquire()
+        do {
+            try Task.checkCancellation()
+            generation &+= 1
+            stopRunningQuery()
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            try database.withExclusive {
+                try database.begin()
+                do {
+                    try database.deleteSession(sessionID)
+                    try database.deleteSessionMetadata(sessionID)
+                    try database.commit()
+                } catch {
+                    database.rollback()
+                    throw error
+                }
+            }
+            await mutationGate.release()
+        } catch {
+            await mutationGate.release()
+            throw error
         }
     }
 
     public func clear() async throws {
-        generation &+= 1
-        stopRunningQuery()
-        guard !disabled, let database else { throw SearchIndexError.disabled }
-        try database.withExclusive {
-            try database.begin()
-            do { try database.clearContent(); try database.commit() }
-            catch { database.rollback(); throw error }
+        try await mutationGate.acquire()
+        do {
+            try Task.checkCancellation()
+            generation &+= 1
+            stopRunningQuery()
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            try database.withExclusive {
+                try database.begin()
+                do {
+                    try database.clearContent()
+                    try database.commit()
+                } catch {
+                    database.rollback()
+                    throw error
+                }
+            }
+            await mutationGate.release()
+        } catch {
+            await mutationGate.release()
+            throw error
         }
     }
 
     public func disable() async throws {
-        generation &+= 1
-        stopRunningQuery()
-        guard !disabled else { return }
-        disabled = true
-        database?.close()
-        database = nil
-        try removeFileIfPresent(url)
-        try removeFileIfPresent(URL(fileURLWithPath: url.path + "-wal"))
-        try removeFileIfPresent(URL(fileURLWithPath: url.path + "-shm"))
+        try await mutationGate.acquire()
+        do {
+            try Task.checkCancellation()
+            generation &+= 1
+            stopRunningQuery()
+            guard !disabled else {
+                await mutationGate.release()
+                return
+            }
+            disabled = true
+            database?.close()
+            database = nil
+            try removeFileIfPresent(url)
+            try removeFileIfPresent(URL(fileURLWithPath: url.path + "-wal"))
+            try removeFileIfPresent(URL(fileURLWithPath: url.path + "-shm"))
+            await mutationGate.release()
+        } catch {
+            await mutationGate.release()
+            throw error
+        }
     }
     public func isDisabled() -> Bool { disabled }
 
     public func search(_ query: String, limit requestedLimit: Int = SearchIndex.defaultLimit) async throws -> SearchResults {
-        guard !disabled, let database else { throw SearchIndexError.disabled }
-        generation &+= 1
-        let requestGeneration = generation
-        stopRunningQuery()
-        let compiled = Self.compile(query: query)
-        guard !compiled.isEmpty else {
-            return SearchResults(hits: [], pendingIndexingSessions: 0, truncatedSessions: 0)
-        }
-        let limit = max(0, min(requestedLimit, SearchIndex.defaultLimit))
-        let lease = try database.beginQuery()
-        let task = Task.detached(priority: .userInitiated) { () throws -> SearchResults in
-            defer { lease.finish() }
-            try Task.checkCancellation()
-            database.queryStarted()
-            try Task.checkCancellation()
-            do {
-                return try database.query(ftsQuery: compiled, limit: limit)
-            } catch SearchIndexError.sqlite(code: 9, message: _) {
-                throw CancellationError()
-            }
-        }
-        let runningQuery = RunningQuery(lease: lease, task: task)
-        self.runningQuery = runningQuery
+        var lease: SQLiteQueryLease?
+        let database: SQLiteConnection
+        let compiled: String
+        let limit: Int
+        let requestGeneration: UInt64
+        let runningQuery: RunningQuery
+
+        try await mutationGate.acquire()
         do {
-            let results = try await task.value
+            try Task.checkCancellation()
+            guard !disabled, let openDatabase = self.database else {
+                throw SearchIndexError.disabled
+            }
+            database = openDatabase
+            generation &+= 1
+            requestGeneration = generation
+            stopRunningQuery()
+            compiled = Self.compile(query: query)
+            guard !compiled.isEmpty else {
+                await mutationGate.release()
+                return SearchResults(hits: [], pendingIndexingSessions: 0, truncatedSessions: 0)
+            }
+            limit = max(0, min(requestedLimit, SearchIndex.defaultLimit))
+            let queryLease = try database.beginQuery()
+            lease = queryLease
+            try Task.checkCancellation()
+            let task = Task.detached(priority: .userInitiated) { () throws -> SearchResults in
+                defer { queryLease.finish() }
+                try Task.checkCancellation()
+                database.queryStarted()
+                try Task.checkCancellation()
+                do {
+                    return try database.query(ftsQuery: compiled, limit: limit)
+                } catch SearchIndexError.sqlite(code: 9, message: _) {
+                    throw CancellationError()
+                }
+            }
+            runningQuery = RunningQuery(lease: queryLease, task: task)
+            self.runningQuery = runningQuery
+            await mutationGate.release()
+            await queryGateReleaseHook?()
+        } catch {
+            lease?.finish()
+            await mutationGate.release()
+            throw error
+        }
+
+        do {
+            let results = try await runningQuery.task.value
             guard requestGeneration == generation, !Task.isCancelled else { throw CancellationError() }
             clearRunningQuery(runningQuery)
             return results
@@ -371,39 +505,55 @@ public actor SearchIndex: SearchQuerying {
     }
 
     // Diagnostics used by integration tests and migration checks.
-    public func storedDigest(for sessionID: String) throws -> String? {
-        guard !disabled, let database else { throw SearchIndexError.disabled }
-        return try database.withExclusive { try database.sessionDigest(sessionID) }
-    }
-
-    public func pendingIndexingSessionCount() throws -> Int {
-        guard !disabled, let database else { throw SearchIndexError.disabled }
-        return try database.withExclusive { Int(try database.pendingIndexingSessionCount()) }
-    }
-
-    public func truncatedSessionCount() throws -> Int {
-        guard !disabled, let database else { throw SearchIndexError.disabled }
-        return try database.withExclusive { Int(try database.truncatedSessionCount()) }
-    }
-
-    public func indexedMessageCount(sessionID: String? = nil) throws -> Int {
-        guard !disabled, let database else { throw SearchIndexError.disabled }
-        return try database.withExclusive { Int(try database.messageCount(sessionID: sessionID)) }
-    }
-    public func markUnwarmed(sessionIDs: [String]) throws {
-        guard !disabled, let database else { throw SearchIndexError.disabled }
-        try database.withExclusive {
-            try database.begin()
-            do {
-                for sessionID in Set(sessionIDs) { try database.markUnwarmed(sessionID: sessionID) }
-                try database.commit()
-            } catch { database.rollback(); throw error }
+    public func storedDigest(for sessionID: String) async throws -> String? {
+        try await withMutationGate {
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            return try database.withExclusive { try database.sessionDigest(sessionID) }
         }
     }
 
-    public func indexedSessionIDs() throws -> [String] {
-        guard !disabled, let database else { throw SearchIndexError.disabled }
-        return try database.withExclusive { try database.sessionIDs() }
+    public func pendingIndexingSessionCount() async throws -> Int {
+        try await withMutationGate {
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            return try database.withExclusive { Int(try database.pendingIndexingSessionCount()) }
+        }
+    }
+
+    public func truncatedSessionCount() async throws -> Int {
+        try await withMutationGate {
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            return try database.withExclusive { Int(try database.truncatedSessionCount()) }
+        }
+    }
+
+    public func indexedMessageCount(sessionID: String? = nil) async throws -> Int {
+        try await withMutationGate {
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            return try database.withExclusive { Int(try database.messageCount(sessionID: sessionID)) }
+        }
+    }
+
+    public func markUnwarmed(sessionIDs: [String]) async throws {
+        try await withMutationGate {
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            try database.withExclusive {
+                try database.begin()
+                do {
+                    for sessionID in Set(sessionIDs) { try database.markUnwarmed(sessionID: sessionID) }
+                    try database.commit()
+                } catch {
+                    database.rollback()
+                    throw error
+                }
+            }
+        }
+    }
+
+    public func indexedSessionIDs() async throws -> [String] {
+        try await withMutationGate {
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            return try database.withExclusive { try database.sessionIDs() }
+        }
     }
 
     internal static func compile(query: String) -> String {
@@ -417,9 +567,15 @@ public actor SearchIndex: SearchQuerying {
         database?.setQueryStartHook(hook)
     }
 
-    internal func _setSchemaVersionForTesting(_ version: Int) throws {
-        guard !disabled, let database else { throw SearchIndexError.disabled }
-        try database.withExclusive { try database.setSchemaVersion(version) }
+    internal func _setQueryGateReleaseHook(_ hook: (@Sendable () async -> Void)?) {
+        queryGateReleaseHook = hook
+    }
+
+    internal func _setSchemaVersionForTesting(_ version: Int) async throws {
+        try await withMutationGate {
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            try database.withExclusive { try database.setSchemaVersion(version) }
+        }
     }
 
     private func stopRunningQuery() {
@@ -440,13 +596,294 @@ public actor SearchIndex: SearchQuerying {
 
     private static func canonicalOrder(_ lhs: SearchDocument, _ rhs: SearchDocument) -> Bool {
         if lhs.messageID.rawValue != rhs.messageID.rawValue { return lhs.messageID.rawValue < rhs.messageID.rawValue }
+        let lhsTimestamp = lhs.timestamp?.timeIntervalSince1970 ?? -.greatestFiniteMagnitude
+        let rhsTimestamp = rhs.timestamp?.timeIntervalSince1970 ?? -.greatestFiniteMagnitude
+        if lhsTimestamp != rhsTimestamp { return lhsTimestamp < rhsTimestamp }
         if lhs.role.rawValue != rhs.role.rawValue { return lhs.role.rawValue < rhs.role.rawValue }
-        return (lhs.timestamp?.timeIntervalSince1970 ?? -.greatestFiniteMagnitude) < (rhs.timestamp?.timeIntervalSince1970 ?? -.greatestFiniteMagnitude)
+        return lhs.body < rhs.body
     }
 
+    private static func lastDocuments(in documents: [SearchDocument]) -> [SearchDocument] {
+        let sorted = documents.filter(\.isSearchable).sorted(by: canonicalOrder)
+        var result: [SearchDocument] = []
+        result.reserveCapacity(sorted.count)
+        for document in sorted {
+            if result.last?.messageID == document.messageID {
+                result[result.count - 1] = document
+            } else {
+                result.append(document)
+            }
+        }
+        return result
+    }
+
+
+    private func digest(
+        sessionID: String,
+        title: String,
+        truncated: Bool,
+        pages: @escaping @Sendable () -> AsyncThrowingStream<SearchDocumentPage, Error>,
+        generation requestGeneration: UInt64
+    ) async throws -> String {
+        var value = SearchDigest.Multiset(sessionID: sessionID, title: title, truncated: truncated)
+        for try await page in pages() {
+            guard requestGeneration == generation, !Task.isCancelled else {
+                throw CancellationError()
+            }
+            for document in page.documents where document.isSearchable {
+                value.append(document)
+            }
+        }
+        return value.finalize()
+    }
+
+    private func withMutationGate<T: Sendable>(
+        _ operation: () throws -> T
+    ) async throws -> T {
+        try await mutationGate.acquire()
+        do {
+            try Task.checkCancellation()
+            let result = try operation()
+            await mutationGate.release()
+            return result
+        } catch {
+            await mutationGate.release()
+            throw error
+        }
+    }
+
+
+    internal func _persistentMutationCount() async throws -> Int {
+        try await withMutationGate {
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            return try database.withExclusive { database.persistentMutationCount() }
+        }
+    }
+
+    internal func _resetPersistentMutationCount() async throws {
+        try await withMutationGate {
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            try database.withExclusive { database.resetPersistentMutationCount() }
+        }
+    }
+
+    internal func _identityLookupCount() async throws -> Int {
+        try await withMutationGate {
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            return try database.withExclusive { database.identityLookupCount() }
+        }
+    }
+
+    internal func _resetIdentityLookupCount() async throws {
+        try await withMutationGate {
+            guard !disabled, let database else { throw SearchIndexError.disabled }
+            try database.withExclusive { database.resetIdentityLookupCount() }
+        }
+    }
+
+    internal func _mutationGateWaiterCount() async -> Int {
+        await mutationGate.waiterCount()
+    }
+
+    internal func _waitForMutationGateWaiters(atLeast count: Int) async {
+        await mutationGate.waitForWaiters(atLeast: count)
+    }
+
+    internal func _setMutationGateGrantHook(_ hook: (@Sendable () async -> Void)?) async {
+        await mutationGate.setGrantHook(hook)
+    }
     private struct RunningQuery {
         let lease: SQLiteQueryLease
         let task: Task<SearchResults, Error>
+    }
+}
+
+private final class SearchIndexMutationSignal: @unchecked Sendable {
+    private let stream: AsyncStream<Void>
+    private let continuation: AsyncStream<Void>.Continuation
+
+    init() {
+        var continuation: AsyncStream<Void>.Continuation?
+        stream = AsyncStream(bufferingPolicy: .bufferingNewest(1)) {
+            continuation = $0
+        }
+        self.continuation = continuation!
+    }
+
+    func wait() async {
+        var iterator = stream.makeAsyncIterator()
+        _ = await iterator.next()
+    }
+
+    func finish() {
+        continuation.finish()
+    }
+}
+
+private final class SearchIndexMutationWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var cancelled = false
+    private var granted = false
+
+    func install(_ continuation: CheckedContinuation<Void, Error>) -> Bool {
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            continuation.resume(throwing: CancellationError())
+            return false
+        }
+        self.continuation = continuation
+        lock.unlock()
+        return true
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let continuation = granted ? nil : self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(throwing: CancellationError())
+    }
+
+    func grant() -> Bool {
+        lock.lock()
+        guard !cancelled, !granted, let continuation else {
+            lock.unlock()
+            return false
+        }
+        granted = true
+        self.continuation = nil
+        lock.unlock()
+        continuation.resume()
+        return true
+    }
+}
+
+private actor SearchIndexMutationGate {
+    private static let maximumRetainedWaiters = 64
+
+    private var held = false
+    private var waiters: [SearchIndexMutationWaiter] = []
+    private var overflowSignal: SearchIndexMutationSignal?
+    private var waiterThreshold: (count: Int, continuation: CheckedContinuation<Void, Never>)?
+    private var grantHook: (@Sendable () async -> Void)?
+
+    func acquire() async throws {
+        try Task.checkCancellation()
+        while true {
+            guard held else {
+                held = true
+                await notifyGrant()
+                return
+            }
+
+            if waiters.count < Self.maximumRetainedWaiters {
+                let waiter = SearchIndexMutationWaiter()
+                try await withTaskCancellationHandler(operation: {
+                    try await withCheckedThrowingContinuation { continuation in
+                        if waiter.install(continuation) {
+                            waiters.append(waiter)
+                            resumeWaiterThresholdIfNeeded()
+                        }
+                    }
+                }, onCancel: {
+                    waiter.cancel()
+                })
+                await notifyGrant()
+                return
+            }
+
+            let signal: SearchIndexMutationSignal
+            if let overflowSignal {
+                signal = overflowSignal
+            } else {
+                let newSignal = SearchIndexMutationSignal()
+                overflowSignal = newSignal
+                signal = newSignal
+            }
+            try await withTaskCancellationHandler(operation: {
+                await signal.wait()
+                try Task.checkCancellation()
+            }, onCancel: {
+                signal.finish()
+            })
+            if overflowSignal === signal {
+                overflowSignal = nil
+            }
+        }
+    }
+
+    func setGrantHook(_ hook: (@Sendable () async -> Void)?) {
+        grantHook = hook
+    }
+
+    private func notifyGrant() async {
+        await grantHook?()
+    }
+
+    func release() {
+        while !waiters.isEmpty {
+            let waiter = waiters.removeFirst()
+            if waiter.grant() {
+                signalOverflowWaiters()
+                return
+            }
+        }
+        held = false
+        signalOverflowWaiters()
+    }
+
+    func waiterCount() -> Int {
+        waiters.count
+    }
+
+    func waitForWaiters(atLeast count: Int) async {
+        guard waiters.count < count else { return }
+        await withCheckedContinuation { continuation in
+            precondition(waiterThreshold == nil)
+            waiterThreshold = (count, continuation)
+        }
+    }
+
+    private func signalOverflowWaiters() {
+        overflowSignal?.finish()
+        overflowSignal = nil
+    }
+
+    private func resumeWaiterThresholdIfNeeded() {
+        guard let waiterThreshold, waiters.count >= waiterThreshold.count else { return }
+        self.waiterThreshold = nil
+        waiterThreshold.continuation.resume()
+    }
+}
+
+private struct SearchSessionMetadata {
+    let digest: String
+    let title: String
+    let incomplete: Bool
+    let warmed: Bool
+}
+
+private struct SearchIdentity {
+    let body: String
+    let role: String
+    let timestamp: Double?
+    let ftsRowID: Int64
+
+    func matches(_ document: SearchDocument) -> Bool {
+        body == document.body
+            && role == document.role.rawValue
+            && timestamp == document.timestamp?.timeIntervalSince1970
+    }
+
+    func isLowerRank(than document: SearchDocument) -> Bool {
+        let documentTimestamp = document.timestamp?.timeIntervalSince1970 ?? -.greatestFiniteMagnitude
+        let timestamp = timestamp ?? -.greatestFiniteMagnitude
+        if timestamp != documentTimestamp { return timestamp < documentTimestamp }
+        if role != document.role.rawValue { return role < document.role.rawValue }
+        return body < document.body
     }
 }
 
@@ -458,6 +895,13 @@ private final class SQLiteConnection: @unchecked Sendable {
     private var activeQuery: SQLiteQueryLease?
     private var exclusiveOperation = false
     private let testHooks = SearchIndexTestHooks()
+    private var persistentMutations = 0
+    private var identityLookups = 0
+
+    func persistentMutationCount() -> Int { persistentMutations }
+    func resetPersistentMutationCount() { persistentMutations = 0 }
+    func identityLookupCount() -> Int { identityLookups }
+    func resetIdentityLookupCount() { identityLookups = 0 }
 
     func setQueryStartHook(_ hook: (@Sendable () -> Void)?) {
         testHooks.setQueryStarted(hook)
@@ -565,12 +1009,28 @@ private final class SQLiteConnection: @unchecked Sendable {
     func prepareSchema() throws {
         do {
             try execute("CREATE TABLE IF NOT EXISTS hermternal_search_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)")
-            try execute("CREATE TABLE IF NOT EXISTS hermternal_search_sessions (session_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL, incomplete INTEGER NOT NULL, warmed INTEGER NOT NULL)")
+            try execute("CREATE TABLE IF NOT EXISTS hermternal_search_sessions (session_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL, title TEXT NOT NULL, incomplete INTEGER NOT NULL, warmed INTEGER NOT NULL)")
+            try execute("""
+                CREATE TABLE IF NOT EXISTS hermternal_search_identities (
+                    session_id TEXT NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    body TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    timestamp REAL,
+                    fts_rowid INTEGER NOT NULL,
+                    PRIMARY KEY(session_id, message_id)
+                ) WITHOUT ROWID
+                """)
             let version = try scalarString("SELECT value FROM hermternal_search_metadata WHERE key = 'schema_version' LIMIT 1")
             let validFTS = (try? queryRows("SELECT title, body, session_id, message_id, role, timestamp FROM hermternal_search_messages LIMIT 0")) != nil
-            let validMetadata = (try? queryRows("SELECT session_id, digest, incomplete, warmed FROM hermternal_search_sessions LIMIT 0")) != nil
-            if version != String(SearchIndex.schemaVersion) || !validFTS || !validMetadata { try rebuildSchema() }
-        } catch { try rebuildSchema() }
+            let validMetadata = (try? queryRows("SELECT session_id, digest, title, incomplete, warmed FROM hermternal_search_sessions LIMIT 0")) != nil
+            let validIdentities = (try? queryRows("SELECT session_id, message_id, body, role, timestamp, fts_rowid FROM hermternal_search_identities LIMIT 0")) != nil
+            if version != String(SearchIndex.schemaVersion) || !validFTS || !validMetadata || !validIdentities {
+                try rebuildSchema()
+            }
+        } catch {
+            try rebuildSchema()
+        }
     }
 
     func begin() throws { try execute("BEGIN IMMEDIATE") }
@@ -579,10 +1039,73 @@ private final class SQLiteConnection: @unchecked Sendable {
     }
     func commit() throws { try execute("COMMIT") }
     func rollback() { try? execute("ROLLBACK") }
-    func sessionDigest(_ id: String) throws -> String? { try scalarString("SELECT digest FROM hermternal_search_sessions WHERE session_id = ? LIMIT 1", bindings: [.text(id)]) }
-    func deleteSession(_ id: String) throws { try execute("DELETE FROM hermternal_search_messages WHERE session_id = ?", bindings: [.text(id)]) }
-    func deleteSessionMetadata(_ id: String) throws { try execute("DELETE FROM hermternal_search_sessions WHERE session_id = ?", bindings: [.text(id)]) }
-    func clearContent() throws { try execute("DELETE FROM hermternal_search_messages"); try execute("DELETE FROM hermternal_search_sessions") }
+
+    func beginExclusiveTransaction() throws -> SQLiteWriteTransaction {
+        lifecycle.lock()
+        while activeQuery != nil || exclusiveOperation { lifecycle.wait() }
+        guard !closed, handle != nil else {
+            lifecycle.unlock()
+            throw SearchIndexError.disabled
+        }
+        exclusiveOperation = true
+        lifecycle.unlock()
+        do {
+            try begin()
+            return SQLiteWriteTransaction(connection: self)
+        } catch {
+            finishExclusiveOperation()
+            throw error
+        }
+    }
+
+    fileprivate func finishExclusiveOperation() {
+        lifecycle.lock()
+        exclusiveOperation = false
+        lifecycle.broadcast()
+        lifecycle.unlock()
+    }
+
+    func sessionDigest(_ id: String) throws -> String? {
+        try sessionMetadata(id)?.digest
+    }
+    func sessionMetadata(_ id: String) throws -> SearchSessionMetadata? {
+        guard let row = try queryRows(
+            "SELECT digest, title, incomplete, warmed FROM hermternal_search_sessions WHERE session_id = ? LIMIT 1",
+            bindings: [.text(id)]
+        ).first else {
+            return nil
+        }
+        return SearchSessionMetadata(
+            digest: row.text(0) ?? "",
+            title: row.text(1) ?? "",
+            incomplete: row.int64(2) != 0,
+            warmed: row.int64(3) != 0
+        )
+    }
+    func sessionMatches(sessionID: String, digest: String, title: String, incomplete: Bool) throws -> Bool {
+        guard let metadata = try sessionMetadata(sessionID) else { return false }
+        return metadata.digest == digest
+            && metadata.title == title
+            && metadata.incomplete == incomplete
+            && metadata.warmed
+    }
+    func deleteSession(_ id: String) throws {
+        for row in try queryRows(
+            "SELECT fts_rowid FROM hermternal_search_identities WHERE session_id = ?",
+            bindings: [.text(id)]
+        ) {
+            try deleteIndexedRow(rowID: row.int64(0))
+        }
+        try execute("DELETE FROM hermternal_search_identities WHERE session_id = ?", bindings: [.text(id)])
+    }
+    func deleteSessionMetadata(_ id: String) throws {
+        try execute("DELETE FROM hermternal_search_sessions WHERE session_id = ?", bindings: [.text(id)])
+    }
+    func clearContent() throws {
+        try execute("DELETE FROM hermternal_search_messages")
+        try execute("DELETE FROM hermternal_search_identities")
+        try execute("DELETE FROM hermternal_search_sessions")
+    }
     func pendingIndexingSessionCount() throws -> Int {
         Int(try scalarInt("SELECT count(*) FROM hermternal_search_sessions WHERE warmed = 0"))
     }
@@ -590,15 +1113,13 @@ private final class SQLiteConnection: @unchecked Sendable {
         Int(try scalarInt("SELECT count(*) FROM hermternal_search_sessions WHERE incomplete = 1"))
     }
     func sessionStatusCounts() throws -> (pendingIndexing: Int, truncated: Int) {
-        let sql = """
+        let rows = try queryRows("""
             SELECT
                 COALESCE(SUM(CASE WHEN warmed = 0 THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN incomplete = 1 THEN 1 ELSE 0 END), 0)
             FROM hermternal_search_sessions
-            """
-        let rows = try queryRows(sql)
-        let row = rows[0]
-        return (Int(row.int64(0)), Int(row.int64(1)))
+            """)
+        return (Int(rows[0].int64(0)), Int(rows[0].int64(1)))
     }
     func messageCount(sessionID: String?) throws -> Int {
         Int(try scalarInt("SELECT count(*) FROM hermternal_search_messages" + (sessionID == nil ? "" : " WHERE session_id = ?"), bindings: sessionID.map { [.text($0)] } ?? []))
@@ -607,15 +1128,112 @@ private final class SQLiteConnection: @unchecked Sendable {
         try queryRows("SELECT session_id FROM hermternal_search_sessions ORDER BY session_id").compactMap { $0.text(0) }
     }
 
-    func upsertSessionMetadata(sessionID: String, digest: String, incomplete: Bool) throws {
-        try execute("INSERT INTO hermternal_search_sessions(session_id, digest, incomplete, warmed) VALUES (?, ?, ?, 1) ON CONFLICT(session_id) DO UPDATE SET digest = excluded.digest, incomplete = excluded.incomplete, warmed = 1", bindings: [.text(sessionID), .text(digest), .int(incomplete ? 1 : 0)])
+    func upsertSessionMetadata(sessionID: String, digest: String, title: String, incomplete: Bool) throws {
+        try execute("INSERT INTO hermternal_search_sessions(session_id, digest, title, incomplete, warmed) VALUES (?, ?, ?, ?, 1) ON CONFLICT(session_id) DO UPDATE SET digest = excluded.digest, title = excluded.title, incomplete = excluded.incomplete, warmed = 1", bindings: [.text(sessionID), .text(digest), .text(title), .int(incomplete ? 1 : 0)])
+    }
+    func updateSessionStatus(sessionID: String, title: String, incomplete: Bool) throws {
+        try execute("INSERT INTO hermternal_search_sessions(session_id, digest, title, incomplete, warmed) VALUES (?, '', ?, ?, 1) ON CONFLICT(session_id) DO UPDATE SET title = excluded.title, incomplete = excluded.incomplete, warmed = 1", bindings: [.text(sessionID), .text(title), .int(incomplete ? 1 : 0)])
     }
     func markUnwarmed(sessionID: String) throws {
-        try execute("INSERT INTO hermternal_search_sessions(session_id, digest, incomplete, warmed) VALUES (?, '', 0, 0) ON CONFLICT(session_id) DO NOTHING", bindings: [.text(sessionID)])
+        try execute("INSERT INTO hermternal_search_sessions(session_id, digest, title, incomplete, warmed) VALUES (?, '', '', 0, 0) ON CONFLICT(session_id) DO NOTHING", bindings: [.text(sessionID)])
     }
 
-    func insert(title: String, body: String, sessionID: String, messageID: Int64, role: String, timestamp: Date?) throws {
+    func insert(title: String, body: String, sessionID: String, messageID: Int64, role: String, timestamp: Date?) throws -> Int64 {
         try execute("INSERT INTO hermternal_search_messages(title, body, session_id, message_id, role, timestamp) VALUES (?, ?, ?, ?, ?, ?)", bindings: [.text(title), .text(body), .text(sessionID), .int64(messageID), .text(role), timestamp.map { .double($0.timeIntervalSince1970) } ?? .null])
+        guard let handle else { throw SearchIndexError.disabled }
+        return api.lastInsertRowID(handle)
+    }
+    func insertIndexed(title: String, document: SearchDocument, sessionID: String) throws {
+        if let existing = try identity(
+            sessionID: sessionID,
+            messageID: document.messageID.rawValue
+        ) {
+            guard existing.isLowerRank(than: document) else { return }
+            try deleteIndexedRow(rowID: existing.ftsRowID)
+        }
+        let rowID = try insert(title: title, body: document.body, sessionID: sessionID, messageID: document.messageID.rawValue, role: document.role.rawValue, timestamp: document.timestamp)
+        try upsertIdentity(document, sessionID: sessionID, ftsRowID: rowID)
+    }
+    func identity(sessionID: String, messageID: Int64) throws -> SearchIdentity? {
+        identityLookups += 1
+        guard let row = try queryRows(
+            "SELECT body, role, timestamp, fts_rowid FROM hermternal_search_identities WHERE session_id = ? AND message_id = ? LIMIT 1",
+            bindings: [.text(sessionID), .int64(messageID)]
+        ).first else {
+            return nil
+        }
+        return SearchIdentity(
+            body: row.text(0) ?? "",
+            role: row.text(1) ?? "",
+            timestamp: row.double(2),
+            ftsRowID: row.int64(3)
+        )
+    }
+    func upsertIdentity(_ document: SearchDocument, sessionID: String, ftsRowID: Int64) throws {
+        try execute("""
+            INSERT INTO hermternal_search_identities(session_id, message_id, body, role, timestamp, fts_rowid)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id, message_id) DO UPDATE SET
+                body = excluded.body,
+                role = excluded.role,
+                timestamp = excluded.timestamp,
+                fts_rowid = excluded.fts_rowid
+            """, bindings: [
+                .text(sessionID),
+                .int64(document.messageID.rawValue),
+                .text(document.body),
+                .text(document.role.rawValue),
+                document.timestamp.map { .double($0.timeIntervalSince1970) } ?? .null,
+                .int64(ftsRowID)
+            ])
+    }
+    func deleteIndexedRow(rowID: Int64) throws {
+        try execute("DELETE FROM hermternal_search_messages WHERE rowid = ?", bindings: [.int64(rowID)])
+    }
+    func updateSessionTitle(sessionID: String, title: String) throws {
+        for row in try queryRows(
+            "SELECT fts_rowid FROM hermternal_search_identities WHERE session_id = ?",
+            bindings: [.text(sessionID)]
+        ) {
+            try execute(
+                "UPDATE hermternal_search_messages SET title = ? WHERE rowid = ?",
+                bindings: [.text(title), .int64(row.int64(0))]
+            )
+        }
+    }
+
+    func digest(for sessionID: String, title: String, truncated: Bool) throws -> String {
+        guard let handle else { throw SearchIndexError.disabled }
+        let sql = """
+            SELECT message_id, body, role, timestamp
+            FROM hermternal_search_identities
+            WHERE session_id = ?
+            ORDER BY message_id, role, timestamp
+            """
+        var statement: OpaquePointer?
+        let result = sql.withCString { api.prepare(handle, $0, -1, &statement, nil) }
+        guard result == SQLiteAPI.ok, let statement else { throw makeError(result) }
+        defer { _ = api.finalize(statement) }
+        try bind([.text(sessionID)], to: statement)
+
+        var digest = SearchDigest.Multiset(
+            sessionID: sessionID,
+            title: title,
+            truncated: truncated
+        )
+        while true {
+            let step = api.step(statement)
+            if step == SQLiteAPI.done { return digest.finalize() }
+            guard step == SQLiteAPI.row else { throw makeError(step) }
+            digest.append(
+                messageID: api.columnInt64(statement, 0),
+                body: columnText(statement, 1) ?? "",
+                role: columnText(statement, 2) ?? "",
+                timestamp: api.columnType(statement, 3) == SQLiteAPI.nullType
+                    ? nil
+                    : api.columnDouble(statement, 3)
+            )
+        }
     }
     func query(ftsQuery: String, limit: Int) throws -> SearchResults {
         let counts = try sessionStatusCounts()
@@ -720,10 +1338,22 @@ private final class SQLiteConnection: @unchecked Sendable {
 
     private func rebuildSchema() throws {
         try execute("DROP TABLE IF EXISTS hermternal_search_messages")
+        try execute("DROP TABLE IF EXISTS hermternal_search_identities")
         try execute("DROP TABLE IF EXISTS hermternal_search_sessions")
         try execute("DROP TABLE IF EXISTS hermternal_search_metadata")
         try execute("CREATE TABLE hermternal_search_metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)")
-        try execute("CREATE TABLE hermternal_search_sessions (session_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL, incomplete INTEGER NOT NULL, warmed INTEGER NOT NULL)")
+        try execute("CREATE TABLE hermternal_search_sessions (session_id TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL, title TEXT NOT NULL, incomplete INTEGER NOT NULL, warmed INTEGER NOT NULL)")
+        try execute("""
+            CREATE TABLE hermternal_search_identities (
+                session_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                body TEXT NOT NULL,
+                role TEXT NOT NULL,
+                timestamp REAL,
+                fts_rowid INTEGER NOT NULL,
+                PRIMARY KEY(session_id, message_id)
+            ) WITHOUT ROWID
+            """)
         try execute("CREATE VIRTUAL TABLE hermternal_search_messages USING fts5(title, body, session_id UNINDEXED, message_id UNINDEXED, role UNINDEXED, timestamp UNINDEXED, tokenize='unicode61 remove_diacritics 2')")
         try execute("INSERT INTO hermternal_search_metadata(key, value) VALUES ('schema_version', '\(SearchIndex.schemaVersion)')")
     }
@@ -751,9 +1381,21 @@ private final class SQLiteConnection: @unchecked Sendable {
     private func scalarInt(_ sql: String, bindings: [Binding] = []) throws -> Int64 { try queryRows(sql, bindings: bindings).first?.int64(0) ?? 0 }
     private func execute(_ sql: String, bindings: [Binding] = []) throws {
         guard let handle else { throw SearchIndexError.disabled }
-        if !bindings.isEmpty { _ = try queryRows(sql, bindings: bindings, collectRows: false); return }
+        if !bindings.isEmpty {
+            _ = try queryRows(sql, bindings: bindings, collectRows: false)
+            recordPersistentMutation(sql)
+            return
+        }
         let result = sql.withCString { sqlite3_exec(handle, $0, nil, nil, nil) }
         guard result == SQLiteAPI.ok else { throw makeError(result) }
+        recordPersistentMutation(sql)
+    }
+
+    private func recordPersistentMutation(_ sql: String) {
+        guard sql.hasPrefix("INSERT") || sql.hasPrefix("UPDATE") || sql.hasPrefix("DELETE") else {
+            return
+        }
+        persistentMutations += 1
     }
 
     private func queryRows(_ sql: String, bindings: [Binding] = [], collectRows: Bool = true) throws -> [Row] {
@@ -803,6 +1445,40 @@ private final class SQLiteConnection: @unchecked Sendable {
     private func makeError(_ code: Int32) -> SearchIndexError { .sqlite(code: code, message: api.errorMessage(handle)) }
 }
 
+
+private final class SQLiteWriteTransaction {
+    private let connection: SQLiteConnection
+    private var finished = false
+
+    init(connection: SQLiteConnection) {
+        self.connection = connection
+    }
+
+    func commit() throws {
+        guard !finished else { return }
+        do {
+            try connection.commit()
+        } catch {
+            connection.rollback()
+            finished = true
+            connection.finishExclusiveOperation()
+            throw error
+        }
+        finished = true
+        connection.finishExclusiveOperation()
+    }
+
+    func rollback() {
+        guard !finished else { return }
+        connection.rollback()
+        finished = true
+        connection.finishExclusiveOperation()
+    }
+
+    deinit {
+        rollback()
+    }
+}
 private final class SQLiteQueryLease: @unchecked Sendable {
     private weak var connection: SQLiteConnection?
     private let completion = NSCondition()
@@ -876,6 +1552,7 @@ private final class SQLiteAPI: @unchecked Sendable {
     }
     func bindInt(_ statement: OpaquePointer, _ index: Int32, _ value: Int32) -> Int32 { sqlite3_bind_int(statement, index, value) }
     func bindInt64(_ statement: OpaquePointer, _ index: Int32, _ value: Int64) -> Int32 { sqlite3_bind_int64(statement, index, value) }
+    func lastInsertRowID(_ database: OpaquePointer) -> Int64 { sqlite3_last_insert_rowid(database) }
     func bindDouble(_ statement: OpaquePointer, _ index: Int32, _ value: Double) -> Int32 { sqlite3_bind_double(statement, index, value) }
     func bindNull(_ statement: OpaquePointer, _ index: Int32) -> Int32 { sqlite3_bind_null(statement, index) }
     func columnCount(_ statement: OpaquePointer) -> Int32 { sqlite3_column_count(statement) }
@@ -919,6 +1596,55 @@ private enum SearchDigest {
         func finalize() -> String {
             var copy = sha
             return copy.finalize().map { String(format: "%02x", $0) }.joined()
+        }
+    }
+
+    struct Multiset: Sendable {
+        private let header: String
+        private var count: UInt64 = 0
+        private var sum: UInt64 = 0
+        private var xor: UInt64 = 0
+
+        init(sessionID: String, title: String, truncated: Bool) {
+            header = Incremental(sessionID: sessionID, title: title, truncated: truncated).finalize()
+        }
+
+        static func replacingHeader(
+            in digest: String,
+            sessionID: String,
+            title: String,
+            truncated: Bool
+        ) -> String {
+            let header = Incremental(sessionID: sessionID, title: title, truncated: truncated).finalize()
+            guard let separator = digest.firstIndex(of: ":") else {
+                return Multiset(sessionID: sessionID, title: title, truncated: truncated).finalize()
+            }
+            return header + String(digest[separator...])
+        }
+
+        mutating func append(_ document: SearchDocument) {
+            append(
+                messageID: document.messageID.rawValue,
+                body: document.body,
+                role: document.role.rawValue,
+                timestamp: document.timestamp?.timeIntervalSince1970
+            )
+        }
+
+        mutating func append(messageID: Int64, body: String, role: String, timestamp: Double?) {
+            var digest = Incremental(sessionID: "", title: "", truncated: false)
+            digest.append(String(messageID))
+            digest.append(body)
+            digest.append(role)
+            digest.append(timestamp.map { String($0) } ?? "")
+            let value = UInt64(digest.finalize().prefix(16), radix: 16) ?? 0
+            count &+= 1
+            sum &+= value
+            xor ^= value
+        }
+
+        func finalize() -> String {
+            "\(header):\(count):\(String(format: "%016llx", sum)):\(String(format: "%016llx", xor))"
         }
     }
 }
