@@ -26,6 +26,24 @@ func sessionOrganizationRoundTrip() throws {
     #expect(decoded.schemaVersion == SessionOrganization.currentSchemaVersion)
 }
 
+@Test("Default organization storage uses the platform-neutral core directory")
+func defaultOrganizationStoreUsesPlatformNeutralDirectory() {
+    let expectedDirectory = FileManager.default.temporaryDirectory
+        .appending(path: SessionOrganizationStore.configurationDirectoryName, directoryHint: .isDirectory)
+    let store = SessionOrganizationStore()
+
+    #expect(SessionOrganizationStore.defaultDirectory == expectedDirectory)
+    #expect(store.configurationURL == expectedDirectory.appending(path: SessionOrganizationStore.configurationFileName))
+}
+
+@Test("Injected organization directory determines the configuration path")
+func injectedOrganizationDirectoryDeterminesConfigurationPath() {
+    let directory = URL(fileURLWithPath: "/injected/session-organization", isDirectory: true)
+    let store = SessionOrganizationStore(directory: directory)
+
+    #expect(store.configurationURL == directory.appending(path: SessionOrganizationStore.configurationFileName))
+}
+
 @Test("Unknown organization keys are ignored")
 func sessionOrganizationIgnoresUnknownKeys() throws {
     let data = Data(#"""

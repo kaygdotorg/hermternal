@@ -231,7 +231,12 @@ final class AppearanceSettings {
         alwaysShowsChatMetadata = defaults.bool(
             forKey: Keys.alwaysShowsChatMetadata
         )
-        applyAppKitAppearance()
+        // System is already AppKit's inherited default. Avoid materializing
+        // NSApplication just to assign its default `nil` appearance before the
+        // first window; explicit light and dark modes remain synchronous.
+        if mode != .system {
+            applyAppKitAppearance()
+        }
     }
 
     /// Sets an override only after the user chooses a colour.

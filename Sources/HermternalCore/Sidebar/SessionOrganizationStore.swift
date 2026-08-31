@@ -39,6 +39,7 @@ public struct LocalSessionOrganizationFileSystem: SessionOrganizationFileSystem 
     }
 }
 
+
 /// Persists the local sidebar organization. A later phase can watch this file;
 /// reload-on-change must use the digest guard so the app ignores its own write.
 public protocol SessionOrganizationPersisting: Sendable {
@@ -49,6 +50,12 @@ public protocol SessionOrganizationPersisting: Sendable {
 public actor SessionOrganizationStore: SessionOrganizationPersisting {
     public static let configurationDirectoryName = ".config/hermternal"
     public static let configurationFileName = "config.json"
+    /// A platform-neutral location for callers that do not inject storage.
+    public static var defaultDirectory: URL {
+        FileManager.default.temporaryDirectory
+            .appending(path: Self.configurationDirectoryName, directoryHint: .isDirectory)
+    }
+
 
     private let directory: URL
     private let fileURL: URL
@@ -58,13 +65,11 @@ public actor SessionOrganizationStore: SessionOrganizationPersisting {
     private var organization = SessionOrganization()
 
     public init(
-        directory: URL? = nil,
+        directory: URL = SessionOrganizationStore.defaultDirectory,
         fileSystem: any SessionOrganizationFileSystem = LocalSessionOrganizationFileSystem()
     ) {
-        let resolvedDirectory = directory ?? FileManager.default.homeDirectoryForCurrentUser
-            .appending(path: Self.configurationDirectoryName, directoryHint: .isDirectory)
-        self.directory = resolvedDirectory
-        self.fileURL = resolvedDirectory.appending(path: Self.configurationFileName)
+        self.directory = directory
+        self.fileURL = directory.appending(path: Self.configurationFileName)
         self.fileSystem = fileSystem
     }
 

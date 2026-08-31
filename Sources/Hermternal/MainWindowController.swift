@@ -281,9 +281,9 @@ final class MainShellViewController: NSViewController {
         guard let window = view.window else { return }
         window.isOpaque = false
         window.backgroundColor = .clear
-        window.styleMask.insert(.fullSizeContentView)
-        window.titlebarAppearsTransparent = true
-        window.titleVisibility = .hidden
+        // Initial chrome is settled before the content host attaches.
+        // Re-applying it here makes AppKit lay out the titlebar and toolbar
+        // again during the launch turn.
         if backgroundHosting == nil {
             let hosting = NSHostingView(
                 rootView: WindowBackdrop(
@@ -336,7 +336,7 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
     private var model: AppModel
     private weak var toolbar: NSToolbar?
     private weak var visibilityBridge: MainSplitVisibilityBridgeView?
-    private let detailGroup = NSToolbarItemGroup(itemIdentifier: .detailControls)
+    private lazy var detailGroup = makeDetailGroup()
     private lazy var optionsItem = makeOptionsItem()
     private lazy var toggleItem = makeToggleItem()
     private lazy var newChatItem = makeCommandItem(
@@ -359,19 +359,12 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
         self.model = model
         self.visibilityBridge = visibilityBridge
         super.init()
-        detailGroup.label = "Chat"
-        detailGroup.paletteLabel = "Chat"
-        detailGroup.subitems = [newChatItem, reloadItem]
-        detailGroup.isBordered = true
-        detailGroup.isEnabled = true
-        detailGroup.controlRepresentation = .expanded
-        detailGroup.selectionMode = .momentary
-        detailGroup.autovalidates = false
         update(model: model)
     }
 
     func setVisibilityBridge(_ bridge: MainSplitVisibilityBridgeView?) {
         visibilityBridge = bridge
+        guard isReadyPhase else { return }
         toggleItem.target = bridge
     }
 
@@ -388,7 +381,12 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
 
     func update(model: AppModel) {
         self.model = model
-        let commandable = isReadyPhase && !model.isSearchPresented
+        guard isReadyPhase else {
+            updateToolbarVisibility()
+            return
+        }
+
+        let commandable = !model.isSearchPresented
         optionsItem.isEnabled = commandable
         toggleItem.isEnabled = commandable
         detailGroup.isEnabled = commandable
@@ -396,6 +394,19 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
         updateToolbarVisibility()
     }
     
+    private func makeDetailGroup() -> NSToolbarItemGroup {
+        let group = NSToolbarItemGroup(itemIdentifier: .detailControls)
+        group.label = "Chat"
+        group.paletteLabel = "Chat"
+        group.subitems = [newChatItem, reloadItem]
+        group.isBordered = true
+        group.isEnabled = true
+        group.controlRepresentation = .expanded
+        group.selectionMode = .momentary
+        group.autovalidates = false
+        return group
+    }
+
     private var isReadyPhase: Bool {
         model.phase == .ready
     }
@@ -468,7 +479,17 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [
+        Self.defaultItemIdentifiers(isReady: isReadyPhase)
+    }
+
+    /// A signed-out launch has no actionable toolbar controls. Supplying only
+    /// the two flexible spaces preserves the complete blank-toolbar geometry
+    /// without asking AppKit to create and immediately remove ready-only items.
+    static func defaultItemIdentifiers(
+        isReady: Bool
+    ) -> [NSToolbarItem.Identifier] {
+        guard isReady else { return [.flexibleSpace, .flexibleSpace] }
+        return [
             .flexibleSpace,
             .sidebarOptions,
             .sidebarToggle,
@@ -494,19 +515,20 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
         itemForItemIdentifier identifier: NSToolbarItem.Identifier,
         willBeInsertedIntoToolbar flag: Bool
     ) -> NSToolbarItem? {
+        guard isReadyPhase else { return nil }
         switch identifier {
         case .sidebarOptions:
-            optionsItem
+            return optionsItem
         case .sidebarToggle:
-            toggleItem
+            return toggleItem
         case .detailControls:
-            detailGroup
+            return detailGroup
         case .newChat:
-            newChatItem
+            return newChatItem
         case .reloadChats:
-            reloadItem
+            return reloadItem
         default:
-            nil
+            return nil
         }
     }
 
@@ -657,6 +679,85 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
     }
 }
 
+/// The launch-time window state must be complete before attaching SwiftUI's
+/// expensive hosting hierarchy. `prepare` asserts that ordering so a later
+/// refactor cannot silently restore redundant titlebar and frame work.
+@MainActor
+enum MainWindowStartupConfiguration {
+    static let defaultContentSize = NSSize(width: 1_040, height: 720)
+    static let minimumContentSize = NSSize(width: 760, height: 480)
+    static let frameAutosaveName = "Hermternal.MainWindow"
+
+    static func prepare(
+        _ window: NSWindow,
+        restoringFrameNamed autosaveName: String? = frameAutosaveName
+    ) {
+        precondition(
+            window.contentViewController == nil,
+            "Configure main window chrome before attaching its content host."
+        )
+
+        window.title = ""
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.toolbarStyle = .unified
+        window.isReleasedWhenClosed = false
+        window.isRestorable = false
+        // WindowServer resolves this ordering transition asynchronously. Keep
+        // it disabled until the initial key-window callback restores defaults.
+        window.animationBehavior = .none
+        window.identifier = NSUserInterfaceItemIdentifier(frameAutosaveName)
+        window.contentMinSize = minimumContentSize
+
+        guard let autosaveName else {
+            setDefaultFrame(on: window)
+            return
+        }
+
+        window.setFrameAutosaveName(autosaveName)
+        guard window.setFrameUsingName(autosaveName),
+              hasValidRestoredFrame(window)
+        else {
+            setDefaultFrame(on: window)
+            return
+        }
+    }
+
+    fileprivate static func setDefaultFrame(on window: NSWindow) {
+        window.setContentSize(defaultContentSize)
+        window.center()
+    }
+
+    private static func hasValidRestoredFrame(_ window: NSWindow) -> Bool {
+        let frame = window.frame
+        return frame.width.isFinite
+            && frame.height.isFinite
+            && frame.width >= window.contentMinSize.width
+            && frame.height >= window.contentMinSize.height
+    }
+}
+enum MainWindowInitialOrderAnimationState: Equatable {
+    case suppressing
+    case restored
+
+    var animationBehavior: NSWindow.AnimationBehavior {
+        switch self {
+        case .suppressing:
+            .none
+        case .restored:
+            .default
+        }
+    }
+
+    mutating func restoreAfterFirstKey() -> Bool {
+        guard self == .suppressing else { return false }
+        self = .restored
+        return true
+    }
+}
+
+
+
 @MainActor
 final class MainWindowController: NSWindowController, NSWindowDelegate {
     static let shared = MainWindowController()
@@ -667,7 +768,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var shellController: MainShellViewController?
     private var toolbarController: MainToolbarController?
     private var hasShownWindow = false
-    private var restoredValidFrame = false
+    private var initialOrderAnimationState: MainWindowInitialOrderAnimationState = .suppressing
 
     private init() {
         super.init(window: nil)
@@ -702,9 +803,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 }
             )
             self.shellController = shellController
-            shellController.preferredContentSize = NSSize(width: 1_040, height: 720)
+            shellController.preferredContentSize = MainWindowStartupConfiguration.defaultContentSize
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 1_040, height: 720),
+                contentRect: NSRect(
+                    origin: .zero,
+                    size: MainWindowStartupConfiguration.defaultContentSize
+                ),
                 styleMask: [
                     .titled,
                     .closable,
@@ -715,6 +819,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 backing: .buffered,
                 defer: false
             )
+            // Configure the final frame and titlebar before AppKit instantiates
+            // the content host and toolbar. The launch profile showed each of
+            // those mutations otherwise triggering titlebar layout separately.
+            MainWindowStartupConfiguration.prepare(window)
+            window.delegate = self
             window.contentViewController = shellController
             let toolbarController = MainToolbarController(
                 model: model,
@@ -722,29 +831,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             )
             self.toolbarController = toolbarController
             window.toolbar = toolbarController.makeToolbar()
-            toolbarController.update(model: model)
-            window.title = ""
-            window.titleVisibility = .hidden
-            window.titlebarAppearsTransparent = true
-            window.toolbarStyle = .unified
-            window.isReleasedWhenClosed = false
-            window.isRestorable = false
-            window.identifier = NSUserInterfaceItemIdentifier("Hermternal.MainWindow")
-            window.setFrameAutosaveName("Hermternal.MainWindow")
-            window.contentMinSize = NSSize(width: 760, height: 480)
-            window.delegate = self
-            let restored = window.setFrameUsingName("Hermternal.MainWindow")
-            let frame = window.frame
-            restoredValidFrame =
-                restored
-                && frame.width.isFinite
-                && frame.height.isFinite
-                && frame.width >= window.contentMinSize.width
-                && frame.height >= window.contentMinSize.height
-            if !restoredValidFrame {
-                window.setContentSize(NSSize(width: 1_040, height: 720))
-                window.center()
-            }
             self.window = window
         }
         if let window {
@@ -757,18 +843,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             }
             if !hasShownWindow {
                 hasShownWindow = true
-                Task { @MainActor [weak self, weak window] in
+                Task { @MainActor [weak window] in
                     await Task.yield()
-                    guard let self, let window else { return }
+                    guard let window else { return }
                     let frame = window.frame
                     let currentFrameIsValid =
                         frame.width.isFinite
                         && frame.height.isFinite
                         && frame.width >= window.contentMinSize.width
                         && frame.height >= window.contentMinSize.height
-                    if !self.restoredValidFrame || !currentFrameIsValid {
-                        window.setContentSize(NSSize(width: 1_040, height: 720))
-                        window.center()
+                    // `prepare` already restored or centered this window. A
+                    // second reset after the first yield is only needed if
+                    // attachment made the frame invalid.
+                    if !currentFrameIsValid {
+                        MainWindowStartupConfiguration.setDefaultFrame(on: window)
                     }
                 }
             }
@@ -786,6 +874,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    func windowDidBecomeKey(_ notification: Notification) {
+        guard initialOrderAnimationState.restoreAfterFirstKey(),
+              let window
+        else { return }
+        window.animationBehavior = initialOrderAnimationState.animationBehavior
+    }
+
     func windowWillClose(_ notification: Notification) {
         shellController?.prepareForWindowClose()
     }
@@ -801,6 +896,7 @@ final class HermternalApplicationDelegate: NSObject, NSApplicationDelegate {
     private var capabilityRefresh: (@MainActor () -> Void)?
     private var didFinishLaunching = false
     private var didStartRestore = false
+
 
     func configure(
         appearance: AppearanceSettings,
@@ -826,7 +922,35 @@ final class HermternalApplicationDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         didFinishLaunching = true
         launchIfNeeded()
+        #if DEBUG
+        emitLaunchWindowProbeIfRequested()
+        #endif
     }
+
+    #if DEBUG
+    private func emitLaunchWindowProbeIfRequested() {
+        guard ProcessInfo.processInfo.environment["HERMTERNAL_LAUNCH_WINDOW_PROBE"] == "1" else {
+            return
+        }
+        Task { @MainActor in
+            await Task.yield()
+            await Task.yield()
+            let windowDescriptions = NSApp.windows.map {
+                "\($0.className):title=\($0.title.debugDescription):visible=\($0.isVisible):frame=\(NSStringFromRect($0.frame))"
+            }
+            let visibleWindows = NSApp.windows.filter(\.isVisible)
+            let visibleContentFrames = visibleWindows.map {
+                NSStringFromRect($0.contentRect(forFrameRect: $0.frame))
+            }
+            print("HERMTERNAL_LAUNCH_WINDOWS=\(windowDescriptions.joined(separator: "|"))")
+            print("HERMTERNAL_LAUNCH_VISIBLE_WINDOW_COUNT=\(visibleWindows.count)")
+            print("HERMTERNAL_LAUNCH_VISIBLE_WINDOW_CONTENT_FRAMES=\(visibleContentFrames.joined(separator: "|"))")
+            print("HERMTERNAL_LAUNCH_WINDOW_COUNT=\(NSApp.windows.count)")
+            NSApp.terminate(nil)
+        }
+    }
+    #endif
+
 
     func showMainWindowIfReady() -> Bool {
         guard let appearance,

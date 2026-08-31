@@ -1,5 +1,6 @@
-import SwiftUI
+import Foundation
 import HermternalCore
+import SwiftUI
 
 
 @main
@@ -14,6 +15,13 @@ struct HermternalApp: App {
     /// injected. Held behind its protocol so a real controller, an in-memory
     /// fake, or an omission are the same seam to every consumer.
     private let debugModules: any DebugModuleCapability
+
+    static func makeOrganizationStore() -> SessionOrganizationStore {
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: SessionOrganizationStore.configurationDirectoryName, directoryHint: .isDirectory)
+        return SessionOrganizationStore(directory: directory)
+    }
+
 
     init() {
         // The app's only reads of the instrumentation environment. Composition
@@ -33,14 +41,22 @@ struct HermternalApp: App {
         )
         self.debugModules = debugModules
 
+        let organizationStore = Self.makeOrganizationStore()
+
         #if DEBUG
         let fixtureMode = SidebarFixtures.isEnabled
         let model: AppModel = {
-            guard fixtureMode else { return AppModel(debugModules: debugModules) }
+            guard fixtureMode else {
+                return AppModel(
+                    organizationStore: organizationStore,
+                    debugModules: debugModules
+                )
+            }
             // Keep fixture authority in memory only. Never write it to the
             // production server setting or credential stores.
             let model = AppModel(
                 transcriptSource: SidebarFixtures.transcriptSource,
+                organizationStore: organizationStore,
                 debugModules: debugModules
             )
             model.serverText = SidebarFixtures.gatewayURL.absoluteString
@@ -53,7 +69,10 @@ struct HermternalApp: App {
         }()
         #else
         let fixtureMode = false
-        let model = AppModel(debugModules: debugModules)
+        let model = AppModel(
+            organizationStore: organizationStore,
+            debugModules: debugModules
+        )
         #endif
         self.fixtureMode = fixtureMode
         _model = State(initialValue: model)
@@ -153,6 +172,7 @@ struct HermternalApp: App {
         Settings {
             EmptyView()
         }
+        .defaultLaunchBehavior(.suppressed)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Chat") {
