@@ -360,6 +360,10 @@ struct BlockTranscriptView: NSViewRepresentable {
         private var pendingPageStarts: Set<Int> = []
         private var pageFlushScheduled = false
         private var tableReloadPending = false
+        /// Next-turn expansion after a paged store attaches. The update turn
+        /// keeps the painted tail count, including zero.
+        private var storeAttachExpansionScheduled = false
+        private var pinToBottomAfterStoreExpansion = false
         private var locateTask: Task<Void, Never>?
         private var generation = 0
         /// Session identity for the painted transcript. Generation is not part
@@ -441,8 +445,8 @@ struct BlockTranscriptView: NSViewRepresentable {
                 : input.paintIdentity
             // Keep painted published-tail rows when the paged store arrives
             // for this same session. Generation is not identity.
-            let attachingStoreToPaintedSession = previousStore == nil
-                && input.store != nil
+            let attachingStore = previousStore == nil && input.store != nil
+            let attachingStoreToPaintedSession = attachingStore
                 && !loadedTurns.isEmpty
                 && (routeKey == "none" || routeKey == nextRouteKey)
             let routeChanged = nextRouteKey != routeKey
@@ -454,6 +458,8 @@ struct BlockTranscriptView: NSViewRepresentable {
                 pageTasks.removeAll(keepingCapacity: true)
                 pendingPageStarts.removeAll(keepingCapacity: true)
                 pageFlushScheduled = false
+                storeAttachExpansionScheduled = false
+                pinToBottomAfterStoreExpansion = false
                 locateTask?.cancel()
                 locateTask = nil
                 loadingStarts.removeAll(keepingCapacity: true)
@@ -493,6 +499,14 @@ struct BlockTranscriptView: NSViewRepresentable {
             if store == nil {
                 installPublishedTail(publishedTail)
                 tableReloadPending = false
+            } else if attachingStore && loadedTurns.isEmpty && !publishedTail.isEmpty {
+                // First paint already has the store. Install the published
+                // tail this turn. Expand on the next turn.
+                installPublishedTail(publishedTail, ignoringStore: true)
+                tableReloadPending = false
+            } else if attachingStore && loadedTurns.isEmpty && publishedTail.isEmpty {
+                // Hold summary.rowCount so the attach turn stays at zero.
+                totalTurnCount = 0
             }
             let count = rowCount
             if findChanged {
@@ -504,9 +518,16 @@ struct BlockTranscriptView: NSViewRepresentable {
             }
             if count == 0 {
                 table.reloadData()
+                if attachingStore {
+                    scheduleStoreAttachExpansion()
+                }
                 return
             }
-            requestVisiblePages()
+            if attachingStore {
+                scheduleStoreAttachExpansion()
+            } else {
+                requestVisiblePages()
+            }
             prepareVisibleTurns()
             scheduleVisibleMeasurements(at: table.bounds.width)
             position(routeChanged: routeChanged)
@@ -522,6 +543,8 @@ struct BlockTranscriptView: NSViewRepresentable {
             pendingPageStarts.removeAll()
             pageFlushScheduled = false
             tableReloadPending = false
+            storeAttachExpansionScheduled = false
+            pinToBottomAfterStoreExpansion = false
             locateTask?.cancel()
             locateTask = nil
             cacheWork.documentPreparationTask?.cancel()
@@ -642,8 +665,11 @@ struct BlockTranscriptView: NSViewRepresentable {
         /// Installs the synchronously published cache tail when the paged
         /// store is not yet on the route. Disk-resident pages replace this
         /// once the store is installed.
-        private func installPublishedTail(_ messages: [ChatMessage]) {
-            guard store == nil else { return }
+        private func installPublishedTail(
+            _ messages: [ChatMessage],
+            ignoringStore: Bool = false
+        ) {
+            guard ignoringStore || store == nil else { return }
             let turns = CachedTranscript(
                 version: HistoryCache.version,
                 messages: messages,
@@ -685,9 +711,37 @@ struct BlockTranscriptView: NSViewRepresentable {
         }
 
         private func requestPage(start: Int) {
-            guard store != nil, start < rowCount else { return }
+            guard store != nil, start < plannedRowCount else { return }
             pendingPageStarts.insert(start)
             schedulePageFlush()
+        }
+
+        private var plannedRowCount: Int {
+            max(rowCount, summary?.rowCount ?? 0)
+        }
+
+        /// Requests the store tail on the next turn after attach.
+        ///
+        /// The attach turn must not change `numberOfRows`. A zero painted
+        /// tail used to return before any page request.
+        private func scheduleStoreAttachExpansion() {
+            guard store != nil, !storeAttachExpansionScheduled else { return }
+            storeAttachExpansionScheduled = true
+            pinToBottomAfterStoreExpansion = true
+            let requestGeneration = generation
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.storeAttachExpansionScheduled = false
+                guard self.generation == requestGeneration, self.store != nil else {
+                    return
+                }
+                let planned = self.plannedRowCount
+                guard planned > 0 else { return }
+                let start = ((planned - 1) / TranscriptPageRequestPlanner.pageSize)
+                    * TranscriptPageRequestPlanner.pageSize
+                self.pendingPageStarts.insert(start)
+                self.flushRequestedPages()
+            }
         }
 
         private func schedulePageFlush() {
@@ -726,7 +780,7 @@ struct BlockTranscriptView: NSViewRepresentable {
         /// through `Task.detached` so the MainActor only applies the page.
         private func startPageLoad(start: Int) {
             guard let store, let route,
-                  start < rowCount,
+                  start < plannedRowCount,
                   loadingStarts.insert(start).inserted
             else { return }
             let requestGeneration = generation
@@ -824,6 +878,11 @@ struct BlockTranscriptView: NSViewRepresentable {
                 // key-view loop for each inserted row and freezes input.
                 table.reloadData()
                 tableReloadPending = false
+                if pinToBottomAfterStoreExpansion {
+                    pinToBottomAfterStoreExpansion = false
+                    scrollToBottom()
+                    requestVisiblePages()
+                }
                 if previousCount > 0 {
                     Log.info(
                         "PERF|transcript accept|rows=\(rowCount) previous=\(previousCount) turns=\(page.turns.count)"

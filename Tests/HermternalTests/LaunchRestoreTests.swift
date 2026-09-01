@@ -459,6 +459,33 @@ func unchangedNetworkReconcileDoesNotRepublishOrRebuildRows() async throws {
     coordinator.dismantle(container: container)
 }
 
+@Test("launch-restore of a long paged chat paints the tail without a selection change — sidecar present")
+@MainActor
+func launchRestoreLongPagedChatPaintsTailWhenSidecarIsPresent() async throws {
+    try await launchRestoreLongPagedChatPaintsTail(source: .sidecar)
+}
+
+@Test("launch-restore of a long paged chat paints the tail without a selection change — sidecar absent")
+@MainActor
+func launchRestoreLongPagedChatPaintsTailWhenSidecarIsAbsent() async throws {
+    try await launchRestoreLongPagedChatPaintsTail(source: .pagedStoreOnly)
+}
+
+@Test("launch-restore fills an empty sidecar from the cache-resident visible tail")
+@MainActor
+func launchRestoreFillsEmptySidecarFromVisibleTail() async throws {
+    try await launchRestoreLongPagedChatPaintsTail(source: .visibleTailOnly)
+}
+
+@Test("publishRestoredTranscript attaches a long paged store without requestOpen")
+@MainActor
+func publishRestoredTranscriptAttachesLongPagedStoreWithoutRequestOpen() async throws {
+    try await launchRestoreLongPagedChatPaintsTail(
+        source: .pagedStoreOnly,
+        requestOpenAfterPublish: false
+    )
+}
+
 @Test("Selecting a chat persists the id for the next launch")
 @MainActor
 func selectingAChatPersistsForNextLaunch() async throws {
@@ -478,6 +505,231 @@ func selectingAChatPersistsForNextLaunch() async throws {
 
     let relaunched = AppModel(cache: HistoryCache(directory: directory))
     #expect(relaunched.selectedSessionID == "second")
+}
+
+private enum LaunchRestoreTailSource {
+    case sidecar
+    case visibleTailOnly
+    case pagedStoreOnly
+}
+
+private let launchRestoreLongRowCount = 240
+private let launchRestoreTailText = "restore-tail-unique"
+private let launchRestoreHeadText = "restore-head-unique"
+
+@MainActor
+private func launchRestoreLongPagedChatPaintsTail(
+    source: LaunchRestoreTailSource,
+    requestOpenAfterPublish: Bool = true
+) async throws {
+    _ = NSApplication.shared
+    let directory = try launchRestoreTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let session = ChatSession(
+        id: "restore-long",
+        title: "Restored long",
+        lastActive: Date(timeIntervalSince1970: 1_700_000_000),
+        messageCount: launchRestoreLongRowCount
+    )
+    let messages = launchRestoreLongMessages()
+    let snapshot = AuthoritativeTranscriptSnapshot(
+        sessionID: session.id,
+        serverTotal: launchRestoreLongRowCount,
+        fetchedRows: launchRestoreLongRowCount,
+        projectedMessages: launchRestoreLongRowCount,
+        truncated: false,
+        fetchedAt: Date(timeIntervalSince1970: 0)
+    )
+    var history = HistoryCache(directory: directory)
+    switch source {
+    case .sidecar:
+        _ = await history.store(messages, snapshot: snapshot, for: session.id)
+        _ = try await history.pagedStore(for: session.id)
+    case .visibleTailOnly:
+        _ = await history.store(messages, snapshot: snapshot, for: session.id)
+        launchRestoreRemoveSidecar(in: directory, sessionID: session.id)
+        history = HistoryCache(directory: directory)
+    case .pagedStoreOnly:
+        let store = try await history.pagedStore(for: session.id)
+        for (index, message) in messages.enumerated() {
+            _ = try await store.append(launchRestoreWireRecord(message, index: index))
+        }
+    }
+    let list = SessionListCache(directory: directory)
+    #expect(list.saveSessions([session]))
+    #expect(list.saveSelectedSessionID(session.id))
+    let model = AppModel(
+        cache: history,
+        transcriptSource: LaunchRestoreSilentSource(),
+        warmStore: TranscriptWarmStore()
+    )
+    model.cacheEnabled = true
+    #expect(model.phase == .restoring)
+    #expect(model.selectedSessionID == session.id)
+
+    model.publishRestoredTranscript()
+    let selected = model.selectedSessionID
+    if requestOpenAfterPublish {
+        let openTask = model.requestOpen(session)
+        await openTask.value
+    }
+    #expect(model.selectedSessionID == selected)
+    #expect(model.selectedSessionID == session.id)
+    let storeAttached = await launchRestoreWaitForStore(model)
+    #expect(storeAttached)
+
+    switch source {
+    case .sidecar, .visibleTailOnly:
+        #expect(!model.messages.isEmpty)
+        #expect(model.messages.last?.text == launchRestoreTailText)
+    case .pagedStoreOnly:
+        break
+    }
+
+    let coordinator = BlockTranscriptView.Coordinator()
+    let container = coordinator.makeContainer()
+    let root = launchRestoreAttachedTranscriptRoot(container)
+    coordinator.update(
+        container: container,
+        input: TranscriptRendererInput(
+            store: model.activeTranscriptStore,
+            route: model.activeTranscriptRoute,
+            summary: model.transcriptSummary,
+            revision: model.transcriptRevision,
+            isReadOnly: false,
+            isStreaming: false,
+            findQuery: "",
+            pendingMessageID: nil,
+            findMessageID: nil,
+            showsMetadata: false,
+            publishedTail: model.messages,
+            paintIdentity: "live:\(session.id)",
+            onCopyCode: { _ in },
+            onPaint: { _ in }
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    let table = container.tableView
+    let attachRows = table.numberOfRows
+    let expectedAttachRows = model.messages.isEmpty ? 0 : CachedTranscript(
+        version: HistoryCache.version,
+        messages: model.messages,
+        snapshot: nil
+    ).turns.count
+    #expect(attachRows == expectedAttachRows)
+    #expect(attachRows != launchRestoreLongRowCount)
+
+    var paintedTail = false
+    for _ in 0..<200 {
+        await launchRestoreDrainMainQueueOnce()
+        root.layoutSubtreeIfNeeded()
+        table.layoutSubtreeIfNeeded()
+        if table.numberOfRows == 0 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+            continue
+        }
+        if launchRestoreTableContains(table, text: launchRestoreTailText) {
+            paintedTail = true
+            break
+        }
+        try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+    #expect(paintedTail)
+    #expect(model.selectedSessionID == session.id)
+    coordinator.dismantle(container: container)
+    model.cancelOpenPreparation()
+}
+
+private func launchRestoreLongMessages() -> [ChatMessage] {
+    (0..<launchRestoreLongRowCount).map { index in
+        let text: String
+        if index == 0 {
+            text = launchRestoreHeadText
+        } else if index == launchRestoreLongRowCount - 1 {
+            text = launchRestoreTailText
+        } else {
+            text = "row \(index)"
+        }
+        return ChatMessage(
+            id: .server(ServerMessageID(rawValue: Int64(index))),
+            role: index.isMultiple(of: 2) ? .user : .assistant,
+            text: text
+        )
+    }
+}
+
+private func launchRestoreWireRecord(_ message: ChatMessage, index: Int) -> WireMessageRecord {
+    let id: String
+    switch message.id {
+    case .server(let value): id = String(value.rawValue)
+    case .provisional(let value): id = value.uuidString
+    }
+    return WireMessageRecord(
+        messageID: id.isEmpty ? "m-\(index)" : id,
+        role: message.role.rawValue,
+        text: message.text
+    )
+}
+
+private func launchRestoreRemoveSidecar(in directory: URL, sessionID: String) {
+    let encoded = sessionID.utf8.reduce(into: "") { result, byte in
+        if (byte >= 48 && byte <= 57)
+            || (byte >= 65 && byte <= 90)
+            || (byte >= 97 && byte <= 122) {
+            result.append(Character(UnicodeScalar(byte)))
+        } else {
+            result += String(format: "%%%02X", byte)
+        }
+    }
+    let url = directory.appendingPathComponent("tail-\(encoded).json")
+    try? FileManager.default.removeItem(at: url)
+}
+
+@MainActor
+private func launchRestoreWaitForStore(_ model: AppModel) async -> Bool {
+    if model.activeTranscriptStore != nil { return true }
+    for _ in 0..<400 {
+        try? await Task.sleep(nanoseconds: 5_000_000)
+        if model.activeTranscriptStore != nil { return true }
+    }
+    return false
+}
+
+@MainActor
+private func launchRestoreDrainMainQueueOnce() async {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.main.async {
+            continuation.resume()
+        }
+    }
+}
+
+@MainActor
+private func launchRestoreTableContains(_ table: NSTableView, text: String) -> Bool {
+    guard table.numberOfRows > 0 else { return false }
+    for row in 0..<table.numberOfRows {
+        guard let view = table.view(atColumn: 0, row: row, makeIfNecessary: false) as? TranscriptTurnRowView
+        else { continue }
+        if launchRestoreRowText(view).contains(text) { return true }
+    }
+    let last = table.numberOfRows - 1
+    guard let view = table.view(atColumn: 0, row: last, makeIfNecessary: true) as? TranscriptTurnRowView
+    else { return false }
+    return view.accessibilityLabel() != "Loading transcript row"
+        && launchRestoreRowText(view).contains(text)
+}
+
+@MainActor
+private func launchRestoreRowText(_ view: NSView) -> String {
+    var parts: [String] = []
+    var stack = [view]
+    while let current = stack.popLast() {
+        if let textView = current as? NSTextView {
+            parts.append(textView.string)
+        }
+        stack.append(contentsOf: current.subviews)
+    }
+    return parts.joined()
 }
 
 private struct LaunchRestoreSilentSource: TranscriptSource {

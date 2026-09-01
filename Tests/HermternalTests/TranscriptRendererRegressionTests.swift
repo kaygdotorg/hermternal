@@ -523,6 +523,94 @@ func storeAttachDoesNotExpandTableRowsOnTheUpdateTurn() async throws {
     coordinator.dismantle(container: container)
 }
 
+@Test("store attach with an empty published tail expands on the next turn")
+@MainActor
+func storeAttachWithEmptyPublishedTailExpandsOnTheNextTurn() async throws {
+    _ = NSApplication.shared
+    let directory = FileManager.default.temporaryDirectory.appending(
+        path: "btv-empty-attach-\(UUID().uuidString)",
+        directoryHint: .isDirectory
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = PagedTranscriptStore(sessionID: "restored-long", directory: directory)
+    try await store.load()
+    let rowCount = 240
+    for index in 0..<rowCount {
+        _ = try await store.append(
+            WireMessageRecord(
+                messageID: "m-\(index)",
+                text: index == rowCount - 1 ? "restore-tail-unique" : "row \(index)"
+            )
+        )
+    }
+    let route = try await store.currentRoute()
+    let coordinator = BlockTranscriptView.Coordinator()
+    let container = coordinator.makeContainer()
+    let root = attachedTranscriptRoot(container)
+    coordinator.update(
+        container: container,
+        input: TranscriptRendererInput(
+            store: nil,
+            route: nil,
+            summary: nil,
+            revision: 0,
+            isReadOnly: false,
+            isStreaming: false,
+            findQuery: "",
+            pendingMessageID: nil,
+            findMessageID: nil,
+            showsMetadata: false,
+            publishedTail: [],
+            paintIdentity: "live:restored-long",
+            onCopyCode: { _ in },
+            onPaint: { _ in }
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    let table = container.tableView
+    #expect(table.numberOfRows == 0)
+
+    coordinator.update(
+        container: container,
+        input: TranscriptRendererInput(
+            store: store,
+            route: route,
+            summary: TranscriptSummary(rowCount: rowCount, messageCount: rowCount),
+            revision: 1,
+            isReadOnly: false,
+            isStreaming: false,
+            findQuery: "",
+            pendingMessageID: nil,
+            findMessageID: nil,
+            showsMetadata: false,
+            publishedTail: [],
+            paintIdentity: "live:restored-long",
+            onCopyCode: { _ in },
+            onPaint: { _ in }
+        )
+    )
+    #expect(table.numberOfRows == 0)
+
+    var expanded = false
+    for _ in 0..<200 {
+        await drainMainQueueOnce()
+        if table.numberOfRows == rowCount {
+            expanded = true
+            break
+        }
+        try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+    root.layoutSubtreeIfNeeded()
+    table.layoutSubtreeIfNeeded()
+    #expect(expanded)
+    #expect(table.numberOfRows == rowCount)
+    let last = try #require(
+        table.view(atColumn: 0, row: rowCount - 1, makeIfNecessary: true) as? TranscriptTurnRowView
+    )
+    #expect(last.accessibilityLabel() != "Loading transcript row")
+    coordinator.dismantle(container: container)
+}
+
 @Test("renderer maps viewport inputs through the Core policy")
 func rendererMapsViewportInputsThroughCorePolicy() {
     #expect(
@@ -1828,7 +1916,8 @@ private func drainMainQueueOnce() async {
 private func viewportRendererInput(
     store: any TranscriptTurnPageLocating,
     sessionID: String,
-    rowCount: Int
+    rowCount: Int,
+    publishedTail: [ChatMessage] = []
 ) -> TranscriptRendererInput {
     TranscriptRendererInput(
         store: store,
@@ -1843,6 +1932,7 @@ private func viewportRendererInput(
         pendingMessageID: nil,
         findMessageID: nil,
         showsMetadata: false,
+        publishedTail: publishedTail,
         onCopyCode: { _ in },
         onPaint: { _ in }
     )
@@ -1886,13 +1976,28 @@ func rendererKeepsReaderRowWhenPageCorrectionLandsAboveViewport() async throws {
             hasMore: false
         )
     )
+    // First attach no longer materializes summary.rowCount on the update
+    // turn. Paint the same count from the published tail so the reader
+    // can sit below the page that is still held.
+    let publishedTail = (0..<totalRows).map { index in
+        ChatMessage(
+            id: .server(ServerMessageID(rawValue: Int64(index))),
+            role: .assistant,
+            text: "Placeholder transcript row."
+        )
+    }
     let coordinator = BlockTranscriptView.Coordinator()
     let container = coordinator.makeContainer()
     let root = attachedTranscriptRoot(container)
     let table = container.tableView
     coordinator.update(
         container: container,
-        input: viewportRendererInput(store: store, sessionID: "anchor", rowCount: totalRows)
+        input: viewportRendererInput(
+            store: store,
+            sessionID: "anchor",
+            rowCount: totalRows,
+            publishedTail: publishedTail
+        )
     )
     #expect(await waitForStartedReads(store, 1))
     root.layoutSubtreeIfNeeded()

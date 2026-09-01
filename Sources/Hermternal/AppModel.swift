@@ -1070,6 +1070,57 @@ final class AppModel: ComposerTurnRouting {
         )
         applyScrubbedRestoredSnapshot()
         LaunchClock.mark("restoredTranscript.published")
+        startRestoredTranscriptFollowUp(session)
+    }
+
+    /// Finishes restore the same way a later user switch does.
+    ///
+    /// A missing sidecar still reads the cache-resident visible tail. The
+    /// paged store then attaches. Row expansion stays on the next renderer
+    /// turn.
+    private func startRestoredTranscriptFollowUp(_ session: ChatSession) {
+        let generation = openGenerations.current()
+        let handle = TranscriptOpenHandle()
+        activeOpenHandle?.cancel()
+        activeOpenTask?.cancel()
+        activeOpenHandle = handle
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { handle.cancel() }
+            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                return
+            }
+            if self.messages.isEmpty, self.cacheEnabled {
+                LaunchClock.mark("restoredTranscript.visibleTail.begin")
+                let diskTail = await self.historyCache.visibleTail(for: session.id)
+                LaunchClock.mark("restoredTranscript.visibleTail.end")
+                guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                    return
+                }
+                if !diskTail.isEmpty {
+                    _ = self.publishCachedTranscript(
+                        CachedTranscriptScrubbing.scrub(diskTail),
+                        session: session,
+                        generation: generation,
+                        warm: nil
+                    )
+                    self.applyScrubbedRestoredSnapshot()
+                }
+            }
+            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                return
+            }
+            await self.prepareActiveTranscriptStore(
+                sessionID: session.id,
+                appGeneration: generation
+            )
+            LaunchClock.mark("restoredTranscript.storeAttached")
+            guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                return
+            }
+            await self.persistTranscriptTail(self.messages)
+        }
+        activeOpenTask = task
     }
 
     /// Strips launch-time streaming flags from the snapshot that `requestOpen`
