@@ -152,13 +152,10 @@ struct ComposerFormattingToolbarPolicyTests {
         #expect(originY == 18 + ComposerFormattingToolbarLayout.gap)
     }
 
-    @Test("a one line field holds the toolbar inside the band")
-    func placementClampsInsideAShortBand() {
-        // The field's own minimum is the shortest band the composer ever
-        // draws, and it is shorter than the strip plus its gap. No side is
-        // fully clear then, so the side with more room wins and the origin is
-        // held inside the band. The strip covers the selected line, which is
-        // the line the reader just chose, and it leaves with the selection.
+    @Test("a short field keeps the toolbar clear after vertical clamping")
+    func placementKeepsSelectionClearWhenBandIsShort() {
+        // The field's minimum is shorter than the strip plus its gap and line.
+        // The below side wins, but clamping it inside the band would overlap.
         let viewportHeight = ComposerEditorHeightPolicy.minimum
         let selectionTop: Double = 7
         let selectionBottom: Double = 24
@@ -174,8 +171,7 @@ struct ComposerFormattingToolbarPolicyTests {
             selectionBottom: selectionBottom,
             viewportHeight: viewportHeight
         )
-        #expect(originY >= 0)
-        #expect(originY + ComposerFormattingToolbarLayout.height <= viewportHeight)
+        #expect(originY >= selectionBottom + ComposerFormattingToolbarLayout.gap)
     }
 
     @Test("the toolbar centres on the selection and never leaves the field")

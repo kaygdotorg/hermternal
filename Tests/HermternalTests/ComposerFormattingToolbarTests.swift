@@ -253,12 +253,39 @@ func selectionShowsAndHidesTheFloatingToolbar() async throws {
             + " placement=\(shown.placement.rawValue)"
             + " showLatencyUs=\(field.toolbar.lastShowLatencyNanoseconds / 1000)"
     )
-    // The strip is inside the field it belongs to.
-    let band = try #require(field.textView.enclosingScrollView).contentView.bounds
-    #expect(shown.originX >= 0)
-    #expect(shown.originX + ComposerFormattingToolbarLayout.width <= Double(band.width) + 0.5)
-    #expect(shown.originY >= 0)
-    #expect(shown.originY + ComposerFormattingToolbarLayout.height <= Double(band.height) + 0.5)
+    // The selected first line leaves no room for the complete strip and gap.
+    // The below fallback keeps the strip clear, even when it extends below the
+    // short visible band.
+    let scrollView = try #require(field.textView.enclosingScrollView)
+    let clipView = scrollView.contentView
+    let layoutManager = try #require(field.textView.layoutManager)
+    let textContainer = try #require(field.textView.textContainer)
+    let glyphRange = layoutManager.glyphRange(
+        forCharacterRange: field.textView.selectedRange(),
+        actualCharacterRange: nil
+    )
+    var selection = layoutManager.boundingRect(
+        forGlyphRange: glyphRange,
+        in: textContainer
+    )
+    selection.origin.x += field.textView.textContainerOrigin.x
+    selection.origin.y += field.textView.textContainerOrigin.y
+    let localSelection = clipView.convert(selection, from: field.textView)
+    let clipBounds = clipView.bounds
+    let selectionBottom = clipView.isFlipped
+        ? localSelection.maxY - clipBounds.minY
+        : clipBounds.maxY - localSelection.minY
+    let band = clipView.convert(clipBounds, to: scrollView)
+    let scrollBounds = scrollView.bounds
+    let bandTop = scrollView.isFlipped
+        ? band.minY - scrollBounds.minY
+        : scrollBounds.maxY - band.maxY
+    #expect(shown.placement == .below)
+    #expect(
+        shown.originY
+            >= Double(bandTop) + Double(selectionBottom)
+            + ComposerFormattingToolbarLayout.gap
+    )
 
     field.textView.setSelectedRange(NSRange(location: 6, length: 0))
     await field.settle()

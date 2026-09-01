@@ -208,13 +208,9 @@ public enum ComposerFormattingToolbarLayout {
 
     /// Picks the side of the selection the strip rests on.
     ///
-    /// Above is the answer whenever the band has room for the strip and its
-    /// gap. Below is the answer when it does not. A one line field is shorter
-    /// than the strip and its gap, so it has no fully clear side: the side
-    /// with more room wins, and `originY` holds the strip inside the band.
-    /// The strip then covers the line the reader just selected, and it leaves
-    /// with the selection. Nothing may draw outside the field, because the
-    /// transcript is directly above the composer panel.
+    /// Above is the answer whenever the band has room for the complete strip
+    /// and its gap. Below is the answer when above does not fit and below does.
+    /// If neither side fits, the side with more room wins.
     public static func placement(
         selectionTop: Double,
         selectionBottom: Double,
@@ -228,7 +224,11 @@ public enum ComposerFormattingToolbarLayout {
         return roomAbove >= roomBelow ? .above : .below
     }
 
-    /// The top of the strip, held inside the band.
+    /// The top of the strip, preserving the gap from the selection.
+    ///
+    /// The strip stays inside the visible band when that clamp keeps the gap.
+    /// A band shorter than the strip cannot satisfy both bounds, so the raw
+    /// side position wins rather than moving across the selected text.
     public static func originY(
         placement: ComposerFormattingToolbarPlacement,
         selectionTop: Double,
@@ -238,7 +238,14 @@ public enum ComposerFormattingToolbarLayout {
         let raw = placement == .above
             ? selectionTop - gap - height
             : selectionBottom + gap
-        return min(max(0, raw), max(0, viewportHeight - height))
+        let maxOrigin = max(0, viewportHeight - height)
+        let clamped = min(max(0, raw), maxOrigin)
+        switch placement {
+        case .above:
+            return clamped + height + gap <= selectionTop ? clamped : raw
+        case .below:
+            return clamped >= selectionBottom + gap ? clamped : raw
+        }
     }
 
     /// The leading edge of the strip: centred on the selection, held inside

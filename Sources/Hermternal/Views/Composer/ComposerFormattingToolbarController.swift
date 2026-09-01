@@ -202,19 +202,31 @@ final class ComposerFormattingToolbarController {
             layoutManager: layoutManager,
             textContainer: textContainer
         )
-        // The band the reader can see. Its own origin is added back, so a
-        // border or a ruler could never move the strip off the line it
-        // points at.
-        let band = clipView.convert(clipView.bounds, to: scrollView)
+        // Normalize both rectangles to the visible clip bounds. The clip view
+        // changes its bounds origin during scrolling, and AppKit may use a
+        // bottom-leading coordinate system, while the SwiftUI overlay starts
+        // at the visible top-leading corner.
+        let clipBounds = clipView.bounds
+        let band = clipView.convert(clipBounds, to: scrollView)
+        let scrollBounds = scrollView.bounds
         let bandTop = scrollView.isFlipped
-            ? band.minY
-            : scrollView.bounds.height - band.maxY
+            ? band.minY - scrollBounds.minY
+            : scrollBounds.maxY - band.maxY
         let local = clipView.convert(selection, from: textView)
-        let viewportHeight = Double(clipView.bounds.height)
-        let viewportWidth = Double(clipView.bounds.width)
+        let selectionTop: Double
+        let selectionBottom: Double
+        if clipView.isFlipped {
+            selectionTop = Double(local.minY - clipBounds.minY)
+            selectionBottom = Double(local.maxY - clipBounds.minY)
+        } else {
+            selectionTop = Double(clipBounds.maxY - local.maxY)
+            selectionBottom = Double(clipBounds.maxY - local.minY)
+        }
+        let viewportHeight = Double(clipBounds.height)
+        let viewportWidth = Double(clipBounds.width)
         guard ComposerFormattingToolbarLayout.anchorIsVisible(
-            selectionTop: Double(local.minY),
-            selectionBottom: Double(local.maxY),
+            selectionTop: selectionTop,
+            selectionBottom: selectionBottom,
             viewportHeight: viewportHeight
         ) else {
             state.anchorLost()
@@ -222,18 +234,18 @@ final class ComposerFormattingToolbarController {
             return
         }
         let placement = ComposerFormattingToolbarLayout.placement(
-            selectionTop: Double(local.minY),
-            selectionBottom: Double(local.maxY),
+            selectionTop: selectionTop,
+            selectionBottom: selectionBottom,
             viewportHeight: viewportHeight
         )
         let originY = ComposerFormattingToolbarLayout.originY(
             placement: placement,
-            selectionTop: Double(local.minY),
-            selectionBottom: Double(local.maxY),
+            selectionTop: selectionTop,
+            selectionBottom: selectionBottom,
             viewportHeight: viewportHeight
         )
         let originX = ComposerFormattingToolbarLayout.originX(
-            selectionCenterX: Double(local.midX),
+            selectionCenterX: Double(local.midX - clipBounds.minX),
             viewportWidth: viewportWidth
         )
         publish(Presentation(

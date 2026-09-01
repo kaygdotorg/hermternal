@@ -21,8 +21,8 @@ import SwiftUI
 /// because a strip over text has to stay legible when the reader asked the
 /// system for less translucency.
 ///
-/// Five items fit the strip. The rest scroll, and the system draws the
-/// scroller. Every item is one action the old Format row also had.
+/// Five items fit the strip. The rest scroll, with no visible scrollbar or
+/// indicator. Every item is one action the old Format row also had.
 struct ComposerFormattingToolbar: View {
     let mode: ComposerEditorMode
     let placement: ComposerFormattingToolbarPlacement
@@ -45,10 +45,9 @@ struct ComposerFormattingToolbar: View {
                 }
             }
         }
-        // The system owns the scroller. A horizontal overlay scroller that
-        // appears while the reader scrolls is the macOS answer here, and this
-        // states it rather than leaving it to a default that could change.
-        .scrollIndicators(.automatic, axes: .horizontal)
+        // Keep the native scroll view and its input behavior, but never show
+        // a scrollbar or scroll indicator over the formatting controls.
+        .scrollIndicators(.hidden, axes: .horizontal)
         .frame(
             width: ComposerFormattingToolbarLayout.contentWidth,
             height: ComposerFormattingToolbarLayout.itemHeight
