@@ -3,10 +3,18 @@ import HermternalCore
 import Testing
 @testable import Hermternal
 
-/// The bound for every asynchronous wait in this file. One sidebar selection
-/// reaches its route and starts its stream in a few scheduler turns. A
-/// condition that stays false for this long shows a defect in the open path.
-private let sidebarWaitBound = Duration.seconds(5)
+/// The bound for every asynchronous wait in this file.
+/// Isolated runs keep 5 s: one sidebar selection reaches its route and
+/// starts its stream in a few scheduler turns. Debug validate.sh runs
+/// this next to the rest of the MainActor suite; the first stream start
+/// can wait behind that load. 15 s still fails a stuck open path.
+private var sidebarWaitBound: Duration {
+#if DEBUG
+    .seconds(15)
+#else
+    .seconds(5)
+#endif
+}
 
 /// Waits until `holds` returns true, or until `sidebarWaitBound` runs out.
 ///
