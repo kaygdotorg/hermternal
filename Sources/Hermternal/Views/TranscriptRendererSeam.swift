@@ -1,3 +1,4 @@
+import Foundation
 import HermternalCore
 
 /// The narrow, bounded seam shared by transcript rendering adapters.
@@ -65,5 +66,100 @@ extension TranscriptRendererInput {
 
     var generation: Int {
         Int(route?.generation ?? 0)
+    }
+}
+
+/// Per-switch counters for the publish-to-draw path.
+///
+/// The coordinator resets this on a route change. The paint callback prints
+/// one line. Visit memory is bounded so a long sidebar walk cannot grow it.
+@MainActor
+enum TranscriptPaintAttribution {
+    static let visitMemoryBound = 128
+
+    struct Snapshot {
+        var visit = 0
+        var creates = 0
+        var reuses = 0
+        var configured = 0
+        var loading = 0
+        var configureNs: UInt64 = 0
+        var attributedNs: UInt64 = 0
+        var hugNs: UInt64 = 0
+        var documentHits = 0
+        var documentMisses = 0
+        var answerChars = 0
+        var codeBlocks = 0
+        var tableBlocks = 0
+        var storeNil = false
+        var tailCount = 0
+        var loadedCount = 0
+        var attrCacheHits = 0
+        var attrCacheMisses = 0
+    }
+
+    private static var visits: [String: Int] = [:]
+    private static var visitOrder: [String] = []
+    static var current = Snapshot()
+
+    static func beginSwitch(
+        identity: String,
+        storeNil: Bool,
+        tailCount: Int,
+        loadedCount: Int
+    ) {
+        let visit = (visits[identity] ?? 0) + 1
+        visits[identity] = visit
+        visitOrder.append(identity)
+        while visitOrder.count > visitMemoryBound {
+            let evicted = visitOrder.removeFirst()
+            if evicted != identity {
+                visits.removeValue(forKey: evicted)
+            }
+        }
+        current = Snapshot(
+            visit: visit,
+            storeNil: storeNil,
+            tailCount: tailCount,
+            loadedCount: loadedCount
+        )
+    }
+
+    static func noteRow(created: Bool) {
+        if created { current.creates += 1 } else { current.reuses += 1 }
+    }
+
+    static func noteLoading() {
+        current.loading += 1
+    }
+
+    static func noteConfigured(
+        documentHit: Bool,
+        answerChars: Int,
+        codeBlocks: Int,
+        tableBlocks: Int,
+        configureNs: UInt64,
+        hugNs: UInt64
+    ) {
+        current.configured += 1
+        if documentHit { current.documentHits += 1 } else { current.documentMisses += 1 }
+        current.answerChars += answerChars
+        current.codeBlocks += codeBlocks
+        current.tableBlocks += tableBlocks
+        current.configureNs &+= configureNs
+        current.hugNs &+= hugNs
+    }
+
+    static func noteAttributed(nanoseconds: UInt64, cacheHit: Bool) {
+        current.attributedNs &+= nanoseconds
+        if cacheHit { current.attrCacheHits += 1 } else { current.attrCacheMisses += 1 }
+    }
+
+    static func line() -> String {
+        let snapshot = current
+        func ms(_ ns: UInt64) -> String {
+            String(format: "%.3f", Double(ns) / 1_000_000)
+        }
+        return "visit=\(snapshot.visit) creates=\(snapshot.creates) reuses=\(snapshot.reuses) configured=\(snapshot.configured) loading=\(snapshot.loading) cfgMs=\(ms(snapshot.configureNs)) attrMs=\(ms(snapshot.attributedNs)) hugMs=\(ms(snapshot.hugNs)) docHit=\(snapshot.documentHits) docMiss=\(snapshot.documentMisses) attrHit=\(snapshot.attrCacheHits) attrMiss=\(snapshot.attrCacheMisses) chars=\(snapshot.answerChars) code=\(snapshot.codeBlocks) tables=\(snapshot.tableBlocks) storeNil=\(snapshot.storeNil) tail=\(snapshot.tailCount) loaded=\(snapshot.loadedCount)"
     }
 }

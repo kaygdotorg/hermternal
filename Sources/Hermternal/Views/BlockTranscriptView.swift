@@ -383,6 +383,7 @@ struct BlockTranscriptView: NSViewRepresentable {
         private var expandedTools = Set<String>()
         private var onCopyCode: (String) -> Void = { _ in }
         private let overdrawRows = 8
+        private let rowPoolDepth = 16
         private var observers: [NSObjectProtocol] = []
         private var showsMetadata = false
 
@@ -419,6 +420,7 @@ struct BlockTranscriptView: NSViewRepresentable {
                 }
             }
             observers.append(boundsToken)
+            table.prefillRowPool(rowPoolDepth)
             return result
         }
 
@@ -508,6 +510,14 @@ struct BlockTranscriptView: NSViewRepresentable {
                 // Hold summary.rowCount so the attach turn stays at zero.
                 totalTurnCount = 0
             }
+            if routeChanged {
+                TranscriptPaintAttribution.beginSwitch(
+                    identity: nextRouteKey,
+                    storeNil: store == nil,
+                    tailCount: publishedTail.count,
+                    loadedCount: loadedTurns.count
+                )
+            }
             let count = rowCount
             if findChanged {
                 let visible = table.rows(in: table.visibleRect)
@@ -577,11 +587,14 @@ struct BlockTranscriptView: NSViewRepresentable {
                   ) as? TranscriptTurnRowView
             else { return nil }
             guard let loaded = loadedTurns[row] else {
+                TranscriptPaintAttribution.noteLoading()
                 view.configureLoading(showText: row.isMultiple(of: TranscriptPageRequestPlanner.pageSize))
                 requestPage(containing: row)
                 return view
             }
+            let configureStart = DispatchTime.now().uptimeNanoseconds
             let document = measuredDocuments.document(for: loaded.turn)
+                ?? TranscriptPaintCache.document(for: loaded.turn)
             let disclosure = MeasuredDocumentCache.DisclosureState(
                 reasoningExpanded: expandedReasoning.contains(loaded.turn.id),
                 toolsExpanded: expandedTools.contains(loaded.turn.id)
@@ -596,12 +609,14 @@ struct BlockTranscriptView: NSViewRepresentable {
                 for: loaded.turn,
                 availableWidth: tableView.bounds.width
             )
-            let outgoingTextWidth = measuredDocuments.layout(
+            let hugStart = DispatchTime.now().uptimeNanoseconds
+            let cachedOutgoingLayout = measuredDocuments.layout(
                 for: row,
                 turn: loaded.turn,
                 effectiveWidth: cap,
                 disclosure: disclosure
-            )?.textWidth ?? (
+            )
+            let outgoingTextWidth = cachedOutgoingLayout?.textWidth ?? (
                 loaded.turn.speaker == .me
                     ? TranscriptTurnTextRenderer.fittingOutgoingTextWidth(
                         document: document,
@@ -610,6 +625,20 @@ struct BlockTranscriptView: NSViewRepresentable {
                     )
                     : nil
             )
+            let hugNs: UInt64 = loaded.turn.speaker == .me && cachedOutgoingLayout == nil
+                ? DispatchTime.now().uptimeNanoseconds &- hugStart
+                : 0
+            var codeBlocks = 0
+            var tableBlocks = 0
+            if let document {
+                for block in document.blocks {
+                    switch block {
+                    case .code: codeBlocks += 1
+                    case .table: tableBlocks += 1
+                    default: break
+                    }
+                }
+            }
             view.configure(
                 turn: loaded.turn,
                 document: document,
@@ -621,6 +650,14 @@ struct BlockTranscriptView: NSViewRepresentable {
                 onReasoning: { [weak self] id in self?.toggleReasoning(id) },
                 onTools: { [weak self] id in self?.toggleTools(id) },
                 onCopyCode: onCopyCode
+            )
+            TranscriptPaintAttribution.noteConfigured(
+                documentHit: document != nil,
+                answerChars: loaded.turn.answer.count,
+                codeBlocks: codeBlocks,
+                tableBlocks: tableBlocks,
+                configureNs: DispatchTime.now().uptimeNanoseconds &- configureStart,
+                hugNs: hugNs
             )
             return view
         }
@@ -639,12 +676,30 @@ struct BlockTranscriptView: NSViewRepresentable {
                 reasoningExpanded: expandedReasoning.contains(turn.id),
                 toolsExpanded: expandedTools.contains(turn.id)
             )
-            return measuredDocuments.height(
+            if let height = measuredDocuments.height(
                 for: row,
                 turn: turn,
                 effectiveWidth: effectiveWidth,
                 disclosure: disclosure
-            ) ?? estimatedHeight(for: turn, width: tableView.bounds.width)
+            ) {
+                return height
+            }
+            if let cached = TranscriptPaintCache.layout(
+                for: turn,
+                width: effectiveWidth,
+                reasoningExpanded: disclosure.reasoningExpanded,
+                toolsExpanded: disclosure.toolsExpanded
+            ) {
+                measuredDocuments.store(
+                    layout: cached,
+                    for: turn,
+                    ordinal: row,
+                    effectiveWidth: effectiveWidth,
+                    disclosure: disclosure
+                )
+                return cached.height
+            }
+            return estimatedHeight(for: turn, width: tableView.bounds.width)
         }
 
 
@@ -678,9 +733,32 @@ struct BlockTranscriptView: NSViewRepresentable {
             totalTurnCount = turns.count
             loadedTurns.removeAll(keepingCapacity: true)
             loadedOrder.removeAll(keepingCapacity: true)
+            let availableWidth = table.bounds.width
             for (ordinal, turn) in turns.enumerated() {
                 loadedTurns[ordinal] = LoadedTurn(ordinal: ordinal, turn: turn)
                 loadedOrder.append(ordinal)
+                if let document = TranscriptPaintCache.document(for: turn) {
+                    measuredDocuments.store(document: document, for: turn)
+                }
+                let effectiveWidth = TranscriptTurnTextRenderer.effectiveWidth(
+                    for: turn,
+                    availableWidth: availableWidth
+                )
+                let disclosure = MeasuredDocumentCache.DisclosureState()
+                if let layout = TranscriptPaintCache.layout(
+                    for: turn,
+                    width: effectiveWidth,
+                    reasoningExpanded: false,
+                    toolsExpanded: false
+                ) {
+                    measuredDocuments.store(
+                        layout: layout,
+                        for: turn,
+                        ordinal: ordinal,
+                        effectiveWidth: effectiveWidth,
+                        disclosure: disclosure
+                    )
+                }
             }
             table.noteNumberOfRowsChanged()
         }
@@ -993,6 +1071,7 @@ struct BlockTranscriptView: NSViewRepresentable {
                               loaded.turn == request.turn
                         else { return nil }
                         self.measuredDocuments.store(document: document, for: request.turn)
+                        TranscriptPaintCache.store(document: document, for: request.turn)
                         return request.ordinal
                     })
                     if !indexes.isEmpty {
@@ -1135,6 +1214,13 @@ struct BlockTranscriptView: NSViewRepresentable {
                             ordinal: request.ordinal,
                             effectiveWidth: request.effectiveWidth,
                             disclosure: request.disclosure
+                        )
+                        TranscriptPaintCache.store(
+                            layout: layout,
+                            for: request.turn,
+                            width: request.effectiveWidth,
+                            reasoningExpanded: request.disclosure.reasoningExpanded,
+                            toolsExpanded: request.disclosure.toolsExpanded
                         )
                         indexes.insert(request.ordinal)
                     }
@@ -1957,9 +2043,26 @@ final class BlockTranscriptContainerView: NSView {
 
 @MainActor
 final class BlockTranscriptTableView: NSTableView {
+    private var spareRows: [TranscriptTurnRowView] = []
+
+    func prefillRowPool(_ depth: Int) {
+        spareRows.reserveCapacity(depth)
+        while spareRows.count < depth {
+            spareRows.append(TranscriptTurnRowView())
+        }
+    }
+
     override func makeView(withIdentifier identifier: NSUserInterfaceItemIdentifier, owner: Any?) -> NSView? {
-        if let view = super.makeView(withIdentifier: identifier, owner: owner) { return view }
+        if let view = super.makeView(withIdentifier: identifier, owner: owner) {
+            TranscriptPaintAttribution.noteRow(created: false)
+            return view
+        }
         guard identifier == TranscriptTurnRowView.identifier else { return nil }
+        if let spare = spareRows.popLast() {
+            TranscriptPaintAttribution.noteRow(created: false)
+            return spare
+        }
+        TranscriptPaintAttribution.noteRow(created: true)
         return TranscriptTurnRowView()
     }
 }
@@ -2522,24 +2625,52 @@ final class TranscriptTurnRowView: NSTableCellView {
         let policy: TranscriptTurnTextRenderer.ForegroundPolicy
         if let outgoing { policy = .uniform(outgoing.foreground) } else { policy = .semantic }
         if let renderedDocument = document {
-            answerView.textStorage?.setAttributedString(
-                TranscriptTurnTextRenderer.attributedAnswer(
+            let attributedStart = DispatchTime.now().uptimeNanoseconds
+            let isUniform = policy.isUniform
+            if let cached = TranscriptPaintCache.attributedString(
+                for: turn,
+                findQuery: findQuery,
+                isUniform: isUniform
+            ) {
+                answerView.textStorage?.setAttributedString(cached)
+                TranscriptPaintAttribution.noteAttributed(
+                    nanoseconds: DispatchTime.now().uptimeNanoseconds &- attributedStart,
+                    cacheHit: true
+                )
+            } else {
+                let built = TranscriptTurnTextRenderer.attributedAnswer(
                     renderedDocument,
                     findQuery: findQuery,
                     foreground: policy
                 )
-            )
+                answerView.textStorage?.setAttributedString(built)
+                TranscriptPaintCache.store(
+                    attributed: built,
+                    for: turn,
+                    findQuery: findQuery,
+                    isUniform: isUniform
+                )
+                TranscriptPaintAttribution.noteAttributed(
+                    nanoseconds: DispatchTime.now().uptimeNanoseconds &- attributedStart,
+                    cacheHit: false
+                )
+            }
             // An outgoing row shows no copy button, so it must not walk the
             // document's blocks and join their code only to discard the result.
             codeToCopy = isUser
                 ? ""
                 : TranscriptTurnTextRenderer.codeText(renderedDocument)
         } else {
+            let attributedStart = DispatchTime.now().uptimeNanoseconds
             answerView.textStorage?.setAttributedString(
                 TranscriptTurnTextRenderer.plainAnswer(
                     turn.answer,
                     foreground: policy
                 )
+            )
+            TranscriptPaintAttribution.noteAttributed(
+                nanoseconds: DispatchTime.now().uptimeNanoseconds &- attributedStart,
+                cacheHit: false
             )
             codeToCopy = ""
         }

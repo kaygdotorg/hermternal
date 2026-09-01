@@ -211,6 +211,7 @@ struct ChatView: View {
     private var transcript: some View {
         let route = model.activeTranscriptRoute
         let summary = model.transcriptSummary
+        let publishedAt = model.transcriptPublishUptimeNanoseconds
         let rendererInput = TranscriptRendererInput(
             store: model.activeTranscriptStore,
             route: route,
@@ -233,11 +234,11 @@ struct ChatView: View {
                 NSPasteboard.general.setString(code, forType: .string)
             },
             onPaint: { visibleAtNanoseconds in
-                let published = model.transcriptPublishUptimeNanoseconds
-                if published > 0 {
+                let published = publishedAt
+                if published > 0, visibleAtNanoseconds >= published {
                     let deltaMs = Double(visibleAtNanoseconds &- published) / 1_000_000
                     Log.info(
-                        "PERF|transcript publishToDraw|ms=\(String(format: "%.3f", deltaMs)) session=\(model.selectedSessionID ?? "") rows=\(model.messages.count)"
+                        "PERF|transcript publishToDraw|ms=\(String(format: "%.3f", deltaMs)) session=\(model.selectedSessionID ?? "") rows=\(model.messages.count) \(TranscriptPaintAttribution.line())"
                     )
                 }
                 guard HermternalSwitchTrace.isEnabled else { return }

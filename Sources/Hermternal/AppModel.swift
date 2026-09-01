@@ -3809,6 +3809,13 @@ final class AppModel: ComposerTurnRouting {
             "PERF|sidebar requestOpen.sync|us=\(syncUs) warm=\(warm != nil) count=\(initialMessages.count)"
         )
         releaseOpenEventGate(generation: generation, sessionID: session.id)
+        TranscriptPaintCache.scheduleAdjacentPrewarm(
+            selectedID: session.id,
+            sessions: sessions,
+            width: MessageTypography.readingMeasure
+                + 2 * MessageTypography.transcriptInset,
+            tails: { [historyCache] id in historyCache.residentVisibleTail(for: id) }
+        )
         let publishedWarm = warm
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
