@@ -469,6 +469,24 @@ func folderDropsRejectUnrecognizedExternalText() {
     #expect(SidebarDragPayload.accepts([foreign, chats]))
 }
 
+@Test("Sidebar dissolve yields its mask while the list is scrolling")
+@MainActor
+func sidebarDissolveMaskPolicyYieldsWhileScrolling() {
+    #expect(SidebarDissolveMaskPolicy.shouldApply(isEnabled: true, isScrolling: false))
+    #expect(!SidebarDissolveMaskPolicy.shouldApply(isEnabled: true, isScrolling: true))
+    #expect(!SidebarDissolveMaskPolicy.shouldApply(isEnabled: false, isScrolling: false))
+    #expect(!SidebarDissolveMaskPolicy.shouldApply(isEnabled: false, isScrolling: true))
+}
+
+@Test("Sidebar dissolve resets scrolling state when its list leaves")
+@MainActor
+func sidebarDissolveMaskPolicyResetsAfterListLifecycle() {
+    let isScrolling = SidebarDissolveMaskPolicy.resetScrollingState()
+    #expect(!isScrolling)
+    #expect(SidebarDissolveMaskPolicy.shouldApply(isEnabled: true, isScrolling: isScrolling))
+}
+
+
 /// A transcript source that holds every authoritative stream open until the
 /// test cancels it.
 ///

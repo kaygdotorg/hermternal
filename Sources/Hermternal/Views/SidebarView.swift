@@ -540,6 +540,10 @@ struct SidebarView: View {
     /// Height of the floating pinned layer. The chat list's dissolve is
     /// measured up from this layer's top edge.
     @State private var pinnedLayerHeight: CGFloat = 0
+    /// True only while the native chat list is tracking, interacting or
+    /// decelerating. The dissolve is restored as soon as scrolling settles,
+    /// but never makes the scroll viewport render through a mask per frame.
+    @State private var isChatListScrolling = false
     /// Ordering and row identity maps survive selection-only body passes. The
     /// cache invalidates only on the explicit ordering inputs.
     @State private var sidebarDerivationCache = SidebarDerivationCache()
@@ -717,7 +721,20 @@ struct SidebarView: View {
         // more than the rows do. The modifier removes the mask outright
         // rather than flattening its gradient, because a mask whose ramps
         // are opaque still makes the compositing group under test.
-        .modifier(SidebarDissolveMask(ramp: chatListDissolve))
+        .modifier(
+            SidebarDissolveMask(
+                ramp: chatListDissolve,
+                isScrolling: isChatListScrolling
+            )
+        )
+        .onDisappear {
+            resetChatListScrollState()
+        }
+        .onScrollPhaseChange { _, phase in
+            let isScrolling = phase != .idle
+            guard self.isChatListScrolling != isScrolling else { return }
+            self.isChatListScrolling = isScrolling
+        }
         // A SwiftUI focus identity, not an AppKit responder lookup. The
         // default is applied only when the window is choosing its initial
         // focus; Composer requests focus explicitly after New Chat.
@@ -1002,6 +1019,7 @@ struct SidebarView: View {
                 }
             }
             .onChange(of: model.sidebarContentMode) { _, mode in
+                resetChatListScrollState()
                 handleContentModeChange(mode)
             }
             .onChange(of: model.archivedSessions) { _, sessions in
@@ -1026,6 +1044,7 @@ struct SidebarView: View {
                 synchronizeModelSelection()
             }
             .onDisappear {
+                resetChatListScrollState()
                 SidebarSelectionEventAdapter.stop()
                 pendingOpenTask?.cancel()
                 pendingOpenTask = nil
@@ -1039,6 +1058,10 @@ struct SidebarView: View {
             messages: model.messages.count
         )
         synchronizeModelSelection(forceChats: newValue != nil)
+    }
+
+    private func resetChatListScrollState() {
+        isChatListScrolling = SidebarDissolveMaskPolicy.resetScrollingState()
     }
     private func handleArchivedSessionsChange(_ sessions: [ChatSession]) {
         archivedSelection.formIntersection(Set(sessions.map(\.id)))
@@ -2156,18 +2179,36 @@ private enum SidebarDissolve {
 /// checker's budget when that expression grew, so a branch wrapped around it
 /// would cost more than a branch inside a modifier of its own.
 ///
-/// The condition is fixed for the life of the process, so the graph settles
-/// into one of the two shapes at first evaluation and never flips between
-/// them. No view identity churns on it.
+/// The mask is removed only for the duration of native scrolling. A
+/// scrolling viewport otherwise has to rebuild the offscreen mask pass for
+/// every wheel frame. Restoring it at idle keeps the fixed chrome's edge
+/// treatment without putting that pass on the input path.
+enum SidebarDissolveMaskPolicy {
+    static func shouldApply(isEnabled: Bool, isScrolling: Bool) -> Bool {
+        isEnabled && !isScrolling
+    }
+
+    /// A List can leave the view tree while its last scroll phase is active.
+    /// The next chat List must start idle, so the mask is restored on its
+    /// first body pass instead of inheriting the old phase.
+    static func resetScrollingState() -> Bool {
+        false
+    }
+}
+
 private struct SidebarDissolveMask<Ramp: View>: ViewModifier {
     let ramp: Ramp
+    let isScrolling: Bool
 
     // `@ViewBuilder` written out rather than inherited from the protocol
     // requirement, so the branch below does not depend on where the builder
     // is declared.
     @ViewBuilder
     func body(content: Content) -> some View {
-        if SidebarDissolve.isEnabled {
+        if SidebarDissolveMaskPolicy.shouldApply(
+            isEnabled: SidebarDissolve.isEnabled,
+            isScrolling: isScrolling
+        ) {
             content.mask { ramp }
         } else {
             content
