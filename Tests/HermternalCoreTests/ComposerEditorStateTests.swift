@@ -126,6 +126,11 @@ struct ComposerEditorStateTests {
         #expect(!ComposerEditorHeightPolicy.isLayoutWidth(-360))
         // A column the composer gives the message field.
         #expect(ComposerEditorHeightPolicy.isLayoutWidth(360))
+        #expect(ComposerEditorHeightPolicy.shouldMeasureHeight(proposedWidth: 714, occupiedWidth: 714))
+        #expect(!ComposerEditorHeightPolicy.shouldMeasureHeight(proposedWidth: 196.5, occupiedWidth: 714))
+        #expect(!ComposerEditorHeightPolicy.shouldMeasureHeight(proposedWidth: 4, occupiedWidth: 714))
+        #expect(!ComposerEditorHeightPolicy.shouldMeasureHeight(proposedWidth: 32, occupiedWidth: 714))
+        #expect(!ComposerEditorHeightPolicy.shouldMeasureHeight(proposedWidth: 714, occupiedWidth: 0))
 
         // Why a probe may not be measured: the same one line of text answers
         // with the two ends of the range. A zero width breaks the line after
@@ -143,44 +148,15 @@ struct ComposerEditorStateTests {
         )
     }
 
-    @Test("formatting controls require explicit disclosure and active source")
-    func formattingRowInteractionPolicy() {
-        #expect(!ComposerEditorInteractionPolicy.formattingRowIsVisible(
-            isEditorFocused: true,
-            isExpanded: false,
-            hasSource: true
+    @Test("the editor publishes only a real focus change")
+    func focusPublicationPolicy() {
+        #expect(ComposerEditorInteractionPolicy.shouldPublishFocusChange(
+            from: false,
+            to: true
         ))
-        #expect(!ComposerEditorInteractionPolicy.shouldRevealFormattingRow(
-            isEditorFocused: true,
-            hasSource: true,
-            explicitFormatAction: false
+        #expect(!ComposerEditorInteractionPolicy.shouldPublishFocusChange(
+            from: true,
+            to: true
         ))
-        #expect(ComposerEditorInteractionPolicy.shouldRevealFormattingRow(
-            isEditorFocused: true,
-            hasSource: true,
-            explicitFormatAction: true
-        ))
-        #expect(ComposerEditorInteractionPolicy.formattingRowIsVisible(
-            isEditorFocused: true,
-            isExpanded: true,
-            hasSource: true
-        ))
-        #expect(ComposerEditorInteractionPolicy.formattingActionPreservesFocus(true))
-        #expect(ComposerEditorInteractionPolicy.shouldHideFormattingRow(
-            isEditorFocused: false,
-            hasSource: true
-        ))
-        #expect(ComposerEditorInteractionPolicy.shouldHideFormattingRow(
-            isEditorFocused: true,
-            hasSource: false
-        ))
-        #expect(ComposerEditorInteractionPolicy.formattingRowTransitionDuration == 0.12)
-        #expect(
-            ComposerEditorInteractionPolicy.formattingRowAnimationDuration(reducesMotion: true) == 0
-        )
-        #expect(
-            ComposerEditorInteractionPolicy.formattingRowAnimationDuration(reducesMotion: false)
-                == ComposerEditorInteractionPolicy.formattingRowTransitionDuration
-        )
     }
 }

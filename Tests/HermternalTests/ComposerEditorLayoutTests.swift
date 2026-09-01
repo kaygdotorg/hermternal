@@ -14,6 +14,9 @@ import Testing
 /// width to the field during a layout pass.
 private struct ComposerEditorHarness: View {
     let store: ComposerEditorHarnessStore
+    /// The field always has a toolbar controller in the app, so the harness
+    /// keeps one. These tests never show the strip; they watch the field.
+    @State private var toolbar = ComposerFormattingToolbarController()
 
     var body: some View {
         HStack(spacing: 8) {
@@ -34,6 +37,7 @@ private struct ComposerEditorHarness: View {
                     isEditable: true,
                     focusRequest: 0,
                     formatRequest: store.formatRequest,
+                    toolbar: toolbar,
                     onSubmit: {},
                     onEscape: { false },
                     onFormatHandled: { store.formatRequest = nil }
@@ -593,4 +597,140 @@ private func visibleBandContainsInsertionLine(_ textView: NSTextView) -> Bool {
     let line = insertionLineRect(in: textView)
     let visible = textView.visibleRect.insetBy(dx: 0, dy: -1)
     return visible.maxY > line.minY && visible.minY < line.maxY
+}
+
+/// New-chat typing is the flicker path: route identity `new`, a live
+/// ComposerView, and one character at a time.
+///
+/// Characters only grow the draft, so the field height never drops.
+/// A wrap may raise the height once. Identical new-chat route republishes
+/// must not prefetch inventory or scroll a caret that is already visible.
+@Test("Typing on a new chat does not oscillate composer height")
+@MainActor
+func typingOnNewChatDoesNotOscillateHeight() async throws {
+    _ = NSApplication.shared
+    let model = makeNewChatComposerModel()
+    let hosting = NSHostingView(rootView: ComposerView(model: model))
+    hosting.frame = NSRect(x: 0, y: 0, width: 720, height: 280)
+    let window = NSWindow(
+        contentRect: hosting.frame,
+        styleMask: [.titled, .resizable],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.animationBehavior = .none
+    window.contentView = hosting
+    window.makeKeyAndOrderFront(nil)
+    defer {
+        window.contentView = nil
+        window.close()
+    }
+    hosting.layoutSubtreeIfNeeded()
+    await Task.yield()
+    hosting.needsLayout = true
+    hosting.layoutSubtreeIfNeeded()
+
+    let editor = try #require(firstTextView(in: hosting))
+    #expect(window.makeFirstResponder(editor))
+
+    ComposerTypingProbe.begin(owner: model)
+    defer { _ = ComposerTypingProbe.finish() }
+
+    let message = "Hermes, name the composer flicker, its cause, and the one "
+        + "layout rule that ends it, in a single plain sentence."
+    var heights: [CGFloat] = []
+    var wraps: [Int] = []
+    for character in message {
+        editor.insertText(String(character), replacementRange: editor.selectedRange())
+        ComposerTypingProbe.noteKeystroke(from: model)
+        model.update(route: model.route)
+        hosting.needsLayout = true
+        hosting.layoutSubtreeIfNeeded()
+        await Task.yield()
+
+        let live = try #require(firstTextView(in: hosting))
+        let field = try #require(live.enclosingScrollView)
+        heights.append(field.frame.height)
+        wraps.append(lineFragmentCount(in: live))
+    }
+
+    #expect(model.text.count == message.count)
+    let snapshot = ComposerTypingProbe.snapshot
+    #expect(snapshot.keystrokes == message.count)
+    let wrapSteps = zip(wraps, wraps.dropFirst()).filter { $0.1 > $0.0 }.count
+    let heightDrops = zip(heights, heights.dropFirst()).filter { $0.1 + 0.5 < $0.0 }.count
+    ComposerTypingProbe.log("new-chat-typing")
+    print(
+        "COMPOSER_TYPING_HEIGHTS unique=\(Set(heights.map { Int(($0 * 10).rounded()) }).count)"
+            + " first=\(heights.first ?? -1) last=\(heights.last ?? -1)"
+            + " wrapsFirst=\(wraps.first ?? -1) wrapsLast=\(wraps.last ?? -1)"
+            + " wrapSteps=\(wrapSteps) heightDrops=\(heightDrops)"
+    )
+    #expect(heightDrops == 0)
+    let appliedChanges = zip(heights, heights.dropFirst()).filter { $0.1 > $0.0 + 0.5 }.count
+    #expect(appliedChanges <= wrapSteps)
+    #expect(snapshot.heightChangeCount <= wrapSteps + 1)
+    #expect(snapshot.prefetchCount == 0)
+    #expect(snapshot.requestInventoryCount == 0)
+    #expect(snapshot.caretScrollCount <= wrapSteps)
+}
+
+
+
+/// Parallel `swift test` mounts other composers in the same process.
+/// Prefetch and inventory notes from those composers must not land in
+/// this snapshot. Defended by typingOnNewChatDoesNotOscillateHeight.
+@Test("Typing probe records only the composer under test")
+@MainActor
+func typingProbeRecordsOnlyTheComposerUnderTest() {
+    let measured = makeNewChatComposerModel()
+    let other = makeNewChatComposerModel()
+    ComposerTypingProbe.begin(owner: measured)
+    defer { _ = ComposerTypingProbe.finish() }
+
+    _ = other.mount()
+    other.update(route: ComposerRoute(identity: "other"))
+    #expect(ComposerTypingProbe.snapshot.prefetchCount == 0)
+    #expect(ComposerTypingProbe.snapshot.requestInventoryCount == 0)
+    #expect(ComposerTypingProbe.snapshot.routeUpdateCount == 0)
+
+    measured.update(route: measured.route)
+    #expect(ComposerTypingProbe.snapshot.routeUpdateCount == 1)
+    #expect(ComposerTypingProbe.snapshot.prefetchCount == 0)
+    #expect(ComposerTypingProbe.snapshot.requestInventoryCount == 0)
+}
+
+@MainActor
+private func makeNewChatComposerModel() -> ComposerModel {
+    ComposerModel(
+        route: ComposerRoute(identity: "new"),
+        runtime: TypingRuntimeStub(),
+        attachmentStaging: TypingAttachmentStub(),
+        turn: nil
+    )
+}
+
+private struct TypingRuntimeStub: SessionRuntimeControlling {
+    func modelInventory(sessionID: String?, refresh: Bool) async throws -> ModelInventory {
+        ModelInventory(providers: [])
+    }
+
+    func setModel(_ model: String, provider: String?, sessionID: String) async throws -> ModelSwitchOutcome {
+        ModelSwitchOutcome(appliedValue: model, isDeferredToNextTurn: false)
+    }
+
+    func setReasoning(_ setting: ReasoningSetting, sessionID: String) async throws {}
+}
+
+private struct TypingAttachmentStub: AttachmentStaging {
+    func stageBatch(
+        _ steps: [ComposerStagingStep],
+        sessionID: String,
+        routeIdentity: String,
+        progress: @escaping @Sendable (UUID, Int) -> Void,
+        reusing receipts: [AttachmentStagingReceipt]
+    ) async throws -> any AttachmentStagingTransaction {
+        throw AttachmentStagingError.invalidRoute
+    }
 }

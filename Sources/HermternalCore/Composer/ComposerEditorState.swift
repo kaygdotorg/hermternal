@@ -52,10 +52,12 @@ public enum ComposerEditorFormat: String, CaseIterable, Hashable, Sendable {
     case emphasis
     case link
     case unorderedList
+    case orderedList
     case quote
     case inlineCode
     case fencedCode
     case strong
+    case strikethrough
 }
 
 /// A source edit and the selection that should remain active after it.
@@ -97,12 +99,18 @@ public enum ComposerEditorFormatter {
         case .strong:
             replacement = "**\(selected)**"
             selectionOffset = 2
+        case .strikethrough:
+            replacement = "~~\(selected)~~"
+            selectionOffset = 2
         case .link:
             replacement = "[\(selected)](https://)"
             selectionOffset = 1
         case .unorderedList:
             replacement = "- \(selected)"
             selectionOffset = 2
+        case .orderedList:
+            replacement = "1. \(selected)"
+            selectionOffset = 3
         case .quote:
             replacement = "> \(selected)"
             selectionOffset = 2
@@ -169,47 +177,24 @@ public enum ComposerEditorHeightPolicy {
     public static func isLayoutWidth(_ proposedWidth: Double) -> Bool {
         proposedWidth.isFinite && proposedWidth > 1
     }
+
+    /// True when the proposal is the column the field currently occupies.
+    ///
+    /// A layout pass still proposes probe widths above one point. Those
+    /// widths are not the occupied column, and a measurement against one
+    /// of them publishes a height the field never keeps.
+    public static func shouldMeasureHeight(
+        proposedWidth: Double,
+        occupiedWidth: Double
+    ) -> Bool {
+        isLayoutWidth(proposedWidth)
+            && isLayoutWidth(occupiedWidth)
+            && abs(proposedWidth - occupiedWidth) <= measurementEpsilon
+    }
 }
 
-/// Focus behaviour for the editor's formatting controls.
+/// Focus behaviour of the composer editor.
 public enum ComposerEditorInteractionPolicy {
-    public static let formattingRowTransitionDuration: Double = 0.12
-
-    /// Duration of the formatting-row reveal.
-    ///
-    /// Reduced motion drops the travel and keeps the same path, matching
-    /// `TranscriptMotion.duration(reducesMotion:)`.
-    public static func formattingRowAnimationDuration(reducesMotion: Bool) -> Double {
-        reducesMotion ? 0 : formattingRowTransitionDuration
-    }
-
-    public static func formattingRowIsVisible(
-        isEditorFocused: Bool,
-        isExpanded: Bool,
-        hasSource: Bool
-    ) -> Bool {
-        isEditorFocused && isExpanded && hasSource
-    }
-
-    public static func shouldRevealFormattingRow(
-        isEditorFocused: Bool,
-        hasSource: Bool,
-        explicitFormatAction: Bool
-    ) -> Bool {
-        explicitFormatAction && isEditorFocused && hasSource
-    }
-
-    public static func formattingActionPreservesFocus(_ isEditorFocused: Bool) -> Bool {
-        isEditorFocused
-    }
-
-    public static func shouldHideFormattingRow(
-        isEditorFocused: Bool,
-        hasSource: Bool
-    ) -> Bool {
-        !isEditorFocused || !hasSource
-    }
-
     public static func shouldPublishFocusChange(
         from previous: Bool,
         to current: Bool

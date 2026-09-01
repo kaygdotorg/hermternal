@@ -28,24 +28,82 @@ import SwiftUI
 /// wrappedTypingKeepsCaretInViewAndLetsOverflowScroll.
 @MainActor
 final class ComposerEditorScrollView: NSScrollView {
+    /// The composer this field belongs to. The typing probe records only that
+    /// composer, so a parallel test cannot write into its snapshot.
+    var typingProbeOwner: ObjectIdentifier?
+
     /// Makes the text view as wide as the visible column, and as tall as the
     /// laid-out text.
     func synchronizeColumn() {
-        guard let textView = documentView as? NSTextView else { return }
+        let timed = ComposerTypingProbe.isRecording(typingProbeOwner)
+        let start = timed ? DispatchTime.now().uptimeNanoseconds : 0
+        var asserted = false
+        guard let textView = documentView as? NSTextView else {
+            if timed {
+                ComposerTypingProbe.noteSynchronizeColumn(
+                    from: typingProbeOwner,
+                    asserted: false,
+                    nanoseconds: 0
+                )
+            }
+            return
+        }
         if contentSize.width > 1, abs(textView.frame.width - contentSize.width) > 0.5 {
             textView.frame.size.width = contentSize.width
             if let container = textView.textContainer,
                let layoutManager = textView.layoutManager {
                 layoutManager.ensureLayout(for: container)
             }
+            asserted = true
         }
         fitDocumentToLaidOutText()
+        if timed {
+            ComposerTypingProbe.noteSynchronizeColumn(
+                from: typingProbeOwner,
+                asserted: asserted,
+                nanoseconds: DispatchTime.now().uptimeNanoseconds &- start
+            )
+        }
     }
 
     /// Scrolls the insertion point into the visible band of the field.
     func scrollInsertionPointIntoView() {
         guard let textView = documentView as? NSTextView else { return }
+        guard !insertionPointIsVisible(in: textView) else { return }
+        ComposerTypingProbe.noteCaretScroll(from: typingProbeOwner)
         textView.scrollRangeToVisible(textView.selectedRange())
+    }
+
+    /// True when the caret line already sits in the visible band.
+    func insertionPointIsVisible(in textView: NSTextView) -> Bool {
+        let line = Self.insertionLineRect(in: textView)
+        let visible = textView.visibleRect.insetBy(dx: 0, dy: -1)
+        return visible.maxY > line.minY && visible.minY < line.maxY
+    }
+
+    static func insertionLineRect(in textView: NSTextView) -> NSRect {
+        guard let layoutManager = textView.layoutManager else { return .zero }
+        let length = (textView.string as NSString).length
+        let origin = textView.textContainerOrigin
+        if length == 0 || layoutManager.numberOfGlyphs == 0 {
+            return layoutManager.extraLineFragmentRect.offsetBy(dx: origin.x, dy: origin.y)
+        }
+        let location = min(textView.selectedRange().location, length)
+        if location >= length, layoutManager.extraLineFragmentRect.height > 0 {
+            return layoutManager.extraLineFragmentRect.offsetBy(dx: origin.x, dy: origin.y)
+        }
+        let characterIndex = min(max(0, location), max(0, length - 1))
+        let glyphIndex = layoutManager.glyphIndexForCharacter(at: characterIndex)
+        var lineRange = NSRange()
+        let glyphCount = layoutManager.numberOfGlyphs
+        guard glyphCount > 0 else {
+            return layoutManager.extraLineFragmentRect.offsetBy(dx: origin.x, dy: origin.y)
+        }
+        let rect = layoutManager.lineFragmentRect(
+            forGlyphAt: min(glyphIndex, glyphCount - 1),
+            effectiveRange: &lineRange
+        )
+        return rect.offsetBy(dx: origin.x, dy: origin.y)
     }
 
     override func layout() {
@@ -53,6 +111,11 @@ final class ComposerEditorScrollView: NSScrollView {
         // Re-sync after sizeThatFits probe widths leak onto the live text view.
         // Defended by editorWrapsAtTheColumnItOccupies.
         synchronizeColumn()
+    }
+
+    override func invalidateIntrinsicContentSize() {
+        ComposerTypingProbe.noteIntrinsicInvalidation(from: typingProbeOwner)
+        super.invalidateIntrinsicContentSize()
     }
 
     /// Grows the document with the laid-out text, never with the field cap.
@@ -104,9 +167,17 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
     let isEditable: Bool
     let focusRequest: Int
     let formatRequest: ComposerEditorFormat?
+    /// Watches this text view's selection and places the floating formatting
+    /// toolbar. The adapter owns the text view, so it is the one seam that can
+    /// hand it over.
+    let toolbar: ComposerFormattingToolbarController
     let onSubmit: () -> Void
     let onEscape: () -> Bool
     let onFormatHandled: () -> Void
+    /// Identity of the composer this field belongs to. The typing probe
+    /// records only that composer, so a parallel test cannot write into
+    /// its snapshot.
+    var typingProbeOwner: ObjectIdentifier? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -137,6 +208,11 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
         textView.autoresizingMask = [.width]
         textView.frame = NSRect(x: 0, y: 0, width: 320, height: 38)
         scrollView.documentView = textView
+        // The document view is in the scroll view now, so the controller can
+        // read the visible band it has to place the strip inside.
+        toolbar.attach(to: textView)
+        scrollView.typingProbeOwner = typingProbeOwner
+        context.coordinator.typingProbeOwner = typingProbeOwner
         return scrollView
     }
 
@@ -162,6 +238,16 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
         nsView: ComposerEditorScrollView,
         context: Context
     ) -> CGSize? {
+        let timed = ComposerTypingProbe.isRecording(typingProbeOwner)
+        let start = timed ? DispatchTime.now().uptimeNanoseconds : 0
+        defer {
+            if timed {
+                ComposerTypingProbe.noteSizeThatFits(
+                    from: typingProbeOwner,
+                    nanoseconds: DispatchTime.now().uptimeNanoseconds &- start
+                )
+            }
+        }
         guard let textView = nsView.documentView as? NSTextView,
               let textContainer = textView.textContainer,
               let layoutManager = textView.layoutManager else {
@@ -174,22 +260,27 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
                 height: context.coordinator.editorHeight
             )
         }
-        // The container tracks the text view, so this one assignment gives the
-        // measurement and the visible line breaks the same width.
-        if textView.frame.width != width {
-            textView.frame.size.width = width
+        let occupied = nsView.contentSize.width
+        // Probe widths reflow the live field and publish a height the column
+        // never keeps. Measure only the occupied column, and only once for
+        // the current text. Defended by typingOnNewChatDoesNotOscillateHeight.
+        guard ComposerEditorHeightPolicy.shouldMeasureHeight(
+            proposedWidth: Double(width),
+            occupiedWidth: Double(occupied)
+        ) else {
+            return CGSize(width: width, height: context.coordinator.editorHeight)
+        }
+        guard context.coordinator.needsMeasurement(for: occupied) else {
+            return CGSize(width: width, height: context.coordinator.editorHeight)
+        }
+        if abs(textView.frame.width - occupied) > 0.5 {
+            textView.frame.size.width = occupied
         }
         layoutManager.ensureLayout(for: textContainer)
         let height = context.coordinator.recordMeasurement(
             contentHeight: Double(layoutManager.usedRect(for: textContainer).height),
-            layoutWidth: width
+            layoutWidth: occupied
         )
-        // A measurement must not leave the live field wrapped at a width it was
-        // only asked about. Most of the widths one pass proposes are probes,
-        // and the one SwiftUI applies arrives afterwards through the scroll
-        // view's own layout.
-        // Defended by editorWrapsAtTheColumnItOccupies.
-        nsView.synchronizeColumn()
         return CGSize(width: width, height: height)
     }
 
@@ -197,6 +288,8 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
     func updateNSView(_ scrollView: ComposerEditorScrollView, context: Context) {
         guard let textView = scrollView.documentView as? NSTextView else { return }
         textView.isEditable = isEditable
+        scrollView.typingProbeOwner = typingProbeOwner
+        context.coordinator.typingProbeOwner = typingProbeOwner
         context.coordinator.source = $source
         context.coordinator.mode = $mode
         context.coordinator.focus = $isFocused
@@ -299,11 +392,14 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
         var lastSource = ""
         var lastMode: ComposerEditorMode = .wysiwyg
         var focus: Binding<Bool> = .constant(false)
+        var typingProbeOwner: ObjectIdentifier?
         /// The last column the editor was measured for, and the height it
         /// reported for that column. A probe proposal is answered from these,
         /// so every proposal in one layout pass gets one height.
         private(set) var layoutWidth: CGFloat = 320
         private(set) var editorHeight = CGFloat(ComposerEditorHeightPolicy.minimum)
+        private var contentGeneration = 0
+        private var lastMeasuredGeneration = -1
         private var lastPublishedFocus = false
         private var pendingFocus: Bool?
         private var focusGeneration = 0
@@ -313,13 +409,31 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
         /// The policy holds the reported height until the measurement leaves
         /// its band, so a sub-point layout difference cannot propose a new
         /// size and no measurement can retarget an animation in flight.
+        func noteContentChange() {
+            contentGeneration += 1
+        }
+
+        func needsMeasurement(for width: CGFloat) -> Bool {
+            if contentGeneration != lastMeasuredGeneration { return true }
+            return abs(layoutWidth - width) > CGFloat(ComposerEditorHeightPolicy.measurementEpsilon)
+        }
+
         func recordMeasurement(contentHeight: Double, layoutWidth width: CGFloat) -> CGFloat {
             layoutWidth = width
+            lastMeasuredGeneration = contentGeneration
             if let next = ComposerEditorHeightPolicy.nextHeight(
                 measuredContentHeight: contentHeight,
                 currentHeight: Double(editorHeight)
             ) {
+                let timed = ComposerTypingProbe.isRecording(typingProbeOwner)
+                let start = timed ? DispatchTime.now().uptimeNanoseconds : 0
                 editorHeight = CGFloat(next)
+                if timed {
+                    ComposerTypingProbe.noteHeightChange(
+                        from: typingProbeOwner,
+                        nanoseconds: DispatchTime.now().uptimeNanoseconds &- start
+                    )
+                }
             }
             return editorHeight
         }
@@ -372,6 +486,7 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
             }
             lastSource = source.wrappedValue
             lastVisibleText = visible
+            noteContentChange()
             revealInsertionPoint(in: textView)
         }
 
@@ -462,6 +577,7 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
                 textView.undoManager?.enableUndoRegistration()
                 isApplying = false
                 lastVisibleText = textView.string
+                noteContentChange()
             }
             switch mode {
             case .source:
@@ -642,8 +758,7 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
                         if itemIndex > 0 {
                             emit("\n", sourceIndex: item.sourceRange.location, mapsToSource: false)
                         }
-                        let marker = item.taskState == .checked ? "☑ "
-                            : item.taskState == .unchecked ? "☐ " : "• "
+                        let marker = visibleListMarker(for: item)
                         let prefix = String(repeating: "  ", count: item.depth) + marker
                         emit(
                             prefix,
@@ -704,7 +819,14 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
             .foregroundColor: NSColor.labelColor
         ]
 
-        private static func attributedString(for document: MarkdownDocument) -> NSAttributedString {
+        static func visibleListMarker(for item: MarkdownListItem) -> String {
+            if item.taskState == .checked { return "☑ " }
+            if item.taskState == .unchecked { return "☐ " }
+            if let number = item.number { return "\(number). " }
+            return "• "
+        }
+
+                private static func attributedString(for document: MarkdownDocument) -> NSAttributedString {
             let result = NSMutableAttributedString(string: "")
             for (index, block) in document.blocks.enumerated() {
                 if index > 0 { result.append(NSAttributedString(string: "\n\n")) }
@@ -729,7 +851,7 @@ struct ComposerMarkdownEditor: NSViewRepresentable {
             case let .list(_, _, items), let .taskList(_, _, items):
                 for (index, item) in items.enumerated() {
                     if index > 0 { result.append(NSAttributedString(string: "\n")) }
-                    let marker = item.taskState == .checked ? "☑ " : item.taskState == .unchecked ? "☐ " : "• "
+                    let marker = visibleListMarker(for: item)
                     result.append(NSAttributedString(string: String(repeating: "  ", count: item.depth) + marker, attributes: baseAttributes))
                     append(item.inlines, to: result, attributes: baseAttributes)
                 }

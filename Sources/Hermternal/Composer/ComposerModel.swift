@@ -365,7 +365,7 @@ final class ComposerModel {
     /// observable write notifies every reader even when it stores the value
     /// already there, and the message row reads this on every keystroke.
     func updateEditorSource(_ source: String) {
-        draft.text = source
+        if draft.text != source { draft.text = source }
         let parseError = editorMode == .source
             ? MarkdownDocument.parse(source).error
             : nil
@@ -421,8 +421,11 @@ final class ComposerModel {
     /// Adoption of the live session is not a route change. It keeps send work
     /// and inventory. Defended by adoptingNewChatKeepsInFlightSend.
     func update(route newRoute: ComposerRoute) {
+        ComposerTypingProbe.noteRouteUpdate(from: self)
         let isAdoption = isNewChatAdoption(from: route, to: newRoute)
         let previousToken = route.token
+        let previousReadOnly = route.isReadOnly
+        let previousLiveSessionID = route.liveSessionID
         let routeChanged = newRoute.token != previousToken && !isAdoption
         if isAdoption {
             if let sessionID = newRoute.liveSessionID,
@@ -491,7 +494,15 @@ final class ComposerModel {
             self.pendingReasoning = nil
         }
         rememberInventorySession(for: newRoute)
-        if hasAppeared, !isUnmounted {
+        // Keystrokes must not re-evaluate inventory. AppModel can republish
+        // the same new-chat route while the user types, and a prefetch there
+        // rebuilt the composer on every character.
+        // Defended by typingOnNewChatDoesNotOscillateHeight.
+        let inventoryEligibilityChanged = routeChanged
+            || isAdoption
+            || previousReadOnly != newRoute.isReadOnly
+            || previousLiveSessionID != newRoute.liveSessionID
+        if hasAppeared, !isUnmounted, inventoryEligibilityChanged {
             restoreInventoryFromCache()
             prefetchInventoryIfEligible()
         }
@@ -1306,6 +1317,7 @@ final class ComposerModel {
     /// A nil session id calls `model.options` with no `session_id`.
     /// A live session id is used only when the route already has one.
     private func requestInventory(refresh: Bool, preparesSession: Bool) {
+        ComposerTypingProbe.noteRequestInventory(from: self)
         if !refresh {
             if case .loaded = inventory { return }
             if case .loading = inventory { return }
@@ -1737,6 +1749,7 @@ final class ComposerModel {
     /// It does not wait for a session that does not exist.
     /// Defended by mountPrefetchesAndCachesInventory.
     private func prefetchInventoryIfEligible() {
+        ComposerTypingProbe.notePrefetch(from: self)
         guard hasAppeared, !isUnmounted, canChangeRuntime else { return }
         if restoreInventoryFromCache() { return }
         requestInventory(refresh: false, preparesSession: false)
