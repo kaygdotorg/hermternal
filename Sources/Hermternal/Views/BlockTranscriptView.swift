@@ -448,11 +448,20 @@ struct BlockTranscriptView: NSViewRepresentable {
             // Keep painted published-tail rows when the paged store arrives
             // for this same session. Generation is not identity.
             let attachingStore = previousStore == nil && input.store != nil
+            // Adopt-live of a new chat is not a selection change. The first
+            // prompt makes the ephemeral route durable; clearing here blanks
+            // the optimistic turn and cancels in-flight page work.
+            let adoptingLiveIdentity = Self.isPublishedLiveAdoption(
+                from: routeKey,
+                to: nextRouteKey,
+                hasPublishedTail: !publishedTail.isEmpty
+            )
             let attachingStoreToPaintedSession = attachingStore
                 && !loadedTurns.isEmpty
-                && (routeKey == "none" || routeKey == nextRouteKey)
+                && (routeKey == "none" || routeKey == nextRouteKey || adoptingLiveIdentity)
             let routeChanged = nextRouteKey != routeKey
                 && !attachingStoreToPaintedSession
+                && !adoptingLiveIdentity
             let revisionChanged = revision != input.revision
             if routeChanged {
                 generation &+= 1
@@ -501,14 +510,17 @@ struct BlockTranscriptView: NSViewRepresentable {
             if store == nil {
                 installPublishedTail(publishedTail)
                 tableReloadPending = false
-            } else if attachingStore && loadedTurns.isEmpty && !publishedTail.isEmpty {
-                // First paint already has the store. Install the published
-                // tail this turn. Expand on the next turn.
+            } else if loadedTurns.isEmpty && !publishedTail.isEmpty {
+                // First paint of a published tail, including a live store
+                // that arrived before the first prompt.
                 installPublishedTail(publishedTail, ignoringStore: true)
                 tableReloadPending = false
             } else if attachingStore && loadedTurns.isEmpty && publishedTail.isEmpty {
                 // Hold summary.rowCount so the attach turn stays at zero.
                 totalTurnCount = 0
+            } else if shouldStreamPublishedTail {
+                installPublishedTail(publishedTail, ignoringStore: true)
+                tableReloadPending = false
             }
             if routeChanged {
                 TranscriptPaintAttribution.beginSwitch(
@@ -717,6 +729,43 @@ struct BlockTranscriptView: NSViewRepresentable {
 
 
 
+        /// True when the painted surface is still the published tail.
+        ///
+        /// A store-backed history is larger than the published window. Stream
+        /// into the tail only while that window is the whole painted set.
+        private var shouldStreamPublishedTail: Bool {
+            guard isStreaming, !publishedTail.isEmpty else { return false }
+            let tailTurns = CachedTranscript(
+                version: HistoryCache.version,
+                messages: publishedTail,
+                snapshot: nil
+            ).turns
+            let painted = totalTurnCount ?? 0
+            if painted < tailTurns.count { return true }
+            if painted != tailTurns.count { return false }
+            guard painted > 0,
+                  let lastOrdinal = loadedOrder.last,
+                  let lastPainted = loadedTurns[lastOrdinal]?.turn,
+                  let lastTail = tailTurns.last
+            else { return false }
+            return lastPainted.answer != lastTail.answer
+                || lastPainted.id != lastTail.id
+                || lastPainted.reasoning != lastTail.reasoning
+        }
+
+        /// Ephemeral new-chat identity becoming the live session id.
+        private static func isPublishedLiveAdoption(
+            from: String,
+            to: String,
+            hasPublishedTail: Bool
+        ) -> Bool {
+            guard hasPublishedTail, from != to else { return false }
+            let ephemeral = from == "none" || from == "new"
+                || from == "live:none" || from == "live:new"
+            return ephemeral && to.hasPrefix("live:") && to != "live:none"
+                && to != "live:new"
+        }
+
         /// Installs the synchronously published cache tail when the paged
         /// store is not yet on the route. Disk-resident pages replace this
         /// once the store is installed.
@@ -730,6 +779,7 @@ struct BlockTranscriptView: NSViewRepresentable {
                 messages: messages,
                 snapshot: nil
             ).turns
+            let previousCount = totalTurnCount ?? 0
             totalTurnCount = turns.count
             loadedTurns.removeAll(keepingCapacity: true)
             loadedOrder.removeAll(keepingCapacity: true)
@@ -760,7 +810,13 @@ struct BlockTranscriptView: NSViewRepresentable {
                     )
                 }
             }
-            table.noteNumberOfRowsChanged()
+            if turns.count != previousCount {
+                table.noteNumberOfRowsChanged()
+            } else if !turns.isEmpty {
+                let last = IndexSet(integer: turns.count - 1)
+                table.reloadData(forRowIndexes: last, columnIndexes: IndexSet(integer: 0))
+                table.noteHeightOfRows(withIndexesChanged: last)
+            }
         }
 
         private func requestVisiblePages() {

@@ -438,6 +438,254 @@ func switchingPaintIdentityInstallsNewTailOnTheUpdateTurn() {
     coordinator.dismantle(container: container)
 }
 
+@Test("new-chat paint identity stays stable through adopt-live")
+func newChatPaintIdentityStaysStableThroughAdoptLive() {
+    let before = TranscriptPaintIdentity.make(
+        archivedSessionID: nil,
+        selectedSessionID: nil,
+        liveSessionID: "durable-chat"
+    )
+    let after = TranscriptPaintIdentity.make(
+        archivedSessionID: nil,
+        selectedSessionID: "durable-chat",
+        liveSessionID: "durable-chat"
+    )
+    #expect(before == "live:durable-chat")
+    #expect(after == before)
+    #expect(
+        TranscriptPaintIdentity.make(
+            archivedSessionID: nil,
+            selectedSessionID: nil,
+            liveSessionID: nil
+        ) == "live:none"
+    )
+    #expect(
+        TranscriptPaintIdentity.make(
+            archivedSessionID: "old",
+            selectedSessionID: "durable-chat",
+            liveSessionID: "durable-chat"
+        ) == "archived:old"
+    )
+}
+
+@Test("new-chat send paints the published tail and streams across the durable flip")
+@MainActor
+func newChatSendPaintsPublishedTailAndStreamsAcrossDurableFlip() async throws {
+    _ = NSApplication.shared
+    let user = ChatMessage(
+        id: .server(ServerMessageID(rawValue: 1)),
+        role: .user,
+        text: "Hello from new chat"
+    )
+    var assistant = ChatMessage(
+        id: .server(ServerMessageID(rawValue: 2)),
+        role: .assistant,
+        text: "Hi",
+        isStreaming: true
+    )
+    let coordinator = BlockTranscriptView.Coordinator()
+    let container = coordinator.makeContainer()
+    let root = attachedTranscriptRoot(container)
+    let table = container.tableView
+
+    coordinator.update(
+        container: container,
+        input: newChatPaintInput(
+            paintIdentity: "new",
+            publishedTail: [],
+            revision: 0,
+            isStreaming: false
+        )
+    )
+    #expect(table.numberOfRows == 0)
+
+    coordinator.update(
+        container: container,
+        input: newChatPaintInput(
+            paintIdentity: "new",
+            publishedTail: [user],
+            revision: 1,
+            isStreaming: true
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    #expect(table.numberOfRows == 1)
+    let userRow = try #require(
+        table.view(atColumn: 0, row: 0, makeIfNecessary: true) as? TranscriptTurnRowView
+    )
+    #expect(userRow.answerViewForTesting.string == "Hello from new chat")
+    #expect(userRow.accessibilityLabel() != "Loading transcript row")
+
+    let store = HeldTranscriptPageStore(
+        page: TranscriptTurnPage(
+            turns: CachedTranscript(
+                version: HistoryCache.version,
+                messages: [user],
+                snapshot: nil
+            ).turns,
+            startOrdinal: 0,
+            nextOrdinal: 1,
+            totalTurnCount: 1,
+            hasMore: false
+        )
+    )
+    coordinator.update(
+        container: container,
+        input: newChatPaintInput(
+            store: store,
+            sessionID: "durable-chat",
+            paintIdentity: "new",
+            publishedTail: [user],
+            revision: 2,
+            isStreaming: true
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    #expect(table.numberOfRows == 1)
+    let afterStore = try #require(
+        table.view(atColumn: 0, row: 0, makeIfNecessary: false) as? TranscriptTurnRowView
+    )
+    #expect(afterStore === userRow)
+    #expect(afterStore.answerViewForTesting.string == "Hello from new chat")
+
+    coordinator.update(
+        container: container,
+        input: newChatPaintInput(
+            store: store,
+            sessionID: "durable-chat",
+            paintIdentity: "new",
+            publishedTail: [user, assistant],
+            revision: 3,
+            isStreaming: true
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    #expect(table.numberOfRows == 2)
+    let streamed = try #require(
+        table.view(atColumn: 0, row: 1, makeIfNecessary: true) as? TranscriptTurnRowView
+    )
+    #expect(streamed.answerViewForTesting.string == "Hi")
+
+    coordinator.update(
+        container: container,
+        input: newChatPaintInput(
+            store: store,
+            sessionID: "durable-chat",
+            paintIdentity: "live:durable-chat",
+            publishedTail: [user, assistant],
+            revision: 4,
+            isStreaming: true
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    #expect(table.numberOfRows == 2)
+    let afterFlipUser = try #require(
+        table.view(atColumn: 0, row: 0, makeIfNecessary: false) as? TranscriptTurnRowView
+    )
+    #expect(afterFlipUser === userRow)
+    #expect(afterFlipUser.answerViewForTesting.string == "Hello from new chat")
+
+    assistant.text = "Hi there"
+    coordinator.update(
+        container: container,
+        input: newChatPaintInput(
+            store: store,
+            sessionID: "durable-chat",
+            paintIdentity: "live:durable-chat",
+            publishedTail: [user, assistant],
+            revision: 5,
+            isStreaming: true
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    #expect(table.numberOfRows == 2)
+    let afterDelta = try #require(
+        table.view(atColumn: 0, row: 1, makeIfNecessary: true) as? TranscriptTurnRowView
+    )
+    #expect(afterDelta.answerViewForTesting.string == "Hi there")
+    #expect(afterDelta.accessibilityLabel() != "Loading transcript row")
+
+    coordinator.dismantle(container: container)
+    await store.releaseAllReads()
+}
+
+@Test("new-chat send paints when the live store is already attached")
+@MainActor
+func newChatSendPaintsWhenLiveStoreIsAlreadyAttached() {
+    _ = NSApplication.shared
+    let user = ChatMessage(
+        id: .server(ServerMessageID(rawValue: 1)),
+        role: .user,
+        text: "First prompt"
+    )
+    let assistant = ChatMessage(
+        id: .server(ServerMessageID(rawValue: 2)),
+        role: .assistant,
+        text: "Reply",
+        isStreaming: true
+    )
+    let store = HeldTranscriptPageStore(
+        page: TranscriptTurnPage(
+            turns: [],
+            startOrdinal: 0,
+            nextOrdinal: 0,
+            totalTurnCount: 0,
+            hasMore: false
+        )
+    )
+    let coordinator = BlockTranscriptView.Coordinator()
+    let container = coordinator.makeContainer()
+    let root = attachedTranscriptRoot(container)
+    let table = container.tableView
+
+    coordinator.update(
+        container: container,
+        input: newChatPaintInput(
+            store: store,
+            sessionID: "ephemeral",
+            paintIdentity: "new",
+            publishedTail: [],
+            revision: 0,
+            isStreaming: false
+        )
+    )
+    #expect(table.numberOfRows == 0)
+
+    coordinator.update(
+        container: container,
+        input: newChatPaintInput(
+            store: store,
+            sessionID: "ephemeral",
+            paintIdentity: "new",
+            publishedTail: [user],
+            revision: 1,
+            isStreaming: true
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    #expect(table.numberOfRows == 1)
+    let userRow = table.view(atColumn: 0, row: 0, makeIfNecessary: true) as? TranscriptTurnRowView
+    #expect(userRow?.answerViewForTesting.string == "First prompt")
+
+    coordinator.update(
+        container: container,
+        input: newChatPaintInput(
+            store: store,
+            sessionID: "ephemeral",
+            paintIdentity: "new",
+            publishedTail: [user, assistant],
+            revision: 2,
+            isStreaming: true
+        )
+    )
+    root.layoutSubtreeIfNeeded()
+    #expect(table.numberOfRows == 2)
+    let reply = table.view(atColumn: 0, row: 1, makeIfNecessary: true) as? TranscriptTurnRowView
+    #expect(reply?.answerViewForTesting.string == "Reply")
+
+    coordinator.dismantle(container: container)
+}
+
 @Test("store attach does not expand table rows on the update turn")
 @MainActor
 func storeAttachDoesNotExpandTableRowsOnTheUpdateTurn() async throws {
@@ -1910,6 +2158,35 @@ private func drainMainQueueOnce() async {
             continuation.resume()
         }
     }
+}
+
+@MainActor
+private func newChatPaintInput(
+    store: (any TranscriptTurnPageLocating)? = nil,
+    sessionID: String? = nil,
+    paintIdentity: String,
+    publishedTail: [ChatMessage],
+    revision: UInt64,
+    isStreaming: Bool
+) -> TranscriptRendererInput {
+    TranscriptRendererInput(
+        store: store,
+        route: sessionID.map { TranscriptRoute(sessionID: $0) },
+        summary: store == nil
+            ? nil
+            : TranscriptSummary(rowCount: publishedTail.count, messageCount: publishedTail.count),
+        revision: revision,
+        isReadOnly: false,
+        isStreaming: isStreaming,
+        findQuery: "",
+        pendingMessageID: nil,
+        findMessageID: nil,
+        showsMetadata: false,
+        publishedTail: publishedTail,
+        paintIdentity: paintIdentity,
+        onCopyCode: { _ in },
+        onPaint: { _ in }
+    )
 }
 
 @MainActor

@@ -69,6 +69,29 @@ extension TranscriptRendererInput {
     }
 }
 
+/// Stable identity for the painted transcript surface.
+///
+/// New chat uses the live session id before a sidebar row exists. Adopt-live
+/// of that same session is then not a switch.
+enum TranscriptPaintIdentity {
+    static func make(
+        archivedSessionID: String?,
+        selectedSessionID: String?,
+        liveSessionID: String?
+    ) -> String {
+        if let archivedSessionID {
+            return "archived:\(archivedSessionID)"
+        }
+        if let selectedSessionID {
+            return "live:\(selectedSessionID)"
+        }
+        if let liveSessionID {
+            return "live:\(liveSessionID)"
+        }
+        return "live:none"
+    }
+}
+
 /// Per-switch counters for the publish-to-draw path.
 ///
 /// The coordinator resets this on a route change. The paint callback prints
