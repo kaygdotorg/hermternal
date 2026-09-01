@@ -825,8 +825,8 @@ final class MainToolbarController: NSObject, NSToolbarDelegate, NSMenuDelegate {
 
 /// Chrome and the restored frame must be complete before the content host
 /// attaches. `prepare` asserts that the content host is still absent.
-/// The window orders front after `prepare` and before `attach`, so the first
-/// SwiftUI layout does not block the first visible frame.
+/// The hosted split attaches before the window orders front, so the first
+/// visible frame already shows the cached sidebar and chat.
 @MainActor
 enum MainWindowStartupConfiguration {
     static let defaultContentSize = NSSize(width: 1_040, height: 720)
@@ -892,8 +892,9 @@ enum MainWindowStartupConfiguration {
         // it back. Measured as a 66 ms second layout plus a visible jump.
         let contentSize = window.contentRect(forFrameRect: preparedFrame).size
         contentHost.view.setFrameSize(contentSize)
-        // The window is already ordered front. Mouse tracking during this
-        // layout must not walk the overlay before SwiftUI publishes flags.
+        // Launch attaches before the window is visible. A later attach on a
+        // visible window must not walk the overlay before SwiftUI publishes
+        // flags.
         let shouldIgnoreMouse = window.isVisible
         if shouldIgnoreMouse {
             window.ignoresMouseEvents = true
@@ -957,7 +958,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var hasShownWindow = false
     private var initialOrderAnimationState: MainWindowInitialOrderAnimationState = .suppressing
     private var launchKeystrokeGate: LaunchKeystrokeGate?
-    private var didScheduleDeferredAttach = false
+    private var didReportLaunchInteractivity = false
 
     private init() {
         super.init(window: nil)
@@ -1023,8 +1024,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             MainWindowStartupConfiguration.prepare(window)
             LaunchClock.mark("window.prepare.end")
             window.delegate = self
-            // Toolbar does not walk the hosted split. The bridge is bound
-            // after the first yield, once attach has built the SwiftUI tree.
+            // Toolbar does not walk the hosted split. The bridge binds after
+            // attach builds the SwiftUI tree.
             LaunchClock.mark("window.toolbar.begin")
             let toolbarController = MainToolbarController(
                 model: model,
@@ -1035,20 +1036,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             window.toolbar = toolbarController.makeToolbar()
             LaunchClock.mark("window.toolbar.end")
             self.window = window
-            // Measured: attach laid out the full ChatView tree for ~300 ms
-            // before the window could order front. Native chrome and the
-            // restored frame are already on the window, so order it first.
-            // Attach still owns the first SwiftUI layout. It waits for the
-            // first runloop idle so a keystroke can land in the launch gate
-            // while the window is already key.
+            // Attach is a few milliseconds on a warm cache. Ordering an
+            // empty shell first showed a blank frame, then a late caret.
+            LaunchStartupContent.attachCachedWorkspace(
+                shellController,
+                to: window,
+                model: model
+            )
+            toolbarController.setVisibilityBridge(shellController.visibilityBridgeView)
             LaunchClock.mark("window.orderFront.begin")
             window.makeKeyAndOrderFront(nil)
             LaunchClock.mark("window.orderedFront")
+            LaunchClock.mark("window.firstContentFrame")
             if window.isKeyWindow {
                 LaunchClock.mark("window.becameKey")
             }
-            installLaunchKeystrokeGate(in: window, model: model)
-            scheduleDeferredAttach(window: window, shellController: shellController)
+            if !LaunchStartupContent.focusComposer(in: window, model: model) {
+                installLaunchKeystrokeGate(in: window, model: model)
+            }
+            scheduleLaunchInteractivityReport()
             didOrderFrontThisTurn = true
         }
         if let window {
@@ -1100,32 +1106,42 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 #endif
     }
 
-    /// Attaches the hosted split after the first idle, not on this turn.
-    private func scheduleDeferredAttach(
-        window: NSWindow,
-        shellController: MainShellViewController
-    ) {
-        LaunchClock.mark("window.attach.deferred")
+    /// Reports interactivity after the first idle. Content is already front.
+    private func scheduleLaunchInteractivityReport() {
         LaunchInteractivityScheduling.afterFirstIdle { [weak self] in
-            self?.performDeferredAttach(window: window, shellController: shellController)
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
-            self?.performDeferredAttach(window: window, shellController: shellController)
+            self?.finishLaunchPresentation()
         }
     }
 
-    private func performDeferredAttach(
-        window: NSWindow,
-        shellController: MainShellViewController
-    ) {
-        guard !didScheduleDeferredAttach else { return }
-        didScheduleDeferredAttach = true
-        let early = launchKeystrokeGate?.detachFromWindowKeepingMonitor() ?? ""
-        MainWindowStartupConfiguration.attach(shellController, to: window)
-        toolbarController?.setVisibilityBridge(shellController.visibilityBridgeView)
-        DispatchQueue.main.async { [weak self] in
-            self?.finishLaunchKeystrokeHandoff(earlyBuffer: early)
+    /// Pins again, focuses the composer or drains the gate, and writes the wall.
+    private func finishLaunchPresentation() {
+        guard !didReportLaunchInteractivity else { return }
+        didReportLaunchInteractivity = true
+        if let window {
+            LaunchStartupContent.pinRestoredTranscript(in: window)
         }
+        if launchKeystrokeGate != nil {
+            let early = launchKeystrokeGate?.detachFromWindowKeepingMonitor() ?? ""
+            finishLaunchKeystrokeHandoff(earlyBuffer: early)
+            return
+        }
+        if let window, let model {
+            _ = LaunchStartupContent.focusComposer(in: window, model: model)
+        }
+        if LaunchClock.recordedMilliseconds(for: "interactivity.firstResponder") == nil {
+            LaunchClock.mark("interactivity.firstResponder")
+        }
+        LaunchClock.mark("interactivity.runloopIdle")
+        LaunchClock.markReadyIfInteractive()
+        LaunchClock.reportBreakdown()
+#if DEBUG
+        if ProcessInfo.processInfo.environment["HERMTERNAL_LAUNCH_KEY_PROBE"] == "1" {
+            let text = model?.composerModel.text ?? ""
+            print("HERMTERNAL_LAUNCH_KEY_BUFFER=\(text)")
+            try? FileHandle.standardOutput.synchronize()
+            Log.info("PERF|launch keyProbe|chars=\(text.count)")
+        }
+#endif
     }
 
     /// Moves buffered launch keystrokes into the composer and reports the wall.
@@ -1137,7 +1153,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             if !combined.isEmpty {
                 model.composerModel.text += combined
             }
-            if model.phase.presentsWorkspace, !model.isViewingArchivedTranscript {
+            if let window {
+                _ = LaunchStartupContent.focusComposer(in: window, model: model)
+            } else if model.phase.presentsWorkspace, !model.isViewingArchivedTranscript {
                 model.requestComposerFocus()
             }
         }
@@ -1169,9 +1187,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     func windowDidBecomeKey(_ notification: Notification) {
         LaunchClock.mark("window.becameKey")
-        if let window, let gate = launchKeystrokeGate, window.firstResponder !== gate {
-            window.makeFirstResponder(gate)
-            LaunchClock.mark("interactivity.firstResponder")
+        if let window, let model {
+            if let gate = launchKeystrokeGate, window.firstResponder !== gate {
+                window.makeFirstResponder(gate)
+                LaunchClock.mark("interactivity.firstResponder")
+            } else if launchKeystrokeGate == nil {
+                _ = LaunchStartupContent.focusComposer(in: window, model: model)
+            }
         }
         LaunchClock.markReadyIfInteractive()
         guard initialOrderAnimationState.restoreAfterFirstKey(),

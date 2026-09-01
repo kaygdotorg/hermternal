@@ -57,11 +57,13 @@ public enum LaunchClock {
         return state.marks[name]
     }
 
-    /// Marks interactivity when the key window has a field and the runloop is idle.
+    /// Marks interactivity when the key window has a field, content exists,
+    /// and the runloop is idle.
     public static func markReadyIfInteractive() {
         guard recordedMilliseconds(for: "interactivity.firstResponder") != nil,
               recordedMilliseconds(for: "window.becameKey") != nil,
-              recordedMilliseconds(for: "interactivity.runloopIdle") != nil
+              recordedMilliseconds(for: "interactivity.runloopIdle") != nil,
+              recordedMilliseconds(for: "window.firstContentFrame") != nil
         else { return }
         mark("interactivity.ready")
     }
@@ -124,6 +126,7 @@ public enum LaunchClock {
             + " attachDeferredMs=\(value("window.attach.deferred"))"
             + " attachMs=\(delta("window.attach.begin", "window.attach.end"))"
             + " contentViewAssignedMs=\(value("window.contentViewAssigned"))"
+            + " contentReadyMs=\(value("window.contentReady"))"
             + " frameRestoredMs=\(value("window.frameRestored"))"
             + " firstSwiftUIRenderMs=\(value("window.firstSwiftUIRender"))"
             + " toolbarMs=\(delta("window.toolbar.begin", "window.toolbar.end"))"
@@ -132,8 +135,14 @@ public enum LaunchClock {
             + " orderFrontMs=\(delta("window.orderFront.begin", "window.orderedFront"))"
             + " publishToFrontMs=\(delta("restoredTranscript.published", "window.orderedFront"))"
             + " windowOrderedFrontMs=\(value("window.orderedFront"))"
+            + " firstContentFrameMs=\(value("window.firstContentFrame"))"
+            + " orderFrontToContentMs=\(delta("window.orderedFront", "window.firstContentFrame"))"
+            + " followUpBeginMs=\(value("restoredTranscript.followUp.begin"))"
+            + " followUpStoreAttachedMs=\(value("restoredTranscript.storeAttached"))"
+            + " followUpEndMs=\(value("restoredTranscript.followUp.end"))"
             + " becameKeyMs=\(value("window.becameKey"))"
             + " firstResponderMs=\(value("interactivity.firstResponder"))"
+            + " composerCaretMs=\(value("interactivity.composerCaret"))"
             + " runloopIdleMs=\(value("interactivity.runloopIdle"))"
             + " interactiveMs=\(value("interactivity.ready"))"
             + " orderFrontToInteractiveMs=\(delta("window.orderedFront", "interactivity.ready"))"

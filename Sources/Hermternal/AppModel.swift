@@ -616,6 +616,14 @@ final class AppModel: ComposerTurnRouting {
     /// the selection turn.
     var transcriptRouteIdentity = "live:none"
     private(set) var transcriptRouteGeneration = 0
+    /// Painted-surface identity. Adopt-live of a new chat is not a switch.
+    var transcriptPaintIdentity: String {
+        TranscriptPaintIdentity.make(
+            archivedSessionID: viewingArchivedSessionID,
+            selectedSessionID: selectedSessionID,
+            liveSessionID: liveSessionID
+        )
+    }
     /// The chat whose transcript has actually been painted, as distinct from
     /// the one that is selected.
     private(set) var displayedTranscriptSessionID: String?
@@ -735,6 +743,10 @@ final class AppModel: ComposerTurnRouting {
     /// remains a generation rather than a Boolean so a request is observable
     /// even when the current selection is already nil.
     var composerFocusRequestGeneration = 0
+    /// Incremented by the Format menu command that summons the composer's
+    /// floating formatting toolbar. ChatView observes it for the same reason
+    /// the Find seam exists: focused values do not cross an AppKit host.
+    var formattingToolbarRequestGeneration = 0
 
     let toastPresenter: ToastPresenter
     private(set) var searchQuerying: (any SearchQuerying)?
@@ -1037,8 +1049,8 @@ final class AppModel: ComposerTurnRouting {
     /// Publishes the restored chat from disk before authentication starts.
     ///
     /// The call stays on the current MainActor turn. The cache-resident tail
-    /// is assigned here. Network work stays in the later reconcile pass, so
-    /// the window can order front without a store reinstall.
+    /// is assigned here. Follow-up store attach reconciles in place after
+    /// the first content frame, so the visible tail does not jump.
     func publishRestoredTranscript() {
         guard cacheEnabled, phase == .restoring else { return }
         guard !didPublishRestoredTranscript else { return }
@@ -1077,7 +1089,7 @@ final class AppModel: ComposerTurnRouting {
     ///
     /// A missing sidecar still reads the cache-resident visible tail. The
     /// paged store then attaches. Row expansion stays on the next renderer
-    /// turn.
+    /// turn and must not move a viewport already pinned to the bottom.
     private func startRestoredTranscriptFollowUp(_ session: ChatSession) {
         let generation = openGenerations.current()
         let handle = TranscriptOpenHandle()
@@ -1087,7 +1099,9 @@ final class AppModel: ComposerTurnRouting {
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { handle.cancel() }
+            LaunchClock.mark("restoredTranscript.followUp.begin")
             guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                LaunchClock.mark("restoredTranscript.followUp.end")
                 return
             }
             if self.messages.isEmpty, self.cacheEnabled {
@@ -1095,6 +1109,7 @@ final class AppModel: ComposerTurnRouting {
                 let diskTail = await self.historyCache.visibleTail(for: session.id)
                 LaunchClock.mark("restoredTranscript.visibleTail.end")
                 guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                    LaunchClock.mark("restoredTranscript.followUp.end")
                     return
                 }
                 if !diskTail.isEmpty {
@@ -1105,9 +1120,11 @@ final class AppModel: ComposerTurnRouting {
                         warm: nil
                     )
                     self.applyScrubbedRestoredSnapshot()
+                    LaunchClock.mark("restoredTranscript.followUpPublished")
                 }
             }
             guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                LaunchClock.mark("restoredTranscript.followUp.end")
                 return
             }
             await self.prepareActiveTranscriptStore(
@@ -1116,9 +1133,11 @@ final class AppModel: ComposerTurnRouting {
             )
             LaunchClock.mark("restoredTranscript.storeAttached")
             guard self.openGenerations.isCurrent(generation), !Task.isCancelled else {
+                LaunchClock.mark("restoredTranscript.followUp.end")
                 return
             }
             await self.persistTranscriptTail(self.messages)
+            LaunchClock.mark("restoredTranscript.followUp.end")
         }
         activeOpenTask = task
     }
@@ -1455,6 +1474,12 @@ final class AppModel: ComposerTurnRouting {
     func requestFind() {
         guard case .ready = phase else { return }
         findRequestGeneration &+= 1
+    }
+
+    /// The Format menu asked for the composer's floating formatting toolbar.
+    func requestFormattingToolbar() {
+        guard case .ready = phase else { return }
+        formattingToolbarRequestGeneration &+= 1
     }
 
     /// Dismisses search before the route opens. A second call is a no-op.
@@ -3241,6 +3266,7 @@ final class AppModel: ComposerTurnRouting {
             }
             liveSessionID = id
             composerRuntimeSnapshot = GatewayRuntimeAdapter.decodeRuntimeSnapshot(from: created)
+            transcriptRouteIdentity = "live:\(id)"
             await ensureLiveTranscriptStore()
             updateComposerRoute()
             return id
@@ -3391,7 +3417,11 @@ final class AppModel: ComposerTurnRouting {
             liveSessionID = result["session_id"]?.stringValue
             composerRuntimeSnapshot = GatewayRuntimeAdapter.decodeRuntimeSnapshot(from: result)
             streamingReducer.reset()
-            transcriptRouteIdentity = "live:none"
+            if let liveSessionID {
+                transcriptRouteIdentity = "live:\(liveSessionID)"
+            } else {
+                transcriptRouteIdentity = "live:none"
+            }
             transcriptRouteGeneration = openGenerations.current()
             messages = []
             isAwaitingReply = streamingReducer.isAwaitingReply

@@ -48,6 +48,25 @@ func findRequestGenerationAdvancesWhenReady() throws {
     #expect(model.findRequestGeneration == 2)
 }
 
+/// The Format menu command reaches the composer through one generation, for
+/// the same reason Find does: a focused value does not cross the AppKit host
+/// that carries the main window.
+@Test("Formatting toolbar request generation advances only when ready")
+@MainActor
+func formattingToolbarRequestGenerationAdvancesWhenReady() throws {
+    let directory = try searchFindTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let model = AppModel(cache: HistoryCache(directory: directory))
+    model.requestFormattingToolbar()
+    #expect(model.formattingToolbarRequestGeneration == 0)
+    model.phase = .ready
+    model.requestFormattingToolbar()
+    #expect(model.formattingToolbarRequestGeneration == 1)
+    // A second summon is a new request even though nothing else changed.
+    model.requestFormattingToolbar()
+    #expect(model.formattingToolbarRequestGeneration == 2)
+}
+
 @Test("Search activation dismisses before open and ignores a second call")
 @MainActor
 func searchActivationDismissesBeforeOpen() async throws {

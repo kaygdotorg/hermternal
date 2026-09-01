@@ -1,14 +1,12 @@
 import AppKit
 import HermternalCore
 
-/// Accepts keystrokes from the moment the main window is key until the
-/// hosted composer editor becomes first responder.
+/// Accepts keystrokes when the composer field is not yet first responder.
 ///
-/// Attach used to run on the same turn as `orderFront` and blocked the
-/// main runloop for hundreds of milliseconds. The window was already key,
-/// but no field could take a character. This gate is first responder
-/// before attach. A local key-down monitor also keeps characters that
-/// arrive while attach later blocks the runloop.
+/// Launch attaches the cached workspace before the window orders front and
+/// focuses the composer on that first frame. This gate is the fallback when
+/// that field is not ready. A local key-down monitor also keeps characters
+/// that arrive while later work blocks the runloop.
 /// Defended by launchKeystrokesBeforeAttachReachComposer.
 @MainActor
 final class LaunchKeystrokeGate: NSView {
@@ -134,14 +132,11 @@ final class LaunchKeystrokeGate: NSView {
 
 /// Marks first main-actor idle and then runs `work` on that turn.
 ///
-/// Attach must not start on the `orderFront` turn. A yield lets the
-/// launch gate receive key events first.
+/// Launch uses this to report interactivity after the first content frame,
+/// not to delay attach. A yield lets the composer take the caret after
+/// AppKit finishes becoming key.
 enum LaunchInteractivityScheduling {
     /// Waits for the next main-actor idle, then runs `work`.
-    ///
-    /// `Task.yield()` lets the main runloop deliver key events to the
-    /// launch gate before attach starts. Attach on the same turn as
-    /// `orderFront` blocked that delivery.
     @MainActor
     @discardableResult
     static func afterFirstIdle(

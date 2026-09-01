@@ -298,8 +298,8 @@ func mainWindowStaysResizableAfterContentAttachment() throws {
     #expect(window.contentMinSize == MainWindowStartupConfiguration.minimumContentSize)
 }
 
-/// Launch orders the prepared window front, then attaches the content host.
-/// Attachment still has to keep the restored size and stay resizable.
+/// Launch can still attach after a window is already front. Attachment
+/// still has to keep the restored size and stay resizable.
 @Test("launch contract: attaching after orderFront leaves the window resizable")
 @MainActor
 func mainWindowStaysResizableWhenAttachedAfterOrderFront() throws {

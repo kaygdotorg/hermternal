@@ -22,6 +22,9 @@ struct ChatView: View {
     /// follows it. Composer consumes this through SwiftUI focus state
     /// rather than taking first responder during every launch.
     @State private var composerFocusRequest = 0
+    /// Incremented by the Format menu command. The composer consumes it to
+    /// summon the floating formatting toolbar at the caret.
+    @State private var composerToolbarRequest = 0
     var body: some View {
         // Keep the composer off the transcript `.id(session:generation)`.
         // That identity changes on every route publication. If the composer
@@ -36,6 +39,10 @@ struct ChatView: View {
         .onChange(of: model.composerFocusRequestGeneration) { _, _ in
             guard !isReadOnly else { return }
             composerFocusRequest &+= 1
+        }
+        .onChange(of: model.formattingToolbarRequestGeneration) { _, _ in
+            guard !isReadOnly else { return }
+            composerToolbarRequest &+= 1
         }
         .onChange(of: model.selectedSessionID) { oldID, newID in
             HermternalSelectionOccupancyTrace.observerInvoked(
@@ -87,7 +94,8 @@ struct ChatView: View {
             if !isReadOnly {
                 ComposerView(
                     model: model.composerModel,
-                    focusRequest: composerFocusRequest
+                    focusRequest: composerFocusRequest,
+                    summonRequest: composerToolbarRequest
                 )
             }
         }
@@ -97,13 +105,11 @@ struct ChatView: View {
     ///
     /// The route prefix is intentional: an archived session can have the same
     /// durable identifier as its live counterpart, but it is a different
-    /// read-only transcript graph. Streaming updates keep this value unchanged
-    /// because they do not change either route or session identifier.
+    /// read-only transcript graph. New chat uses the live session id before a
+    /// sidebar row exists, so adopt-live is not a switch. Streaming updates
+    /// keep this value unchanged.
     private var transcriptIdentity: String {
-        if let archivedID = model.viewingArchivedSessionID {
-            return "archived:\(archivedID)"
-        }
-        return "live:\(model.selectedSessionID ?? "none")"
+        model.transcriptPaintIdentity
     }
 
 
