@@ -15,6 +15,9 @@ and versions follow Semantic Versioning.
 
 ### Changed
 
+- Launch accepts a keystroke when the window is key, before the hosted
+  chat tree attaches. Early characters are held and then given to the
+  composer. The launch wall report includes `interactiveMs`.
 - Build and release tooling now refuses stale, incomplete, unsigned, or
   provenance-mismatched app bundles instead of handing them to callers.
 - Both speakers share one text measure. A message the user wrote is no longer

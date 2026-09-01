@@ -50,7 +50,32 @@ public enum LaunchClock {
         Log.info("PERF|launch marker|\(name) ms=\(ms) token=\(token)")
     }
 
-    /// Emits the mandatory wall-time report once the window has ordered front.
+    /// First recorded value for `name`, if the mark has fired.
+    public static func recordedMilliseconds(for name: String) -> Int? {
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        return state.marks[name]
+    }
+
+    /// Marks interactivity when the key window has a field and the runloop is idle.
+    public static func markReadyIfInteractive() {
+        guard recordedMilliseconds(for: "interactivity.firstResponder") != nil,
+              recordedMilliseconds(for: "window.becameKey") != nil,
+              recordedMilliseconds(for: "interactivity.runloopIdle") != nil
+        else { return }
+        mark("interactivity.ready")
+    }
+
+    /// Formats the wall-time report from the marks recorded so far.
+    public static func formatBreakdown() -> String {
+        state.lock.lock()
+        let token = state.token
+        let marks = state.marks
+        state.lock.unlock()
+        return formatBreakdown(marks: marks, token: token)
+    }
+
+    /// Emits the mandatory wall-time report once attach and interactivity exist.
     public static func reportBreakdown() {
         state.lock.lock()
         guard !state.didReportBreakdown else {
@@ -61,7 +86,20 @@ public enum LaunchClock {
         let token = state.token
         let marks = state.marks
         state.lock.unlock()
+        Log.info(formatBreakdown(marks: marks, token: token))
+    }
 
+    /// Clears process-lifetime state. Tests call this so marks do not leak.
+    public static func resetForTests() {
+        state.lock.lock()
+        state.processStartNanoseconds = nil
+        state.token = "--------"
+        state.marks = [:]
+        state.didReportBreakdown = false
+        state.lock.unlock()
+    }
+
+    private static func formatBreakdown(marks: [String: Int], token: String) -> String {
         func value(_ name: String) -> String {
             marks[name].map(String.init) ?? "-"
         }
@@ -71,30 +109,34 @@ public enum LaunchClock {
             }
             return String(end - start)
         }
-        Log.info(
-            "PERF|launch wall breakdown"
-                + "|processStartMs=\(value("processStart"))"
-                + " appModelInitMs=\(delta("appModel.init.begin", "appModel.init.end"))"
-                + " searchIndexMs=\(delta("searchIndex.open.begin", "searchIndex.open.end"))"
-                + " sessionListMs=\(delta("sessionList.cache.begin", "sessionList.cache.end"))"
-                + " residentVisibleTailMs=\(delta("residentVisibleTail.begin", "residentVisibleTail.end"))"
-                + " restoredTranscriptMs=\(value("restoredTranscript.published"))"
-                + " windowShowBeginMs=\(value("window.show.begin"))"
-                + " shellConstructMs=\(delta("window.shellConstruct.begin", "window.shellConstruct.end"))"
-                + " windowCreateMs=\(delta("window.create.begin", "window.create.end"))"
-                + " windowPrepareMs=\(delta("window.prepare.begin", "window.prepare.end"))"
-                + " hostingViewLoadMs=\(delta("window.hostingView.begin", "window.hostingView.end"))"
-                + " attachMs=\(delta("window.attach.begin", "window.attach.end"))"
-                + " contentViewAssignedMs=\(value("window.contentViewAssigned"))"
-                + " frameRestoredMs=\(value("window.frameRestored"))"
-                + " firstSwiftUIRenderMs=\(value("window.firstSwiftUIRender"))"
-                + " toolbarMs=\(delta("window.toolbar.begin", "window.toolbar.end"))"
-                + " backdropHostedMs=\(value("window.backdropHosted"))"
-                + " orderFrontBeginMs=\(value("window.orderFront.begin"))"
-                + " orderFrontMs=\(delta("window.orderFront.begin", "window.orderedFront"))"
-                + " publishToFrontMs=\(delta("restoredTranscript.published", "window.orderedFront"))"
-                + " windowOrderedFrontMs=\(value("window.orderedFront"))"
-                + " token=\(token)"
-        )
+        return "PERF|launch wall breakdown"
+            + "|processStartMs=\(value("processStart"))"
+            + " appModelInitMs=\(delta("appModel.init.begin", "appModel.init.end"))"
+            + " searchIndexMs=\(delta("searchIndex.open.begin", "searchIndex.open.end"))"
+            + " sessionListMs=\(delta("sessionList.cache.begin", "sessionList.cache.end"))"
+            + " residentVisibleTailMs=\(delta("residentVisibleTail.begin", "residentVisibleTail.end"))"
+            + " restoredTranscriptMs=\(value("restoredTranscript.published"))"
+            + " windowShowBeginMs=\(value("window.show.begin"))"
+            + " shellConstructMs=\(delta("window.shellConstruct.begin", "window.shellConstruct.end"))"
+            + " windowCreateMs=\(delta("window.create.begin", "window.create.end"))"
+            + " windowPrepareMs=\(delta("window.prepare.begin", "window.prepare.end"))"
+            + " hostingViewLoadMs=\(delta("window.hostingView.begin", "window.hostingView.end"))"
+            + " attachDeferredMs=\(value("window.attach.deferred"))"
+            + " attachMs=\(delta("window.attach.begin", "window.attach.end"))"
+            + " contentViewAssignedMs=\(value("window.contentViewAssigned"))"
+            + " frameRestoredMs=\(value("window.frameRestored"))"
+            + " firstSwiftUIRenderMs=\(value("window.firstSwiftUIRender"))"
+            + " toolbarMs=\(delta("window.toolbar.begin", "window.toolbar.end"))"
+            + " backdropHostedMs=\(value("window.backdropHosted"))"
+            + " orderFrontBeginMs=\(value("window.orderFront.begin"))"
+            + " orderFrontMs=\(delta("window.orderFront.begin", "window.orderedFront"))"
+            + " publishToFrontMs=\(delta("restoredTranscript.published", "window.orderedFront"))"
+            + " windowOrderedFrontMs=\(value("window.orderedFront"))"
+            + " becameKeyMs=\(value("window.becameKey"))"
+            + " firstResponderMs=\(value("interactivity.firstResponder"))"
+            + " runloopIdleMs=\(value("interactivity.runloopIdle"))"
+            + " interactiveMs=\(value("interactivity.ready"))"
+            + " orderFrontToInteractiveMs=\(delta("window.orderedFront", "interactivity.ready"))"
+            + " token=\(token)"
     }
 }

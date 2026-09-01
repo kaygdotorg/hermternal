@@ -956,6 +956,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var toolbarController: MainToolbarController?
     private var hasShownWindow = false
     private var initialOrderAnimationState: MainWindowInitialOrderAnimationState = .suppressing
+    private var launchKeystrokeGate: LaunchKeystrokeGate?
+    private var didScheduleDeferredAttach = false
 
     private init() {
         super.init(window: nil)
@@ -1036,12 +1038,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             // Measured: attach laid out the full ChatView tree for ~300 ms
             // before the window could order front. Native chrome and the
             // restored frame are already on the window, so order it first.
-            // Attach still owns the first SwiftUI layout; it just no longer
-            // blocks the first visible frame. No placeholder chrome.
+            // Attach still owns the first SwiftUI layout. It waits for the
+            // first runloop idle so a keystroke can land in the launch gate
+            // while the window is already key.
             LaunchClock.mark("window.orderFront.begin")
             window.makeKeyAndOrderFront(nil)
             LaunchClock.mark("window.orderedFront")
-            MainWindowStartupConfiguration.attach(shellController, to: window)
+            if window.isKeyWindow {
+                LaunchClock.mark("window.becameKey")
+            }
+            installLaunchKeystrokeGate(in: window, model: model)
+            scheduleDeferredAttach(window: window, shellController: shellController)
             didOrderFrontThisTurn = true
         }
         if let window {
@@ -1054,8 +1061,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.toolbarController?.setVisibilityBridge(
                     self?.shellController?.visibilityBridgeView
                 )
-                // Backdrop installs in viewDidAppear, after attach returns.
-                LaunchClock.reportBreakdown()
             }
             if !hasShownWindow {
                 hasShownWindow = true
@@ -1080,6 +1085,78 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// Makes a field that can take a keystroke as soon as the window is key.
+    private func installLaunchKeystrokeGate(in window: NSWindow, model: AppModel) {
+        guard model.phase.presentsWorkspace,
+              !model.isViewingArchivedTranscript
+        else { return }
+        let gate = LaunchKeystrokeGate()
+        launchKeystrokeGate = gate
+        gate.install(in: window)
+#if DEBUG
+        if ProcessInfo.processInfo.environment["HERMTERNAL_LAUNCH_KEY_PROBE"] == "1" {
+            LaunchKeystrokeGate.postCharacter("k", to: window)
+        }
+#endif
+    }
+
+    /// Attaches the hosted split after the first idle, not on this turn.
+    private func scheduleDeferredAttach(
+        window: NSWindow,
+        shellController: MainShellViewController
+    ) {
+        LaunchClock.mark("window.attach.deferred")
+        LaunchInteractivityScheduling.afterFirstIdle { [weak self] in
+            self?.performDeferredAttach(window: window, shellController: shellController)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
+            self?.performDeferredAttach(window: window, shellController: shellController)
+        }
+    }
+
+    private func performDeferredAttach(
+        window: NSWindow,
+        shellController: MainShellViewController
+    ) {
+        guard !didScheduleDeferredAttach else { return }
+        didScheduleDeferredAttach = true
+        let early = launchKeystrokeGate?.detachFromWindowKeepingMonitor() ?? ""
+        MainWindowStartupConfiguration.attach(shellController, to: window)
+        toolbarController?.setVisibilityBridge(shellController.visibilityBridgeView)
+        DispatchQueue.main.async { [weak self] in
+            self?.finishLaunchKeystrokeHandoff(earlyBuffer: early)
+        }
+    }
+
+    /// Moves buffered launch keystrokes into the composer and reports the wall.
+    private func finishLaunchKeystrokeHandoff(earlyBuffer: String) {
+        let later = launchKeystrokeGate?.stop() ?? ""
+        launchKeystrokeGate = nil
+        if let model {
+            let combined = earlyBuffer + later
+            if !combined.isEmpty {
+                model.composerModel.text += combined
+            }
+            if model.phase.presentsWorkspace, !model.isViewingArchivedTranscript {
+                model.requestComposerFocus()
+            }
+        }
+        if LaunchClock.recordedMilliseconds(for: "interactivity.firstResponder") == nil {
+            LaunchClock.mark("interactivity.firstResponder")
+        }
+        LaunchClock.mark("interactivity.runloopIdle")
+        LaunchClock.markReadyIfInteractive()
+        LaunchClock.reportBreakdown()
+#if DEBUG
+        if ProcessInfo.processInfo.environment["HERMTERNAL_LAUNCH_KEY_PROBE"] == "1" {
+            let text = model?.composerModel.text ?? ""
+            print("HERMTERNAL_LAUNCH_KEY_BUFFER=\(text)")
+            try? FileHandle.standardOutput.synchronize()
+            Log.info("PERF|launch keyProbe|chars=\(text.count)")
+        }
+#endif
+    }
+
     func refreshChrome() {
         if let model {
             toolbarController?.update(model: model)
@@ -1091,13 +1168,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
+        LaunchClock.mark("window.becameKey")
+        if let window, let gate = launchKeystrokeGate, window.firstResponder !== gate {
+            window.makeFirstResponder(gate)
+            LaunchClock.mark("interactivity.firstResponder")
+        }
+        LaunchClock.markReadyIfInteractive()
         guard initialOrderAnimationState.restoreAfterFirstKey(),
               let window
         else { return }
         window.animationBehavior = initialOrderAnimationState.animationBehavior
     }
-
     func windowWillClose(_ notification: Notification) {
+        _ = launchKeystrokeGate?.stop()
+        launchKeystrokeGate = nil
         shellController?.prepareForWindowClose()
     }
 }
@@ -1202,6 +1286,7 @@ final class HermternalApplicationDelegate: NSObject, NSApplicationDelegate {
         model.publishRestoredTranscript()
         _ = showMainWindowIfReady()
         Task { @MainActor [weak self] in
+            await Task.yield()
             await self?.model?.restoreOrPromptSignIn()
         }
     }

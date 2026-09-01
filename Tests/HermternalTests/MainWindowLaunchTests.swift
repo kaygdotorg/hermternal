@@ -637,3 +637,88 @@ func appCompositionKeepsMacOSOrganizationDirectory() {
 
     #expect(HermternalApp.makeOrganizationStore().configurationURL == expectedURL)
 }
+
+@Test("launch contract: the keystroke gate buffers printable keys")
+@MainActor
+func launchKeystrokeGateBuffersPrintableKeys() {
+    _ = NSApplication.shared
+    let window = NSWindow(
+        contentRect: NSRect(origin: .zero, size: MainWindowStartupConfiguration.defaultContentSize),
+        styleMask: [.titled, .closable, .resizable],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    window.makeKeyAndOrderFront(nil)
+    defer { window.close() }
+    let gate = LaunchKeystrokeGate()
+    gate.install(in: window)
+    LaunchKeystrokeGate.postCharacter("h", to: window)
+    LaunchKeystrokeGate.postCharacter("i", to: window)
+    #expect(gate.bufferedText == "hi")
+    #expect(window.firstResponder === gate)
+    _ = gate.stop()
+}
+
+@Test("launch contract: keystrokes before attach reach the composer")
+@MainActor
+func launchKeystrokesBeforeAttachReachComposer() throws {
+    _ = NSApplication.shared
+    let directory = FileManager.default.temporaryDirectory
+        .appending(path: "HermternalTests.LaunchKeys.\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let suiteName = "HermternalTests.LaunchKeys.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let model = AppModel(cache: HistoryCache(directory: directory))
+    model.phase = .restoring
+    let shell = MainShellViewController(
+        appearance: AppearanceSettings(defaults: defaults),
+        model: model,
+        onModelStateChanged: {}
+    )
+    let window = NSWindow(
+        contentRect: NSRect(
+            origin: .zero,
+            size: MainWindowStartupConfiguration.defaultContentSize
+        ),
+        styleMask: [
+            .titled,
+            .closable,
+            .miniaturizable,
+            .resizable,
+            .fullSizeContentView
+        ],
+        backing: .buffered,
+        defer: false
+    )
+    window.isReleasedWhenClosed = false
+    MainWindowStartupConfiguration.prepare(window, restoringFrameNamed: nil)
+    window.makeKeyAndOrderFront(nil)
+    let gate = LaunchKeystrokeGate()
+    gate.install(in: window)
+    LaunchKeystrokeGate.postCharacter("h", to: window)
+    LaunchKeystrokeGate.postCharacter("i", to: window)
+    #expect(window.contentViewController == nil)
+    let early = gate.detachFromWindowKeepingMonitor()
+    LaunchKeystrokeGate.postCharacter("!", to: window)
+    MainWindowStartupConfiguration.attach(shell, to: window)
+    defer { window.close() }
+    let later = gate.stop()
+    model.composerModel.text += early + later
+    #expect(early + later == "hi!")
+    #expect(model.composerModel.text == "hi!")
+}
+
+@Test("launch contract: attach waits for the first runloop idle")
+@MainActor
+func launchAttachWaitsForFirstRunLoopIdle() async {
+    var ran = false
+    let scheduled = LaunchInteractivityScheduling.afterFirstIdle {
+        ran = true
+    }
+    #expect(!ran)
+    await scheduled.value
+    #expect(ran)
+}
