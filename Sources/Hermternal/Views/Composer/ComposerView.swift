@@ -6,9 +6,11 @@ import UniformTypeIdentifiers
 
 /// The message composer.
 ///
-/// The accessory row includes one Format disclosure control.
-/// Explicit Format activation reveals actions above the message field.
-/// Row three appears only while the draft holds attachments.
+/// Formatting has no control in the accessory row and no row of its own.
+/// A floating toolbar appears over the message field while text is selected,
+/// and the Format menu summons it from the keyboard. Row two is therefore the
+/// only accessory row, and row three appears only while the draft holds
+/// attachments.
 ///
 /// Every row sits inside one glass panel. That panel is the only surface
 /// the composer paints, and it is inset from the detail column edge, so it
@@ -21,6 +23,10 @@ struct ComposerView: View {
     /// composer reacts to a change of this value, so it never takes first
     /// responder on its own during a launch or a chat switch.
     var focusRequest: Int = 0
+    /// Incremented by the caller to summon the floating formatting toolbar.
+    /// The Format menu owns that command, so the toolbar has one documented
+    /// keyboard path and the composer holds no shortcut of its own.
+    var summonRequest: Int = 0
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.hermternalAccentColor) private var accentColor
@@ -28,22 +34,34 @@ struct ComposerView: View {
     /// Token for this view instance. Pass it to unmount so a late disappear is a no-op.
     @State private var mountToken: ComposerMountToken?
     @State private var handledFocusRequest = 0
+    @State private var handledSummonRequest = 0
     @State private var isFileImporterPresented = false
     @State private var filePickerTarget: ComposerRouteToken?
     @State private var photoSelection: [PhotosPickerItem] = []
     @State private var photoPickerTarget: ComposerRouteToken?
     @State private var quickLookURL: URL?
     @State private var formatRequest: ComposerEditorFormat?
-    @State private var isFormattingExpanded = false
     @State private var localFocusRequest = 0
     @State private var isEditorFocused = false
+    /// Watches the editor selection and places the floating toolbar. One
+    /// instance per composer, and it lives as long as this view does.
+    @State private var toolbar = ComposerFormattingToolbarController()
 
     var body: some View {
+        let recording = ComposerTypingProbe.isRecording(model)
+        let start = recording ? DispatchTime.now().uptimeNanoseconds : 0
+        let _ = ComposerTypingProbe.noteComposerViewUpdate(
+            from: model,
+            nanoseconds: recording
+                ? DispatchTime.now().uptimeNanoseconds &- start
+                : 0
+        )
         composerLayout
         // Escape belongs to the composer only while it has something to
-        // cancel. The caller owns the find bar and receives the key press
-        // when the composer does not use it.
-        .onKeyPress(.escape) { model.handleEscape() ? .handled : .ignored }
+        // cancel, and the floating toolbar is the first thing it cancels.
+        .onKeyPress(.escape) {
+            toolbar.handleEscape() || model.handleEscape() ? .handled : .ignored
+        }
         .animation(
             reduceMotion ? nil : .snappy(duration: 0.18),
             value: model.attachments.count + model.outgoing.count
@@ -68,17 +86,15 @@ struct ComposerView: View {
             handlePhotoSelectionChange(items)
         }
         .onChange(of: isEditorFocused) { _, focused in
-            if ComposerEditorInteractionPolicy.shouldHideFormattingRow(
-                isEditorFocused: focused,
-                hasSource: !model.text.isEmpty
-            ) {
-                isFormattingExpanded = false
-            }
+            toolbar.noteFocusChange(focused)
         }
-        .onChange(of: model.text) { _, text in
-            if text.isEmpty {
-                isFormattingExpanded = false
-            }
+        .onChange(of: model.route.isReadOnly) { _, isReadOnly in
+            toolbar.setEnabled(!isReadOnly)
+        }
+        .onChange(of: summonRequest) { _, request in
+            guard request != handledSummonRequest else { return }
+            handledSummonRequest = request
+            summonFormattingToolbar()
         }
         .onChange(of: focusRequest) { _, request in
             guard request != handledFocusRequest else { return }
@@ -88,6 +104,7 @@ struct ComposerView: View {
             // Issue a mount token for this view. An unmount without it is a no-op.
             // Defended by outOfOrderUnmountDoesNotBlockSubmit.
             mountToken = model.mount()
+            toolbar.setEnabled(!model.route.isReadOnly)
         }
         .onDisappear {
             // SwiftUI can fire this after the successor appears. Pass the token.
@@ -95,6 +112,9 @@ struct ComposerView: View {
                 model.unmount(mountToken)
             }
             mountToken = nil
+            // The controller holds one notification observer. Release it with
+            // the view, so a replaced composer leaves nothing watching.
+            toolbar.detach()
         }
         // A refused or failed action states its reason once. The composer has
         // no room for a fourth row, and an alert is the system answer.
@@ -222,30 +242,6 @@ struct ComposerView: View {
     // MARK: - Row one
     private var messageRow: some View {
         VStack(alignment: .leading, spacing: 4) {
-            if ComposerEditorInteractionPolicy.formattingRowIsVisible(
-                isEditorFocused: isEditorFocused,
-                isExpanded: isFormattingExpanded,
-                hasSource: !model.text.isEmpty
-            ) {
-                ComposerFormattingRow(
-                    mode: model.editorMode,
-                    onFormat: {
-                        formatRequest = $0
-                        isFormattingExpanded = ComposerEditorInteractionPolicy
-                            .formattingActionPreservesFocus(isEditorFocused)
-                    },
-                    onToggleSource: {
-                        let next: ComposerEditorMode = model.editorMode == .source ? .wysiwyg : .source
-                        _ = model.setEditorMode(next)
-                    }
-                )
-                .disabled(model.route.isReadOnly)
-                .transition(
-                    reduceMotion
-                        ? .identity
-                        : .opacity.combined(with: .move(edge: .top))
-                )
-            }
             HStack(spacing: 8) {
                 ZStack(alignment: .topLeading) {
                     ComposerMarkdownEditor(
@@ -258,9 +254,13 @@ struct ComposerView: View {
                         isEditable: !model.route.isReadOnly,
                         focusRequest: focusRequest + localFocusRequest,
                         formatRequest: formatRequest,
+                        toolbar: toolbar,
                         onSubmit: { model.submit() },
-                        onEscape: { model.handleEscape() },
-                        onFormatHandled: { formatRequest = nil }
+                        // The toolbar answers Escape first, because closing
+                        // the strip is the smaller cancel of the two.
+                        onEscape: { toolbar.handleEscape() || model.handleEscape() },
+                        onFormatHandled: { formatRequest = nil },
+                        typingProbeOwner: ObjectIdentifier(model)
                     )
                     // The placeholder is always in the tree, and always the
                     // same size, so the first character removes no view and
@@ -274,6 +274,10 @@ struct ComposerView: View {
                         .allowsHitTesting(false)
                         .accessibilityHidden(true)
                 }
+                // An overlay, not a third stack child: the strip must never
+                // take part in the field's own size. It floats inside the
+                // field's bounds, and the controller states where.
+                .overlay(alignment: .topLeading) { formattingToolbar }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityLabel("Message")
                 .accessibilityHint(model.text.isEmpty ? "Message Hermes…" : "")
@@ -285,27 +289,54 @@ struct ComposerView: View {
                     .accessibilityLabel("Source error: \(error.message)")
             }
         }
-        .animation(formattingRowAnimation, value: isEditorFocused)
-        .animation(formattingRowAnimation, value: isFormattingExpanded)
     }
 
-    /// The Format row travels with focus and with explicit disclosure.
+    /// The floating formatting toolbar, at the place the controller states.
     ///
-    /// Reduced motion keeps the same path at duration zero, matching
-    /// `TranscriptMotion.duration(reducesMotion:)`.
-    private var formattingRowAnimation: Animation {
-        .easeInOut(
-            duration: ComposerEditorInteractionPolicy.formattingRowAnimationDuration(
-                reducesMotion: reduceMotion
-            )
+    /// One animation drives the whole show and hide, and its value is the
+    /// placement itself, so a reposition inside the field travels and an
+    /// arrival pops. Reduced motion runs the same path at duration zero.
+    @ViewBuilder private var formattingToolbar: some View {
+        let presentation = toolbar.presentation
+        Group {
+            if let presentation {
+                ComposerFormattingToolbar(
+                    mode: model.editorMode,
+                    placement: presentation.placement,
+                    isSummoned: presentation.isSummoned,
+                    summonGeneration: presentation.summonGeneration,
+                    onAction: { runFormattingAction($0) }
+                )
+                .offset(x: presentation.originX, y: presentation.originY)
+            }
+        }
+        .animation(
+            .snappy(duration: reduceMotion ? 0 : 0.18),
+            value: presentation
         )
+    }
+
+    private func runFormattingAction(_ action: ComposerFormattingToolbarAction) {
+        switch action {
+        case let .format(format):
+            formatRequest = format
+        case .toggleSource:
+            let next: ComposerEditorMode = model.editorMode == .source ? .wysiwyg : .source
+            _ = model.setEditorMode(next)
+        }
+    }
+
+    private func summonFormattingToolbar() {
+        if !isEditorFocused {
+            localFocusRequest += 1
+        }
+        toolbar.summon()
     }
 
     // MARK: - Row two
 
     private var controlRow: some View {
         HStack(spacing: 8) {
-            formatDisclosureButton
             filesButton
             photosButton
             recordButton
@@ -324,25 +355,6 @@ struct ComposerView: View {
     /// The left controls stay icon only while the row is narrow, because a
     /// revealed title there would push the row past the detail width.
     private var canRevealLabels: Bool { model.density != .minimal }
-
-    private var formatDisclosureButton: some View {
-        Button {
-            guard !model.text.isEmpty else { return }
-            isFormattingExpanded = true
-            if !isEditorFocused {
-                localFocusRequest += 1
-            }
-        } label: {
-            Label("Format", systemImage: "textformat")
-        }
-        .buttonStyle(.borderless)
-        .controlSize(.regular)
-        .disabled(model.route.isReadOnly || model.text.isEmpty)
-        .help("Show formatting actions.")
-        .accessibilityLabel("Format")
-        .accessibilityValue(isFormattingExpanded ? "Shown" : "Hidden")
-        .accessibilityIdentifier("composer-format-disclosure")
-    }
 
     private var filesButton: some View {
         ComposerHoverReveal { isRevealed in

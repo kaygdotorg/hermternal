@@ -12,12 +12,23 @@ and versions follow Semantic Versioning.
 - A width toggle in the window's toolbar, and in the View menu, switches the
   transcript between the reading measure and the full window. The choice is
   remembered.
+- A floating formatting toolbar appears over the composer field on a text
+  selection. Bold, Italic, Code, Link, and Strikethrough are visible, and
+  the headings, list, quote, code block, and source actions scroll into
+  view. The strip rests above the selected line when the field has room,
+  and below it when it does not. Format ▸ Show Formatting Toolbar (⌥⌘T)
+  summons it at the caret and focuses the first item.
+- Strikethrough and Numbered List commands, and the field now draws the
+  number of a numbered list item instead of a bullet.
 
 ### Changed
 
-- Launch accepts a keystroke when the window is key, before the hosted
-  chat tree attaches. Early characters are held and then given to the
-  composer. The launch wall report includes `interactiveMs`.
+- Launch attaches the cached sidebar and chat before the window orders
+  front. The first visible frame already holds that content, the
+  composer caret is live, and a later store attach does not jump the
+  transcript. Early keystrokes still reach the composer if the field is
+  not ready. The launch wall report includes `interactiveMs` and
+  `firstContentFrameMs`.
 - Build and release tooling now refuses stale, incomplete, unsigned, or
   provenance-mismatched app bundles instead of handing them to callers.
 - Both speakers share one text measure. A message the user wrote is no longer
@@ -30,6 +41,12 @@ and versions follow Semantic Versioning.
 - A row measurement that lands writes only what it changed: the row height and
   the outgoing bubble's width. A visible row no longer rebuilds its text for
   every measurement that arrives while an answer streams.
+- The composer's Format control and the row it opened are gone. Formatting
+  is on the floating toolbar, so the composer takes no height for actions
+  that only a selection can use. Typing costs the toolbar nothing: a
+  keystroke with no selection is one length read and no scheduled work,
+  measured as identical layout counts with the observer attached and
+  detached.
 
 ## [v0.0.4] — 2026-08-23
 

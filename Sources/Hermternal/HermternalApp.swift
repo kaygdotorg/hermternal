@@ -217,6 +217,23 @@ struct HermternalApp: App {
                 .keyboardShortcut("k", modifiers: .command)
                 .disabled(model.phase != .ready || model.searchQuerying == nil)
             }
+            // The Format menu. `textFormatting` builds it, which the app has
+            // no other item in, so this one command creates the menu and the
+            // only formatting affordance outside the composer field itself
+            // is discoverable there. Measured on macOS 26.6.2 with a probe:
+            // the group does produce a Format menu with one item.
+            //
+            // Option-Command-T is free. The default menu bar holds no such
+            // key equivalent, and the main window's toolbar is set in AppKit,
+            // so no Show Toolbar item claims it.
+            CommandGroup(after: .textFormatting) {
+                Button("Show Formatting Toolbar") {
+                    _ = applicationDelegate.showMainWindowIfReady()
+                    model.requestFormattingToolbar()
+                }
+                .keyboardShortcut("t", modifiers: [.option, .command])
+                .disabled(model.phase != .ready)
+            }
             // The View menu. Reload lives here, on its standard key
             // equivalent, instead of in a toolbar slot: it is a command a
             // reader reaches for once a session, and the slot it held now
